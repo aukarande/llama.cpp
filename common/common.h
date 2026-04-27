@@ -739,6 +739,9 @@ struct common_params {
     std::string tts_speaker_file = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
+
+    size_t   max_vram_alloc   = 0;
+    uint32_t pshard_tier_max  = 0;
 };
 
 // call once at the start of a program if it uses libcommon
@@ -1118,7 +1121,7 @@ inline std::string llm_ffn_exps_block_regex(int idx) {
 }
 
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
-    return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
+    return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type(), -1 };
 }
 
 //

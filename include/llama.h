@@ -302,6 +302,7 @@ extern "C" {
     struct llama_model_tensor_buft_override {
         const char * pattern;
         ggml_backend_buffer_type_t buft;
+        int32_t backend_id;
     };
 
     struct llama_model_params {
@@ -339,6 +340,11 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        bool pshard;          // enable pipelined sharding: weights on CPU host, pipelined to GPU per split
+        bool pshard_cache_skip_load; // skip loading plan cache (rebuild from scratch, then overwrite)
+        size_t max_vram_alloc; // VRAM budget in MiB for the unified preload buffer (0 = auto from free VRAM)
+        struct llama_pshard_plan_registry * pshard_registry; // tier plan registry, caller-owned. populated by llama_params_fit_pshard
     };
 
     struct llama_sampler_seq_config {
@@ -408,6 +414,8 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        bool pshard;          // enable pipelined sharding for this context (3 GPU backends, split callbacks)
     };
 
     struct llama_model_tensor_override {
@@ -540,6 +548,26 @@ extern "C" {
 
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
+
+    // Pipelined sharding planner: probes VRAM usage for each strategy/tier combination,
+    // selects the best plan (by TPS if benchmark data available, else by VRAM fit),
+    // and populates tensor_buft_overrides for model loading.
+    // Results are cached to <model_path>.tensor_overrides.pshard_registry for fast subsequent launches.
+    // If all layers fit in VRAM, sets mparams->pshard=false and returns (baseline loading).
+    // (the generic parameter fit moved upstream to common/fit.h: common_fit_params)
+    LLAMA_API void llama_params_fit_pshard(
+                                   const char   * path_model,
+                    struct llama_model_params   * mparams,
+                    struct llama_context_params * cparams,
+        struct llama_model_tensor_buft_override * tensor_buft_overrides,
+                                         size_t   max_vram_mb);           // 0 = use actual free VRAM
+
+    // Create/free a tier plan registry. Caller owns the pointer and passes it via
+    // mparams->pshard_registry before calling llama_params_fit_pshard.
+    // n_tier_max: largest batch size to probe (determines tier range, typically max(n_batch, 16384)).
+    // n_seq_max: for speculative decoding tiers.
+    LLAMA_API struct llama_pshard_plan_registry * llama_pshard_registry_create(uint32_t n_tier_max, uint32_t n_seq_max);
+    LLAMA_API void                         llama_pshard_registry_free(struct llama_pshard_plan_registry * registry);
 
     LLAMA_API int64_t llama_time_us(void);
 

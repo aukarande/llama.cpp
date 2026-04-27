@@ -1176,7 +1176,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // check overrides
         if (tensor_buft_overrides) {
-            std::string tensor_name = tn.str();
+            // when a tensor is remapped (e.g. token_embd duplicated as output),
+            // match overrides against the remapped name so each copy can be
+            // placed independently (e.g. token_embd on CPU, output on GPU)
+            std::string tensor_name = (tn_tensor != tn.tensor)
+                ? LLM_TN_IMPL(tn.arch, tn_tensor, tn.suffix, tn.bid, tn.xid).str() : tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
@@ -1306,7 +1310,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
-    if (flags & TENSOR_DUPLICATED) {
+    // pshard needs separate tensors for output vs token_embd (different GPU/CPU placement)
+    if ((flags & TENSOR_DUPLICATED) && !force_duplicate_tied) {
         ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
         if (t) {
             return t;
@@ -1316,7 +1321,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
-    ggml_set_name(tensor, ggml_get_name(&t_meta));
+
+    if (duplicated && force_duplicate_tied) {
+        // pshard: a TIED output head must become a REAL "output.weight"
+        // tensor (separate placement from token_embd)
+        ggml_set_name(tensor, "output.weight");
+        if (weights_map.find("output.weight") == weights_map.end()) {
+            auto it = weights_map.find(ggml_get_name(&t_meta));
+            if (it != weights_map.end()) {
+                weights_map.emplace("output.weight", it->second);
+            }
+        }
+    } else {
+        ggml_set_name(tensor, ggml_get_name(&t_meta));
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);

@@ -269,6 +269,13 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         std::string tensor_name = override.substr(0, pos);
         std::string buffer_type = override.substr(pos + 1);
 
+        int32_t backend_id = -1;
+        auto colon_pos = buffer_type.rfind(':');
+        if (colon_pos != std::string::npos) {
+            backend_id = std::stoi(buffer_type.substr(colon_pos + 1));
+            buffer_type = buffer_type.substr(0, colon_pos);
+        }
+
         if (buft_list.find(buffer_type) == buft_list.end()) {
             printf("Available buffer types:\n");
             for (const auto & it : buft_list) {
@@ -279,7 +286,7 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         // keep strings alive and avoid leaking memory by storing them in a static vector
         static std::list<std::string> buft_overrides;
         buft_overrides.push_back(tensor_name);
-        overrides.push_back({buft_overrides.back().c_str(), buft_list.at(buffer_type)});
+        overrides.push_back({buft_overrides.back().c_str(), buft_list.at(buffer_type), backend_id});
     }
 }
 
@@ -945,11 +952,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // pad tensor_buft_overrides for llama_params_fit:
     const size_t ntbo = llama_max_tensor_buft_overrides();
     while (params.tensor_buft_overrides.size() < ntbo) {
-        params.tensor_buft_overrides.push_back({nullptr, nullptr});
+        params.tensor_buft_overrides.push_back({nullptr, nullptr, -1});
     }
 
     if (!params.speculative.draft.tensor_buft_overrides.empty()) {
-        params.speculative.draft.tensor_buft_overrides.push_back({nullptr, nullptr});
+        params.speculative.draft.tensor_buft_overrides.push_back({nullptr, nullptr, -1});
     }
 
     if (!params.chat_template.empty() && !common_chat_verify_template(params.chat_template, params.use_jinja)) {
@@ -1961,6 +1968,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"-mva", "--max-vram-alloc"}, "N",
+        "VRAM budget in MB for pshard (0 = use actual free VRAM)",
+        [](common_params & params, int value) {
+            params.max_vram_alloc = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--pshard-tier-max"}, "N",
+        "max tier batch size for pshard planning (0 = auto, capped by n_ctx)",
+        [](common_params & params, int value) {
+            params.pshard_tier_max = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--spm-infill"},
         string_format(
             "use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this. (default: %s)",
@@ -2754,7 +2775,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 // keep strings alive and avoid leaking memory by storing them in a static vector
                 static std::list<std::string> buft_overrides;
                 buft_overrides.push_back(llm_ffn_exps_block_regex(i));
-                params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), ggml_backend_cpu_buffer_type()});
+                params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), ggml_backend_cpu_buffer_type(), -1});
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));

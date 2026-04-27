@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-pshard-plan.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -23,6 +24,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -362,6 +365,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
             return {0, model_ptr.release()};
         }
+
+        // pshard needs a REAL output.weight even for tied embeddings
+        // (separate GPU/CPU placement from token_embd)
+        ml.force_duplicate_tied = params.pshard;
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
