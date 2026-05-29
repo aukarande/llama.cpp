@@ -43,7 +43,8 @@ struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+                  llama_context_probe_reserve probe_reserve = {});
 
     ~llama_context();
 
@@ -280,6 +281,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    llama_context_probe_reserve probe_reserve;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
@@ -395,6 +397,11 @@ private:
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };
 
+llama_context * llama_init_from_model_internal(
+                 llama_model * model,
+        llama_context_params   params,
+        llama_context_probe_reserve probe_reserve = {});
+
 // pshard free functions (implemented in llama-context-pshard.cpp)
 struct llama_memory_i;
 
@@ -403,5 +410,4 @@ void pshard_assign_tensors(
         const llama_model                               & model,
         llama_memory_i                                  * memory,
         const std::vector<ggml_backend_ptr>             & backends,
-        const pshard_dev_layout                         & layout,
-        ggml_cgraph                                     * gf);
+        const pshard_dev_layout                         & layout);
