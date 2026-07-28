@@ -2,7 +2,7 @@
 
 set(TARGET llama-fit-params-impl)
 
-add_library(${TARGET} fit-params.cpp)
+add_library(${TARGET} fit-params.cpp fit-params-pshard.cpp)
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

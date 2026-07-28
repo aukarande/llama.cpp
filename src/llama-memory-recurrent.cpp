@@ -72,6 +72,55 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
 
+    if (model.is_pshard()) {
+        std::vector<llama_memory_pshard::tensor_spec> specs;
+        for (int i = 0; i < n_layer; i++) {
+            if (filter && !filter(i)) continue;
+            specs.push_back({
+                /*.il       =*/ (uint32_t)i,
+                /*.type_t1  =*/ type_r,
+                /*.type_t2  =*/ type_s,
+                /*.dim_t1   =*/ (uint32_t)(hparams.n_embd_r() * mem_size),
+                /*.dim_t2   =*/ (uint32_t)(hparams.n_embd_s() * mem_size),
+                /*.seq_len  =*/ 0,
+                /*.n_stream =*/ 1,
+                /*.is_1d    =*/ true,
+                /*.name_t1  =*/ "cache_r",
+                /*.name_t2  =*/ "cache_s",
+            });
+        }
+
+        pipe_shard_rs = std::make_unique<llama_memory_pshard>();
+        pipe_shard_rs->mode = llama_memory_pshard::FULL;
+
+        pipe_shard_rs->on_activate_gpu = [this](int32_t il, ggml_tensor * r, ggml_tensor * s) {
+            r_l[il] = r;
+            s_l[il] = s;
+        };
+
+        pipe_shard_rs->on_activate_cpu = [this](int32_t il, ggml_tensor * r, ggml_tensor * s) {
+            r_l[il] = r;
+            s_l[il] = s;
+        };
+
+        const int32_t cpu_bid = pshard_dev_layout::compute_cpu_backend_id(model.devices.size());
+        // no_alloc == planner probe: there is no runtime pshard_pack_cache_region() to assign
+        // addresses later, so pass no external buffer and let init() allocate eagerly.
+        ggml_backend_buffer_t preload_buf = hparams.no_alloc ? nullptr : model.get_dev_preload_buf();
+        if (!pipe_shard_rs->init(specs, model.get_layer_backend_ids(), cpu_bid, hparams.no_alloc, preload_buf)) {
+            throw std::runtime_error("failed to initialize RS pipe shard");
+        }
+
+        const auto & ps_layers = pipe_shard_rs->get_layers();
+        for (size_t i = 0; i < ps_layers.size(); ++i) {
+            const bool cpu = pipe_shard_rs->is_cpu_only(ps_layers[i].il);
+            r_l[ps_layers[i].il] = cpu ? ps_layers[i].t1_cpu : ps_layers[i].t1_gpu;
+            s_l[ps_layers[i].il] = cpu ? ps_layers[i].t2_cpu : ps_layers[i].t2_gpu;
+        }
+
+        return;
+    }
+
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, i);
@@ -401,7 +450,21 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
     for (const auto & [_, buf] : ctxs_bufs) {
         ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
     }
+
+    if (pipe_shard_rs) {
+        const auto & bufs  = pipe_shard_rs->get_bufs();
+        const auto & sizes = pipe_shard_rs->get_bufs_planned_sizes();
+        for (size_t i = 0; i < bufs.size(); i++) {
+            if (!bufs[i]) continue;
+            ret[ggml_backend_buffer_get_type(bufs[i].get())] += sizes[i];
+        }
+    }
     return ret;
+}
+
+std::vector<llama_memory_pipe_shard_i *> llama_memory_recurrent::get_pipe_shards() {
+    if (pipe_shard_rs) return { pipe_shard_rs.get() };
+    return {};
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -416,15 +479,12 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
-                if (n_rs_seq > 0) {
-                    // [TAG_RECURRENT_ROLLBACK_SPLITS]
-                    // TODO: recurrent state rollback does not support equal splits
-                    ubatch = balloc.split_seq(n_ubatch);
-                } else {
-                    // TODO: non-sequential equal split can be done if using unified KV cache
-                    //       for simplicity, we always use sequential equal split for now
-                    ubatch = balloc.split_equal(n_ubatch, true);
-                }
+                // TODO: non-sequential equal split can be done if using unified KV cache
+                //       for simplicity, we always use sequential equal split for now
+                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+                //   so that the rollback snapshots remain valid
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -822,7 +882,12 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     bool res = true;
 
     res = res && state_read_meta(io, cell_count, seq_id);
-    res = res && state_read_data(io, cell_count);
+
+    try {
+        res = res && state_read_data(io, cell_count);
+    } catch (...) {
+        res = false;
+    }
 
     if (!res) {
         if (seq_id == -1) {

@@ -17,6 +17,9 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct weight_preload_entry;
+struct llama_pshard_plan;
+struct llama_pshard_plan_registry;
 
 // available models
 enum llm_type {
@@ -36,6 +39,7 @@ enum llm_type {
     LLM_TYPE_160M,
     LLM_TYPE_190M,
     LLM_TYPE_220M,
+    LLM_TYPE_230M,
     LLM_TYPE_250M,
     LLM_TYPE_256M,
     LLM_TYPE_270M,
@@ -133,6 +137,7 @@ enum llm_type {
     LLM_TYPE_122B_A10B, // Qwen3.5
     LLM_TYPE_196B_A11B, // Step3.5-Flash
     LLM_TYPE_230B_A10B, // Minimax M2
+    LLM_TYPE_428B_A23B, // Minimax M3
     LLM_TYPE_235B_A22B,
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
@@ -254,9 +259,11 @@ struct llama_layer {
     struct ggml_tensor * wq_b      = nullptr;
     struct ggml_tensor * wkv_a_mqa = nullptr;
     struct ggml_tensor * wkv_b     = nullptr;
+    struct ggml_tensor * wkv       = nullptr;
     struct ggml_tensor * wk_b      = nullptr;
     struct ggml_tensor * wv_b      = nullptr;
     struct ggml_tensor * wqkv_b    = nullptr;
+    struct ggml_tensor * wo_a      = nullptr;
     struct ggml_tensor * wo_b      = nullptr;
     struct ggml_tensor * wq_cross  = nullptr;
     struct ggml_tensor * wk_cross  = nullptr;
@@ -332,6 +339,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -462,6 +470,23 @@ struct llama_layer {
     // openai-moe
     struct ggml_tensor * attn_sinks = nullptr;
 
+    // DeepSeek-V4
+    struct ggml_tensor * attn_kv_norm = nullptr;
+    struct ggml_tensor * hc_attn_fn   = nullptr;
+    struct ggml_tensor * hc_attn_base = nullptr;
+    struct ggml_tensor * hc_attn_scale = nullptr;
+    struct ggml_tensor * hc_ffn_fn    = nullptr;
+    struct ggml_tensor * hc_ffn_base  = nullptr;
+    struct ggml_tensor * hc_ffn_scale = nullptr;
+    struct ggml_tensor * attn_comp_wkv   = nullptr;
+    struct ggml_tensor * attn_comp_wgate = nullptr;
+    struct ggml_tensor * attn_comp_ape   = nullptr;
+    struct ggml_tensor * attn_comp_norm  = nullptr;
+    struct ggml_tensor * indexer_comp_wkv   = nullptr;
+    struct ggml_tensor * indexer_comp_wgate = nullptr;
+    struct ggml_tensor * indexer_comp_ape   = nullptr;
+    struct ggml_tensor * indexer_comp_norm  = nullptr;
+
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
     struct ggml_tensor * visexp_attn_wo   = nullptr;
@@ -493,6 +518,12 @@ struct llama_layer {
     struct ggml_tensor * indexer_proj     = nullptr;
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
+
+    // MSA
+    struct ggml_tensor * index_q_proj = nullptr;
+    struct ggml_tensor * index_k_proj = nullptr;
+    struct ggml_tensor * index_q_norm = nullptr;
+    struct ggml_tensor * index_k_norm = nullptr;
 
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
@@ -551,6 +582,11 @@ struct llama_model {
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
+
+    // DeepSeek-V4
+    struct ggml_tensor * hc_head_fn    = nullptr;
+    struct ggml_tensor * hc_head_base  = nullptr;
+    struct ggml_tensor * hc_head_scale = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;
@@ -611,6 +647,8 @@ struct llama_model {
 
     std::string desc() const;
 
+    llama_ftype ftype() const;
+
     size_t size() const; // file size
     size_t n_tensors() const;
     size_t n_devices() const;
@@ -632,6 +670,29 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+
+    bool is_pshard() const;
+    bool pshard_delegates_compute() const;
+
+    const std::unordered_map<struct ggml_tensor *, int32_t> & get_tensor_backend_ids() const;
+    const std::unordered_map<int, int32_t> & get_layer_backend_ids() const;
+
+    ggml_backend_buffer_t get_dev_preload_buf() const;
+    size_t get_dev_preloaded_size() const;
+    void   sync_dev_preload();
+
+    void pshard_set_backend_maps(const llama_pshard_plan & plan);
+    std::unordered_map<struct ggml_tensor *, int32_t> pshard_build_canonical_weight_order(
+            std::vector<struct ggml_tensor *> & preload_order,
+            size_t & n_common);
+    void pshard_finalize_canonical_weight_layout(
+            const std::vector<struct ggml_tensor *> & preload_order,
+            size_t n_common);
+    void pshard_stamp_plan_offsets(const llama_pshard_plan & plan);
+    size_t pshard_compute_scratch_off(const llama_pshard_plan & plan);
+    size_t pshard_apply_plan(const llama_pshard_plan & plan, ggml_backend_t gpu = nullptr);
+
+    llama_pshard_plan_registry * get_plan_registry() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

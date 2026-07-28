@@ -14,8 +14,10 @@ add_library(llama
             llama-adapter.cpp
             llama-arch.cpp
             llama-batch.cpp
+            llama-benchmark.cpp
             llama-chat.cpp
             llama-context.cpp
+            llama-context-pshard.cpp
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp
@@ -25,14 +27,18 @@ add_library(llama
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsa.cpp
+            llama-kv-cache-dsv4.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
+            llama-memory-pshard.cpp
             llama-memory-recurrent.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
+            llama-pshard-cache.cpp
+            llama-pshard-plan.cpp
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp

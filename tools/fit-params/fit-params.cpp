@@ -7,6 +7,8 @@
 #include "log.h"
 
 #include <cinttypes>
+#include <cstring>
+#include <vector>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -14,9 +16,25 @@
 
 // satisfies -Wmissing-declarations
 int llama_fit_params(int argc, char ** argv);
+int llama_fit_params_pshard(int argc, char ** argv);
 
 int llama_fit_params(int argc, char ** argv) {
     common_params params;
+
+    // pipeline-sharding planner mode: separate argument handling (it pre-parses
+    // --bench-plan before forwarding the rest), so dispatch before common_init()
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-pshard") == 0 || strcmp(argv[i], "--pshard") == 0) {
+            std::vector<char *> fwd;
+            fwd.reserve(argc - 1);
+            for (int j = 0; j < argc; j++) {
+                if (j != i) {
+                    fwd.push_back(argv[j]);
+                }
+            }
+            return llama_fit_params_pshard((int) fwd.size(), fwd.data());
+        }
+    }
 
     common_init();
 
