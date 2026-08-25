@@ -2695,7 +2695,7 @@ void llama_model::pshard_set_backend_maps(const llama_pshard_plan & plan) {
     }
 }
 
-size_t llama_model::pshard_apply_plan(const llama_pshard_plan & plan, ggml_backend_t gpu) {
+size_t llama_model::pshard_apply_plan(const llama_pshard_plan & plan, ggml_backend_t gpu, bool force_upload) {
     params.pshard_delegate_compute = llama_pshard_strategy_delegates_compute(plan.strategy);
     pshard_set_backend_maps(plan);
 
@@ -2827,14 +2827,16 @@ size_t llama_model::pshard_apply_plan(const llama_pshard_plan & plan, ggml_backe
             if (entry.device_only_common || entry.cpu_addr == nullptr) continue;
             if (tensor->data == entry.cpu_addr) continue;
             void * old = old_addrs[tensor];
-            if (old != tensor->data && gpu) {
+            if ((force_upload || old != tensor->data) && gpu) {
                 ggml_backend_tensor_set_async(gpu, tensor, entry.cpu_addr, 0, ggml_nbytes(tensor));
                 n_uploaded++;
                 bytes_uploaded += ggml_nbytes(tensor);
             }
         }
 
-        if (gpu && n_uploaded > 0) {
+        if (gpu) {
+            // fence unconditionally: download-only switches still have in-flight
+            // async KV D2H copies that must complete before compute resumes
             ggml_backend_synchronize(gpu);
         }
 

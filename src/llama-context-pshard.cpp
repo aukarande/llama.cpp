@@ -263,9 +263,9 @@ void llama_context::pshard_setup_sched() {
     }
 }
 
-void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload) {
+void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload, bool force_upload) {
     ggml_backend_t gpu = backends[pshard_layout.compute].get();
-    size_t scratch_off = const_cast<llama_model &>(model).pshard_apply_plan(plan, with_upload ? gpu : nullptr);
+    size_t scratch_off = const_cast<llama_model &>(model).pshard_apply_plan(plan, with_upload ? gpu : nullptr, force_upload);
 
     const auto & lbids = model.get_layer_backend_ids();
     const auto & layout = pshard_layout;
@@ -479,7 +479,9 @@ void llama_context::pshard_apply_initial_plan() {
     }
 
     if (initial) {
-        pshard_apply_plan(*initial);
+        // force_upload: warmup applies moved tensor addresses without uploading, so an
+        // extra landing at the same offset as the last warmup tier would otherwise be skipped
+        pshard_apply_plan(*initial, /*with_upload=*/true, /*force_upload=*/true);
         pshard_active_plan = initial;
     }
 }

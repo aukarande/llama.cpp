@@ -733,7 +733,7 @@ struct llama_model {
             size_t n_common);
     void pshard_stamp_plan_offsets(const llama_pshard_plan & plan);
     size_t pshard_compute_scratch_off(const llama_pshard_plan & plan);
-    size_t pshard_apply_plan(const llama_pshard_plan & plan, ggml_backend_t gpu = nullptr);
+    size_t pshard_apply_plan(const llama_pshard_plan & plan, ggml_backend_t gpu = nullptr, bool force_upload = false);
 
     llama_pshard_plan_registry * get_plan_registry() const;
 

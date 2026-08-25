@@ -275,12 +275,12 @@ private:
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
     // TODO: read/write lora adapters and cvec
-    size_t state_write_data(llama_io_write_i & io);
-    size_t state_read_data (llama_io_read_i  & io);
+    size_t state_write_data(llama_io_write_i & io, bool pshard_host_access);
+    size_t state_read_data (llama_io_read_i  & io, bool pshard_host_access);
 
     void pshard_setup_sched();
     void pshard_pack_cache_region();
-    void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true);
+    void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true, bool force_upload = false);
     void pshard_reapply_active_plan();
     void pshard_reserve_and_save(const llama_pshard_plan & plan);
     void pshard_save_alloc_state(const llama_pshard_plan & plan);
@@ -299,8 +299,8 @@ private:
 
     // TODO: read/write lora adapters and cvec
 
-    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
-    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool pshard_host_access);
+    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool pshard_host_access);
 
     //
     // members
