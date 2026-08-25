@@ -1333,8 +1333,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // until the fused path is certified for redirected splits (stock runs are unaffected)
 #ifdef _WIN32
         _putenv_s("GGML_CUDA_DISABLE_FUSION_GLU", "1");
+        // page-lock mmap'd weights so streamed copies run at full async PCIe rate
+        _putenv_s("GGML_CUDA_REGISTER_HOST", "1");
 #else
         setenv("GGML_CUDA_DISABLE_FUSION_GLU", "1", 0);
+        setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
 #endif
         params.tensor_buft_overrides.resize(4096);
         mparams.pshard_registry = llama_pshard_registry_create(params.pshard_tier_max, cparams.n_seq_max);

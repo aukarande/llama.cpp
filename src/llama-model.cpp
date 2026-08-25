@@ -1927,6 +1927,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (params.pshard && params.max_vram_alloc > 0) {
+        // page-lock the mmap regions: streamed weight sources are mmap-backed (pageable), and
+        // cudaMemcpyAsync from pageable memory host-blocks at a fraction of the PCIe rate
+        {
+            auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            if (gpu_dev) {
+                auto * reg = ggml_backend_dev_backend_reg(gpu_dev);
+                auto register_fn = (bool (*)(void *, size_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+                if (register_fn) {
+                    for (const auto & mapping : pimpl->mappings) {
+                        const int64_t t0 = ggml_time_us();
+                        if (register_fn(mapping->addr(), mapping->size())) {
+                            LLAMA_LOG_INFO("%s: pshard: page-locked %.1f MiB mmap region in %.1f ms\n",
+                                __func__, mapping->size() / (1024.0 * 1024.0),
+                                (ggml_time_us() - t0) / 1000.0);
+                        }
+                    }
+                }
+            }
+        }
+
         size_t buf_size = params.max_vram_alloc * 1024ULL * 1024ULL;
 
         if (pimpl->dev_preload_buf != nullptr) {

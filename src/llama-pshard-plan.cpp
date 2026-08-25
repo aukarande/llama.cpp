@@ -96,8 +96,9 @@ static void llama_pshard_generate_overrides(
         } else if (il >= il_pin_start && il < il_pin_end) {
             emit(patterns_layer[il].c_str(), gpu_buft, layout.compute);
         } else {
-            const bool    use_alternating_shards = strategy == LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM;
-            const int32_t shard_bid = use_alternating_shards ? layout.shard(il) : layout.shard_a;
+            // alternate shard slots for every streaming strategy: double-buffering lets the
+            // copy of layer i+1 overlap compute that still reads layer i's slot
+            const int32_t shard_bid = layout.shard(il);
 
             switch (strategy) {
                 case LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM:
