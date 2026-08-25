@@ -2766,8 +2766,3 @@ std::vector<std::vector<uint32_t>> llama_kv_cache_context::get_write_cells() con
     }
     return result;
 }
-
-std::vector<llama_memory_pipe_shard_i *> llama_kv_cache::get_pipe_shards() {
-    if (pipe_shard_kv) return { pipe_shard_kv.get() };
-    return {};
-}

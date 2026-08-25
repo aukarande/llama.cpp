@@ -1,0 +1,2 @@
+C:\Aditya\lcpp-pshard\src\llama-pshard-cache.cpp(528,19): error C2039: 'use_mmap': is not a member of 'llama_model_params' 
+C:\Aditya\lcpp-pshard\src\llama-pshard-cache.cpp(529,19): error C2039: 'use_mlock': is not a member of 'llama_model_params' 

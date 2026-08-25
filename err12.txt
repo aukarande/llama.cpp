@@ -1,0 +1,20 @@
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(474,12): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(475,1): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(476,12): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(476,5): error C2146: syntax error: missing ')' before identifier 'printf' 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(476,5): error C2146: syntax error: missing ';' before identifier 'printf' 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(477,1): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(478,12): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(478,5): error C2146: syntax error: missing ')' before identifier 'printf' 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(478,5): error C2146: syntax error: missing ';' before identifier 'printf' 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(479,40): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(480,12): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(480,5): error C2146: syntax error: missing ')' before identifier 'printf' 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(480,5): error C2146: syntax error: missing ';' before identifier 'printf' 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(481,1): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(482,12): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(482,5): error C2146: syntax error: missing ')' before identifier 'printf' 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(482,5): error C2146: syntax error: missing ';' before identifier 'printf' 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(483,1): error C2001: newline in constant 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(484,5): error C2146: syntax error: missing ')' before identifier 'printf' 
+C:\Aditya\lcpp-pshard\tools\llama-bench\llama-bench.cpp(484,5): error C2146: syntax error: missing ';' before identifier 'printf' 

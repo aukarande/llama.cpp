@@ -512,7 +512,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    int32_t default_threads = cpu_get_num_math();
+    int32_t default_threads = common_cpu_get_num_math();
     int threads = (fixed_threads > 0) ? fixed_threads : default_threads;
     std::vector<int32_t> batch_sizes = { 1, 64, 512 };
 

@@ -676,8 +676,7 @@ void llama_context::sched_reserve() {
         resolve_fused_ops(mctx.get(), n_seqs);
     } else {
         // pshard no_alloc probe: fused-op device probing would allocate
-        LLAMA_LOG_INFO("%s: pshard probe - skipping fused-op resolution
-", __func__);
+        LLAMA_LOG_INFO("%s: pshard probe - skipping fused-op resolution\n", __func__);
     }
 
     // reserve worst-case graph
@@ -697,8 +696,7 @@ void llama_context::sched_reserve() {
             throw std::runtime_error("failed to measure compute buffers for pshard probe");
         }
     } else if (cparams.pshard) {
-        LLAMA_LOG_INFO("%s: pshard enabled, skipping baseline reserves (deferred to first plan apply)
-", __func__);
+        LLAMA_LOG_INFO("%s: pshard enabled, skipping baseline reserves (deferred to first plan apply)\n", __func__);
     } else {
         // reserve pp (prompt processing) graph first so that buffers are only allocated once
         {
@@ -3157,7 +3155,7 @@ private:
 size_t llama_context::state_get_size() {
     llama_io_write_dummy io(false);
     try {
-        return state_write_data(io, false);
+        return state_write_data(io);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
         return 0;
@@ -3167,7 +3165,7 @@ size_t llama_context::state_get_size() {
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
     llama_io_write_host io(dst, size);
     try {
-        return state_write_data(io, true);
+        return state_write_data(io);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -3177,7 +3175,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     llama_io_read_host io(src, size);
     try {
-        return state_read_data(io, true);
+        return state_read_data(io);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
@@ -3289,7 +3287,7 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
         const size_t n_state_size_cur = file.size() - file.tell();
 
         llama_io_read_file io( &file);
-        const size_t n_read = state_read_data(io, true);
+        const size_t n_read = state_read_data(io);
 
         if (n_read != n_state_size_cur) {
             LLAMA_LOG_ERROR("%s: did not read all of the session file data! size %zu, got %zu\n", __func__, n_state_size_cur, n_read);
@@ -3312,7 +3310,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 
     // save the context state using stream saving
     llama_io_write_file io(&file);
-    state_write_data(io, true);
+    state_write_data(io);
 
     return true;
 }
@@ -3359,7 +3357,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     {
         const size_t state_size = file.size() - file.tell();
         llama_io_read_file io(&file);
-        const size_t nread = state_seq_read_data(io, seq_id, 0, true);
+        const size_t nread = state_seq_read_data(io, seq_id, 0);
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
             return 0;
@@ -3383,7 +3381,7 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 
     // save the context state using stream saving
     llama_io_write_file io(&file);
-    state_seq_write_data(io, seq_id, 0, true);
+    state_seq_write_data(io, seq_id, 0);
 
     const size_t res = file.tell();
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
@@ -3391,37 +3389,50 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return res;
 }
 
-size_t llama_context::state_write_data(llama_io_write_i & io, bool pshard_host_access) {
-    const bool pshard_restore = pshard_host_access && pshard_prepare_host_access();
+size_t llama_context::state_write_data(llama_io_write_i & io) {
+    LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
-    try {
-        LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
+    // write model info
+    {
+        LLAMA_LOG_DEBUG("%s: - writing model info\n", __func__);
 
-        // write model info
-        {
-            LLAMA_LOG_DEBUG("%s: - writing model info\n", __func__);
-
-            const std::string arch_str = llm_arch_name(model.arch);
-            io.write_string(arch_str);
-            // TODO: add more model-specific info which should prevent loading the session file if not identical
-        }
-
-        if (memory != nullptr) {
-            LLAMA_LOG_DEBUG("%s: - writing memory module\n", __func__);
-            memory->state_write(io);
-        }
-
-        const size_t res = io.n_bytes();
-        if (pshard_restore) {
-            pshard_restore_after_host_access();
-        }
-        return res;
-    } catch (...) {
-        if (pshard_restore) {
-            pshard_restore_after_host_access();
-        }
-        throw;
+        const std::string arch_str = llm_arch_name(model.arch);
+        io.write_string(arch_str);
+        // TODO: add more model-specific info which should prevent loading the session file if not identical
     }
+
+    if (memory != nullptr) {
+        LLAMA_LOG_DEBUG("%s: - writing memory module\n", __func__);
+        memory->state_write(io);
+    }
+
+    return io.n_bytes();
+}
+
+size_t llama_context::state_read_data(llama_io_read_i & io) {
+    LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
+
+    // read model info
+    {
+        LLAMA_LOG_DEBUG("%s: - reading model info\n", __func__);
+
+        const std::string cur_arch_str = llm_arch_name(model.arch);
+
+        std::string arch_str;
+        io.read_string(arch_str);
+        if (cur_arch_str != arch_str) {
+            throw std::runtime_error(format("wrong model arch: '%s' instead of '%s'", arch_str.c_str(), cur_arch_str.c_str()));
+        }
+        // TODO: add more info which needs to be identical but which is not verified otherwise
+    }
+
+    if (memory) {
+        LLAMA_LOG_DEBUG("%s: - reading memory module\n", __func__);
+
+        memory->state_read(io);
+    }
+
+    return io.n_bytes();
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -3429,29 +3440,17 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
         memory->state_write(io, seq_id, flags);
     }
 
-    try {
-        if (memory) {
-            memory->state_write(io, seq_id, flags);
-        }
-
-        const size_t res = io.n_bytes();
-        if (pshard_restore) {
-            pshard_restore_after_host_access();
-        }
-        return res;
-    } catch (...) {
-        if (pshard_restore) {
-            pshard_restore_after_host_access();
-        }
-        throw;
-    }
+    return io.n_bytes();
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
+
+    return io.n_bytes();
 }
+
 //
 // perf
 //

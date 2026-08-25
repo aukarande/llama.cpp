@@ -1293,10 +1293,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     auto fit_params = [&]() {
-        COM_TRC("%s", "fitting params to device memory ...
-");
-        COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
-");
+        COM_TRC("%s", "fitting params to device memory ...\n");
+        COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
         // the draft context is created from the same base params and follows the main context, fit both together
         const bool has_draft = params.speculative.has_dft();
@@ -1329,16 +1327,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     };
 
     if (params.pshard) {
-        LOG_INF("%s: pshard enabled, probing and loading plan cache
-", __func__);
+        LOG_INF("%s: pshard enabled, probing and loading plan cache\n", __func__);
         params.tensor_buft_overrides.resize(4096);
         mparams.pshard_registry = llama_pshard_registry_create(params.pshard_tier_max, cparams.n_seq_max);
         const size_t fit_target_mb = params.fit_params_target.empty() ? 0 : params.fit_params_target[0] / (1024 * 1024);
         llama_params_fit_pshard(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_buft_overrides.data(), params.max_vram_alloc, fit_target_mb);
         if (!mparams.pshard) {
-            LOG_WRN("%s: pshard not active for this configuration
-", __func__);
+            LOG_WRN("%s: pshard not active for this configuration\n", __func__);
             llama_pshard_registry_free(mparams.pshard_registry);
             mparams.pshard_registry = nullptr;
             if (params.fit_params) {
@@ -1347,8 +1343,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         } else {
             params.n_batch  = (int32_t) cparams.n_batch;
             params.n_ubatch = (int32_t) cparams.n_ubatch;
-            LOG_INF("%s: pshard runtime batch/ubatch set to selected cache_ubatch=%u
-",
+            LOG_INF("%s: pshard runtime batch/ubatch set to selected cache_ubatch=%u\n",
                 __func__, cparams.n_ubatch);
         }
     } else if (params.fit_params) {

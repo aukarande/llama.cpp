@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-ext.h"
 #include "llama-context.h"
 #include "llama-cparams.h"
 #include "llama-model.h"
@@ -29,10 +30,6 @@ inline const char * llama_pshard_strategy_name(llama_pshard_strategy s) {
         case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS:    return "STATIC_ATTNPRIO_ALLMODELS";
         default:                                        return "UNKNOWN";
     }
-}
-
-inline bool llama_pshard_strategy_delegates_compute(llama_pshard_strategy s) {
-    return s == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS;
 }
 
 inline bool llama_pshard_strategy_delegates_compute(llama_pshard_strategy s) {
@@ -125,11 +122,8 @@ void llama_pshard_generate_overrides(
         bool output_on_gpu = false,
         uint32_t n_attn_pinned = 0);
 
-struct llama_device_memory_data {
-    int64_t total;
-    int64_t free;
-    llama_memory_breakdown_data mb;
-};
+// llama_device_memory_data and llama_memory_breakdown_data come from
+// ToT's src/llama-ext.h (included above)
 
 // probe hook runs before context teardown
 // used by TPS prediction to inspect scheduler splits

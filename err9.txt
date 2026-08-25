@@ -1,0 +1,4 @@
+C:\Aditya\lcpp-pshard\build\bin\Release\llama.dll : fatal error LNK1169: one or more multiply defined symbols found 
+llama-pshard-plan.obj : error LNK2005: llama_params_fit_pshard already defined in llama-pshard-cache.obj 
+llama-pshard-plan.obj : error LNK2005: llama_pshard_registry_create already defined in llama-pshard-cache.obj 
+llama-pshard-plan.obj : error LNK2005: llama_pshard_registry_free already defined in llama-pshard-cache.obj 

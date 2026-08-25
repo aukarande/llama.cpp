@@ -1,0 +1,7 @@
+C:\Aditya\lcpp-pshard\build\bin\Release\llama.dll : fatal error LNK1169: one or more multiply defined symbols found 
+llama-pshard-plan.obj : error LNK2005: "bool __cdecl pshard_registry_load(struct llama_pshard_plan_registry *,unsigned __int64,char const *,struct ggml_backend_buffer_type *,unsigned __int64,bool)" (?pshard_registry_load@@YA_NPEAUllama_pshard_plan_registry@@_KPEBDPEAUggml_backend_buffer_type@@1_N@Z) already defined in llama-pshard-cache.obj 
+llama-pshard-plan.obj : error LNK2005: "char const * __cdecl llama_get_overflow_pattern(unsigned __int64,enum llama_layer_fraction)" (?llama_get_overflow_pattern@@YAPEBD_KW4llama_layer_fraction@@@Z) already defined in llama-pshard-cache.obj 
+llama-pshard-plan.obj : error LNK2005: "unsigned __int64 __cdecl pshard_registry_fingerprint(struct llama_model_params const *,struct llama_context_params const *,__int64)" (?pshard_registry_fingerprint@@YA_KPEBUllama_model_params@@PEBUllama_context_params@@_J@Z) already defined in llama-pshard-cache.obj 
+llama-pshard-plan.obj : error LNK2005: llama_params_fit_pshard already defined in llama-pshard-cache.obj 
+llama-pshard-plan.obj : error LNK2005: llama_pshard_registry_create already defined in llama-pshard-cache.obj 
+llama-pshard-plan.obj : error LNK2005: llama_pshard_registry_free already defined in llama-pshard-cache.obj 

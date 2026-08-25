@@ -363,6 +363,7 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     }
 
     return llama_model_create(arch, params);
+}
 
 static int pshard_weight_layer(const ggml_tensor * t) {
     const char * blk = strstr(ggml_get_name(t), "blk.");

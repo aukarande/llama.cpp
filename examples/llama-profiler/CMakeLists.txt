@@ -1,7 +1,7 @@
 set(TARGET_CPU llama-profiler-cpu)
 add_executable(${TARGET_CPU} profiler-cpu.cpp)
 install(TARGETS ${TARGET_CPU} RUNTIME)
-target_link_libraries(${TARGET_CPU} PRIVATE ggml ggml-base common ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET_CPU} PRIVATE ggml ggml-base llama-common ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET_CPU} PRIVATE cxx_std_17)
 if (GGML_CUDA)
     target_link_libraries(${TARGET_CPU} PRIVATE ggml-cuda)

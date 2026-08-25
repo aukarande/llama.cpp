@@ -40,34 +40,6 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data_safe(
         probe_n_tokens, probe_n_outputs);
 }
 
-const char * llama_get_overflow_pattern(size_t il, llama_layer_fraction lf) {
-    constexpr size_t n_strings = 1000;
-    GGML_ASSERT(il < n_strings);
-    switch (lf) {
-        case LLAMA_LAYER_FRACTION_ATTN: {
-            static std::array<std::string, n_strings> p;
-            if (p[il].empty()) { p[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|gate|down).*"; }
-            return p[il].c_str();
-        }
-        case LLAMA_LAYER_FRACTION_UP: {
-            static std::array<std::string, n_strings> p;
-            if (p[il].empty()) { p[il] = "blk\\." + std::to_string(il) + "\\.ffn_(gate|down).*"; }
-            return p[il].c_str();
-        }
-        case LLAMA_LAYER_FRACTION_GATE: {
-            static std::array<std::string, n_strings> p;
-            if (p[il].empty()) { p[il] = "blk\\." + std::to_string(il) + "\\.ffn_down.*"; }
-            return p[il].c_str();
-        }
-        case LLAMA_LAYER_FRACTION_MOE: {
-            static std::array<std::string, n_strings> p;
-            if (p[il].empty()) { p[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate)_(ch|)exps"; }
-            return p[il].c_str();
-        }
-        default:
-            return nullptr;
-    }
-}
 
 static void llama_pshard_generate_overrides(
         uint32_t n_pinned,
@@ -78,9 +50,9 @@ static void llama_pshard_generate_overrides(
         llama_layer_fraction overflow_type,
         llama_pshard_strategy strategy,
         const pshard_dev_layout & layout,
-        bool pin_from_back = false,
-        bool output_on_gpu = false,
-        uint32_t n_attn_pinned = 0) {
+        bool pin_from_back,
+        bool output_on_gpu,
+        uint32_t n_attn_pinned) {
     thread_local std::array<std::string, 1000> patterns_layer;
     thread_local std::array<std::string, 1000> patterns_layer_attn;
     thread_local std::array<std::string, 1000> patterns_layer_ffn;
@@ -685,39 +657,10 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
     return plan;
 }
 
-llama_pshard_plan_registry * llama_pshard_registry_create(uint32_t n_tier_max, uint32_t n_seq_max) {
-    auto * registry = new llama_pshard_plan_registry();
-    registry->init(n_tier_max, n_seq_max);
-    return registry;
-}
 
-void llama_pshard_registry_free(llama_pshard_plan_registry * registry) {
-    delete registry;
-}
 
 // plan cache serialization
 
-uint64_t pshard_registry_fingerprint(
-        const struct llama_model_params * mparams,
-        const struct llama_context_params * cparams,
-        int64_t model_file_size) {
-
-    (void) mparams;
-
-    uint64_t h = 0xcbf29ce484222325ULL;
-    auto mix = [&](uint64_t v) { h ^= v; h *= 0x100000001b3ULL; };
-
-    mix(cparams->n_ctx);
-    mix(cparams->n_seq_max);
-    mix(cparams->n_threads);
-    mix((uint64_t)cparams->flash_attn_type);
-    mix((uint64_t)cparams->type_k);
-    mix((uint64_t)cparams->type_v);
-    mix((uint64_t)model_file_size);
-    mix((uint64_t)pshard_strategy_from_env());
-
-    return h;
-}
 
 static std::string pshard_plan_to_ot(const llama_pshard_plan & plan, ggml_backend_buffer_type_t host_buft) {
     std::string ot;
@@ -1563,7 +1506,7 @@ static bool llama_pshard_params_supported(
     return true;
 }
 
-void llama_params_fit_pshard(
+void llama_params_fit_pshard_plan(
         const char                              * path_model,
         struct llama_model_params               * mparams,
         struct llama_context_params             * cparams,

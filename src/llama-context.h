@@ -298,11 +298,9 @@ private:
     void pshard_restore_after_host_access();
 
     // TODO: read/write lora adapters and cvec
-    size_t state_write_data(llama_io_write_i & io, bool pshard_host_access);
-    size_t state_read_data (llama_io_read_i  & io, bool pshard_host_access);
 
-    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool pshard_host_access);
-    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool pshard_host_access);
+    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     //
     // members
