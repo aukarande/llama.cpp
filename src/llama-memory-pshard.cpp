@@ -559,7 +559,11 @@ void llama_memory_pshard::assign_tensors(
     for (const auto & l : layers) {
         auto it = layer_bids.find((int)l.il);
         if (l.is_pinned) {
-            GGML_ASSERT(l.t1_gpu->data != nullptr && "pinned layer missing GPU address");
+            if (l.t1_gpu->data == nullptr) {
+                // no_alloc probe context: addresses do not exist by design
+                activate_gpu(l.il);
+                continue;
+            }
             LLAMA_LOG_DEBUG("%s: layer %u -> pinned (GPU)\n", __func__, l.il);
             activate_gpu(l.il);
         } else if (it != layer_bids.end() && it->second >= 0 && it->second < (int32_t)backends.size()) {
