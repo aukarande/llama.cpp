@@ -1,5 +1,0 @@
-C:\Aditya\lcpp-pshard\src\llama-pshard-fit.cpp(116,37): error C2440: '=': cannot convert from 'uint32_t (__cdecl llama_hparams::* )(void) const' to 'uint32_t' 
-C:\Aditya\lcpp-pshard\src\llama-pshard-fit.cpp(116,37): error C3867: 'llama_hparams::n_layer': non-standard syntax; use '&' to create a pointer to member 
-C:\Aditya\lcpp-pshard\src\llama-pshard-fit.cpp(121,5): error C3861: 'llama_memory_breakdown_print': identifier not found 
-C:\Aditya\lcpp-pshard\src\llama-pshard-fit.cpp(57,18): error C2039: 'use_mmap': is not a member of 'llama_model_params' 
-C:\Aditya\lcpp-pshard\src\llama-pshard-fit.cpp(58,18): error C2039: 'use_mlock': is not a member of 'llama_model_params' 
