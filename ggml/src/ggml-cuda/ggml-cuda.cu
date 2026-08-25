@@ -3026,6 +3026,14 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
                                std::initializer_list<enum ggml_unary_op> unary_ops) {
+    // the gated-FFN fusion family corrupts decode on pshard split graphs whose weight srcs are
+    // scheduler copies in recycled scratch slots (bisected 2026-08-25; the memory-range check
+    // passes, so the defect is inside the fused execution path). pshard runs set this env at
+    // init until the fused path is certified for redirected splits.
+    static bool disable_glu_fusion = getenv("GGML_CUDA_DISABLE_FUSION_GLU") != nullptr;
+    if (disable_glu_fusion) {
+        return false;
+    }
 #ifndef NDEBUG
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
@@ -3298,8 +3306,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     //topk-moe
-    if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
-            cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+    // debug kill-switch (pshard split-graph triage)
+    static bool disable_topk_fusion = getenv("GGML_CUDA_DISABLE_FUSION_TOPK") != nullptr;
+    if (!disable_topk_fusion &&
+            (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+            cgraph->nodes[i]->op == GGML_OP_ARGSORT)) {
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;

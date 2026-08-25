@@ -1328,6 +1328,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (params.pshard) {
         LOG_INF("%s: pshard enabled, probing and loading plan cache\n", __func__);
+        // the CUDA gated-FFN fusion family corrupts decode on pshard split graphs whose weight
+        // srcs are scheduler copies in recycled scratch slots; keep it off for pshard runs
+        // until the fused path is certified for redirected splits (stock runs are unaffected)
+#ifdef _WIN32
+        _putenv_s("GGML_CUDA_DISABLE_FUSION_GLU", "1");
+#else
+        setenv("GGML_CUDA_DISABLE_FUSION_GLU", "1", 0);
+#endif
         params.tensor_buft_overrides.resize(4096);
         mparams.pshard_registry = llama_pshard_registry_create(params.pshard_tier_max, cparams.n_seq_max);
         const size_t fit_target_mb = params.fit_params_target.empty() ? 0 : params.fit_params_target[0] / (1024 * 1024);

@@ -1765,6 +1765,30 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// zero the allocation-padding tail of a quantized weight copy. compute-usage buffers skip the
+// init-time padding memset, and recycled scratch slots refill the padding with garbage that
+// padded-tile kernels (e.g. CUDA MMQ, fused MUL_MAT_ID) read as quant scales
+static void ggml_backend_sched_zero_copy_padding(ggml_backend_t backend, struct ggml_tensor * input_cpy) {
+    if (!ggml_is_quantized(input_cpy->type) || input_cpy->view_src != NULL) {
+        return;
+    }
+    ggml_backend_buffer_t buf = input_cpy->buffer;
+    if (buf == NULL) {
+        return;
+    }
+    const size_t nbytes = ggml_nbytes(input_cpy);
+    const size_t alloc  = ggml_backend_buffer_get_alloc_size(buf, input_cpy);
+    if (alloc <= nbytes) {
+        return;
+    }
+    if (backend->iface.memset_tensor_async != NULL) {
+        // same stream as set_tensor_async, so the existing copy->compute fences cover it
+        backend->iface.memset_tensor_async(backend, input_cpy, 0, nbytes, alloc - nbytes);
+    } else if (buf->iface.memset_tensor != NULL) {
+        buf->iface.memset_tensor(buf, input_cpy, 0, nbytes, alloc - nbytes);
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1864,6 +1888,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_buffer_is_host(next_input->buffer)) {
                     struct ggml_tensor * input_cpy = tensor_copy(next_input, next_gpu->backend_id, sched->cur_copy);
                     ggml_backend_tensor_set_async(next_copy, input_cpy, next_input->data, 0, ggml_nbytes(next_input));
+                    ggml_backend_sched_zero_copy_padding(next_copy, input_cpy);
                     did_prefetch = true;
                 }
             }
@@ -2017,6 +2042,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (sched->has_redirects && input->data != NULL &&
                             ggml_backend_buffer_is_host(input->buffer)) {
                             ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                            ggml_backend_sched_zero_copy_padding(split_backend, input_cpy);
                         } else {
                             ggml_backend_tensor_copy(input, input_cpy);
                         }
