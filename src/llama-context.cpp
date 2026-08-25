@@ -689,8 +689,11 @@ void llama_context::sched_reserve() {
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
     if (cparams.pshard && model.hparams.no_alloc) {
-        // pshard probe: measure compute buffers only (planner budget input)
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        // pshard probe: measure compute buffers only (planner budget input);
+        // honor the planner's per-tier probe size so the TPS hook scores the tier's real graph
+        const uint32_t reserve_tokens  = probe_reserve.n_tokens  ? probe_reserve.n_tokens  : n_tokens;
+        const uint32_t reserve_outputs = probe_reserve.n_outputs ? probe_reserve.n_outputs : reserve_tokens;
+        auto * gf = graph_reserve(reserve_tokens, n_seqs, reserve_outputs, mctx.get(),
                 true, backend_buf_exp_size.data());
         if (!gf) {
             throw std::runtime_error("failed to measure compute buffers for pshard probe");
