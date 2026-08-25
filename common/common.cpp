@@ -1292,9 +1292,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
-        COM_TRC("%s", "fitting params to device memory ...\n");
-        COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+    auto fit_params = [&]() {
+        COM_TRC("%s", "fitting params to device memory ...
+");
+        COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+");
 
         // the draft context is created from the same base params and follows the main context, fit both together
         const bool has_draft = params.speculative.has_dft();
@@ -1324,6 +1326,33 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    };
+
+    if (params.pshard) {
+        LOG_INF("%s: pshard enabled, probing and loading plan cache
+", __func__);
+        params.tensor_buft_overrides.resize(4096);
+        mparams.pshard_registry = llama_pshard_registry_create(params.pshard_tier_max, cparams.n_seq_max);
+        const size_t fit_target_mb = params.fit_params_target.empty() ? 0 : params.fit_params_target[0] / (1024 * 1024);
+        llama_params_fit_pshard(params.model.path.c_str(), &mparams, &cparams,
+            params.tensor_buft_overrides.data(), params.max_vram_alloc, fit_target_mb);
+        if (!mparams.pshard) {
+            LOG_WRN("%s: pshard not active for this configuration
+", __func__);
+            llama_pshard_registry_free(mparams.pshard_registry);
+            mparams.pshard_registry = nullptr;
+            if (params.fit_params) {
+                fit_params();
+            }
+        } else {
+            params.n_batch  = (int32_t) cparams.n_batch;
+            params.n_ubatch = (int32_t) cparams.n_ubatch;
+            LOG_INF("%s: pshard runtime batch/ubatch set to selected cache_ubatch=%u
+",
+                __func__, cparams.n_ubatch);
+        }
+    } else if (params.fit_params) {
+        fit_params();
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1712,6 +1741,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
+    mparams.pshard          = params.pshard;
     mparams.max_vram_alloc  = params.max_vram_alloc;
     return mparams;
 }
@@ -1751,6 +1781,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.pshard            = params.pshard;
 
     return cparams;
 }

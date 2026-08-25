@@ -91,6 +91,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
 
         pipe_shard_rs = std::make_unique<llama_memory_pshard>();
+        pipe_shard_rs->mode = llama_memory_pshard::FULL;
 
         pipe_shard_rs->on_activate_gpu = [this](int32_t il, ggml_tensor * r, ggml_tensor * s) {
             r_l[il] = r;
@@ -103,7 +104,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         };
 
         const int32_t cpu_bid = pshard_dev_layout::compute_cpu_backend_id(model.devices.size());
-        if (!pipe_shard_rs->init(specs, model.get_layer_backend_ids(), cpu_bid, hparams.no_alloc)) {
+        if (!pipe_shard_rs->init(specs, model.get_layer_backend_ids(), cpu_bid, hparams.no_alloc, model.get_dev_preload_buf())) {
             throw std::runtime_error("failed to initialize RS pipe shard");
         }
 
@@ -113,6 +114,7 @@ llama_memory_recurrent::llama_memory_recurrent(
             r_l[ps_layers[i].il] = cpu ? ps_layers[i].t1_cpu : ps_layers[i].t1_gpu;
             s_l[ps_layers[i].il] = cpu ? ps_layers[i].t2_cpu : ps_layers[i].t2_gpu;
         }
+
         return;
     }
 
@@ -461,8 +463,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
         const auto & sizes = pipe_shard_rs->get_bufs_planned_sizes();
         for (size_t i = 0; i < bufs.size(); i++) {
             if (!bufs[i]) continue;
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(bufs[i].get());
-            ret[buft] += sizes[i];
+            ret[ggml_backend_buffer_get_type(bufs[i].get())] += sizes[i];
         }
     }
     return ret;

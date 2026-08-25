@@ -363,6 +363,16 @@ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
 #endif
 }
 
+static void ggml_dyn_tallocr_reset_with_range(struct ggml_dyn_tallocr * alloc, size_t offset, size_t size) {
+    ggml_dyn_tallocr_reset(alloc);
+    ggml_dyn_tallocr_new_chunk(alloc, 0);
+    struct tallocr_chunk * c0 = alloc->chunks[0];
+    c0->n_free_blocks = 1;
+    c0->free_blocks[0].offset = offset;
+    c0->free_blocks[0].size = size;
+    c0->max_size = 0;
+}
+
 static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t max_buffer_size) {
     struct ggml_dyn_tallocr * alloc = (struct ggml_dyn_tallocr *)malloc(sizeof(struct ggml_dyn_tallocr));
 
@@ -485,6 +495,10 @@ struct ggml_gallocr {
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
 
+    bool * buf_external; // [n_buffers]
+    size_t * buf_alloc_offset; // [n_buffers]
+    size_t * buf_alloc_size; // [n_buffers]
+
     struct ggml_hash_set hash_set;
     struct hash_node * hash_values; // [hash_set.size]
 
@@ -507,6 +521,15 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
     GGML_ASSERT(galloc->buf_tallocs != NULL);
+
+    galloc->buf_external = calloc(n_bufs, sizeof(bool));
+    GGML_ASSERT(galloc->buf_external != NULL);
+
+    galloc->buf_alloc_offset = calloc(n_bufs, sizeof(size_t));
+    GGML_ASSERT(galloc->buf_alloc_offset != NULL);
+
+    galloc->buf_alloc_size = calloc(n_bufs, sizeof(size_t));
+    GGML_ASSERT(galloc->buf_alloc_size != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -551,6 +574,9 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
                 }
             }
             if (!freed) {
+                if (galloc->buf_external[i]) {
+                    galloc->buffers[i]->chunks[0] = NULL;
+                }
                 ggml_vbuffer_free(galloc->buffers[i]);
             }
         }
@@ -574,6 +600,9 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->bufts);
     free(galloc->buffers);
     free(galloc->buf_tallocs);
+    free(galloc->buf_external);
+    free(galloc->buf_alloc_offset);
+    free(galloc->buf_alloc_size);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
@@ -875,6 +904,24 @@ static bool ggml_gallocr_reserve_n_impl(
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
     }
 
+    // constrain external buffers to their allocation range
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (!galloc->buf_external[i]) {
+            continue;
+        }
+        bool already_seeded = false;
+        for (int j = 0; j < i; j++) {
+            if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                already_seeded = true;
+                break;
+            }
+        }
+        if (already_seeded) {
+            continue;
+        }
+        ggml_dyn_tallocr_reset_with_range(galloc->buf_tallocs[i], galloc->buf_alloc_offset[i], galloc->buf_alloc_size[i]);
+    }
+
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
@@ -954,23 +1001,49 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
-#ifndef NDEBUG
-            {
-                size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-                if (cur_size > 0) {
-                    GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
-                        __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+            if (galloc->buf_external[i]) {
+                struct ggml_dyn_tallocr * talloc = galloc->buf_tallocs[i];
+                if (!no_alloc) {
+                    for (int c = 1; c < talloc->n_chunks; c++) {
+                        size_t chunk_size = talloc->chunks[c]->max_size;
+                        size_t cur_size = ggml_vbuffer_chunk_size(galloc->buffers[i], c);
+                        if (chunk_size > cur_size) {
+                            ggml_backend_buffer_free(galloc->buffers[i]->chunks[c]);
+                            galloc->buffers[i]->chunks[c] = ggml_backend_buft_alloc_buffer(galloc->bufts[i], chunk_size);
+                            if (galloc->buffers[i]->chunks[c] == NULL) {
+                                GGML_LOG_ERROR("%s: failed to allocate overflow chunk %d of size %zu\n", __func__, c, chunk_size);
+                                return false;
+                            }
+                            ggml_backend_buffer_set_usage(galloc->buffers[i]->chunks[c], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                        }
+                    }
                 }
-            }
-#endif
-            ggml_vbuffer_free(galloc->buffers[i]);
-            if (no_alloc) {
-                galloc->buffers[i] = NULL;
+                for (int c = talloc->n_chunks; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+                    if (galloc->buffers[i]->chunks[c] == NULL) {
+                        break;
+                    }
+                    ggml_backend_buffer_free(galloc->buffers[i]->chunks[c]);
+                    galloc->buffers[i]->chunks[c] = NULL;
+                }
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-                if (galloc->buffers[i] == NULL) {
-                    GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
-                    return false;
+#ifndef NDEBUG
+                {
+                    size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                    if (cur_size > 0) {
+                        GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
+                            __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+                    }
+                }
+#endif
+                ggml_vbuffer_free(galloc->buffers[i]);
+                if (no_alloc) {
+                    galloc->buffers[i] = NULL;
+                } else {
+                    galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                    if (galloc->buffers[i] == NULL) {
+                        GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                        return false;
+                    }
                 }
             }
         }
@@ -1154,6 +1227,112 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
+}
+
+int ggml_gallocr_get_n_chunks(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    return galloc->buf_tallocs[buffer_id]->n_chunks;
+}
+
+size_t ggml_gallocr_get_chunk_max_size(ggml_gallocr_t galloc, int buffer_id, int chunk_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    GGML_ASSERT(chunk_id >= 0 && chunk_id < galloc->buf_tallocs[buffer_id]->n_chunks);
+    return galloc->buf_tallocs[buffer_id]->chunks[chunk_id]->max_size;
+}
+
+void ggml_gallocr_set_buffer(ggml_gallocr_t galloc, int buffer_id,
+        ggml_backend_buffer_t buffer, size_t alloc_offset, size_t alloc_size) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    GGML_ASSERT(galloc->buffers[buffer_id] == NULL && "buffer slot must be empty, call set_buffer before reserve");
+
+    struct vbuffer * vbuf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
+    GGML_ASSERT(vbuf != NULL);
+    vbuf->chunks[0] = buffer;
+
+    size_t range = alloc_size > 0 ? alloc_size : ggml_backend_buffer_get_size(buffer) - alloc_offset;
+
+    galloc->buffers[buffer_id] = vbuf;
+    galloc->buf_external[buffer_id] = true;
+    galloc->buf_alloc_offset[buffer_id] = alloc_offset;
+    galloc->buf_alloc_size[buffer_id] = range;
+
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (i != buffer_id && galloc->buf_tallocs[i] == galloc->buf_tallocs[buffer_id]) {
+            galloc->buffers[i] = vbuf;
+            galloc->buf_external[i] = true;
+            galloc->buf_alloc_offset[i] = alloc_offset;
+            galloc->buf_alloc_size[i] = range;
+        }
+    }
+}
+
+void ggml_gallocr_set_alloc_range(ggml_gallocr_t galloc, int buffer_id, size_t alloc_offset, size_t alloc_size) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    GGML_ASSERT(galloc->buf_external[buffer_id] && "set_alloc_range requires an external buffer");
+
+    galloc->buf_alloc_offset[buffer_id] = alloc_offset;
+    galloc->buf_alloc_size[buffer_id] = alloc_size;
+
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (i != buffer_id && galloc->buf_tallocs[i] == galloc->buf_tallocs[buffer_id]) {
+            galloc->buf_alloc_offset[i] = alloc_offset;
+            galloc->buf_alloc_size[i] = alloc_size;
+        }
+    }
+}
+
+void ggml_gallocr_get_state_sizes(ggml_gallocr_t galloc, size_t * node_size, size_t * leaf_size) {
+    if (!galloc) {
+        if (node_size) *node_size = 0;
+        if (leaf_size) *leaf_size = 0;
+        return;
+    }
+    if (node_size) *node_size = galloc->n_nodes * sizeof(struct node_alloc);
+    if (leaf_size) *leaf_size = galloc->n_leafs * sizeof(struct leaf_alloc);
+}
+
+void ggml_gallocr_save_state(ggml_gallocr_t galloc,
+                              void * node_buf, void * leaf_buf,
+                              int * n_nodes, int * n_leafs) {
+    if (!galloc) {
+        if (n_nodes) *n_nodes = 0;
+        if (n_leafs) *n_leafs = 0;
+        return;
+    }
+    if (n_nodes) *n_nodes = galloc->n_nodes;
+    if (n_leafs) *n_leafs = galloc->n_leafs;
+    if (node_buf && galloc->n_nodes > 0) {
+        memcpy(node_buf, galloc->node_allocs, galloc->n_nodes * sizeof(struct node_alloc));
+    }
+    if (leaf_buf && galloc->n_leafs > 0) {
+        memcpy(leaf_buf, galloc->leaf_allocs, galloc->n_leafs * sizeof(struct leaf_alloc));
+    }
+}
+
+void ggml_gallocr_restore_state(ggml_gallocr_t galloc,
+                                 const void * node_buf, size_t node_size,
+                                 const void * leaf_buf, size_t leaf_size,
+                                 int n_nodes, int n_leafs) {
+    if (!galloc || n_nodes == 0) return;
+
+    if (galloc->n_nodes < n_nodes) {
+        free(galloc->node_allocs);
+        galloc->node_allocs = calloc(n_nodes, sizeof(struct node_alloc));
+        GGML_ASSERT(galloc->node_allocs != NULL);
+    }
+    if (galloc->n_leafs < n_leafs) {
+        free(galloc->leaf_allocs);
+        galloc->leaf_allocs = calloc(n_leafs, sizeof(struct leaf_alloc));
+        GGML_ASSERT(galloc->leaf_allocs != NULL);
+    }
+    galloc->n_nodes = n_nodes;
+    galloc->n_leafs = n_leafs;
+    if (node_buf && node_size > 0) {
+        memcpy(galloc->node_allocs, node_buf, node_size);
+    }
+    if (leaf_buf && leaf_size > 0) {
+        memcpy(galloc->leaf_allocs, leaf_buf, leaf_size);
+    }
 }
 
 // utils

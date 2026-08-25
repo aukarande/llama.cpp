@@ -6,9 +6,16 @@
 #include <vector>
 #include <unordered_map>
 
+struct llama_model;
+struct llama_hparams;
 struct ggml_tensor;
 
 struct llama_memory_pshard : llama_memory_pipe_shard_i {
+    enum transfer_mode {
+        FULL,           // always transfer entire tensors (RS, or KV with v_trans)
+        CELL_GRANULAR,  // transfer by cell ranges (KV without v_trans)
+    };
+
     struct stream_views {
         std::vector<ggml_tensor *> t1_stream_gpu;
         std::vector<ggml_tensor *> t2_stream_gpu;
@@ -17,10 +24,13 @@ struct llama_memory_pshard : llama_memory_pipe_shard_i {
     };
 
     // parent cache callbacks set before init
-    using activate_fn_t = std::function<void(int32_t il, ggml_tensor * t1, ggml_tensor * t2)>;
+    using activate_fn_t    = std::function<void(int32_t il, ggml_tensor * t1, ggml_tensor * t2)>;
+    using cells_used_fn_t  = std::function<uint32_t(uint32_t stream_idx)>;
 
-    activate_fn_t on_activate_gpu;
-    activate_fn_t on_activate_cpu;
+    transfer_mode   mode = FULL;
+    activate_fn_t   on_activate_gpu;
+    activate_fn_t   on_activate_cpu;
+    cells_used_fn_t on_cells_used;  // null for FULL mode
 
     struct tensor_spec {
         uint32_t    il;
@@ -36,10 +46,11 @@ struct llama_memory_pshard : llama_memory_pipe_shard_i {
     };
 
     bool init(
-        const std::vector<tensor_spec>         & specs,
-        const std::unordered_map<int, int32_t> & layer_backend_ids,
-        int32_t                                  cpu_backend_id,
-        bool                                     no_alloc = false);
+        const std::vector<tensor_spec>             & specs,
+        const std::unordered_map<int, int32_t>     & layer_backend_ids,
+        int32_t                                      cpu_backend_id,
+        bool                                         no_alloc,
+        ggml_backend_buffer_t                        preload_buf);
 
     bool is_cpu_only(int32_t il) const;
 
@@ -48,14 +59,30 @@ struct llama_memory_pshard : llama_memory_pipe_shard_i {
     // llama_memory_pipe_shard_i interface
     const std::vector<layer> & get_layers() const override { return layers; }
 
+    void clear_prefetch() override;
+    bool prefetch_if_owned(ggml_tensor * t, ggml_backend_t be) override;
+    bool upload_if_owned(ggml_tensor * t, ggml_backend_t be) override;
+    bool download_if_owned(ggml_tensor * t, ggml_backend_t be) override;
+
+    void upload_for_switch(int32_t il, ggml_backend_t be) override;
+    void download_for_switch(int32_t il, ggml_backend_t be) override;
+
     void activate_gpu(int32_t il) override;
     void activate_cpu(int32_t il) override;
+    void prepare_for_host_access() override;
+    void pin_layer(int32_t il) override;
+    void unpin_layer(int32_t il) override;
+    void set_external_addrs(int32_t il, void * a1, void * a2, size_t sz) override;
+
+    void refresh_stream_views(int32_t il) override;
 
     void assign_tensors(
             ggml_backend_sched_t sched,
             const std::unordered_map<int, int32_t> & layer_bids,
             const std::vector<ggml_backend_ptr> & backends,
             const pshard_dev_layout & layout) override;
+
+    size_t current_pinned_size() const override;
 
     // stream accessors (KV only, empty for RS)
     const stream_views & get_stream(size_t idx) const { return streams[idx]; }
@@ -71,6 +98,22 @@ private:
     std::vector<ggml_context_ptr>          ctxs;
     std::vector<ggml_backend_buffer_ptr>   bufs;
     std::vector<size_t>                    bufs_planned_sizes;
+    ggml_backend_buffer_t                  external_buf = nullptr;
     int32_t                                cpu_bid_     = -1;
     std::unordered_map<int, int32_t>       layer_bids_;
+
+    void upload_full(int32_t il, ggml_backend_t gpu);
+    void download_full(int32_t il, ggml_backend_t be);
+    void upload_cells(int32_t il, ggml_backend_t gpu, bool zero_tail);
+    void download_cells(int32_t il, ggml_backend_t be);
+    void download_written(int32_t il, const std::vector<std::vector<uint32_t>> & wc_per_stream, ggml_backend_t be);
+
+    void upload_full_one(ggml_tensor * t_gpu, ggml_tensor * t_cpu, ggml_backend_t gpu);
+    void download_full_one(ggml_tensor * t_gpu, ggml_tensor * t_cpu, ggml_backend_t be);
+    void upload_cells_one(int32_t il, ggml_tensor * t_gpu, ggml_tensor * t_cpu, ggml_backend_t gpu, bool zero_tail);
+    void download_cells_one(int32_t il, ggml_tensor * t_gpu, ggml_tensor * t_cpu, ggml_backend_t be);
+    void download_written_one(int32_t il, ggml_tensor * t_gpu, ggml_tensor * t_cpu, const std::vector<std::vector<uint32_t>> & wc_per_stream, ggml_backend_t be);
+
+    struct cell_range { uint32_t start; uint32_t count; };
+    static std::vector<cell_range> batch_ranges(const std::vector<uint32_t> & sorted);
 };

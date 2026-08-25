@@ -39,6 +39,7 @@ add_library(llama
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
+            llama-pshard-cache.cpp
             llama-pshard-plan.cpp
             llama-quant.cpp
             llama-sampler.cpp

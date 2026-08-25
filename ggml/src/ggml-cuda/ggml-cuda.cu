@@ -4572,6 +4572,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 }
 
+static void ggml_backend_cuda_memset_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + offset, value, size, cuda_ctx->stream()));
+}
+
 static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_get_name,
     /* .free                    = */ ggml_backend_cuda_free,
@@ -4589,6 +4595,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .memset_tensor_async     = */ ggml_backend_cuda_memset_tensor_async,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

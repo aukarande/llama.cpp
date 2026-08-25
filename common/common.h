@@ -740,6 +740,7 @@ struct common_params {
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 
+    bool     pshard           = false;
     size_t   max_vram_alloc   = 0;
     uint32_t pshard_tier_max  = 0;
 };

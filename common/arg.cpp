@@ -1968,6 +1968,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"-pshard"},
+        "enable pipelined sharding (weights on CPU, pipelined to GPU per split)",
+        [](common_params & params) {
+            params.pshard = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-mva", "--max-vram-alloc"}, "N",
         "VRAM budget in MB for pshard (0 = use actual free VRAM minus --fit-target)",
         [](common_params & params, int value) {

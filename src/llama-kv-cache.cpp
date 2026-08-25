@@ -166,6 +166,8 @@ llama_kv_cache::llama_kv_cache(
             if (!hparams.has_kv(il)) continue;
             if (filter && !filter(il)) continue;
 
+            map_layer_ids[il] = (int32_t)specs.size();
+
             // MLA caches only the compressed latent + rope part in K; V is derived at attn time via wv_b
             const uint32_t n_embd_k_gqa = is_mla
                 ? (hparams.n_lora_kv + hparams.n_rot())
@@ -189,6 +191,8 @@ llama_kv_cache::llama_kv_cache(
         }
 
         pipe_shard_kv = std::make_unique<llama_memory_pshard>();
+        pipe_shard_kv->mode = v_trans ? llama_memory_pshard::FULL : llama_memory_pshard::CELL_GRANULAR;
+
         auto * ps = pipe_shard_kv.get();
 
         pipe_shard_kv->on_activate_gpu = [this, ps](int32_t il, ggml_tensor * k, ggml_tensor * v) {
@@ -209,8 +213,12 @@ llama_kv_cache::llama_kv_cache(
             layers[idx].v_stream = sv.t2_stream_cpu;
         };
 
+        pipe_shard_kv->on_cells_used = [this](uint32_t s) -> uint32_t {
+            return v_cells[s].used_max_p1();
+        };
+
         const int32_t cpu_bid = pshard_dev_layout::compute_cpu_backend_id(model.devices.size());
-        if (!pipe_shard_kv->init(specs, model.get_layer_backend_ids(), cpu_bid, hparams.no_alloc)) {
+        if (!pipe_shard_kv->init(specs, model.get_layer_backend_ids(), cpu_bid, hparams.no_alloc, model.get_dev_preload_buf())) {
             throw std::runtime_error("failed to initialize KV pipe shard");
         }
 
@@ -940,6 +948,11 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     if (do_shift) {
         if (!get_can_shift()) {
             GGML_ABORT("The current KV cache / model configuration does not support K-shift");
+        }
+
+        if (pipe_shard_kv) {
+            LLAMA_LOG_WARN("%s: pshard + KV shift -- testing pending, results may be incorrect\n", __func__);
+            pipe_shard_kv->prepare_for_host_access();
         }
 
         LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
@@ -2736,4 +2749,25 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+std::vector<std::vector<uint32_t>> llama_kv_cache_context::get_write_cells() const {
+    if (i_cur >= sinfos.size()) {
+        return {};
+    }
+    const auto & sinfo = sinfos[i_cur];
+    const uint32_t ns = kv->get_n_stream();
+    std::vector<std::vector<uint32_t>> result(ns);
+    for (size_t i = 0; i < sinfo.idxs.size(); ++i) {
+        uint32_t s = sinfo.s0 + (uint32_t)i;
+        if (s < ns) {
+            result[s] = sinfo.idxs[i];
+        }
+    }
+    return result;
+}
+
+std::vector<llama_memory_pipe_shard_i *> llama_kv_cache::get_pipe_shards() {
+    if (pipe_shard_kv) return { pipe_shard_kv.get() };
+    return {};
 }

@@ -408,6 +408,8 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    std::vector<std::vector<uint32_t>> get_write_cells() const;
+
 private:
     llama_memory_status status;
 

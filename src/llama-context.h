@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_pshard_plan;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -38,6 +39,12 @@ struct llama_memory_buffer {
 };
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+// pshard planner probes contexts at specific tier sizes (0 = default)
+struct llama_context_probe_reserve {
+    uint32_t n_tokens  = 0;
+    uint32_t n_outputs = 0;
+};
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -271,8 +278,31 @@ private:
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
 
-    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
-    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+    void pshard_setup_sched();
+    void pshard_pack_cache_region();
+    void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true);
+    void pshard_reapply_active_plan();
+    void pshard_reserve_and_save(const llama_pshard_plan & plan);
+    void pshard_save_alloc_state(const llama_pshard_plan & plan);
+    void pshard_warmup_plan_reserves();
+    void pshard_apply_initial_plan();
+    void pshard_switch_plan(
+            const llama_pshard_plan & old_plan,
+            const llama_pshard_plan & new_plan,
+            size_t                    old_tier,
+            size_t                    new_tier,
+            uint32_t                  n_tokens);
+    void pshard_maybe_switch(uint32_t n_tokens);
+    void pshard_update_write_cells(llama_memory_context_i * mctx);
+    bool pshard_prepare_host_access();
+    void pshard_restore_after_host_access();
+
+    // TODO: read/write lora adapters and cvec
+    size_t state_write_data(llama_io_write_i & io, bool pshard_host_access);
+    size_t state_read_data (llama_io_read_i  & io, bool pshard_host_access);
+
+    size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool pshard_host_access);
+    size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags, bool pshard_host_access);
 
     //
     // members
@@ -347,7 +377,9 @@ private:
 
     bool sched_need_reserve = true;
 
-    pshard_dev_layout pshard_layout = {};
+    const llama_pshard_plan * pshard_active_plan = nullptr;
+    bool pshard_memory_dirty = false;
+    pshard_dev_layout   pshard_layout = {};
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
@@ -411,3 +443,5 @@ void pshard_assign_tensors(
         llama_memory_i                                  * memory,
         const std::vector<ggml_backend_ptr>             & backends,
         const pshard_dev_layout                         & layout);
+
+void pshard_refresh_stream_views(llama_memory_i * memory);

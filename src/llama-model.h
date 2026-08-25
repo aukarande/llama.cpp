@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct weight_preload_entry;
 struct llama_pshard_plan;
 struct llama_pshard_plan_registry;
 
@@ -716,10 +717,25 @@ struct llama_model {
     bool is_pshard() const;
     bool pshard_delegates_compute() const;
 
-    llama_pshard_plan_registry * get_plan_registry() const;
-
     const std::unordered_map<struct ggml_tensor *, int32_t> & get_tensor_backend_ids() const;
     const std::unordered_map<int, int32_t> & get_layer_backend_ids() const;
+
+    ggml_backend_buffer_t get_dev_preload_buf() const;
+    size_t get_dev_preloaded_size() const;
+    void   sync_dev_preload();
+
+    void pshard_set_backend_maps(const llama_pshard_plan & plan);
+    std::unordered_map<struct ggml_tensor *, int32_t> pshard_build_canonical_weight_order(
+            std::vector<struct ggml_tensor *> & preload_order,
+            size_t & n_common);
+    void pshard_finalize_canonical_weight_layout(
+            const std::vector<struct ggml_tensor *> & preload_order,
+            size_t n_common);
+    void pshard_stamp_plan_offsets(const llama_pshard_plan & plan);
+    size_t pshard_compute_scratch_off(const llama_pshard_plan & plan);
+    size_t pshard_apply_plan(const llama_pshard_plan & plan, ggml_backend_t gpu = nullptr);
+
+    llama_pshard_plan_registry * get_plan_registry() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

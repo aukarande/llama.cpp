@@ -338,6 +338,7 @@ struct cmd_params {
     std::vector<bool>                cpu_strict;
     std::vector<int>                 poll;
     std::vector<int>                 n_gpu_layers;
+    bool                             n_gpu_layers_user;
     std::vector<int>                 n_cpu_moe;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
@@ -350,6 +351,8 @@ struct cmd_params {
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
+    std::vector<bool>                pshard;
+    std::vector<size_t>              max_vram_alloc;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
     ggml_numa_strategy               numa;
@@ -382,6 +385,7 @@ static const cmd_params cmd_params_defaults = {
     /* cpu_strict           */ { false },
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { -1 },
+    /* n_gpu_layers_user    */ false,
     /* n_cpu_moe            */ { 0 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
@@ -394,6 +398,8 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
+    /* pshard               */ { false },
+    /* max_vram_alloc       */ { 0 },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
@@ -465,9 +471,16 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
-    printf("                                                    (default: disabled)\n");
-    printf("  -nopo, --no-op-offload <0|1>                      (default: 0)\n");
-    printf("  --no-host <0|1>                                   (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("                                                    (default: disabled)
+");
+    printf("  -nopo, --no-op-offload <0|1>                      (default: 0)
+");
+    printf("  --no-host <0|1>                                   (default: %s)
+", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("  -pshard                                           enable pshard plan cache loading
+");
+    printf("  -mva, --max-vram-alloc <MiB>                      VRAM budget in MiB for pshard (0 = free VRAM minus -fitt)
+");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -521,6 +534,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.n_gpu_layers_user    = cmd_params_defaults.n_gpu_layers_user;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -707,6 +721,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i], /*allow_negative=*/true);
                 params.n_gpu_layers.insert(params.n_gpu_layers.end(), p.begin(), p.end());
+                params.n_gpu_layers_user = true;
             } else if (arg == "-ncmoe" || arg == "--n-cpu-moe") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -900,6 +915,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
+            } else if (arg == "-pshard" || arg == "--pshard") {
+                params.pshard.push_back(true);
+            } else if (arg == "-mva" || arg == "--max-vram-alloc") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & v : p) {
+                    params.max_vram_alloc.push_back(std::stoull(v));
+                }
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1164,6 +1190,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.no_host.empty()) {
         params.no_host = cmd_params_defaults.no_host;
     }
+    if (params.pshard.empty()) {
+        params.pshard = cmd_params_defaults.pshard;
+    }
+    if (params.max_vram_alloc.empty()) {
+        params.max_vram_alloc = cmd_params_defaults.max_vram_alloc;
+    }
     if (params.n_threads.empty()) {
         params.n_threads = cmd_params_defaults.n_threads;
     }
@@ -1212,6 +1244,8 @@ struct cmd_params_instance {
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
+    bool               pshard;
+    size_t             max_vram_alloc;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
 
@@ -1227,6 +1261,8 @@ struct cmd_params_instance {
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
+        mparams.pshard        = pshard;
+        mparams.max_vram_alloc = max_vram_alloc;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1272,6 +1308,9 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && devices == other.devices && no_host == other.no_host &&
+               pshard == other.pshard &&
+               max_vram_alloc == other.max_vram_alloc &&
+               (!pshard || (n_prompt + n_gen + n_depth) == (other.n_prompt + other.n_gen + other.n_depth)) &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
@@ -1281,6 +1320,8 @@ struct cmd_params_instance {
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
+        cparams.n_threads       = n_threads;
+        cparams.n_threads_batch = n_threads;
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
@@ -1288,6 +1329,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.pshard          = pshard;
 
         return cparams;
     }
@@ -1301,6 +1343,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & m : params.model)
     for (const auto & fpt : params.fit_params_target)
     for (const auto & fpc : params.fit_params_min_ctx)
+    for (const auto & ps : params.pshard)
+    for (const auto & mva : params.max_vram_alloc)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
     for (const auto & sm : params.split_mode)
@@ -1353,6 +1397,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
+                /* .pshard                = */ ps,
+                /* .max_vram_alloc        = */ mva,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1389,6 +1435,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
+                /* .pshard                = */ ps,
+                /* .max_vram_alloc        = */ mva,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1425,6 +1473,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
+                /* .pshard                = */ ps,
+                /* .max_vram_alloc        = */ mva,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1466,6 +1516,8 @@ struct test {
     bool                     embeddings;
     bool                     no_op_offload;
     bool                     no_host;
+    bool                     pshard;
+    size_t                   max_vram_alloc;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
     int                      n_prompt;
@@ -1505,6 +1557,8 @@ struct test {
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
         no_host        = inst.no_host;
+        pshard         = inst.pshard;
+        max_vram_alloc = inst.max_vram_alloc;
         fit_target     = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
         n_prompt       = inst.n_prompt;
@@ -1564,7 +1618,8 @@ struct test {
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
-            "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
+            "no_op_offload",  "no_host",        "pshard",        "max_vram_alloc",
+            "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1578,11 +1633,12 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "max_vram_alloc") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host") {
+            field == "embeddings" || field == "no_host" || field == "pshard") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1661,6 +1717,8 @@ struct test {
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
+                                            std::to_string(pshard),
+                                            std::to_string(max_vram_alloc),
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
                                             std::to_string(n_prompt),
@@ -1854,6 +1912,12 @@ struct markdown_printer : public printer {
         if (field == "no_host") {
             return 4;
         }
+        if (field == "pshard") {
+            return 4;
+        }
+        if (field == "max_vram_alloc") {
+            return 6;
+        }
 
         int width = std::max((int) field.length(), 10);
 
@@ -1890,6 +1954,12 @@ struct markdown_printer : public printer {
         }
         if (field == "no_host") {
             return "noh";
+        }
+        if (field == "pshard") {
+            return "psh";
+        }
+        if (field == "max_vram_alloc") {
+            return "mva";
         }
         if (field == "devices") {
             return "dev";
@@ -1980,6 +2050,12 @@ struct markdown_printer : public printer {
         }
         if (params.no_host.size() > 1 || params.no_host != cmd_params_defaults.no_host) {
             fields.emplace_back("no_host");
+        }
+        if (params.pshard.size() > 1 || params.pshard != cmd_params_defaults.pshard) {
+            fields.emplace_back("pshard");
+        }
+        if (params.max_vram_alloc.size() > 1 || params.max_vram_alloc != cmd_params_defaults.max_vram_alloc) {
+            fields.emplace_back("max_vram_alloc");
         }
         if (params.fit_params_target.size() > 1 || params.fit_params_target != cmd_params_defaults.fit_params_target) {
             fields.emplace_back("fit_target");
@@ -2247,8 +2323,21 @@ int llama_bench(int argc, char ** argv) {
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
 
-    llama_model *               lmodel    = nullptr;
-    const cmd_params_instance * prev_inst = nullptr;
+    llama_model *                 lmodel                  = nullptr;
+    llama_pshard_plan_registry *  active_pshard_registry  = nullptr;
+    const cmd_params_instance *   prev_inst               = nullptr;
+
+    auto free_active_model = [&]() {
+        if (lmodel) {
+            llama_model_free(lmodel);
+            lmodel = nullptr;
+        }
+        if (active_pshard_registry) {
+            llama_pshard_registry_free(active_pshard_registry);
+            active_pshard_registry = nullptr;
+        }
+        prev_inst = nullptr;
+    };
 
     // store the llama_context state at the previous depth that we performed a test
     // ref: https://github.com/ggml-org/llama.cpp/pull/16944#issuecomment-3478151721
@@ -2264,19 +2353,22 @@ int llama_bench(int argc, char ** argv) {
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
 
-        bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
-                      inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
+        const bool fit_target_changed = inst.fit_target != cmd_params_defaults.fit_params_target[0];
+        const bool fit_ctx_changed    = inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
+        const bool do_fit             = fit_target_changed || fit_ctx_changed;
+
+        if (inst.pshard && fit_ctx_changed) {
+            fprintf(stderr, "%s: error: -pshard cannot be combined with -fitc\n", __func__);
+            free_active_model();
+            return 1;
+        }
 
         std::vector<float> fit_tensor_split(llama_max_devices(), 0.0f);
         std::vector<llama_model_tensor_buft_override> fit_overrides(llama_max_tensor_buft_overrides(), {nullptr, nullptr});
 
-        if (do_fit) {
+        if (do_fit && !inst.pshard) {
             // free the previous model so fit sees full free VRAM
-            if (lmodel) {
-                llama_model_free(lmodel);
-                lmodel    = nullptr;
-                prev_inst = nullptr;
-            }
+            free_active_model();
 
             // use default n_gpu_layers and n_ctx so common_fit_params can adjust them
             mparams.n_gpu_layers          = llama_model_default_params().n_gpu_layers;
@@ -2298,28 +2390,66 @@ int llama_bench(int argc, char ** argv) {
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
        }
 
+        std::vector<llama_model_tensor_buft_override> pshard_overrides;
+        llama_pshard_plan_registry * pending_pshard_registry = nullptr;
+        if (inst.pshard) {
+            // free the previous model so pshard probes see the same free VRAM that the cached plan used
+            free_active_model();
+
+            pshard_overrides.resize(4096, { nullptr, nullptr, -1 });
+
+            if (!params.n_gpu_layers_user) {
+                mparams.n_gpu_layers = llama_model_default_params().n_gpu_layers;
+            }
+
+            const uint32_t n_ctx_plan = cparams.n_ctx;
+            const uint32_t tier_max_auto = std::min(std::max(cparams.n_batch, (uint32_t) 16384), n_ctx_plan);
+
+            pending_pshard_registry = llama_pshard_registry_create(tier_max_auto, cparams.n_seq_max);
+            mparams.pshard_registry = pending_pshard_registry;
+
+            llama_params_fit_pshard(inst.model.c_str(), &mparams, &cparams,
+                pshard_overrides.data(), inst.max_vram_alloc, inst.fit_target);
+
+            if (!mparams.pshard) {
+                llama_pshard_registry_free(pending_pshard_registry);
+                pending_pshard_registry = nullptr;
+                mparams.pshard_registry = nullptr;
+            }
+        }
+
+        cmd_params_instance run_inst = inst;
+        run_inst.n_batch        = (int) cparams.n_batch;
+        run_inst.n_ubatch       = (int) cparams.n_ubatch;
+        run_inst.pshard         = mparams.pshard && cparams.pshard;
+        run_inst.max_vram_alloc = mparams.max_vram_alloc;
+
         // keep the same model between tests when possible
         if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
-            if (lmodel) {
-                llama_model_free(lmodel);
-            }
+            free_active_model();
 
             lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);
             if (lmodel == NULL) {
                 fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
+                if (pending_pshard_registry) {
+                    llama_pshard_registry_free(pending_pshard_registry);
+                    pending_pshard_registry = nullptr;
+                }
                 return 1;
             }
+            active_pshard_registry = pending_pshard_registry;
+            pending_pshard_registry = nullptr;
             prev_inst = &inst;
         }
 
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
-            llama_model_free(lmodel);
+            free_active_model();
             return 1;
         }
 
-        test t(inst, lmodel, ctx);
+        test t(run_inst, lmodel, ctx);
 
         llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2468,7 +2598,7 @@ int llama_bench(int argc, char ** argv) {
         ggml_threadpool_free_fn(threadpool);
     }
 
-    llama_model_free(lmodel);
+    free_active_model();
 
     if (p) {
         p->print_footer();

@@ -35,6 +35,10 @@ inline bool llama_pshard_strategy_delegates_compute(llama_pshard_strategy s) {
     return s == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS;
 }
 
+inline bool llama_pshard_strategy_delegates_compute(llama_pshard_strategy s) {
+    return s == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS;
+}
+
 // PSHARD_STRATEGY accepts a name or numeric id
 inline int pshard_strategy_from_env() {
     const char * env = getenv("PSHARD_STRATEGY");
@@ -59,6 +63,17 @@ struct llama_pshard_override {
     int32_t                    backend_id;
 };
 
+// saved allocator and backend ids for plan switches
+struct llama_pshard_alloc_state {
+    std::vector<uint8_t> node_allocs;
+    std::vector<uint8_t> leaf_allocs;
+    std::vector<int>     node_backend_ids;
+    std::vector<int>     leaf_backend_ids;
+    int  n_nodes = 0;
+    int  n_leafs = 0;
+    bool valid   = false;
+};
+
 struct llama_pshard_plan {
     llama_pshard_strategy strategy       = LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS;
     uint32_t             batch_size      = 0;
@@ -75,6 +90,16 @@ struct llama_pshard_plan {
     size_t cache_measured   = 0;
     float  tps              = 0.0f;  // predicted tokens/sec (0 = no benchmark data)
     bool   is_viable        = false;
+
+    // cached maps and offsets from first apply
+    mutable std::unordered_map<std::string, int32_t> cached_tensor_bids;
+    mutable std::unordered_map<int, int32_t>         cached_layer_bids;
+    mutable std::unordered_map<std::string, size_t>  cached_weight_offsets;
+    mutable size_t cached_scratch_off = 0;
+    mutable bool   maps_cached       = false;
+    mutable bool   addrs_cached      = false;
+
+    mutable llama_pshard_alloc_state alloc_state;
 };
 
 enum llama_layer_fraction {
@@ -86,6 +111,19 @@ enum llama_layer_fraction {
 };
 
 const char * llama_get_overflow_pattern(size_t il, llama_layer_fraction lf);
+
+void llama_pshard_generate_overrides(
+        uint32_t n_pinned,
+        uint32_t n_layers,
+        ggml_backend_buffer_type_t gpu_buft,
+        ggml_backend_buffer_type_t host_buft,
+        struct llama_model_tensor_buft_override * tensor_buft_overrides,
+        llama_layer_fraction overflow_type,
+        llama_pshard_strategy strategy,
+        const pshard_dev_layout & layout,
+        bool pin_from_back = false,
+        bool output_on_gpu = false,
+        uint32_t n_attn_pinned = 0);
 
 struct llama_device_memory_data {
     int64_t total;
@@ -108,7 +146,8 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         uint32_t probe_n_tokens = 0,
         uint32_t probe_n_outputs = 0);
 
-// fit params entry point used by pshard planning
+// fit params entry point used by pshard planning (relocated from the
+// base-era src/llama.cpp; upstream's generic fit moved to common/fit)
 void llama_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -146,6 +185,12 @@ struct llama_pshard_plan_registry {
 
     void init(uint32_t n_ubatch, uint32_t n_parallel = 1, uint32_t n_draft = 0) {
         tier_sizes.clear();
+        best_plans.clear();
+
+        if (n_ubatch == 0) {
+            cache_ubatch = 0;
+            return;
+        }
         best_plans.clear();
 
         if (n_ubatch == 0) {
@@ -196,5 +241,31 @@ struct llama_pshard_plan_registry {
 
     llama_pshard_plan * get_best(size_t tier) {
         return best_plans[tier].is_viable ? &best_plans[tier] : nullptr;
+    }
+
+    // pick the prefill ubatch with the lowest predicted ttft
+    // use max_ubatch when TPS data is missing
+    uint32_t find_optimal_ubatch(uint32_t n_prompt, uint32_t max_ubatch) const {
+        uint32_t best_ub  = max_ubatch;
+        double   best_time = 1e30;
+
+        for (size_t t = 0; t < tier_sizes.size(); t++) {
+            uint32_t ts = tier_sizes[t];
+            if (ts < 512 || ts > max_ubatch) continue;
+
+            const auto & plan = best_plans[t];
+            if (!plan.is_viable || plan.tps <= 0.0f) continue;
+
+            double per_iter = (double)ts / (double)plan.tps;
+            uint32_t n_iters = (n_prompt + ts - 1) / ts;
+            double total = n_iters * per_iter;
+
+            if (total < best_time) {
+                best_time = total;
+                best_ub   = ts;
+            }
+        }
+
+        return best_ub;
     }
 };
