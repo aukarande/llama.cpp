@@ -414,6 +414,8 @@ void llama_params_fit_pshard(
     if (!pshard_registry_load(registry, fp, cache_path.c_str(), host_buft, vram_free, false)) {
         LLAMA_LOG_WARN("%s: no matching plan cache at %s (fingerprint=0x%016" PRIx64 "), disabling pshard\n",
             __func__, cache_path.c_str(), fp);
+        LLAMA_LOG_WARN("%s: >>> pshard DISABLED: this run uses the STOCK path - benchmark numbers will not be pshard numbers <<<\n", __func__);
+        LLAMA_LOG_WARN("%s: fingerprint inputs (n_ctx, n_seq_max, n_threads, flash_attn, type_k/v, model file size, PSHARD_STRATEGY env) must match the planner invocation exactly\n", __func__);
         mparams->pshard = false;
         cparams->pshard = false;
         return;

@@ -2653,6 +2653,14 @@ size_t llama_model::pshard_compute_scratch_off(const llama_pshard_plan & plan) {
 
     for (auto * tensor : pinned) {
         size_t tsize = ggml_backend_buffer_get_alloc_size(pimpl->dev_preload_buf, tensor);
+        // fixed-placement common tensors keep their loader-assigned address; only advance
+        // the cursor past them (mirrors the canonical packer's device_only_common branch)
+        auto entry_it = pimpl->weight_preload_map.find(tensor);
+        if (entry_it != pimpl->weight_preload_map.end() && entry_it->second.device_only_common) {
+            const size_t off = (size_t) ((char *) entry_it->second.gpu_addr - (char *) buf_base);
+            talloc.offset = std::max(talloc.offset, GGML_PAD(off + tsize, talloc.alignment));
+            continue;
+        }
         if (talloc.offset + tsize > buf_size) break;
         tensor->buffer = NULL;
         tensor->data   = NULL;
