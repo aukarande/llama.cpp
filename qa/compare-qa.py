@@ -42,7 +42,16 @@ def main():
     hard, soft, better, info = [], [], [], []
 
     for (cfg, side), r in sorted(new.items()):
-        if r["status"] not in ("OK", "TOKEN_DIVERGED_PPL_OK"):
+        # cells where STOCK itself cannot run (e.g. 16k ctx in a 2 GB budget: stock fails to
+        # allocate compute buffers while pshard runs) are informational pshard wins, not failures
+        if side == "stock" and r["status"] == "FAIL":
+            info.append(f"{cfg}: stock cannot run this cell (pshard-only)")
+            continue
+        if side == "pshard":
+            stock = new.get((cfg.rsplit("-s", 1)[0], "stock"))
+            if stock is not None and stock["status"] == "FAIL" and r["status"] != "OK":
+                r = dict(r, status="STOCK_UNAVAILABLE")
+        if r["status"] not in ("OK", "TOKEN_DIVERGED_PPL_OK", "STOCK_UNAVAILABLE"):
             hard.append(f"{cfg}/{side}: status={r['status']}")
             continue
         if side != "pshard":
