@@ -1040,8 +1040,8 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     for (int i = 0; i < graph->n_nodes; i++) {
         if (cur_split < sched->n_splits && i == sched->splits[cur_split].i_start) {
             ggml_backend_t split_backend = sched->backends[sched->splits[cur_split].backend_id];
-            GGML_LOG_DEBUG("\n## SPLIT #%d: %s # %d inputs", cur_split, ggml_backend_name(split_backend),
-                sched->splits[cur_split].n_inputs);
+            GGML_LOG_DEBUG("\n## SPLIT #%d: %s(bid=%d) # %d inputs", cur_split, ggml_backend_name(split_backend),
+                sched->splits[cur_split].backend_id, sched->splits[cur_split].n_inputs);
             for (int j = 0; j < sched->splits[cur_split].n_inputs; j++) {
                 if (j == 0) {
                     GGML_LOG_DEBUG(": ");
@@ -1104,6 +1104,93 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+// true if the ids tensor (or a view ancestor of it) is produced by a node of this split —
+// in that case its values do not exist yet at input-copy time and sliced copies must not read it
+static bool ggml_backend_sched_split_produces_ids(
+        const struct ggml_backend_sched_split * split, const struct ggml_tensor * ids) {
+    for (const struct ggml_tensor * t = ids; t != NULL; t = t->view_src) {
+        for (int i = 0; i < split->graph.n_nodes; i++) {
+            if (split->graph.nodes[i] == t) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// find the MUL_MAT_ID node in this split that consumes input_cpy as its expert weights AND whose
+// expert ids are already computed (by an earlier split), making a sliced-by-used-ids copy valid
+static struct ggml_tensor * ggml_backend_sched_split_find_moe_consumer(
+        const struct ggml_backend_sched_split * split, const struct ggml_tensor * input_cpy) {
+    for (int i = 0; i < split->graph.n_nodes; i++) {
+        struct ggml_tensor * node = split->graph.nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy &&
+            node->src[2] != NULL && !ggml_backend_sched_split_produces_ids(split, node->src[2])) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+// expert weights consumed by a small-batch MUL_MAT_ID are far cheaper to copy sliced-by-used-ids
+// at consume time than to prefetch in full; both the prefetch and consume loops must agree on
+// this decision, so it is a pure function of the split graph
+static bool ggml_backend_sched_prefer_sliced_expert_copy(
+        const struct ggml_backend_sched_split * split, const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
+    const struct ggml_tensor * node = ggml_backend_sched_split_find_moe_consumer(split, input_cpy);
+    if (node == NULL || node->src[1] == NULL) {
+        return false;
+    }
+    const int64_t n_expert = input->ne[2];
+    // expert-token pairs this evaluation will actually gather
+    const int64_t n_pairs  = ggml_nelements(node->src[1]) / std::max<int64_t>(node->src[1]->ne[0], 1);
+    return n_pairs * 2 < n_expert;
+}
+
+// true if the split has at least one host-weight input the prefetch pass would actually copy
+// (i.e. not deferred to the sliced-by-used-ids consume-time path)
+static bool ggml_backend_sched_split_has_prefetchable_weights(
+        struct ggml_backend_sched * sched, struct ggml_backend_sched_split * candidate) {
+    for (int j = 0; j < candidate->n_inputs; j++) {
+        struct ggml_tensor * input = candidate->inputs[j];
+        if (input->buffer == NULL ||
+            ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            !ggml_backend_buffer_is_host(input->buffer)) {
+            continue;
+        }
+        struct ggml_tensor * input_cpy = tensor_copy(input, candidate->backend_id, sched->cur_copy);
+        if (input_cpy == NULL) {
+            continue;
+        }
+        if (!ggml_backend_sched_prefer_sliced_expert_copy(candidate, input, input_cpy)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// scan forward from split i+1 for the next redirected split with prefetchable host weights,
+// crossing CPU and pinned-compute splits (bounded lookahead). Used by BOTH the build-time galloc
+// keepalive and the runtime prefetch: they must agree, so every prefetch destination's lifetime
+// covers the whole window the copy can overlap (CPU-FFN + attn compute in the alternation
+// strategy). Both sides also step the same outstanding-prefetch state machine, so keepalives are
+// emitted exactly at the split where the runtime enqueues the copy.
+#define GGML_SCHED_PREFETCH_LOOKAHEAD 8
+static int ggml_backend_sched_next_prefetch_split(struct ggml_backend_sched * sched, int i) {
+    const int lim = std::min(i + 1 + GGML_SCHED_PREFETCH_LOOKAHEAD, sched->n_splits);
+    for (int nid = i + 1; nid < lim; nid++) {
+        struct ggml_backend_sched_split * candidate = &sched->splits[nid];
+        if (sched->redirect_target[candidate->backend_id] < 0 ||
+            sched->copy_backends[candidate->backend_id] == NULL) {
+            continue;
+        }
+        if (ggml_backend_sched_split_has_prefetchable_weights(sched, candidate)) {
+            return nid;
+        }
+    }
+    return -1;
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1560,6 +1647,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     struct ggml_cgraph * graph_copy = &sched->graph;
 
+    // mirrors the runtime's outstanding-prefetch state machine (see compute_splits)
+    int prefetch_outstanding = -1;
+
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
@@ -1597,28 +1687,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             graph_copy->nodes[graph_copy->n_nodes++] = prealloc;
         }
 
-        // prefetch: reserve immediate next sharded split's prefetch destinations
-        // (race-protect copy stream vs current compute, do not scan past CPU splits)
+        // prefetch: reserve the NEXT sharded split's prefetch destinations, scanning across
+        // CPU/pinned splits (same scan as the runtime prefetch) so the destination slots stay
+        // alive for the whole overlap window
         if (sched->prefetch_weights) {
+            if (prefetch_outstanding == i) {
+                prefetch_outstanding = -1;
+            }
             struct ggml_backend_sched_split * next_gpu = NULL;
-            if (i + 1 < sched->n_splits) {
-                struct ggml_backend_sched_split * candidate = &sched->splits[i + 1];
-                // only prefetch into redirected backends
-                // the main compute backend should use the normal input copy i.e. no prefetch
-                if (sched->redirect_target[candidate->backend_id] >= 0 &&
-                    sched->copy_backends[candidate->backend_id] != NULL) {
-                    bool has_host_weights = false;
-                    for (int j = 0; j < candidate->n_inputs; j++) {
-                        if (candidate->inputs[j]->buffer != NULL &&
-                            ggml_backend_buffer_get_usage(candidate->inputs[j]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                            ggml_backend_buffer_is_host(candidate->inputs[j]->buffer)) {
-                            has_host_weights = true;
-                            break;
-                        }
-                    }
-                    if (has_host_weights) {
-                        next_gpu = candidate;
-                    }
+            if (prefetch_outstanding < 0) {
+                const int nid = ggml_backend_sched_next_prefetch_split(sched, i);
+                if (nid >= 0) {
+                    next_gpu = &sched->splits[nid];
+                    prefetch_outstanding = nid;
                 }
             }
             if (next_gpu != NULL) {
@@ -1789,49 +1870,6 @@ static void ggml_backend_sched_zero_copy_padding(ggml_backend_t backend, struct 
     }
 }
 
-// true if the ids tensor (or a view ancestor of it) is produced by a node of this split —
-// in that case its values do not exist yet at input-copy time and sliced copies must not read it
-static bool ggml_backend_sched_split_produces_ids(
-        const struct ggml_backend_sched_split * split, const struct ggml_tensor * ids) {
-    for (const struct ggml_tensor * t = ids; t != NULL; t = t->view_src) {
-        for (int i = 0; i < split->graph.n_nodes; i++) {
-            if (split->graph.nodes[i] == t) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// find the MUL_MAT_ID node in this split that consumes input_cpy as its expert weights AND whose
-// expert ids are already computed (by an earlier split), making a sliced-by-used-ids copy valid
-static struct ggml_tensor * ggml_backend_sched_split_find_moe_consumer(
-        const struct ggml_backend_sched_split * split, const struct ggml_tensor * input_cpy) {
-    for (int i = 0; i < split->graph.n_nodes; i++) {
-        struct ggml_tensor * node = split->graph.nodes[i];
-        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy &&
-            node->src[2] != NULL && !ggml_backend_sched_split_produces_ids(split, node->src[2])) {
-            return node;
-        }
-    }
-    return NULL;
-}
-
-// expert weights consumed by a small-batch MUL_MAT_ID are far cheaper to copy sliced-by-used-ids
-// at consume time than to prefetch in full; both the prefetch and consume loops must agree on
-// this decision, so it is a pure function of the split graph
-static bool ggml_backend_sched_prefer_sliced_expert_copy(
-        const struct ggml_backend_sched_split * split, const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
-    const struct ggml_tensor * node = ggml_backend_sched_split_find_moe_consumer(split, input_cpy);
-    if (node == NULL || node->src[1] == NULL) {
-        return false;
-    }
-    const int64_t n_expert = input->ne[2];
-    // expert-token pairs this evaluation will actually gather
-    const int64_t n_pairs  = ggml_nelements(node->src[1]) / std::max<int64_t>(node->src[1]->ne[0], 1);
-    return n_pairs * 2 < n_expert;
-}
-
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1847,6 +1885,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // host-side phase timing (GGML_SCHED_TIMING=1): totals per compute_splits call, in us
     static const bool sched_timing = getenv("GGML_SCHED_TIMING") != nullptr;
     int64_t tt_redirect = 0, tt_inputs = 0, tt_precomp = 0, tt_prefetch = 0, tt_launch = 0, tt_postcomp = 0;
+    int nn_redirected = 0, nn_prefetched = 0;
     const int64_t tt_start = sched_timing ? ggml_time_us() : 0;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1867,6 +1906,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // pshard: a redirected backend executes this split on its target
         if (sched->redirect_target[split_backend_id] >= 0) {
+            nn_redirected++;
             const int64_t t0 = sched_timing ? ggml_time_us() : 0;
             ggml_backend_synchronize(sched->backends[split_backend_id]);
             if (sched_timing) tt_redirect += ggml_time_us() - t0;
@@ -1877,6 +1917,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const bool weights_prefetched =
             prefetched_split_id == split_id &&
             prefetched_backend_id == copy_backend_id;
+        if (weights_prefetched) {
+            nn_prefetched++;
+        }
 
         if (prefetched_split_id == split_id && !weights_prefetched) {
             prefetched_split_id = -1;
@@ -1898,26 +1941,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             struct ggml_backend_sched_split * next_gpu = NULL;
             int next_gpu_id = -1;
-            if (split_id + 1 < sched->n_splits) {
-                const int nid = split_id + 1;
-                struct ggml_backend_sched_split * candidate = &splits[nid];
-                // only prefetch into redirected backends
-                // the main compute backend should use the normal input copy i.e. no prefetch
-                if (sched->redirect_target[candidate->backend_id] >= 0 &&
-                    sched->copy_backends[candidate->backend_id] != NULL) {
-                    bool has_host_weights = false;
-                    for (int j = 0; j < candidate->n_inputs; j++) {
-                        if (candidate->inputs[j]->buffer != NULL &&
-                            ggml_backend_buffer_get_usage(candidate->inputs[j]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                            ggml_backend_buffer_is_host(candidate->inputs[j]->buffer)) {
-                            has_host_weights = true;
-                            break;
-                        }
-                    }
-                    if (has_host_weights) {
-                        next_gpu = candidate;
-                        next_gpu_id = nid;
-                    }
+            {
+                const int nid = ggml_backend_sched_next_prefetch_split(sched, split_id);
+                if (nid >= 0) {
+                    next_gpu = &splits[nid];
+                    next_gpu_id = nid;
                 }
             }
             if (next_gpu == NULL) {
@@ -1926,6 +1954,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             ggml_backend_t next_copy = sched->copy_backends[next_gpu->backend_id];
 
+            // conservative fence: the copy destination shares galloc bytes with activations, so
+            // it must wait for ALL prior compute. A per-slot fence needs dedicated slot regions
+            // outside the shared scratch window (galloc dedups allocators by buft) - future work.
             if (sched->compute_events[split_backend_id] != NULL) {
                 ggml_backend_event_wait(next_copy, sched->compute_events[split_backend_id]);
             }
@@ -2188,8 +2219,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (sched_timing) {
-        GGML_LOG_INFO("sched_timing: n_splits=%d total=%lld us | redirect_sync=%lld inputs=%lld precomp=%lld prefetch=%lld launch=%lld postcomp=%lld\n",
-            sched->n_splits, (long long)(ggml_time_us() - tt_start),
+        GGML_LOG_INFO("sched_timing: n_splits=%d redirected=%d prefetched=%d total=%lld us | redirect_sync=%lld inputs=%lld precomp=%lld prefetch=%lld launch=%lld postcomp=%lld\n",
+            sched->n_splits, nn_redirected, nn_prefetched, (long long)(ggml_time_us() - tt_start),
             (long long)tt_redirect, (long long)tt_inputs, (long long)tt_precomp,
             (long long)tt_prefetch, (long long)tt_launch, (long long)tt_postcomp);
     }

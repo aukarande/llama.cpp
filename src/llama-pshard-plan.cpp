@@ -124,6 +124,22 @@ static void llama_pshard_generate_overrides(
                     }
                     break;
 
+                case LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE:
+                    // even unpinned FFNs compute on CPU, odd ones stream to alternating shard
+                    // slots so the copy overlaps CPU-FFN + attn compute; attn is pinned for the
+                    // first n_attn_pinned layers and streamed for the rest (budget knob)
+                    if (il % 2 == 0) {
+                        emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
+                    } else {
+                        emit(patterns_layer_ffn[il].c_str(), host_buft, layout.shard(il / 2));
+                    }
+                    if (n_attn_pinned > 0 && il < n_attn_pinned) {
+                        emit(patterns_layer[il].c_str(), gpu_buft, layout.compute);
+                    } else {
+                        emit(patterns_layer[il].c_str(), host_buft, layout.shard(il / 2));
+                    }
+                    break;
+
                 default: break;
             }
         }
@@ -430,6 +446,7 @@ static llama_pshard_plan llama_pshard_search_strategy(
 
 static llama_pshard_plan llama_pshard_search_attn_pin(
         const llama_pshard_search_ctx & ctx,
+        llama_pshard_strategy strategy,
         uint32_t hi_attn_hint = UINT32_MAX,
         uint32_t hi_full_hint = UINT32_MAX,
         uint32_t lo_full_hint = 0) {
@@ -445,16 +462,16 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
     const auto   is_moe     = ctx.is_moe;
 
     llama_pshard_plan plan;
-    plan.strategy = LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS;
+    plan.strategy = strategy;
 
     auto measure_vram = [&](uint32_t n_full, uint32_t n_attn, bool out_gpu) -> llama_memory_breakdown_data {
         llama_pshard_generate_overrides(n_full, n_layers, gpu_buft, host_buft,
-            tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS,
+            tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, strategy,
             layout, false, out_gpu, n_attn);
 
         llama_model_params mp = *mparams;
         mp.pshard = true;
-        mp.pshard_delegate_compute = true;
+        mp.pshard_delegate_compute = llama_pshard_strategy_delegates_compute(strategy);
         mp.n_gpu_layers = n_layers + 1;
         mp.tensor_buft_overrides = tensor_buft_overrides;
 
@@ -627,12 +644,12 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
     plan.output_on_gpu = output_on_gpu;
 
     llama_pshard_generate_overrides(n_full, n_layers, gpu_buft, host_buft,
-        tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS,
+        tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, strategy,
         layout, false, plan.output_on_gpu, n_attn);
     {
         llama_model_params mp = *mparams;
         mp.pshard = true;
-        mp.pshard_delegate_compute = true;
+        mp.pshard_delegate_compute = llama_pshard_strategy_delegates_compute(strategy);
         mp.n_gpu_layers = n_layers + 1;
         mp.tensor_buft_overrides = tensor_buft_overrides;
         llama_pshard_tps_hook_data tps_data = { ctx.predictor, layout.cpu, ctx.kv_size, (int32_t)cparams->n_batch, cparams->n_seq_max, ctx.has_rs, &plan.tps };
@@ -1285,7 +1302,7 @@ static llama_pshard_plan llama_pshard_attn_pin_fallback(
         int      force_strategy,
         uint32_t hi_attn   = UINT32_MAX,
         uint32_t hi_pinned = UINT32_MAX) {
-    llama_pshard_plan fallback = llama_pshard_search_attn_pin(ctx, hi_attn, hi_pinned);
+    llama_pshard_plan fallback = llama_pshard_search_attn_pin(ctx, LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS, hi_attn, hi_pinned);
     fallback.batch_size = ctx.cparams->n_batch;
     LLAMA_LOG_INFO("llama_params_fit_pshard: [bs=%-4u %-10s] forced %s non-viable, STATIC_ATTNPRIO_ALLMODELS fallback: n_pinned=%2u/%2u, %s\n",
         ctx.cparams->n_batch, llama_pshard_strategy_name(LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS),
@@ -1321,8 +1338,9 @@ static llama_pshard_plan llama_pshard_search_tier(
         llama_pshard_strategy strategy = (llama_pshard_strategy)s;
         llama_pshard_plan plan;
 
-        if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS) {
-            plan = llama_pshard_search_attn_pin(ctx, prune.hi_attn, prune.hi_pinned[s]);
+        if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
+            strategy == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
+            plan = llama_pshard_search_attn_pin(ctx, strategy, prune.hi_attn, prune.hi_pinned[s]);
         } else {
             plan = llama_pshard_search_strategy(ctx, strategy, prune.hi_pinned[s]);
         }
@@ -1413,8 +1431,9 @@ static void llama_pshard_strategy_sweep(
 
             const uint32_t lo_hint = ctx.has_rs ? 0 : prev_n_pinned;
 
-            if (strat == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS) {
-                plan = llama_pshard_search_attn_pin(ctx, prune.hi_attn, UINT32_MAX, lo_hint);
+            if (strat == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
+                strat == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
+                plan = llama_pshard_search_attn_pin(ctx, strat, prune.hi_attn, UINT32_MAX, lo_hint);
                 plan.batch_size = cp_tier.n_batch;
             } else {
                 plan = llama_pshard_search_strategy(ctx, strat, UINT32_MAX, lo_hint);

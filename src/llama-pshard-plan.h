@@ -18,6 +18,9 @@ enum llama_pshard_strategy {
     LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM           = 1,
     LLAMA_PSHARD_DYNAMIC_FFNCPU_ATTNSTREAM           = 2,
     LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS           = 3,
+    // unpinned FFNs alternate CPU compute / GPU streaming: the PCIe copy of the next streamed
+    // FFN overlaps CPU-FFN + pinned-attn compute, so DDR and PCIe bandwidth add up
+    LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE               = 4,
     LLAMA_PSHARD_COUNT
 };
 
@@ -28,6 +31,7 @@ inline const char * llama_pshard_strategy_name(llama_pshard_strategy s) {
         case LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM:    return "GPUONLY_ATTNPIN_FFNSTREAM";
         case LLAMA_PSHARD_DYNAMIC_FFNCPU_ATTNSTREAM:    return "DYNAMIC_FFNCPU_ATTNSTREAM";
         case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS:    return "STATIC_ATTNPRIO_ALLMODELS";
+        case LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE:        return "DYNAMIC_FFN_ALTERNATE";
         default:                                        return "UNKNOWN";
     }
 }

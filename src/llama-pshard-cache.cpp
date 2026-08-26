@@ -119,6 +119,21 @@ void llama_pshard_generate_overrides(
                         emit(patterns_layer[il].c_str(), host_buft, layout.cpu);
                     }
                     break;
+                case LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE:
+                    // even unpinned FFNs compute on CPU, odd ones stream to alternating shard
+                    // slots so the copy overlaps CPU-FFN + attn compute; attn is pinned for the
+                    // first n_attn_pinned layers and streamed for the rest (budget knob)
+                    if (il % 2 == 0) {
+                        emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
+                    } else {
+                        emit(patterns_layer_ffn[il].c_str(), host_buft, layout.shard(il / 2));
+                    }
+                    if (n_attn_pinned > 0 && il < n_attn_pinned) {
+                        emit(patterns_layer[il].c_str(), host_buft, layout.compute);
+                    } else {
+                        emit(patterns_layer[il].c_str(), host_buft, layout.shard(il / 2));
+                    }
+                    break;
                 default: break;
             }
         }
