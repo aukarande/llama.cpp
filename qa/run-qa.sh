@@ -1,0 +1,176 @@
+#!/bin/sh
+# pshard QA harness: stock is the golden.
+#
+# For every config (model x ctx x mva x strategy) this:
+#   1. wipes the model's plan registry and plans fresh (forced strategy via PSHARD_STRATEGY,
+#      or auto), reading cache_ubatch back from the registry,
+#   2. runs the STOCK baseline once per (model, ctx, mva) with -fitt equalized to the same
+#      budget and -ub matched to pshard's cache_ubatch (value-comparable),
+#   3. runs pshard with -v (tier summary => active strategy / overlap / n_pinned),
+#      sampling VRAM at 1 Hz,
+#   4. appends one CSV row per side to the run ledger.
+#
+# Generation goes to stdout (*.gen files, hashed for the token gate); logs go to stderr
+# (*.log files, parsed for perf and plan info). Never merge the streams: init banners and
+# verbose logs differ between sides and would poison the hash.
+#
+# Gates are applied by qa/compare-qa.py against a committed reference ledger.
+#
+# Usage:
+#   sh qa/run-qa.sh <out-dir> [smoke|full]
+# Environment:
+#   QA_MODELS_DIR (default C:/Aditya/Models), QA_PROMPTS_DIR (default C:/Aditya/Prompts)
+#   QA_BIN (default <repo>/build/bin/Release)
+# The machine must be otherwise idle (benches get the whole machine), and only ONE
+# instance may run at a time (registries are per-model global state).
+
+set -u
+OUT=${1:?usage: run-qa.sh <out-dir> [smoke|full]}
+GRID=${2:-smoke}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN=${QA_BIN:-$ROOT/build/bin/Release}
+MODELS=${QA_MODELS_DIR:-/c/Aditya/Models}
+PROMPTS=${QA_PROMPTS_DIR:-/c/Aditya/Prompts}
+N_GEN=32
+mkdir -p "$OUT"
+cd "$BIN" || exit 1
+
+# single-instance lock: rival harnesses clobber each other's registries mid-flight
+LOCK="$OUT/../qa-run.lock"
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK")" 2>/dev/null; then
+    echo "another qa run (pid $(cat "$LOCK")) is active; refusing to start" >&2
+    exit 1
+fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+
+LEDGER="$OUT/ledger.csv"
+echo "config,side,model,ctx,mva,strategy_forced,strategy_active,overlap,n_pinned,cache_ubatch,prompt_tps,decode_tps,vram_peak_delta,token_hash,status" > "$LEDGER"
+
+IDLE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+echo "# idle_used=$IDLE" >> "$LEDGER"
+FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
+
+MODELS_LIST="q35:Qwen3.6-35B-A3B-UD-Q4_K_M oss:gpt-oss-20b-Q4_0 q8d:Qwen3.6-27B-Q8_0"
+if [ "$GRID" = "full" ]; then
+    CTX_LIST="2048 16384"
+    MVA_LIST="2000 4000 8000 12000"
+    STRAT_LIST="auto 0 1 2 3 4"
+else
+    CTX_LIST="2048"
+    MVA_LIST="4000 8000"
+    STRAT_LIST="auto"
+fi
+
+hash_gen() { # generation file (pure stdout) -> hash
+    tr -d '\r\n' < "$1" | md5sum | cut -c1-16
+}
+perf_field() { # log pattern -> tok/s
+    grep -a "$2" "$1" | tail -1 | sed 's/.*, *//;s/ tokens per second.*//'
+}
+
+run_side() { # samp-file log-file gen-file cmd...
+    SAMP=$1; LOG=$2; GENF=$3; shift 3
+    : > "$SAMP"
+    ( while :; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits >> "$SAMP" 2>/dev/null; sleep 1; done ) &
+    SPID=$!
+    "$@" > "$GENF" 2> "$LOG"
+    RC=$?
+    kill $SPID 2>/dev/null; wait $SPID 2>/dev/null
+    PEAK=$(sort -n "$SAMP" | tail -1); [ -z "$PEAK" ] && PEAK=$IDLE
+    echo $RC $((PEAK - IDLE))
+}
+
+for MDL in $MODELS_LIST; do
+    MK=${MDL%%:*}; MP="$MODELS/${MDL#*:}.gguf"
+    cat "$MP" > /dev/null   # warm file cache
+    for CTX in $CTX_LIST; do
+        PROMPT="$PROMPTS/prompt-512.txt"
+        [ "$CTX" -ge 16384 ] && PROMPT="$PROMPTS/prompt-16k.txt"
+        for MVA in $MVA_LIST; do
+            FITT=$((FREE - MVA))
+            STOCK_DONE=0
+            STOCK_HASH=""
+            for STRAT in $STRAT_LIST; do
+                CFG="${MK}-c${CTX}-mva${MVA}-s${STRAT}"
+                echo "=== $CFG"
+                rm -f "$MP.tensor_overrides.pshard_registry"
+
+                # 1. plan fresh
+                PLOG="$OUT/plan_$CFG.log"
+                if [ "$STRAT" = "auto" ]; then
+                    ./llama-pshard-plan-params.exe -m "$MP" -c "$CTX" -mva "$MVA" > "$PLOG" 2>&1
+                else
+                    env PSHARD_STRATEGY=$STRAT ./llama-pshard-plan-params.exe -m "$MP" -c "$CTX" -mva "$MVA" > "$PLOG" 2>&1
+                fi
+                if [ $? -ne 0 ]; then
+                    echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,PLAN_FAILED,,,,,,,,FAIL" >> "$LEDGER"
+                    continue
+                fi
+                CUB=$(grep -aoE "cache_ubatch=[0-9]+" "$MP.tensor_overrides.pshard_registry" | head -1 | cut -d= -f2)
+                [ -z "$CUB" ] && CUB=$CTX
+
+                # 2. stock baseline (once per model/ctx/mva), ub matched to pshard's cache_ubatch
+                SLOG="$OUT/stock_${MK}-c${CTX}-mva${MVA}.log"
+                if [ "$STOCK_DONE" = "0" ]; then
+                    R=$(run_side "$OUT/vram_stock_${MK}-c${CTX}-mva${MVA}.txt" "$SLOG" "$SLOG.gen" \
+                        ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" \
+                        --temp 0 -no-cnv --ignore-eos --no-display-prompt \
+                        -fitt "$FITT" -ub "$CUB" -b "$CUB")
+                    RC=${R%% *}; DELTA=${R##* }
+                    P=$(perf_field "$SLOG" "prompt eval time"); D=$(perf_field "$SLOG" " eval time")
+                    STOCK_HASH=$(hash_gen "$SLOG.gen")
+                    ST=$([ "$RC" = "0" ] && echo OK || echo FAIL)
+                    echo "${MK}-c${CTX}-mva${MVA},stock,$MK,$CTX,$MVA,,,,,${CUB},$P,$D,$DELTA,$STOCK_HASH,$ST" >> "$LEDGER"
+                    STOCK_DONE=1
+                fi
+
+                # 3. pshard run (stderr verbose for tier summary; stdout = generation)
+                RLOG="$OUT/run_$CFG.log"
+                if [ "$STRAT" = "auto" ]; then
+                    R=$(run_side "$OUT/vram_$CFG.txt" "$RLOG" "$RLOG.gen" \
+                        ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" \
+                        --temp 0 -no-cnv --ignore-eos --no-display-prompt -v \
+                        -pshard -mva "$MVA")
+                else
+                    R=$(run_side "$OUT/vram_$CFG.txt" "$RLOG" "$RLOG.gen" \
+                        env PSHARD_STRATEGY=$STRAT ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" \
+                        --temp 0 -no-cnv --ignore-eos --no-display-prompt -v \
+                        -pshard -mva "$MVA")
+                fi
+                RC=${R%% *}; DELTA=${R##* }
+                P=$(perf_field "$RLOG" "prompt eval time"); D=$(perf_field "$RLOG" " eval time")
+                H=$(hash_gen "$RLOG.gen")
+                T0=$(grep -a "warmup_plan_reserves:   tier 0" "$RLOG" | head -1)
+                ACT=$(echo "$T0" | grep -aoE "bs=1[[:space:]]+[A-Z_]+" | awk '{print $2}')
+                NP=$(echo "$T0" | grep -aoE "n_pinned=[0-9]+" | cut -d= -f2)
+                OVL=$(grep -aoE "overlap=[01]" "$MP.tensor_overrides.pshard_registry" | head -1 | cut -d= -f2)
+                if grep -aq "pshard DISABLED" "$RLOG"; then ACT="STOCK_FALLBACK"; fi
+                ST=OK
+                [ "$RC" != "0" ] && ST=FAIL
+                if [ "$ST" = "OK" ] && [ -n "$STOCK_HASH" ] && [ "$H" != "$STOCK_HASH" ]; then
+                    # secondary gate: token streams may legitimately diverge across placements
+                    # at temp 0 (near-tie logits); PPL at matched eval shapes must still agree
+                    CH=8; [ "$CTX" -ge 16384 ] && CH=2
+                    PPLC="$PROMPTS/prompt-256k.txt"
+                    ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH                         -fitt "$FITT" -ub "$CUB" -b "$CUB" > "$OUT/ppl_stock_$CFG.log" 2>&1
+                    PS_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_stock_$CFG.log" | grep -aoE "[0-9.]+$")
+                    if [ "$STRAT" = "auto" ]; then
+                        ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH                             -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
+                    else
+                        env PSHARD_STRATEGY=$STRAT ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH                             -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
+                    fi
+                    PP_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_pshard_$CFG.log" | grep -aoE "[0-9.]+$")
+                    if [ -n "$PS_" ] && [ -n "$PP_" ] &&                        awk -v a="$PS_" -v b="$PP_" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d <= 0.005*a)}'; then
+                        ST=TOKEN_DIVERGED_PPL_OK
+                    else
+                        ST="PPL_MISMATCH(stock=$PS_ pshard=$PP_)"
+                    fi
+                fi
+                echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,$ACT,$OVL,$NP,$CUB,$P,$D,$DELTA,$H,$ST" >> "$LEDGER"
+                echo "    active=$ACT ovl=$OVL np=$NP prompt=$P decode=$D vram=+$DELTA $ST"
+            done
+        done
+    done
+done
+echo "QA_RUN_DONE $LEDGER"
