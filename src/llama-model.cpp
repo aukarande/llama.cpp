@@ -2651,15 +2651,23 @@ size_t llama_model::pshard_compute_scratch_off(const llama_pshard_plan & plan) {
     struct ggml_tallocr talloc = ggml_tallocr_new(pimpl->dev_preload_buf);
     size_t buf_size = ggml_backend_buffer_get_size(pimpl->dev_preload_buf);
 
+    // reserve ALL fixed-placement common regions up front: the category sort places commons
+    // after attn tensors, so an in-loop cursor advance would let earlier allocations land on
+    // top of a common's loader-fixed placement
     for (auto * tensor : pinned) {
-        size_t tsize = ggml_backend_buffer_get_alloc_size(pimpl->dev_preload_buf, tensor);
-        // fixed-placement common tensors keep their loader-assigned address; only advance
-        // the cursor past them (mirrors the canonical packer's device_only_common branch)
         auto entry_it = pimpl->weight_preload_map.find(tensor);
         if (entry_it != pimpl->weight_preload_map.end() && entry_it->second.device_only_common) {
-            const size_t off = (size_t) ((char *) entry_it->second.gpu_addr - (char *) buf_base);
+            const size_t tsize = ggml_backend_buffer_get_alloc_size(pimpl->dev_preload_buf, tensor);
+            const size_t off   = (size_t) ((char *) entry_it->second.gpu_addr - (char *) buf_base);
             talloc.offset = std::max(talloc.offset, GGML_PAD(off + tsize, talloc.alignment));
-            continue;
+        }
+    }
+
+    for (auto * tensor : pinned) {
+        size_t tsize = ggml_backend_buffer_get_alloc_size(pimpl->dev_preload_buf, tensor);
+        auto entry_it = pimpl->weight_preload_map.find(tensor);
+        if (entry_it != pimpl->weight_preload_map.end() && entry_it->second.device_only_common) {
+            continue; // fixed placement already reserved above
         }
         if (talloc.offset + tsize > buf_size) break;
         tensor->buffer = NULL;

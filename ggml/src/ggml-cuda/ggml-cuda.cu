@@ -3026,14 +3026,6 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
                                std::initializer_list<enum ggml_unary_op> unary_ops) {
-    // the gated-FFN fusion family corrupts decode on pshard split graphs whose weight srcs are
-    // scheduler copies in recycled scratch slots (bisected 2026-08-25; the memory-range check
-    // passes, so the defect is inside the fused execution path). pshard runs set this env at
-    // init until the fused path is certified for redirected splits.
-    static bool disable_glu_fusion = getenv("GGML_CUDA_DISABLE_FUSION_GLU") != nullptr;
-    if (disable_glu_fusion) {
-        return false;
-    }
 #ifndef NDEBUG
     const size_t num_unary = std::count(ops.begin(), ops.end(), GGML_OP_UNARY);
     GGML_ASSERT(unary_ops.size() == num_unary);
@@ -3050,7 +3042,15 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     std::initializer_list<enum ggml_op> mul_mat_id_glu_ops = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
     std::initializer_list<enum ggml_op> mul_mat_glu_ops    = { GGML_OP_MUL_MAT,    GGML_OP_MUL_MAT,    GGML_OP_GLU };
 
-    if ((is_equal(mul_mat_bias_glu_ops, ops) || is_equal(mul_mat_id_bias_glu_ops, ops)) &&
+    // the gated-FFN fusion family corrupts decode on pshard split graphs whose weight srcs are
+    // scheduler copies in recycled scratch slots (bisected 2026-08-25; the memory-range check
+    // passes, so the defect is inside the fused execution path). pshard runs set this env at
+    // init until the fused path is certified for redirected splits. Other fusion families
+    // (rope+set_rows, rms_norm chains) stay enabled.
+    static const bool disable_glu_fusion = getenv("GGML_CUDA_DISABLE_FUSION_GLU") != nullptr;
+
+    if (!disable_glu_fusion &&
+        (is_equal(mul_mat_bias_glu_ops, ops) || is_equal(mul_mat_id_bias_glu_ops, ops)) &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 })) {
         const ggml_tensor * ffn_gate      = cgraph->nodes[node_idx];
         const ggml_tensor * ffn_gate_bias = cgraph->nodes[node_idx + 1];
@@ -3064,7 +3064,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
-    if ((is_equal(mul_mat_id_glu_ops, ops) || is_equal(mul_mat_glu_ops, ops)) &&
+    if (!disable_glu_fusion &&
+        (is_equal(mul_mat_id_glu_ops, ops) || is_equal(mul_mat_glu_ops, ops)) &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
         const ggml_tensor * ffn_gate = cgraph->nodes[node_idx];
         const ggml_tensor * ffn_up   = cgraph->nodes[node_idx + 1];

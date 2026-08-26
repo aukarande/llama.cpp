@@ -1345,6 +1345,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         llama_params_fit_pshard(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_buft_overrides.data(), params.max_vram_alloc, fit_target_mb);
         if (!mparams.pshard) {
+            // this process continues on the STOCK path: undo the pshard-only env gates so the
+            // fallback run keeps stock fusion behavior
+#ifdef _WIN32
+            _putenv_s("GGML_CUDA_DISABLE_FUSION_GLU", "");
+            _putenv_s("GGML_CUDA_REGISTER_HOST", "");
+#else
+            unsetenv("GGML_CUDA_DISABLE_FUSION_GLU");
+            unsetenv("GGML_CUDA_REGISTER_HOST");
+#endif
             LOG_WRN("%s: pshard not active for this configuration\n", __func__);
             llama_pshard_registry_free(mparams.pshard_registry);
             mparams.pshard_registry = nullptr;
