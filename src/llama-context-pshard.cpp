@@ -433,6 +433,22 @@ void llama_context::pshard_warmup_plan_reserves() {
             llama_pshard_strategy_name(plan.strategy), plan.n_pinned,
             plan.cached_scratch_off / (1024.0 * 1024.0));
 
+        // the planner's no_alloc probe can undershoot the runtime canonical packing by
+        // alignment/padding; a tier whose packed weights + pinned cache exceed the managed
+        // buffer must degrade, not assert (seen: 24 MiB overshoot at a 2000 MiB budget)
+        if (model.get_dev_preload_buf()) {
+            const size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
+            const size_t pc        = total_pinned_cache_size(memory.get());
+            if (plan.cached_scratch_off + pc > buf_total) {
+                LLAMA_LOG_WARN("%s: tier %zu (bs=%u, %s, n_pinned=%u) packing overshoots buffer by %.2f MiB; marking unviable\n",
+                    __func__, t, registry->tier_sizes[t],
+                    llama_pshard_strategy_name(plan.strategy), plan.n_pinned,
+                    (plan.cached_scratch_off + pc - buf_total) / (1024.0 * 1024.0));
+                plan.is_viable = false;
+                continue;
+            }
+        }
+
         pshard_apply_plan(plan, /*with_upload=*/false);
 
         if (!plan.alloc_state.valid) {
