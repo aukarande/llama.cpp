@@ -224,7 +224,7 @@ void llama_context::pshard_pack_cache_region() {
 }
 
 void llama_context::pshard_setup_sched() {
-    ggml_backend_sched_set_prefetch_weights(sched.get(), true);
+    ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap);
 
     g_split_ctx = {};
     g_split_ctx.pipe_shards = memory->get_pipe_shards();
@@ -264,6 +264,8 @@ void llama_context::pshard_setup_sched() {
 }
 
 void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload, bool force_upload) {
+    // per-tier transport mode: governs split_graph keepalives and the runtime prefetch scan
+    ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
     ggml_backend_t gpu = backends[pshard_layout.compute].get();
     size_t scratch_off = const_cast<llama_model &>(model).pshard_apply_plan(plan, with_upload ? gpu : nullptr, force_upload);
 
@@ -420,6 +422,9 @@ void llama_context::pshard_warmup_plan_reserves() {
     for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
         auto & plan = registry->best_plans[t];
         if (!plan.is_viable) continue;
+
+        // the reserve must see the same prefetch/keepalive mode this tier will run with
+        ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
 
         const_cast<llama_model &>(model).pshard_compute_scratch_off(plan); // see pshard_apply_plan
 

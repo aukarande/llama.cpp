@@ -66,6 +66,7 @@ struct llama_cparams {
     llama_context * ctx_other;
 
     bool    pshard = false;
+    bool    pshard_overlap = true;
     int32_t cpu_backend_id = -1;
 };
 

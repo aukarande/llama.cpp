@@ -417,6 +417,7 @@ extern "C" {
         struct llama_context * ctx_other;
 
         bool pshard;          // enable pipelined sharding for this context (3 GPU backends, split callbacks)
+        bool pshard_overlap;  // allow the streaming overlap machinery (double-buffer slots + prefetch); plans may opt out per tier
     };
 
     struct llama_model_tensor_override {

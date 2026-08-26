@@ -53,7 +53,8 @@ void llama_pshard_generate_overrides(
         const pshard_dev_layout & layout,
         bool pin_from_back,
         bool output_on_gpu,
-        uint32_t n_attn_pinned) {
+        uint32_t n_attn_pinned,
+        bool overlap) {
     GGML_UNUSED(gpu_buft);
 
     thread_local std::array<std::string, 1000> patterns_layer;
@@ -96,9 +97,10 @@ void llama_pshard_generate_overrides(
         } else if (il >= il_pin_start && il < il_pin_end) {
             emit(patterns_layer[il].c_str(), host_buft, layout.compute);
         } else {
-            // alternate shard slots for every streaming strategy: double-buffering lets the
-            // copy of layer i+1 overlap compute that still reads layer i's slot
-            const int32_t shard_bid = layout.shard(il);
+            // overlap=1: alternating shard slots (double-buffering lets the copy of layer i+1
+            // overlap compute that still reads layer i's slot). overlap=0: one slot, no
+            // prefetch - cheaper plan for budgets that cannot fund the second slot
+            const int32_t shard_bid = overlap ? layout.shard(il) : layout.shard_a;
             switch (strategy) {
                 case LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM:
                     emit(patterns_layer[il].c_str(), host_buft, shard_bid);
@@ -126,12 +128,12 @@ void llama_pshard_generate_overrides(
                     if (il % 2 == 0) {
                         emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
                     } else {
-                        emit(patterns_layer_ffn[il].c_str(), host_buft, layout.shard(il / 2));
+                        emit(patterns_layer_ffn[il].c_str(), host_buft, overlap ? layout.shard(il / 2) : layout.shard_a);
                     }
                     if (n_attn_pinned > 0 && il < n_attn_pinned) {
                         emit(patterns_layer[il].c_str(), host_buft, layout.compute);
                     } else {
-                        emit(patterns_layer[il].c_str(), host_buft, layout.shard(il / 2));
+                        emit(patterns_layer[il].c_str(), host_buft, overlap ? layout.shard(il / 2) : layout.shard_a);
                     }
                     break;
                 default: break;

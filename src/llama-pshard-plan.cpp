@@ -52,7 +52,8 @@ static void llama_pshard_generate_overrides(
         const pshard_dev_layout & layout,
         bool pin_from_back,
         bool output_on_gpu,
-        uint32_t n_attn_pinned) {
+        uint32_t n_attn_pinned,
+        bool overlap) {
     thread_local std::array<std::string, 1000> patterns_layer;
     thread_local std::array<std::string, 1000> patterns_layer_attn;
     thread_local std::array<std::string, 1000> patterns_layer_ffn;
@@ -96,9 +97,9 @@ static void llama_pshard_generate_overrides(
         } else if (il >= il_pin_start && il < il_pin_end) {
             emit(patterns_layer[il].c_str(), gpu_buft, layout.compute);
         } else {
-            // alternate shard slots for every streaming strategy: double-buffering lets the
-            // copy of layer i+1 overlap compute that still reads layer i's slot
-            const int32_t shard_bid = layout.shard(il);
+            // overlap=1: alternating shard slots (double-buffering). overlap=0: one slot,
+            // no prefetch - cheaper plan for budgets that cannot fund the second slot
+            const int32_t shard_bid = overlap ? layout.shard(il) : layout.shard_a;
 
             switch (strategy) {
                 case LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM:
@@ -131,12 +132,12 @@ static void llama_pshard_generate_overrides(
                     if (il % 2 == 0) {
                         emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
                     } else {
-                        emit(patterns_layer_ffn[il].c_str(), host_buft, layout.shard(il / 2));
+                        emit(patterns_layer_ffn[il].c_str(), host_buft, overlap ? layout.shard(il / 2) : layout.shard_a);
                     }
                     if (n_attn_pinned > 0 && il < n_attn_pinned) {
                         emit(patterns_layer[il].c_str(), gpu_buft, layout.compute);
                     } else {
-                        emit(patterns_layer[il].c_str(), host_buft, layout.shard(il / 2));
+                        emit(patterns_layer[il].c_str(), host_buft, overlap ? layout.shard(il / 2) : layout.shard_a);
                     }
                     break;
 
@@ -196,7 +197,8 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
         const llama_context_params    & cparams,
         ggml_log_level                  log_level,
         llama_probe_hook_t              probe_hook = nullptr,
-        void                          * probe_hook_data = nullptr) {
+        void                          * probe_hook_data = nullptr,
+        bool                            overlap = true) {
     std::vector<llama_device> devs;
     uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0, hp_n_embd_r = 0;
 
@@ -204,6 +206,7 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
     const uint32_t probe_n_outputs = probe_n_tokens;
 
     llama_context_params cparams_probe = cparams;
+    cparams_probe.pshard_overlap = overlap;
     if (ctx.cache_ubatch != 0) {
         cparams_probe.n_batch  = std::max(cparams_probe.n_batch, ctx.cache_ubatch);
         cparams_probe.n_ubatch = ctx.cache_ubatch;
@@ -250,7 +253,8 @@ static llama_pshard_plan llama_pshard_search_strategy(
         const llama_pshard_search_ctx & ctx,
         llama_pshard_strategy strategy,
         uint32_t hi_hint = UINT32_MAX,
-        uint32_t lo_hint = 0) {
+        uint32_t lo_hint = 0,
+        bool overlap = true) {
 
     const auto * mparams    = ctx.mparams;
     const auto * cparams    = ctx.cparams;
@@ -265,6 +269,7 @@ static llama_pshard_plan llama_pshard_search_strategy(
     llama_pshard_plan plan;
     plan.strategy   = strategy;
     plan.batch_size = cparams->n_batch;
+    plan.overlap    = overlap;
 
     const bool delegate_compute = llama_pshard_strategy_delegates_compute(strategy);
 
@@ -276,14 +281,14 @@ static llama_pshard_plan llama_pshard_search_strategy(
     // try the upper bound first
     {
         llama_pshard_generate_overrides(hi, n_layers, gpu_buft, host_buft,
-            tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, strategy, layout, false, false);
+            tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, strategy, layout, false, false, 0, overlap);
         llama_model_params mp = *mparams;
         mp.pshard = true;
         mp.pshard_delegate_compute = delegate_compute;
         mp.n_gpu_layers = n_layers + 1;
         mp.tensor_buft_overrides = tensor_buft_overrides;
         try {
-            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR);
+            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, overlap);
             const int64_t gpu_used = d[0].mb.total();
             LLAMA_LOG_INFO("%s: [%s] n_pinned=%u -> %.1f MiB (model=%.1f cache=%.1f compute=%.1f) budget %.1f %s (hi-first)\n",
                 __func__, llama_pshard_strategy_name(strategy), hi,
@@ -314,7 +319,7 @@ static llama_pshard_plan llama_pshard_search_strategy(
         }
 
         llama_pshard_generate_overrides(mid, n_layers, gpu_buft, host_buft,
-            tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, strategy, layout, false, false);
+            tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, strategy, layout, false, false, 0, overlap);
 
         llama_model_params mp = *mparams;
         mp.pshard = true;
@@ -323,7 +328,7 @@ static llama_pshard_plan llama_pshard_search_strategy(
         mp.tensor_buft_overrides = tensor_buft_overrides;
 
         try {
-            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR);
+            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, overlap);
             const int64_t gpu_used = d[0].mb.total();
 
             LLAMA_LOG_INFO("%s: [%s] n_pinned=%u -> %.1f MiB (model=%.1f cache=%.1f compute=%.1f) budget %.1f %s\n",
@@ -358,14 +363,14 @@ static llama_pshard_plan llama_pshard_search_strategy(
         const uint32_t frac_n_pinned = best_n_pinned + 1; // pin one more layer, partially
         auto try_frac = [&](llama_layer_fraction frac) -> bool {
             llama_pshard_generate_overrides(frac_n_pinned, n_layers, gpu_buft, host_buft,
-                tensor_buft_overrides, frac, strategy, layout, false, false);
+                tensor_buft_overrides, frac, strategy, layout, false, false, 0, overlap);
             llama_model_params mp = *mparams;
             mp.pshard = true;
             mp.pshard_delegate_compute = delegate_compute;
             mp.n_gpu_layers = n_layers + 1;
             mp.tensor_buft_overrides = tensor_buft_overrides;
             try {
-                const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR);
+                const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, overlap);
                 return d[0].mb.total() <= (int64_t)vram_free;
             } catch (...) {
                 LLAMA_LOG_WARN("%s: [%s] overflow probe failed (frac=%d)\n", __func__, llama_pshard_strategy_name(strategy), (int)frac);
@@ -387,7 +392,7 @@ static llama_pshard_plan llama_pshard_search_strategy(
     plan.output_on_gpu = false;
 
     llama_pshard_generate_overrides(best_n_pinned, n_layers, gpu_buft, host_buft,
-        tensor_buft_overrides, best_overflow, strategy, layout, false, plan.output_on_gpu);
+        tensor_buft_overrides, best_overflow, strategy, layout, false, plan.output_on_gpu, 0, overlap);
     {
         llama_model_params mp = *mparams;
         mp.pshard = true;
@@ -399,7 +404,7 @@ static llama_pshard_plan llama_pshard_search_strategy(
         auto * hookdata = ctx.predictor ? (void *)&tps_data     : nullptr;
 
         try {
-            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata);
+            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, overlap);
             plan.total_vram_req   = d[0].mb.total();
             plan.scratch_measured = d[0].mb.compute;
             plan.cache_measured   = d[0].mb.context;
@@ -417,7 +422,7 @@ static llama_pshard_plan llama_pshard_search_strategy(
         plan.n_pinned = best_n_pinned;
         plan.overflow = best_overflow;
         llama_pshard_generate_overrides(best_n_pinned, n_layers, gpu_buft, host_buft,
-            tensor_buft_overrides, best_overflow, strategy, layout, false, plan.output_on_gpu);
+            tensor_buft_overrides, best_overflow, strategy, layout, false, plan.output_on_gpu, 0, overlap);
         llama_model_params mp = *mparams;
         mp.pshard = true;
         mp.pshard_delegate_compute = delegate_compute;
@@ -427,7 +432,7 @@ static llama_pshard_plan llama_pshard_search_strategy(
         auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
         auto * hookdata = ctx.predictor ? (void *)&tps_data     : nullptr;
         try {
-            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata);
+            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, overlap);
             plan.total_vram_req   = d[0].mb.total();
             plan.scratch_measured = d[0].mb.compute;
             plan.cache_measured   = d[0].mb.context;
@@ -449,7 +454,8 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
         llama_pshard_strategy strategy,
         uint32_t hi_attn_hint = UINT32_MAX,
         uint32_t hi_full_hint = UINT32_MAX,
-        uint32_t lo_full_hint = 0) {
+        uint32_t lo_full_hint = 0,
+        bool overlap = true) {
 
     const auto * mparams    = ctx.mparams;
     const auto * cparams    = ctx.cparams;
@@ -463,11 +469,12 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
 
     llama_pshard_plan plan;
     plan.strategy = strategy;
+    plan.overlap  = overlap;
 
     auto measure_vram = [&](uint32_t n_full, uint32_t n_attn, bool out_gpu) -> llama_memory_breakdown_data {
         llama_pshard_generate_overrides(n_full, n_layers, gpu_buft, host_buft,
             tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, strategy,
-            layout, false, out_gpu, n_attn);
+            layout, false, out_gpu, n_attn, overlap);
 
         llama_model_params mp = *mparams;
         mp.pshard = true;
@@ -475,7 +482,7 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
         mp.n_gpu_layers = n_layers + 1;
         mp.tensor_buft_overrides = tensor_buft_overrides;
 
-        const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR);
+        const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, overlap);
         return d[0].mb;
     };
 
@@ -645,7 +652,7 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
 
     llama_pshard_generate_overrides(n_full, n_layers, gpu_buft, host_buft,
         tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, strategy,
-        layout, false, plan.output_on_gpu, n_attn);
+        layout, false, plan.output_on_gpu, n_attn, overlap);
     {
         llama_model_params mp = *mparams;
         mp.pshard = true;
@@ -657,7 +664,7 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
         auto * hookdata = ctx.predictor ? (void *)&tps_data     : nullptr;
 
         try {
-            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata);
+            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, overlap);
             plan.total_vram_req   = d[0].mb.total();
             plan.scratch_measured = d[0].mb.compute;
             plan.cache_measured   = d[0].mb.context;
@@ -874,12 +881,12 @@ bool pshard_registry_save(
                 continue;
             }
             fprintf(f, "[tier %zu bs=%u]\n", t, registry->tier_sizes[t]);
-            fprintf(f, "strategy=%s n_pinned=%u n_attn_pinned=%u overflow=%s tps=%.2f vram=%.1f output_on_gpu=%d pin_from_back=%d\n",
+            fprintf(f, "strategy=%s n_pinned=%u n_attn_pinned=%u overflow=%s tps=%.2f vram=%.1f output_on_gpu=%d pin_from_back=%d overlap=%d\n",
                 llama_pshard_strategy_name(plan.strategy),
                 plan.n_pinned, plan.n_attn_pinned,
                 pshard_overflow_name(plan.overflow),
                 plan.tps, plan.total_vram_req / (1024.0 * 1024.0),
-                (int)plan.output_on_gpu, (int)plan.pin_from_back);
+                (int)plan.output_on_gpu, (int)plan.pin_from_back, (int)plan.overlap);
             fprintf(f, "ot=%s\n", pshard_plan_to_ot(plan, host_buft).c_str());
         }
     }
@@ -916,6 +923,7 @@ bool pshard_registry_load(
         double vram_mib = 0.0;
         int output_on_gpu = 0;
         int pin_from_back = 0;
+        int overlap = 1;
         std::string ot_line;
     };
     struct variant_data {
@@ -997,6 +1005,8 @@ bool pshard_registry_load(
             }
             td.output_on_gpu = atoi(ogg + 14);
             td.pin_from_back = atoi(pfb + 14);
+            const char * ovl = strstr(s.c_str(), "overlap=");
+            td.overlap = ovl ? atoi(ovl + 8) : 1;
 
             td.overflow = pshard_overflow_from_name(overflow_name);
             bool found_strategy = false;
@@ -1029,6 +1039,7 @@ bool pshard_registry_load(
         plan.tps           = td.tps;
         plan.total_vram_req = (size_t)(td.vram_mib * 1024 * 1024);
         plan.is_viable     = td.viable;
+        plan.overlap       = td.overlap != 0;
         plan.output_on_gpu = (bool)td.output_on_gpu;
         plan.pin_from_back = (bool)td.pin_from_back;
 
@@ -1345,6 +1356,25 @@ static llama_pshard_plan llama_pshard_search_tier(
             plan = llama_pshard_search_strategy(ctx, strategy, prune.hi_pinned[s]);
         }
 
+        // a strategy priced out by the overlap machinery (double slots + prefetch keepalives)
+        // may still fit without it: keep the placement, drop the transport luxury
+        if (!plan.is_viable && !llama_pshard_strategy_delegates_compute(strategy)) {
+            llama_pshard_plan p2;
+            if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
+                strategy == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
+                p2 = llama_pshard_search_attn_pin(ctx, strategy, prune.hi_attn, prune.hi_pinned[s],
+                        0, /*overlap=*/false);
+            } else {
+                p2 = llama_pshard_search_strategy(ctx, strategy, prune.hi_pinned[s],
+                        0, /*overlap=*/false);
+            }
+            if (p2.is_viable) {
+                LLAMA_LOG_INFO("%s: [%s] overlap machinery does not fit the budget; using overlap=0 plan\n",
+                    __func__, llama_pshard_strategy_name(strategy));
+                plan = p2;
+            }
+        }
+
         plan.batch_size = cparams->n_batch;
 
         {
@@ -1373,6 +1403,20 @@ static llama_pshard_plan llama_pshard_search_tier(
     }
 
     if (!best.is_viable && force_strategy >= 0 && force_strategy != LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS) {
+        // before abandoning the forced strategy, try it without the overlap machinery
+        llama_pshard_plan forced_noovl;
+        if (force_strategy == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
+            forced_noovl = llama_pshard_search_attn_pin(ctx, (llama_pshard_strategy)force_strategy,
+                    prune.hi_attn, UINT32_MAX, 0, /*overlap=*/false);
+        } else {
+            forced_noovl = llama_pshard_search_strategy(ctx, (llama_pshard_strategy)force_strategy,
+                    UINT32_MAX, 0, /*overlap=*/false);
+        }
+        if (forced_noovl.is_viable) {
+            LLAMA_LOG_INFO("%s: forced %s viable only with overlap=0\n",
+                __func__, llama_pshard_strategy_name((llama_pshard_strategy)force_strategy));
+            return forced_noovl;
+        }
         llama_pshard_plan fallback = llama_pshard_attn_pin_fallback(
             ctx, force_strategy, prune.hi_attn, prune.hi_pinned[LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS]);
         prune.update(LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS, fallback);
@@ -1434,9 +1478,19 @@ static void llama_pshard_strategy_sweep(
             if (strat == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
                 strat == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
                 plan = llama_pshard_search_attn_pin(ctx, strat, prune.hi_attn, UINT32_MAX, lo_hint);
+                if (!plan.is_viable && !llama_pshard_strategy_delegates_compute(strat)) {
+                    llama_pshard_plan p2 = llama_pshard_search_attn_pin(ctx, strat, prune.hi_attn,
+                            UINT32_MAX, lo_hint, /*overlap=*/false);
+                    if (p2.is_viable) { plan = p2; }
+                }
                 plan.batch_size = cp_tier.n_batch;
             } else {
                 plan = llama_pshard_search_strategy(ctx, strat, UINT32_MAX, lo_hint);
+                if (!plan.is_viable) {
+                    llama_pshard_plan p2 = llama_pshard_search_strategy(ctx, strat, UINT32_MAX,
+                            lo_hint, /*overlap=*/false);
+                    if (p2.is_viable) { plan = p2; }
+                }
                 plan.batch_size = cp_tier.n_batch;
             }
         }
@@ -1917,7 +1971,7 @@ void llama_params_fit_pshard_plan(
     // step 8: apply best plan to tensor_buft_overrides
     llama_pshard_generate_overrides(best_plan.n_pinned, n_layers, gpu_buft, host_buft,
         tensor_buft_overrides, (llama_layer_fraction)best_plan.overflow, best_plan.strategy, layout,
-        best_plan.pin_from_back, best_plan.output_on_gpu, best_plan.n_attn_pinned);
+        best_plan.pin_from_back, best_plan.output_on_gpu, best_plan.n_attn_pinned, best_plan.overlap);
 
     for (size_t i = 0; tensor_buft_overrides[i].pattern; i++) {
         if (tensor_buft_overrides[i].backend_id == layout.compute) {

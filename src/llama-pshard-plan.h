@@ -83,6 +83,7 @@ struct llama_pshard_plan {
     int                  overflow        = 0;   // llama_layer_fraction
     bool                 pin_from_back   = false;
     bool                 output_on_gpu   = false;
+    bool                 overlap         = true;   // transport mode: double-buffer slots + prefetch scan-ahead
 
     std::vector<llama_pshard_override> overrides;
 
@@ -124,7 +125,8 @@ void llama_pshard_generate_overrides(
         const pshard_dev_layout & layout,
         bool pin_from_back = false,
         bool output_on_gpu = false,
-        uint32_t n_attn_pinned = 0);
+        uint32_t n_attn_pinned = 0,
+        bool overlap = true);
 
 // llama_device_memory_data and llama_memory_breakdown_data come from
 // ToT's src/llama-ext.h (included above)

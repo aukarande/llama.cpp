@@ -135,6 +135,7 @@ llama_context::llama_context(
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
     cparams.pshard = params.pshard;
+    cparams.pshard_overlap = params.pshard_overlap;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -3819,6 +3820,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.pshard                      =*/ false,
+        /*.pshard_overlap              =*/ true,
     };
 
     return result;
