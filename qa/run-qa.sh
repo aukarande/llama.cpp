@@ -45,7 +45,12 @@ echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
 LEDGER="$OUT/ledger.csv"
-echo "config,side,model,ctx,mva,strategy_forced,strategy_active,overlap,n_pinned,cache_ubatch,prompt_tps,decode_tps,vram_peak_delta,token_hash,status" > "$LEDGER"
+# QA_RESUME=1: keep an existing ledger and skip configs already recorded (crash/restart recovery)
+if [ "${QA_RESUME:-0}" = "1" ] && [ -f "$LEDGER" ]; then
+    echo "resuming: $(grep -c ',pshard,' "$LEDGER") pshard rows already present"
+else
+    echo "config,side,model,ctx,mva,strategy_forced,strategy_active,overlap,n_pinned,cache_ubatch,prompt_tps,decode_tps,vram_peak_delta,token_hash,status" > "$LEDGER"
+fi
 
 IDLE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
 echo "# idle_used=$IDLE" >> "$LEDGER"
@@ -93,6 +98,10 @@ for MDL in $MODELS_LIST; do
             STOCK_HASH=""
             for STRAT in $STRAT_LIST; do
                 CFG="${MK}-c${CTX}-mva${MVA}-s${STRAT}"
+                if grep -q "^$CFG,pshard," "$LEDGER"; then
+                    echo "=== $CFG (already in ledger, skipping)"
+                    continue
+                fi
                 echo "=== $CFG"
                 rm -f "$MP.tensor_overrides.pshard_registry"
 
@@ -112,6 +121,10 @@ for MDL in $MODELS_LIST; do
 
                 # 2. stock baseline (once per model/ctx/mva), ub matched to pshard's cache_ubatch
                 SLOG="$OUT/stock_${MK}-c${CTX}-mva${MVA}.log"
+                if [ "$STOCK_DONE" = "0" ] && [ -f "$SLOG.gen" ] && grep -q "^${MK}-c${CTX}-mva${MVA},stock," "$LEDGER"; then
+                    STOCK_HASH=$(hash_gen "$SLOG.gen")
+                    STOCK_DONE=1
+                fi
                 if [ "$STOCK_DONE" = "0" ]; then
                     R=$(run_side "$OUT/vram_stock_${MK}-c${CTX}-mva${MVA}.txt" "$SLOG" "$SLOG.gen" \
                         ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" \
