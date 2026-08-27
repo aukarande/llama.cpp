@@ -1817,17 +1817,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
-    if (cparams.pshard) {
-        pshard_maybe_switch(n_tokens_all);
-    }
-
-    sched_reserve();
-
-    bool did_optimize = false;
-
-    // handle any pending shifts/copies
-    memory_update(false);
-
     uint32_t n_ubatch_eff = cparams.n_ubatch;
     if (cparams.pshard && n_tokens_all >= 512) {
         auto * registry = model.get_plan_registry();
@@ -1844,6 +1833,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
     }
+
+    if (cparams.pshard) {
+        // switch to the plan of the tier that will EXECUTE: batches are split into
+        // n_ubatch_eff ubatches, so keying the tier off n_tokens_all would apply the
+        // top tier's plan (e.g. an unviable-streaming fallback) to smaller ubatches
+        // that were chosen precisely because their tier predicts far better tps
+        pshard_maybe_switch(std::min(n_tokens_all, n_ubatch_eff));
+    }
+
+    sched_reserve();
+
+    bool did_optimize = false;
+
+    // handle any pending shifts/copies
+    memory_update(false);
 
     llama_memory_context_ptr mctx;
 
