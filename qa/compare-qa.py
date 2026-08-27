@@ -41,20 +41,26 @@ def main():
 
     hard, soft, better, info = [], [], [], []
 
+    def normalize(rows, cfg, side, r):
+        # cells where STOCK itself cannot run (e.g. 16k ctx in a 2 GB budget) make the token/PPL
+        # gates unadjudicable - classify the pshard row as STOCK_UNAVAILABLE (pshard-only cell)
+        if side == "pshard" and r["status"] != "OK":
+            stock = rows.get((cfg.rsplit("-s", 1)[0], "stock"))
+            if stock is not None and stock["status"] == "FAIL":
+                return dict(r, status="STOCK_UNAVAILABLE")
+        return r
+
     for (cfg, side), r in sorted(new.items()):
-        # cells where STOCK itself cannot run (e.g. 16k ctx in a 2 GB budget: stock fails to
-        # allocate compute buffers while pshard runs) are informational pshard wins, not failures
         if side == "stock" and r["status"] == "FAIL":
             info.append(f"{cfg}: stock cannot run this cell (pshard-only)")
             continue
-        if side == "pshard":
-            stock = new.get((cfg.rsplit("-s", 1)[0], "stock"))
-            if stock is not None and stock["status"] == "FAIL" and r["status"] != "OK":
-                r = dict(r, status="STOCK_UNAVAILABLE")
+        r = normalize(new, cfg, side, r)
         if r["status"] not in ("OK", "TOKEN_DIVERGED_PPL_OK", "STOCK_UNAVAILABLE"):
             # a bad status that exactly matches the reference is a tracked known issue -
             # report it, but only NEW breakage hard-fails the gate
             rr = ref.get((cfg, side))
+            if rr is not None:
+                rr = normalize(ref, cfg, side, rr)
             if rr is not None and rr["status"] == r["status"]:
                 info.append(f"{cfg}/{side}: KNOWN ISSUE (unchanged): {r['status'][:70]}")
             else:
@@ -66,6 +72,7 @@ def main():
         if rr is None:
             info.append(f"{cfg}: no reference row (new config)")
             continue
+        rr = normalize(ref, cfg, side, rr)
         if r["status"] != rr["status"]:
             hard.append(f"{cfg}: token-gate class drift {rr['status']} -> {r['status']}")
         if r["strategy_active"] != rr["strategy_active"] or r["overlap"] != rr["overlap"]:
