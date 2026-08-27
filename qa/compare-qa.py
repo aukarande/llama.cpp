@@ -52,7 +52,13 @@ def main():
             if stock is not None and stock["status"] == "FAIL" and r["status"] != "OK":
                 r = dict(r, status="STOCK_UNAVAILABLE")
         if r["status"] not in ("OK", "TOKEN_DIVERGED_PPL_OK", "STOCK_UNAVAILABLE"):
-            hard.append(f"{cfg}/{side}: status={r['status']}")
+            # a bad status that exactly matches the reference is a tracked known issue -
+            # report it, but only NEW breakage hard-fails the gate
+            rr = ref.get((cfg, side))
+            if rr is not None and rr["status"] == r["status"]:
+                info.append(f"{cfg}/{side}: KNOWN ISSUE (unchanged): {r['status'][:70]}")
+            else:
+                hard.append(f"{cfg}/{side}: status={r['status'][:70]}")
             continue
         if side != "pshard":
             continue

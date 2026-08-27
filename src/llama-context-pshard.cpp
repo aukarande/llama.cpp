@@ -1,6 +1,8 @@
 #include "llama-context.h"
 
 #include "llama-impl.h"
+
+#include <stdexcept>
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
@@ -248,8 +250,16 @@ void llama_context::pshard_setup_sched() {
                 buf_total         / (1024.0 * 1024.0),
                 (preloaded_size + pinned_cache_size - buf_total) / (1024.0 * 1024.0));
         }
-        GGML_ASSERT(preloaded_size + pinned_cache_size <= buf_total &&
-            "pshard: weights + pinned cache exceed VRAM buffer -- plan overshoots budget");
+        if (preloaded_size + pinned_cache_size > buf_total) {
+            // the canonical layout is the UNION across all tier plans plus the pinned cache;
+            // per-plan probes (even with the packing margin) cannot see this union, so at
+            // tight budgets it can overshoot. Degrade loudly instead of crashing: pshard is
+            // disabled for this run and the caller falls back to the stock path.
+            LLAMA_LOG_WARN("%s: >>> canonical layout (%.2f MiB) + pinned cache (%.2f MiB) exceed the %.2f MiB budget; pshard DISABLED for this run <<<\n",
+                __func__, preloaded_size / (1024.0 * 1024.0), pinned_cache_size / (1024.0 * 1024.0),
+                buf_total / (1024.0 * 1024.0));
+            throw std::runtime_error("pshard: canonical layout overshoots the VRAM budget");
+        }
 
         size_t scratch_size = buf_total - preloaded_size - pinned_cache_size;
 
