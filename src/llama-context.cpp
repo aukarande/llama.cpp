@@ -1834,6 +1834,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (registry && !registry->tier_sizes.empty()) {
             const uint32_t max_ubatch = std::min(cparams.n_ubatch, registry->tier_sizes.back());
             n_ubatch_eff = registry->find_optimal_ubatch(n_tokens_all, max_ubatch);
+            // eval shape changes numerics on shape-sensitive models - log once so A/B
+            // baselines can match -ub to what pshard actually evaluates with
+            static uint32_t logged_ub = 0;
+            if (n_ubatch_eff != cparams.n_ubatch && logged_ub != n_ubatch_eff) {
+                logged_ub = n_ubatch_eff;
+                LLAMA_LOG_INFO("%s: pshard_prefill_ubatch_eff=%u (n_ubatch=%u, predicted-ttft optimum; PSHARD_FORCE_PREFILL_UB overrides)\n",
+                    __func__, n_ubatch_eff, cparams.n_ubatch);
+            }
         }
     }
 

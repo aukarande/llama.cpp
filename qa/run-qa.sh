@@ -66,6 +66,11 @@ else
     MVA_LIST="4000 8000"
     STRAT_LIST="auto"
 fi
+# targeted re-adjudication overrides (e.g. after a gate change, re-run a few cells)
+MODELS_LIST=${QA_MODELS_LIST:-$MODELS_LIST}
+CTX_LIST=${QA_CTX_LIST:-$CTX_LIST}
+MVA_LIST=${QA_MVA_LIST:-$MVA_LIST}
+STRAT_LIST=${QA_STRAT_LIST:-$STRAT_LIST}
 
 hash_gen() { # generation file (pure stdout) -> hash
     tr -d '\r\n' < "$1" | md5sum | cut -c1-16
@@ -163,15 +168,48 @@ for MDL in $MODELS_LIST; do
                 [ "$RC" != "0" ] && ST=FAIL
                 if [ "$ST" = "OK" ] && [ -n "$STOCK_HASH" ] && [ "$H" != "$STOCK_HASH" ]; then
                     # secondary gate: token streams may legitimately diverge across placements
-                    # at temp 0 (near-tie logits); PPL at matched eval shapes must still agree
+                    # at temp 0 (near-tie logits); PPL must agree once BOTH eval shape and
+                    # compute placement are matched. Proven on gpt-oss (raw-text PPL is
+                    # hypersensitive): STOCK alone spans 1401.9 (all-GPU) -> 4025.0 (experts
+                    # on CPU) at the same ubatch, and stock with the plan's exact expert
+                    # placement reproduces pshard's PPL to 5 digits (3440.80 vs 3440.82).
                     CH=8; [ "$CTX" -ge 16384 ] && CH=2
                     PPLC="$PROMPTS/prompt-256k.txt"
-                    ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH                         -fitt "$FITT" -ub "$CUB" -b "$CUB" > "$OUT/ppl_stock_$CFG.log" 2>&1
+                    STOCK_PPL_ARGS="-fitt $FITT"
+                    case "$ACT" in
+                      DYNAMIC_FFNCPU*|DYNAMIC_FFN_ALTERNATE)
+                        # CPU-delegate strategies: give stock the same expert placement
+                        # (MoE models; dense CPU-delegate placement has no _exps match and
+                        # falls back to the budget-equalized stock baseline)
+                        # n_layer only prints in the VERBOSE (pshard) log; the parity placement
+                        # must mirror the bs=CUB tier's plan (its n_pinned differs from tier 0)
+                        NL=$(grep -aoE "n_layer += +[0-9]+" "$RLOG" | head -1 | grep -aoE "[0-9]+$")
+                        # anchor: "n_attn_pinned=N" contains the substring "n_pinned=N"
+                        NPP=$(grep -aA1 "bs=$CUB\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "(^| )n_pinned=[0-9]+" | tail -1 | cut -d= -f2)
+                        LIST=""
+                        i=${NPP:-0}
+                        while [ "$i" -lt "${NL:-0}" ]; do
+                            # ALTERNATE delegates only even unpinned layers to the CPU
+                            if [ "$ACT" = "DYNAMIC_FFN_ALTERNATE" ] && [ $((i % 2)) -ne 0 ]; then i=$((i+1)); continue; fi
+                            LIST="$LIST${LIST:+|}$i"
+                            i=$((i+1))
+                        done
+                        if [ -n "$LIST" ]; then
+                            STOCK_PPL_ARGS="-ngl 99 -ot blk\\.($LIST)\\.ffn_.*_exps=CPU --no-op-offload"
+                        fi
+                        ;;
+                    esac
+                    ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
+                        $STOCK_PPL_ARGS -ub "$CUB" -b "$CUB" > "$OUT/ppl_stock_$CFG.log" 2>&1
                     PS_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_stock_$CFG.log" | grep -aoE "[0-9.]+$")
+                    # pin pshard's prefill ubatch to CUB so both sides eval at the same shape
+                    # (the runtime otherwise picks the predicted-ttft-optimal tier, e.g. 512)
                     if [ "$STRAT" = "auto" ]; then
-                        ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH                             -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
+                        env PSHARD_FORCE_PREFILL_UB=$CUB ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
+                            -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
                     else
-                        env PSHARD_STRATEGY=$STRAT ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH                             -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
+                        env PSHARD_STRATEGY=$STRAT PSHARD_FORCE_PREFILL_UB=$CUB ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
+                            -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
                     fi
                     PP_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_pshard_$CFG.log" | grep -aoE "[0-9.]+$")
                     if [ -n "$PS_" ] && [ -n "$PP_" ] &&                        awk -v a="$PS_" -v b="$PP_" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d <= 0.005*a)}'; then

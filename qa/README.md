@@ -6,6 +6,15 @@ Stock llama.cpp is the golden. Three gates, applied over the full config grid:
    Stock runs with `-ub` matched to pshard's planner-chosen `cache_ubatch` (evaluation
    shape changes numerics on some models — gpt-oss PPL moves 23% on ubatch alone), and
    `-fitt (free - budget)` so both sides get the same effective VRAM budget.
+   When tokens diverge, the PPL-parity fallback matches BOTH remaining numeric factors:
+   the pshard side pins its prefill ubatch (`PSHARD_FORCE_PREFILL_UB`, since the runtime
+   otherwise picks the predicted-ttft-optimal tier, e.g. 512-token sub-batches for
+   CPU-delegate plans), and for CPU-delegate strategies the stock side gets the plan's
+   exact expert placement (`-ot blk.(pinned..n_layer).ffn_.*_exps=CPU --no-op-offload`).
+   Calibration (2026-08-27, gpt-oss): stock spans PPL 1401.9 (all-GPU) to 4025.0 (all
+   experts on CPU) at identical ubatch/tokens; with placement+shape matched, pshard
+   agrees with stock to <=0.0007% (two cells bit-identical) — so the 0.5% tolerance
+   adjudicates real defects, not kernel-placement numerics.
 2. **Plan stability**: the active tier-0 strategy, overlap mode, and n_pinned must match
    the reference ledger. This catches silent fallbacks (forced strategy unviable -> stock
    or ATTNPRIO fallback) and planner drift — both produced misleading numbers before.
