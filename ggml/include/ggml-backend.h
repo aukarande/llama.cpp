@@ -395,10 +395,14 @@ extern "C" {
     struct ggml_backend_sched_split_info {
         struct ggml_cgraph * graph;
         int                  backend_id;
-        size_t               input_weight_bytes;
-        size_t               input_weight_copy_bytes;
+        size_t               input_weight_bytes;          // full size of all host-weight inputs
+        size_t               input_weight_copy_bytes;     // consume-time copy estimate (sliced experts + full others)
+        size_t               input_weight_sliced_bytes;   // consume-time sliced-expert copies only (still paid when prefetched)
+        size_t               input_weight_prefetch_bytes; // what the prefetch pass would move (excludes sliced-eligible experts)
         size_t               input_activ_bytes;
-        size_t               writeback_bytes;
+        size_t               writeback_bytes;             // total (kv + rs)
+        size_t               writeback_kv_bytes;          // attention KV cache: runtime moves only newly written cells
+        size_t               writeback_rs_bytes;          // recurrent state: runtime moves the full tensor every eval
         bool                 can_prefetch_weights;
     };
 

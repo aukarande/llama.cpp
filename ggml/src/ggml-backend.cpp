@@ -2764,32 +2764,27 @@ bool ggml_backend_sched_get_split_info(
     out->graph      = &s->graph;
     out->backend_id = s->backend_id;
 
-    auto effective_weight_copy_bytes = [&](struct ggml_tensor * inp) {
+    // sliced estimate for one expert weight tensor, mirroring the runtime's
+    // by-used-ids copy: find the MUL_MAT_ID consumer anywhere in the split (the
+    // runtime scans the whole split - gate/up/down each have their own consumer)
+    // and charge only the experts one evaluation actually gathers
+    auto sliced_weight_copy_bytes = [&](struct ggml_tensor * inp, struct ggml_tensor * inp_cpy) {
         const size_t full_size = ggml_nbytes(inp);
 
-        if (s->graph.n_nodes <= 0) {
-            return full_size;
-        }
-
-        struct ggml_tensor * node = s->graph.nodes[0];
-        if (node->op != GGML_OP_MUL_MAT_ID) {
-            return full_size;
-        }
-
-        struct ggml_tensor * inp_cpy = tensor_copy(inp, s->backend_id, sched->cur_copy);
-        if (node->src[0] != inp_cpy) {
+        const struct ggml_tensor * node = ggml_backend_sched_split_find_moe_consumer(&s->graph, inp_cpy);
+        if (node == NULL || node->src[2] == NULL) {
             return full_size;
         }
 
         const int64_t n_expert = inp->ne[2];
-        if (n_expert <= 0 || node->src[2] == NULL) {
+        if (n_expert <= 0) {
             return full_size;
         }
 
         const size_t expert_size = inp->nb[2];
         const int64_t n_routes = ggml_nelements(node->src[2]);
         int64_t n_used = std::min<int64_t>(n_expert, std::max<int64_t>(1, n_routes));
-        const int64_t n_expert_used = node->ne[1];
+        const int64_t n_expert_used = node->src[2]->ne[0];
         // ids contains one route per token/top-k slot, not unique experts.
         // For larger batches, estimate unique experts instead of charging every route.
         if (n_used > n_expert_used) {
@@ -2800,24 +2795,47 @@ bool ggml_backend_sched_get_split_info(
         return std::min(full_size, (size_t) n_used * (expert_size + padding));
     };
 
-    out->input_weight_bytes      = 0;
-    out->input_weight_copy_bytes = 0;
-    out->input_activ_bytes       = 0;
+    out->input_weight_bytes          = 0;
+    out->input_weight_copy_bytes     = 0;
+    out->input_weight_sliced_bytes   = 0;
+    out->input_weight_prefetch_bytes = 0;
+    out->input_activ_bytes           = 0;
     for (int j = 0; j < s->n_inputs; j++) {
         struct ggml_tensor * inp = s->inputs[j];
         if (inp->buffer != NULL &&
             ggml_backend_buffer_get_usage(inp->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             ggml_backend_buffer_is_host(inp->buffer)) {
-            out->input_weight_bytes += ggml_nbytes(inp);
-            out->input_weight_copy_bytes += effective_weight_copy_bytes(inp);
+            const size_t full = ggml_nbytes(inp);
+            out->input_weight_bytes += full;
+            struct ggml_tensor * inp_cpy = tensor_copy(inp, s->backend_id, sched->cur_copy);
+            if (inp_cpy != NULL && ggml_backend_sched_prefer_sliced_expert_copy(&s->graph, inp, inp_cpy)) {
+                // runtime prefetch SKIPS this tensor; the consume-time sliced copy pays instead
+                const size_t sliced = sliced_weight_copy_bytes(inp, inp_cpy);
+                out->input_weight_copy_bytes   += sliced;
+                out->input_weight_sliced_bytes += sliced;
+            } else {
+                out->input_weight_copy_bytes     += full;
+                out->input_weight_prefetch_bytes += full;
+            }
         } else {
             out->input_activ_bytes += ggml_nbytes(inp);
         }
     }
 
-    out->writeback_bytes = 0;
+    // classify writebacks: the runtime delta-syncs attention KV (write-cells) but
+    // moves recurrent state in full every evaluation
+    out->writeback_bytes    = 0;
+    out->writeback_kv_bytes = 0;
+    out->writeback_rs_bytes = 0;
     for (int w = 0; w < s->n_writeback; w++) {
-        out->writeback_bytes += ggml_nbytes(s->writeback[w]);
+        const size_t wb = ggml_nbytes(s->writeback[w]);
+        out->writeback_bytes += wb;
+        const char * wn = s->writeback[w]->name;
+        if (strncmp(wn, "cache_k", 7) == 0 || strncmp(wn, "cache_v", 7) == 0) {
+            out->writeback_kv_bytes += wb;
+        } else {
+            out->writeback_rs_bytes += wb;
+        }
     }
 
     out->can_prefetch_weights =

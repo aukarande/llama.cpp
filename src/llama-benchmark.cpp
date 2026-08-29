@@ -572,13 +572,13 @@ double llama_benchmark_predictor::predict_tps(
         __func__, n_splits, batch_size, kv_size, n_outputs, (int)has_rs);
 
     const double pcie_bw = stats.peak_pcie_bw;
-    // KV transfer ratios vs full writeback_bytes the sched reports:
-    //   download: only newly written cells -> batch_size/kv_size (decode bs=1/kv=1024 -> 0.1%)
-    //   upload:   all used cells (cache fills over time) -> 1.0 (conservative, assumes full cache)
-    // RS models use FULL mode (entire tensor every batch), so both are 1.0.
-    const double dl_ratio = has_rs ? 1.0
-        : ((kv_size > 0) ? std::min(1.0, (double)batch_size / kv_size) : 1.0);
-    const double ul_ratio = 1.0;
+    // per-class writeback ratios, matching what the runtime actually moves:
+    //   attention KV: write-cells delta sync -> batch_size/kv_size in both directions
+    //   recurrent state: FULL mode, entire tensor every eval -> 1.0
+    // A blanket has_rs ratio charged hybrid models' attention KV at full-cache cost per
+    // decode step, under-predicting pinned-attn plans 2-12x at 16k ctx.
+    GGML_UNUSED(has_rs);
+    const double kv_ratio = (kv_size > 0) ? std::min(1.0, (double)batch_size / kv_size) : 1.0;
     double total_ms = 0.0;
     bool copy_prefetched = false;
     timing_cache_t timing_cache;
@@ -591,9 +591,14 @@ double llama_benchmark_predictor::predict_tps(
 
         double input_copy_ms = 0.0;
         double input_copy_bytes = 0.0;
-        if (is_gpu && !copy_prefetched && pcie_bw > 0.0) {
-            input_copy_bytes = (double)si.input_weight_copy_bytes
-                             + (double)si.writeback_bytes * ul_ratio;
+        if (is_gpu && pcie_bw > 0.0) {
+            // a prefetched split still pays its sliced-by-used-ids expert copies at
+            // consume time (the prefetch pass skips those tensors on purpose)
+            input_copy_bytes = copy_prefetched
+                ? (double)si.input_weight_sliced_bytes
+                : (double)si.input_weight_copy_bytes
+                    + (double)si.writeback_kv_bytes * kv_ratio
+                    + (double)si.writeback_rs_bytes;
             input_copy_ms = (input_copy_bytes / 1e9 / pcie_bw) * 1000.0;
         }
 
@@ -604,8 +609,10 @@ double llama_benchmark_predictor::predict_tps(
             struct ggml_backend_sched_split_info next_si = {};
             if (ggml_backend_sched_get_split_info(sched, i + 1, &next_si) &&
                 next_si.can_prefetch_weights) {
-                prefetch_bytes = (double)next_si.input_weight_bytes
-                               + (double)next_si.writeback_bytes * ul_ratio;
+                // the prefetch pass moves non-sliceable weights + writebacks only
+                prefetch_bytes = (double)next_si.input_weight_prefetch_bytes
+                               + (double)next_si.writeback_kv_bytes * kv_ratio
+                               + (double)next_si.writeback_rs_bytes;
                 next_copy_prefetched = prefetch_bytes > 0.0;
             }
         }
@@ -655,7 +662,8 @@ double llama_benchmark_predictor::predict_tps(
         // KV/RS download cost (GPU splits, after compute, on compute stream)
         double kv_dl_ms = 0.0;
         if (is_gpu && si.writeback_bytes > 0 && pcie_bw > 0.0) {
-            double dl_bytes = (double)si.writeback_bytes * dl_ratio;
+            double dl_bytes = (double)si.writeback_kv_bytes * kv_ratio
+                            + (double)si.writeback_rs_bytes;
             kv_dl_ms = (dl_bytes / 1e9 / pcie_bw) * 1000.0;
         }
 
@@ -673,7 +681,7 @@ double llama_benchmark_predictor::predict_tps(
         total_ms += split_ms;
         copy_prefetched = next_copy_prefetched;
 
-        double dl_bytes = is_gpu ? (double)si.writeback_bytes * dl_ratio : 0.0;
+        double dl_bytes = is_gpu ? (double)si.writeback_kv_bytes * kv_ratio + (double)si.writeback_rs_bytes : 0.0;
         LLAMA_LOG_DEBUG("%s:   split %d/%d [%s] input_copy=%.3f (%.2f MiB) compute=%.3f kv_dl=%.3f (%.2f MiB) prefetch=%.3f (%.2f MiB) activ=%.3f (%.2f MiB) -> %.3f ms"
             " (exact=%d near=%d fall=%d cache=%d)\n",
             __func__, i, n_splits, is_gpu ? "GPU" : "CPU",
@@ -687,7 +695,7 @@ double llama_benchmark_predictor::predict_tps(
     }
 
     double tps = (total_ms > 0.0) ? (batch_size * 1000.0 / total_ms) : 0.0;
-    LLAMA_LOG_DEBUG("%s: total=%.3f ms, dl_ratio=%.4f, ul_ratio=%.1f, pcie_bw=%.1f GB/s -> %.1f tps\n",
-        __func__, total_ms, dl_ratio, ul_ratio, pcie_bw, tps);
+    LLAMA_LOG_DEBUG("%s: total=%.3f ms, kv_ratio=%.4f, pcie_bw=%.1f GB/s -> %.1f tps\n",
+        __func__, total_ms, kv_ratio, pcie_bw, tps);
     return tps;
 }
