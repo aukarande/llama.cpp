@@ -180,6 +180,38 @@ struct llama_pshard_plan_registry {
     uint32_t                             budget_mib = 0;
     uint32_t                             cache_ubatch = 0;
 
+    // switch-cost estimate constants (written by the planner; 0 = not available).
+    // Residency-switch cost is a pure function of two plans' pin fields, so it is
+    // evaluated pairwise on demand rather than precomputed against one anchor plan.
+    float switch_layer_mb  = 0.0f;  // est. weight MB of one full layer
+    float switch_attn_frac = 0.0f;  // attention share of a layer's bytes
+    float switch_head_mb   = 0.0f;  // est. MB of the output head
+    float switch_pcie_gb_s = 0.0f;  // upload rate for pinned weights
+
+    // one-way cost of switching pinned residency between two plans, in ms.
+    // Falls back to the tier0-anchored per-plan estimate for legacy caches.
+    float switch_cost_ms(const llama_pshard_plan & from, const llama_pshard_plan & to) const {
+        if (switch_layer_mb <= 0.0f || switch_pcie_gb_s <= 0.0f) {
+            return to.switch_ms;
+        }
+        double mb = 0.0;
+        // fully pinned layers: nested sets when pinned from the same end, disjoint otherwise
+        if (from.pin_from_back == to.pin_from_back) {
+            mb += (to.n_pinned > from.n_pinned ? to.n_pinned - from.n_pinned
+                                               : from.n_pinned - to.n_pinned) * (double)switch_layer_mb;
+        } else {
+            mb += ((double)to.n_pinned + (double)from.n_pinned) * (double)switch_layer_mb;
+        }
+        // attention-only pins (n_attn_pinned includes the fully pinned layers)
+        const double fa = from.n_attn_pinned > from.n_pinned ? from.n_attn_pinned - from.n_pinned : 0;
+        const double ta = to.n_attn_pinned   > to.n_pinned   ? to.n_attn_pinned   - to.n_pinned   : 0;
+        mb += (ta > fa ? ta - fa : fa - ta) * (double)switch_layer_mb * (double)switch_attn_frac;
+        if (from.output_on_gpu != to.output_on_gpu) {
+            mb += (double)switch_head_mb;
+        }
+        return (float)(mb / (double)switch_pcie_gb_s);  // MB / (GB/s) == ms
+    }
+
     // variant marker for a baseline load that fits
     // runtime still checks baseline_vram_req against the current budget
     bool                                 pshard_disabled = false;
@@ -247,7 +279,8 @@ struct llama_pshard_plan_registry {
 
     // pick the prefill ubatch with the lowest predicted ttft
     // use max_ubatch when TPS data is missing
-    uint32_t find_optimal_ubatch(uint32_t n_prompt, uint32_t max_ubatch) const {
+    uint32_t find_optimal_ubatch(uint32_t n_prompt, uint32_t max_ubatch,
+                                 const llama_pshard_plan * from_plan = nullptr) const {
         // QA/debug override: evaluation shape changes numerics on shape-sensitive models
         // (gpt-oss raw-text PPL), so A/B runs need a way to pin the prefill ubatch
         if (const char * force = getenv("PSHARD_FORCE_PREFILL_UB")) {
@@ -259,6 +292,14 @@ struct llama_pshard_plan_registry {
         uint32_t best_ub  = max_ubatch;
         double   best_time = 1e30;
 
+        // switches are pairwise: prefill leaves whatever plan is CURRENTLY active
+        // (usually - but not always - the decode plan) and returns to the decode plan
+        const llama_pshard_plan * decode_plan =
+            (!best_plans.empty() && best_plans[0].is_viable) ? &best_plans[0] : nullptr;
+        if (from_plan == nullptr) {
+            from_plan = decode_plan;
+        }
+
         for (size_t t = 0; t < tier_sizes.size(); t++) {
             uint32_t ts = tier_sizes[t];
             if (ts < 512 || ts > max_ubatch) continue;
@@ -268,10 +309,17 @@ struct llama_pshard_plan_registry {
 
             double per_iter = (double)ts / (double)plan.tps;
             uint32_t n_iters = (n_prompt + ts - 1) / ts;
-            // TTFT includes switching INTO this tier's plan and back to the decode plan
-            // after prefill; a tier sharing the decode plan's residency (switch_ms = 0)
-            // wins ties against one that swaps pinned weights around the prompt
-            double total = n_iters * per_iter + 2.0 * (double)plan.switch_ms / 1000.0;
+            // TTFT includes switching INTO this tier's plan from the active one and back
+            // to the decode plan after prefill; a tier sharing that residency wins ties
+            // against one that swaps pinned weights around the prompt
+            double switch_total_ms = 0.0;
+            if (from_plan != nullptr) {
+                switch_total_ms += (double)switch_cost_ms(*from_plan, plan);
+            }
+            if (decode_plan != nullptr) {
+                switch_total_ms += (double)switch_cost_ms(plan, *decode_plan);
+            }
+            double total = n_iters * per_iter + switch_total_ms / 1000.0;
 
             if (total < best_time) {
                 best_time = total;

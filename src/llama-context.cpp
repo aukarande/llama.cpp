@@ -1822,7 +1822,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         auto * registry = model.get_plan_registry();
         if (registry && !registry->tier_sizes.empty()) {
             const uint32_t max_ubatch = std::min(cparams.n_ubatch, registry->tier_sizes.back());
-            n_ubatch_eff = registry->find_optimal_ubatch(n_tokens_all, max_ubatch);
+            // switches are pairwise: TTFT depends on the plan that is active RIGHT NOW
+            // (not necessarily the decode plan, e.g. bs=16 decode or back-to-back prompts)
+            n_ubatch_eff = registry->find_optimal_ubatch(n_tokens_all, max_ubatch, pshard_active_plan);
             // eval shape changes numerics on shape-sensitive models - log once so A/B
             // baselines can match -ub to what pshard actually evaluates with
             static uint32_t logged_ub = 0;

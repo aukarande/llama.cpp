@@ -761,6 +761,13 @@ static void pshard_compute_switch_costs(
     const double attn_frac   = is_moe ? 0.12 : 0.35;  // attention share of a layer's bytes
     const double head_bytes  = 0.04 * (double)model_file_size;
 
+    // publish the estimate constants: switches are pairwise (any plan to any plan), so
+    // the runtime evaluates switch_cost_ms(from, to) on demand from these
+    registry->switch_layer_mb  = (float)(layer_bytes / 1e6);
+    registry->switch_attn_frac = (float)attn_frac;
+    registry->switch_head_mb   = (float)(head_bytes / 1e6);
+    registry->switch_pcie_gb_s = (float)pcie_gb_s;
+
     const double base_attn_extra = (double)(base.n_attn_pinned > base.n_pinned
                                             ? base.n_attn_pinned - base.n_pinned : 0);
     for (auto & plan : registry->best_plans) {
@@ -915,7 +922,12 @@ bool pshard_registry_save(
         }
     }
 
-    fprintf(f, "\n[variant budget=%u cache_ubatch=%u]\n", budget_mib, cache_ubatch);
+    // trailing fields after cache_ubatch are ignored by older parsers (sscanf assigns
+    // the two %u before the literal ']' mismatch and still returns 2)
+    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f]\n",
+        budget_mib, cache_ubatch,
+        registry->switch_layer_mb, registry->switch_attn_frac,
+        registry->switch_head_mb, registry->switch_pcie_gb_s);
     if (registry->pshard_disabled) {
         fprintf(f, "pshard_disabled=1 baseline_vram=%.1f\n", registry->baseline_vram_req / (1024.0 * 1024.0));
     } else {
@@ -978,6 +990,10 @@ bool pshard_registry_load(
         uint32_t cache_ubatch = 0;
         bool pshard_disabled = false;
         double baseline_vram_mib = 0.0;
+        float switch_layer_mb = 0.0f;
+        float switch_attn_frac = 0.0f;
+        float switch_head_mb = 0.0f;
+        float switch_pcie_gb_s = 0.0f;
         std::vector<tier_data> tiers;
     };
     std::vector<variant_data> variants;
@@ -1001,6 +1017,12 @@ bool pshard_registry_load(
             cur_variant = &variants.back();
             cur_variant->budget_mib = variant_budget;
             cur_variant->cache_ubatch = variant_cache_ubatch;
+            // optional switch-cost estimate constants (absent in older caches)
+            const char * p;
+            if ((p = strstr(s.c_str(), "switch_mb=")) != NULL) cur_variant->switch_layer_mb  = (float)atof(p + 10);
+            if ((p = strstr(s.c_str(), "attn_frac=")) != NULL) cur_variant->switch_attn_frac = (float)atof(p + 10);
+            if ((p = strstr(s.c_str(), "head_mb="))   != NULL) cur_variant->switch_head_mb   = (float)atof(p + 8);
+            if ((p = strstr(s.c_str(), "pcie="))      != NULL) cur_variant->switch_pcie_gb_s = (float)atof(p + 5);
             continue;
         }
         if (!cur_variant) continue;
@@ -1230,6 +1252,12 @@ bool pshard_registry_load(
     registry->baseline_vram_req = 0;
     registry->budget_mib = best_whole ? best_whole->budget_mib : 0;
     registry->cache_ubatch = selected_cache_ubatch;
+    if (best_whole) {
+        registry->switch_layer_mb  = best_whole->switch_layer_mb;
+        registry->switch_attn_frac = best_whole->switch_attn_frac;
+        registry->switch_head_mb   = best_whole->switch_head_mb;
+        registry->switch_pcie_gb_s = best_whole->switch_pcie_gb_s;
+    }
 
     for (auto & item : selected) {
         const auto & p = item.second;
