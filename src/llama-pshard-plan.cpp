@@ -741,6 +741,51 @@ static bool pshard_parse_variant_header(const std::string & line, uint32_t & bud
 
 static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current);
 
+// estimate, for every tier plan, the one-way cost of switching into it from the decode
+// (tier 0) plan: the pinned-residency delta uploaded over PCIe. Byte counts are coarse
+// (file-size based - the registry has no per-layer tensor sizes), which is fine: the term
+// exists to separate "same residency, free switch" from "multi-GB pin swap around every
+// prompt", not to rank close calls.
+static void pshard_compute_switch_costs(
+        llama_pshard_plan_registry * registry,
+        int64_t model_file_size, uint32_t n_layers, bool is_moe, double pcie_gb_s) {
+    if (!registry || registry->best_plans.empty() || n_layers == 0 ||
+            model_file_size <= 0 || pcie_gb_s <= 0.0) {
+        return;
+    }
+    const llama_pshard_plan & base = registry->best_plans[0];
+    if (!base.is_viable) {
+        return;
+    }
+    const double layer_bytes = 0.92 * (double)model_file_size / n_layers;
+    const double attn_frac   = is_moe ? 0.12 : 0.35;  // attention share of a layer's bytes
+    const double head_bytes  = 0.04 * (double)model_file_size;
+
+    const double base_attn_extra = (double)(base.n_attn_pinned > base.n_pinned
+                                            ? base.n_attn_pinned - base.n_pinned : 0);
+    for (auto & plan : registry->best_plans) {
+        if (&plan == &registry->best_plans[0] || !plan.is_viable) {
+            plan.switch_ms = 0.0f;
+            continue;
+        }
+        double bytes = 0.0;
+        // fully pinned layers: nested sets when pinned from the same end, disjoint otherwise
+        if (plan.pin_from_back == base.pin_from_back) {
+            bytes += std::abs((double)plan.n_pinned - (double)base.n_pinned) * layer_bytes;
+        } else {
+            bytes += ((double)plan.n_pinned + (double)base.n_pinned) * layer_bytes;
+        }
+        // attention-only pins (n_attn_pinned includes the fully pinned layers)
+        const double attn_extra = (double)(plan.n_attn_pinned > plan.n_pinned
+                                           ? plan.n_attn_pinned - plan.n_pinned : 0);
+        bytes += std::abs(attn_extra - base_attn_extra) * layer_bytes * attn_frac;
+        if (plan.output_on_gpu != base.output_on_gpu) {
+            bytes += head_bytes;
+        }
+        plan.switch_ms = (float)(bytes / 1e9 / pcie_gb_s * 1000.0);
+    }
+}
+
 bool pshard_registry_save(
         const llama_pshard_plan_registry * registry, uint64_t fingerprint,
         const char * cache_path, ggml_backend_buffer_type_t host_buft,
@@ -881,12 +926,13 @@ bool pshard_registry_save(
                 continue;
             }
             fprintf(f, "[tier %zu bs=%u]\n", t, registry->tier_sizes[t]);
-            fprintf(f, "strategy=%s n_pinned=%u n_attn_pinned=%u overflow=%s tps=%.2f vram=%.1f output_on_gpu=%d pin_from_back=%d overlap=%d\n",
+            fprintf(f, "strategy=%s n_pinned=%u n_attn_pinned=%u overflow=%s tps=%.2f vram=%.1f output_on_gpu=%d pin_from_back=%d overlap=%d switch_ms=%.2f\n",
                 llama_pshard_strategy_name(plan.strategy),
                 plan.n_pinned, plan.n_attn_pinned,
                 pshard_overflow_name(plan.overflow),
                 plan.tps, plan.total_vram_req / (1024.0 * 1024.0),
-                (int)plan.output_on_gpu, (int)plan.pin_from_back, (int)plan.overlap);
+                (int)plan.output_on_gpu, (int)plan.pin_from_back, (int)plan.overlap,
+                plan.switch_ms);
             fprintf(f, "ot=%s\n", pshard_plan_to_ot(plan, host_buft).c_str());
         }
     }
@@ -924,6 +970,7 @@ bool pshard_registry_load(
         int output_on_gpu = 0;
         int pin_from_back = 0;
         int overlap = 1;
+        float switch_ms = 0.0f;
         std::string ot_line;
     };
     struct variant_data {
@@ -1007,6 +1054,8 @@ bool pshard_registry_load(
             td.pin_from_back = atoi(pfb + 14);
             const char * ovl = strstr(s.c_str(), "overlap=");
             td.overlap = ovl ? atoi(ovl + 8) : 1;
+            const char * swm = strstr(s.c_str(), "switch_ms=");
+            td.switch_ms = swm ? (float)atof(swm + 10) : 0.0f;
 
             td.overflow = pshard_overflow_from_name(overflow_name);
             bool found_strategy = false;
@@ -1037,6 +1086,7 @@ bool pshard_registry_load(
         plan.n_attn_pinned = td.n_attn_pinned;
         plan.overflow      = td.overflow;
         plan.tps           = td.tps;
+        plan.switch_ms     = td.switch_ms;
         plan.total_vram_req = (size_t)(td.vram_mib * 1024 * 1024);
         plan.is_viable     = td.viable;
         plan.overlap       = td.overlap != 0;
@@ -1922,6 +1972,8 @@ void llama_params_fit_pshard_plan(
             }
         }
 
+        pshard_compute_switch_costs(registry, model_file_size, n_layers, ctx.is_moe,
+            predictor ? predictor->stats.peak_pcie_bw : 25.0);
         pshard_registry_save(registry, fp, cache_path.c_str(), host_buft, cparams);
     }
 
@@ -1948,6 +2000,8 @@ void llama_params_fit_pshard_plan(
                 if (registry->tier_sizes[t] == best_plan.batch_size) {
                     registry->best_plans[t] = best_plan;
                     registry->active_plan = &registry->best_plans[t];
+                    pshard_compute_switch_costs(registry, model_file_size, n_layers, ctx.is_moe,
+                        predictor ? predictor->stats.peak_pcie_bw : 25.0);
                     pshard_registry_save(registry, fp, cache_path.c_str(), host_buft, cparams);
                     break;
                 }

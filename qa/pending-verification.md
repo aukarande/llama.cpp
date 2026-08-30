@@ -22,6 +22,13 @@ and corrupt concurrent measurements).
 4. **DeepSeek-V4 pshard perf** - the correctness smoke stands (runs, output matches
    stock), but its 7.40 t/s decode was measured under zombie contention - remeasure
    one cell before quoting perf.
+5. **Switch-cost terms (commit pending)** - plan q35 at 16k (auto): registry tier
+   lines must carry sensible `switch_ms=` values (0 for tiers sharing the decode
+   plan's residency; ~100-500ms-scale for multi-layer pin deltas at ~450 MB/layer).
+   Then check `pshard_prefill_ubatch_eff`: a short prompt (e.g. 600 tokens) should
+   now prefer a residency-coherent tier over a marginally faster incoherent one;
+   long prompts (16k) should be unchanged (switch cost amortizes). Perf-check one
+   short-prompt cell vs pre-change numbers.
 
 ## Contamination note (2026-08-30)
 

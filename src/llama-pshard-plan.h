@@ -91,6 +91,8 @@ struct llama_pshard_plan {
     size_t scratch_measured = 0;
     size_t cache_measured   = 0;
     float  tps              = 0.0f;  // predicted tokens/sec (0 = no benchmark data)
+    float  switch_ms        = 0.0f;  // est. one-way cost of switching into this plan from
+                                     // the decode (tier 0) plan: pinned-residency delta / PCIe
     bool   is_viable        = false;
 
     // cached maps and offsets from first apply
@@ -266,7 +268,10 @@ struct llama_pshard_plan_registry {
 
             double per_iter = (double)ts / (double)plan.tps;
             uint32_t n_iters = (n_prompt + ts - 1) / ts;
-            double total = n_iters * per_iter;
+            // TTFT includes switching INTO this tier's plan and back to the decode plan
+            // after prefill; a tier sharing the decode plan's residency (switch_ms = 0)
+            // wins ties against one that swaps pinned weights around the prompt
+            double total = n_iters * per_iter + 2.0 * (double)plan.switch_ms / 1000.0;
 
             if (total < best_time) {
                 best_time = total;
