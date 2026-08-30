@@ -991,13 +991,13 @@ bool pshard_registry_save(
                 continue;
             }
             fprintf(f, "[tier %zu bs=%u]\n", t, registry->tier_sizes[t]);
-            fprintf(f, "strategy=%s n_pinned=%u n_attn_pinned=%u overflow=%s tps=%.2f vram=%.1f output_on_gpu=%d pin_from_back=%d overlap=%d switch_ms=%.2f\n",
+            fprintf(f, "strategy=%s n_pinned=%u n_attn_pinned=%u overflow=%s tps=%.2f vram=%.1f output_on_gpu=%d pin_from_back=%d overlap=%d switch_ms=%.2f ids_cross=%d\n",
                 llama_pshard_strategy_name(plan.strategy),
                 plan.n_pinned, plan.n_attn_pinned,
                 pshard_overflow_name(plan.overflow),
                 plan.tps, plan.total_vram_req / (1024.0 * 1024.0),
                 (int)plan.output_on_gpu, (int)plan.pin_from_back, (int)plan.overlap,
-                plan.switch_ms);
+                plan.switch_ms, (int)plan.ids_cross);
             fprintf(f, "ot=%s\n", pshard_plan_to_ot(plan, host_buft).c_str());
         }
     }
@@ -1168,6 +1168,7 @@ bool pshard_registry_load(
         plan.total_vram_req = (size_t)(td.vram_mib * 1024 * 1024);
         plan.is_viable     = td.viable;
         plan.overlap       = td.overlap != 0;
+        plan.ids_cross     = td.ids_cross != 0;
         plan.ids_cross     = td.ids_cross != 0;
         plan.output_on_gpu = (bool)td.output_on_gpu;
         plan.pin_from_back = (bool)td.pin_from_back;
@@ -1843,6 +1844,8 @@ void llama_params_fit_pshard_plan(
             }
             gguf_free(g);
         }
+        LLAMA_LOG_INFO("%s: ids-cross inputs: n_expert=%u n_expert_used=%u model_mb=%lld\n",
+            __func__, ctx.n_expert, ctx.n_expert_used, (long long)(model_file_size / (1024 * 1024)));
     }
 
     llama_pshard_plan_registry * registry  = mparams->pshard_registry;
