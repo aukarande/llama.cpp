@@ -5,7 +5,30 @@ in one session (machine exclusive, zombie-check first: `tasklist /fi "IMAGENAME 
 llama-perplexity.exe"` etc. - TaskStop'd harness shells survive as detached sh.exe
 and corrupt concurrent measurements).
 
+## Drained 2026-08-31 (targeted items; grid + nem HELD by user)
+
+- Loader determinism: VERIFIED - exact hit / smaller-with-warning / honest refusal.
+- Switch-cost constants: VERIFIED - variant header switch_mb=509.1 attn_frac=0.12
+  head_mb=885.4 pcie=45.0 (matches hand arithmetic); behavioral check rides the grid.
+- ids-cross: VERIFIED - oss s4 flags exactly tier bs=1 (pair gate) with router
+  patterns; q35-16k@2000 forced-s4 decode 7.65 -> 19.99 t/s (+161%), prompt
+  unchanged, token gate OK. (Two silently no-op'd serialization hunks were found
+  and restored en route - 7c6a48bbe. Lesson: verify batch replaces by count.)
+- DSv4 perf (clean machine): s3 forced = 52.1 prompt / 10.87 decode t/s. NEW BUG
+  found below.
+
 ## Queued
+
+0. **DSv4 streamed-attn runtime crash (NEW)** - dual-cache models (MLA + indexer,
+   both naming cache_k_l%d): tiers that stream attention activate KV write-cells
+   writeback which doesn't know the second cache unit -> CUDA illegal memory access
+   on the first >=512-token batch (tier bs=512 FFNCPU plan). AUTO on DSv4 crashes
+   for real prompts. Repro: PSHARD_STRATEGY default, prompt-512, -mva 8000.
+   All-STATIC (attn pinned) runs clean end-to-end. Fix: teach llama_memory_pshard /
+   pshard_update_write_cells the dual-cache layout; interim: planner marks
+   streamed-attn strategies unviable when the model has 2 attn cache units per layer.
+0b. **Harness nit**: strategy_prefill parses empty when the top (bs=CUB) tier is
+   not_viable - key the parse off the effective prefill tier (bs=PUB) instead.
 
 1. **Registry loader determinism (commit pending)** - accumulate variants at two
    budgets (plan oss @4000 then @2000, same ctx), then with `-v`:
