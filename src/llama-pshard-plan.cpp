@@ -1099,51 +1099,57 @@ bool pshard_registry_load(
         }
     }
 
+    // deterministic variant selection (the accumulate + first-match era produced plans
+    // from mixed planning sessions - see the phantom q8d 2.84 t/s incident):
+    //   1. a variant planned for EXACTLY this budget always wins
+    //   2. otherwise the largest stored budget <= requested (safe: only leaves VRAM idle)
+    //   3. NEVER a variant planned for a bigger budget, and no per-tier salvage from
+    //      one - its reserves were validated against headroom this run does not have
+    //   4. remaining ties: larger cache_ubatch, then the NEWER entry (later in file)
     const variant_data * best_whole = nullptr;
+    bool best_is_exact = false;
     for (const auto & variant : variants) {
         if (variant.pshard_disabled || variant.tiers.empty()) continue;
         if (!cache_ubatch_ok(variant)) continue;
-        if (require_exact_budget) {
-            if (variant.budget_mib != current_budget_mib) continue;
-        } else if (pshard_mib_to_bytes(variant.budget_mib) > current_budget) {
+        const bool exact = variant.budget_mib == current_budget_mib;
+        if (require_exact_budget && !exact) continue;
+        if (!exact && pshard_mib_to_bytes(variant.budget_mib) > current_budget) continue;
+        if (!best_whole) {
+            best_whole = &variant; best_is_exact = exact;
             continue;
         }
-        if (!best_whole ||
-                variant_cache_ubatch(variant) > variant_cache_ubatch(*best_whole) ||
-                (variant_cache_ubatch(variant) == variant_cache_ubatch(*best_whole) &&
-                 variant.budget_mib > best_whole->budget_mib)) {
-            best_whole = &variant;
+        if (exact != best_is_exact) {
+            if (exact) { best_whole = &variant; best_is_exact = true; }
+            continue;
         }
+        const uint32_t vu = variant_cache_ubatch(variant);
+        const uint32_t bu = variant_cache_ubatch(*best_whole);
+        if (vu != bu) {
+            if (vu > bu) { best_whole = &variant; }
+            continue;
+        }
+        if (variant.budget_mib != best_whole->budget_mib) {
+            if (variant.budget_mib > best_whole->budget_mib) { best_whole = &variant; }
+            continue;
+        }
+        best_whole = &variant; // all keys equal: later in file = newer wins
     }
 
     std::vector<std::pair<uint32_t, llama_pshard_plan>> selected;
-    auto add_or_fill_plan = [&](const tier_data & td, bool allow_existing) {
-        llama_pshard_plan plan = make_plan(td);
-        auto it = std::find_if(selected.begin(), selected.end(),
-            [&](const auto & p) { return p.first == td.bs; });
-        if (it == selected.end()) {
-            selected.push_back({td.bs, std::move(plan)});
-        } else if (allow_existing || !it->second.is_viable ||
-                (!best_whole && plan.is_viable && pshard_plan_is_better(plan, it->second))) {
-            it->second = std::move(plan);
-        }
-    };
-
     if (best_whole) {
         for (const auto & td : best_whole->tiers) {
-            add_or_fill_plan(td, true);
-        }
-    }
-
-    if (!require_exact_budget) {
-        for (const auto & variant : variants) {
-            if (variant.pshard_disabled || pshard_mib_to_bytes(variant.budget_mib) <= current_budget) continue;
-            if (!cache_ubatch_ok(variant)) continue;
-            for (const auto & td : variant.tiers) {
-                if (!td.viable || td.ot_line.empty()) continue;
-                if (pshard_mib_to_bytes(td.vram_mib) > current_budget) continue;
-                add_or_fill_plan(td, false);
+            llama_pshard_plan plan = make_plan(td);
+            auto it = std::find_if(selected.begin(), selected.end(),
+                [&](const auto & p) { return p.first == td.bs; });
+            if (it == selected.end()) {
+                selected.push_back({td.bs, std::move(plan)});
+            } else {
+                it->second = std::move(plan);
             }
+        }
+        if (!best_is_exact) {
+            LLAMA_LOG_WARN("%s: no budget=%u MiB variant; using the budget=%u MiB plan (safe but leaves VRAM idle - replan at this budget for full utilization)\n",
+                __func__, current_budget_mib, best_whole->budget_mib);
         }
     }
 
@@ -1187,16 +1193,9 @@ bool pshard_registry_load(
         registry->best_plans.push_back(std::move(item.second));
     }
 
-    if (require_exact_budget) {
-        LLAMA_LOG_INFO("%s: loaded %zu tier plans from exact budget=%u MiB cache_ubatch=%u variant in %s\n",
-            __func__, registry->tier_sizes.size(), registry->budget_mib, registry->cache_ubatch, cache_path);
-    } else if (best_whole) {
-        LLAMA_LOG_INFO("%s: loaded %zu tier plans from budget=%u MiB cache_ubatch=%u variant for current budget=%u MiB in %s\n",
-            __func__, registry->tier_sizes.size(), registry->budget_mib, registry->cache_ubatch, current_budget_mib, cache_path);
-    } else {
-        LLAMA_LOG_INFO("%s: loaded %zu salvaged tier plans for current budget=%u MiB from %s\n",
-            __func__, registry->tier_sizes.size(), current_budget_mib, cache_path);
-    }
+    LLAMA_LOG_INFO("%s: loaded %zu tier plans from %s budget=%u MiB cache_ubatch=%u variant (current budget=%u MiB) in %s\n",
+        __func__, registry->tier_sizes.size(), best_is_exact ? "exact" : "smaller",
+        registry->budget_mib, registry->cache_ubatch, current_budget_mib, cache_path);
     return true;
 }
 
