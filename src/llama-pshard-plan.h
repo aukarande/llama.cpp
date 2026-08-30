@@ -84,6 +84,8 @@ struct llama_pshard_plan {
     bool                 pin_from_back   = false;
     bool                 output_on_gpu   = false;
     bool                 overlap         = true;   // transport mode: double-buffer slots + prefetch scan-ahead
+    bool                 ids_cross       = false;  // ALTERNATE only: pin routers on the compute GPU so
+                                                   // expert ids cross a split boundary -> sliced uploads
 
     std::vector<llama_pshard_override> overrides;
 
@@ -128,7 +130,8 @@ void llama_pshard_generate_overrides(
         bool pin_from_back = false,
         bool output_on_gpu = false,
         uint32_t n_attn_pinned = 0,
-        bool overlap = true);
+        bool overlap = true,
+        bool ids_cross = false);
 
 // llama_device_memory_data and llama_memory_breakdown_data come from
 // ToT's src/llama-ext.h (included above)

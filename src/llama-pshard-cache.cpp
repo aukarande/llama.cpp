@@ -54,10 +54,12 @@ void llama_pshard_generate_overrides(
         bool pin_from_back,
         bool output_on_gpu,
         uint32_t n_attn_pinned,
-        bool overlap) {
+        bool overlap,
+        bool ids_cross) {
     GGML_UNUSED(gpu_buft);
 
     thread_local std::array<std::string, 1000> patterns_layer;
+    thread_local std::array<std::string, 1000> patterns_layer_router;
     thread_local std::array<std::string, 1000> patterns_layer_attn;
     thread_local std::array<std::string, 1000> patterns_layer_ffn;
     thread_local std::string pat_output = "^output";
@@ -128,6 +130,11 @@ void llama_pshard_generate_overrides(
                     if (il % 2 == 0) {
                         emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
                     } else {
+                        if (ids_cross) {
+                            // router pinned on the compute GPU: ids land in an earlier split
+                            // than the streamed experts -> sliced-by-used-ids uploads
+                            emit(patterns_layer_router[il].c_str(), host_buft, layout.compute);
+                        }
                         emit(patterns_layer_ffn[il].c_str(), host_buft, overlap ? layout.shard(il / 2) : layout.shard_a);
                     }
                     if (n_attn_pinned > 0 && il < n_attn_pinned) {
@@ -488,7 +495,8 @@ void llama_params_fit_pshard(
         tensor_buft_overrides,
         (llama_layer_fraction)best->overflow,
         best->strategy, layout,
-        best->pin_from_back, best->output_on_gpu, best->n_attn_pinned);
+        best->pin_from_back, best->output_on_gpu, best->n_attn_pinned,
+        best->overlap, best->ids_cross);
 
     for (size_t i = 0; tensor_buft_overrides[i].pattern; i++) {
         if (tensor_buft_overrides[i].backend_id == layout.compute) {
