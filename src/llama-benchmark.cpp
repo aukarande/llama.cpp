@@ -352,8 +352,12 @@ llama_split_timing llama_benchmark_predictor::predict_split(
         double op_time_ms  = 0.0;
         double pcie_contrib = 0.0;
 
+        // LLAMA_BENCH_PREDICT_NODES=1: per-node pricing dump (bypasses the timing cache
+        // so every node shows its matched entry, bytes, and chosen roofline branch)
+        static const bool dump_nodes = getenv("LLAMA_BENCH_PREDICT_NODES") != nullptr;
+
         std::string tkey = make_timing_key(is_gpu, async_copy, op_name, m, batch_size);
-        auto cache_it = cache.find(tkey);
+        auto cache_it = dump_nodes ? cache.end() : cache.find(tkey);
         if (cache_it != cache.end()) {
             op_time_ms   = cache_it->second.first;
             pcie_contrib = cache_it->second.second;
@@ -424,6 +428,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
         }
 
         // compute timing from match or fall back to peak BW
+        const char * price_branch = "none";
         if (match) {
             // GPU always peak; CPU uses eff (concurrent) when async_copy, peak otherwise
             const double gflops = is_gpu ? match->peak_gflops
@@ -432,13 +437,32 @@ llama_split_timing llama_benchmark_predictor::predict_split(
             if (exact) {
                 if (gflops > 0.0) {
                     op_time_ms = (m.ops / 1e9) / gflops * 1000.0;
+                    price_branch = "exact-comp";
                 }
             } else {
                 const double ai = m.bytes > 0.0 ? (m.ops / m.bytes) : 0.0;
-                if (ai < match->ridge && match->bw_gb_s > 0.0) {
-                    op_time_ms = (m.bytes / 1e9) / match->bw_gb_s * 1000.0;
+                if (ai < match->ridge) {
+                    // memory-bound op. The matched entry's observed bytes/s is only a
+                    // bandwidth measurement if that entry ALSO ran memory-bound; a
+                    // compute-bound benchmark's byte throughput is an artifact far below
+                    // the machine's streaming rate (seen: FLASH_ATTN entry at 2.6 GB/s on
+                    // a 45.7 GB/s machine -> CPU attention priced 18x too slow, hiding
+                    // attn-pinned plans from the search)
+                    double mem_bw = match->bw_gb_s;
+                    if (match->ai >= match->ridge || mem_bw <= 0.0) {
+                        mem_bw = is_gpu ? stats.peak_gpu_mem_bw
+                                        : (async_copy ? stats.eff_system_bw : stats.peak_system_bw);
+                    }
+                    if (mem_bw > 0.0) {
+                        op_time_ms = (m.bytes / 1e9) / mem_bw * 1000.0;
+                        price_branch = "near-mem";
+                    } else if (gflops > 0.0) {
+                        op_time_ms = (m.ops / 1e9) / gflops * 1000.0;
+                        price_branch = "near-comp";
+                    }
                 } else if (gflops > 0.0) {
                     op_time_ms = (m.ops / 1e9) / gflops * 1000.0;
+                    price_branch = "near-comp";
                 }
             }
 
@@ -450,11 +474,25 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                                          : (async_copy ? stats.eff_system_bw : stats.peak_system_bw);
                 if (bw > 0.0) {
                     op_time_ms = (m.bytes / 1e9) / bw * 1000.0;
+                    price_branch = "fall-mem";
                 }
                 if (!is_gpu && stats.eff_pcie_bw > 0.0) {
                     pcie_contrib = op_time_ms * stats.eff_pcie_bw;
                 }
             }
+        }
+
+        if (dump_nodes && op_time_ms > 0.0) {
+            LLAMA_LOG_DEBUG("predict_node: [%s] %-16s %-28s q=%-8s NKM=%lld/%lld/%lld ctx=%lld kvh=%lld bytes=%.2fMiB ops=%.1fMF %s ent=[%s q=%s N=%lld K=%lld B=%lld ctx=%lld bw=%.1f pk=%.1f eff=%.1f ridge=%.2f] -> %.4f ms\n",
+                is_gpu ? "GPU" : "CPU", op_name, node->name, m.quant_type ? m.quant_type : "-",
+                (long long)m.N, (long long)m.K, (long long)m.M, (long long)m.ctx_len, (long long)m.n_kv_heads,
+                m.bytes / (1024.0*1024.0), m.ops / 1e6, price_branch,
+                match ? match->op_name.c_str() : "-", match ? match->quant.c_str() : "-",
+                match ? (long long)match->N : 0, match ? (long long)match->K : 0,
+                match ? (long long)match->B : 0, match ? (long long)match->ctx_len : 0,
+                match ? match->bw_gb_s : 0.0, match ? match->peak_gflops : 0.0,
+                match ? match->eff_gflops : 0.0, match ? match->ridge : 0.0,
+                op_time_ms);
         }
 
         result.time_ms += op_time_ms;
