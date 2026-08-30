@@ -72,6 +72,8 @@ public:
     llama_kv_cache * get_mla() const;
     llama_kv_cache * get_lid() const;
 
+    std::vector<llama_memory_pipe_shard_i *> get_pipe_shards() override;
+
 private:
     // we keep indexer KV cache hparams instance here as llama_kv_cache stores only reference to it
     llama_hparams hparams_lid;

@@ -19,14 +19,17 @@ and corrupt concurrent measurements).
 
 ## Queued
 
-0. **DSv4 streamed-attn runtime crash (NEW)** - dual-cache models (MLA + indexer,
-   both naming cache_k_l%d): tiers that stream attention activate KV write-cells
-   writeback which doesn't know the second cache unit -> CUDA illegal memory access
-   on the first >=512-token batch (tier bs=512 FFNCPU plan). AUTO on DSv4 crashes
-   for real prompts. Repro: PSHARD_STRATEGY default, prompt-512, -mva 8000.
-   All-STATIC (attn pinned) runs clean end-to-end. Fix: teach llama_memory_pshard /
-   pshard_update_write_cells the dual-cache layout; interim: planner marks
-   streamed-attn strategies unviable when the model has 2 attn cache units per layer.
+0. ~~DSv4 streamed-attn runtime crash~~ **FIXED**: root cause was one level up from
+   the write-cells guess - llama_kv_cache_dsa(+_iswa) never overrode
+   get_pipe_shards(), so the ENTIRE pipe-shard machinery was invisible for
+   dual-cache models (no tensor assignment, no uploads, no writeback). Added the
+   overrides ([mla, lid] / [mla, lid, swa]) + write-cells binder cases for both
+   DSA context types with dedicated lid storage. Crash repro (auto, prompt-512,
+   -mva 8000) now completes: 21.7 prompt / 9.9 decode t/s, coherent output.
+   FOLLOW-UP observation: DSv4 auto prefill (21.7) trails forced-s3 (52.1) - the
+   bs=512 FFNCPU tier's predicted 100 tps measures ~22; predictor accuracy on
+   MLA/dense-lead architectures is untuned. Value A/B vs stock rides the held
+   grid-class runs.
 0b. **Harness nit**: strategy_prefill parses empty when the top (bs=CUB) tier is
    not_viable - key the parse off the effective prefill tier (bs=PUB) instead.
 

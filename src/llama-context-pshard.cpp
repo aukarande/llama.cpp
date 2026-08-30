@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-dsa.h"
+#include "llama-kv-cache-dsa-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-pipe-shard.h"
@@ -56,6 +58,7 @@ namespace {
     thread_local llama_pshard_split_cb_context g_split_ctx;
     thread_local std::vector<std::vector<uint32_t>> g_kv_write_cells;
     thread_local std::vector<std::vector<uint32_t>> g_swa_write_cells;
+    thread_local std::vector<std::vector<uint32_t>> g_lid_write_cells;
 
     size_t total_pinned_cache_size(llama_memory_i * mem) {
         size_t total = 0;
@@ -677,6 +680,7 @@ void llama_context::pshard_maybe_switch(uint32_t n_tokens) {
 void llama_context::pshard_update_write_cells(llama_memory_context_i * mctx) {
     g_kv_write_cells.clear();
     g_swa_write_cells.clear();
+    g_lid_write_cells.clear();
     for (auto * ps : g_split_ctx.pipe_shards) {
         ps->set_write_cells(nullptr);
         ps->clear_prefetch();
@@ -690,6 +694,8 @@ void llama_context::pshard_update_write_cells(llama_memory_context_i * mctx) {
     //   iSWA:           [base_ps, swa_ps]
     //   hybrid:         [kv_ps, rs_ps]
     //   hybrid_iswa:    [base_ps, swa_ps, rs_ps]
+    //   DSA:            [mla_ps, lid_ps]
+    //   DSA_iswa:       [mla_ps, lid_ps, swa_ps]
     auto assign_wc = [&](const llama_kv_cache_context * kv_ctx,
                          std::vector<std::vector<uint32_t>> & storage, size_t ps_idx) {
         if (!kv_ctx || ps_idx >= g_split_ctx.pipe_shards.size()) return;
@@ -711,6 +717,22 @@ void llama_context::pshard_update_write_cells(llama_memory_context_i * mctx) {
     if (auto * iswa_ctx = dynamic_cast<llama_kv_cache_iswa_context *>(mctx)) {
         assign_wc(iswa_ctx->get_base(), g_kv_write_cells,  0);
         assign_wc(iswa_ctx->get_swa(),  g_swa_write_cells, 1);
+        return;
+    }
+
+    if (auto * dsa_ctx = dynamic_cast<llama_kv_cache_dsa_context *>(mctx)) {
+        assign_wc(dsa_ctx->get_mla(), g_kv_write_cells,  0);
+        assign_wc(dsa_ctx->get_lid(), g_lid_write_cells, 1);
+        return;
+    }
+
+    if (auto * dsa_iswa = dynamic_cast<llama_kv_cache_dsa_iswa_context *>(mctx)) {
+        auto * dsa_ctx = dsa_iswa->get_dsa();
+        if (dsa_ctx) {
+            assign_wc(dsa_ctx->get_mla(), g_kv_write_cells,  0);
+            assign_wc(dsa_ctx->get_lid(), g_lid_write_cells, 1);
+        }
+        assign_wc(dsa_iswa->get_swa(), g_swa_write_cells, 2);
         return;
     }
 

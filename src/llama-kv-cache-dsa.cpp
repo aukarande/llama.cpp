@@ -171,6 +171,14 @@ void llama_kv_cache_dsa::state_read(llama_io_read_i & io, llama_seq_id seq_id, l
     kv_lid->state_read(io, seq_id, flags);
 }
 
+std::vector<llama_memory_pipe_shard_i *> llama_kv_cache_dsa::get_pipe_shards() {
+    // order matters: the write-cells binder indexes [0]=mla, [1]=lid
+    std::vector<llama_memory_pipe_shard_i *> result;
+    if (kv_mla && kv_mla->get_pipe_shard()) result.push_back(kv_mla->get_pipe_shard());
+    if (kv_lid && kv_lid->get_pipe_shard()) result.push_back(kv_lid->get_pipe_shard());
+    return result;
+}
+
 llama_kv_cache * llama_kv_cache_dsa::get_mla() const {
     return kv_mla.get();
 }

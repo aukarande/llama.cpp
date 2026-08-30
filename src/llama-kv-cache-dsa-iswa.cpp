@@ -253,6 +253,14 @@ llama_kv_cache_dsa * llama_kv_cache_dsa_iswa::get_dsa() const {
     return kv_dsa.get();
 }
 
+std::vector<llama_memory_pipe_shard_i *> llama_kv_cache_dsa_iswa::get_pipe_shards() {
+    // order matters: the write-cells binder indexes [0]=mla, [1]=lid, [2]=swa
+    std::vector<llama_memory_pipe_shard_i *> result = kv_dsa ? kv_dsa->get_pipe_shards()
+                                                             : std::vector<llama_memory_pipe_shard_i *>{};
+    if (kv_swa && kv_swa->get_pipe_shard()) result.push_back(kv_swa->get_pipe_shard());
+    return result;
+}
+
 llama_kv_cache * llama_kv_cache_dsa_iswa::get_swa() const {
     return kv_swa.get();
 }
