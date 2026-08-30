@@ -663,10 +663,19 @@ double llama_benchmark_predictor::predict_tps(
         llama_split_timing t = predict_split(nodes, n_nodes, is_gpu, batch_size, async_copy, &timing_cache);
 
         // prefetch cost: use concurrent PCIe BW for CPU splits (bus shared with DRAM),
-        // peak PCIe BW for GPU splits (GPU compute doesn't contend with PCIe DMA)
+        // peak PCIe BW for GPU splits (GPU compute doesn't contend with PCIe DMA).
+        // The per-op aggregate eff_pcie_bw can be far below the machine's measured
+        // concurrent PCIe rate (same unrepresentative-entry disease as the memory-branch
+        // bandwidth) - floor it with the profiler's directly measured concurrent value.
         double prefetch_ms = 0.0;
         if (prefetch_bytes > 0.0) {
-            const double eff_bw = (!is_gpu && t.eff_pcie_bw > 0.0) ? t.eff_pcie_bw : pcie_bw;
+            double eff_bw = pcie_bw;
+            if (!is_gpu) {
+                eff_bw = std::max(t.eff_pcie_bw, stats.eff_pcie_bw);
+                if (eff_bw <= 0.0) {
+                    eff_bw = pcie_bw;
+                }
+            }
             prefetch_ms = (prefetch_bytes / 1e9 / eff_bw) * 1000.0;
         }
 

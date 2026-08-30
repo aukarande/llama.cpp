@@ -168,12 +168,14 @@ llama_kv_cache::llama_kv_cache(
 
             map_layer_ids[il] = (int32_t)specs.size();
 
-            // MLA caches only the compressed latent + rope part in K; V is derived at attn time via wv_b
-            const uint32_t n_embd_k_gqa = is_mla
-                ? (hparams.n_lora_kv + hparams.n_rot())
-                : hparams.n_embd_k_gqa(il);
+            // size rows with the SAME accessors as the stock allocation below - they are
+            // the per-arch source of truth (a hand-rolled n_lora_kv + n_rot here computed
+            // 64 instead of 576 for DeepSeek-V4-Flash, whose rank lives elsewhere, and the
+            // probe then crashed writing 512-wide latents into a 64-wide cache).
+            // MLA still has no separate V cache; dim_t2=0 signals "skip t2".
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
             const uint32_t n_embd_v_gqa = is_mla
-                ? 0u  // MLA: no separate V cache; dim_t2=0 signals "skip t2"
+                ? 0u
                 : (!v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max());
 
             specs.push_back({

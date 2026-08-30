@@ -3939,6 +3939,13 @@ struct ggml_tensor * ggml_set_rows(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         struct ggml_tensor  * c) {
+    if (a->ne[0] != b->ne[0]) {
+        // identify the offending tensors before the hard assert below fires
+        GGML_LOG_ERROR("%s: ne[0] mismatch: dst '%s' [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
+                       "src '%s' [%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+            __func__, a->name, a->ne[0], a->ne[1], a->ne[2], a->ne[3],
+            b->name, b->ne[0], b->ne[1], b->ne[2], b->ne[3]);
+    }
     GGML_ASSERT(a->ne[0] == b->ne[0]);
     GGML_ASSERT(a->ne[2] == b->ne[2]);
     GGML_ASSERT(a->ne[3] == b->ne[3]);

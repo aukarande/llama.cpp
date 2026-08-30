@@ -49,7 +49,7 @@ LEDGER="$OUT/ledger.csv"
 if [ "${QA_RESUME:-0}" = "1" ] && [ -f "$LEDGER" ]; then
     echo "resuming: $(grep -c ',pshard,' "$LEDGER") pshard rows already present"
 else
-    echo "config,side,model,ctx,mva,strategy_forced,strategy_active,overlap,n_pinned,cache_ubatch,prompt_tps,decode_tps,vram_peak_delta,token_hash,status" > "$LEDGER"
+    echo "config,side,model,ctx,mva,strategy_forced,strategy_active,strategy_prefill,overlap,n_pinned,n_attn_pinned,cache_ubatch,prefill_ub,prompt_tps,decode_tps,vram_peak_delta,token_hash,status" > "$LEDGER"
 fi
 
 IDLE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
@@ -118,7 +118,7 @@ for MDL in $MODELS_LIST; do
                     env PSHARD_STRATEGY=$STRAT ./llama-pshard-plan-params.exe -m "$MP" -c "$CTX" -mva "$MVA" > "$PLOG" 2>&1
                 fi
                 if [ $? -ne 0 ]; then
-                    echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,PLAN_FAILED,,,,,,,,FAIL" >> "$LEDGER"
+                    echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,PLAN_FAILED,,,,,,,,,,,FAIL" >> "$LEDGER"
                     continue
                 fi
                 CUB=$(grep -aoE "cache_ubatch=[0-9]+" "$MP.tensor_overrides.pshard_registry" | head -1 | cut -d= -f2)
@@ -139,7 +139,11 @@ for MDL in $MODELS_LIST; do
                     P=$(perf_field "$SLOG" "prompt eval time"); D=$(perf_field "$SLOG" " eval time")
                     STOCK_HASH=$(hash_gen "$SLOG.gen")
                     ST=$([ "$RC" = "0" ] && echo OK || echo FAIL)
-                    echo "${MK}-c${CTX}-mva${MVA},stock,$MK,$CTX,$MVA,,,,,${CUB},$P,$D,$DELTA,$STOCK_HASH,$ST" >> "$LEDGER"
+                    if [ "$RC" != "0" ]; then
+                        # a failed run has no meaningful perf/hash/vram telemetry
+                        P=""; D=""; DELTA=""; STOCK_HASH=""
+                    fi
+                    echo "${MK}-c${CTX}-mva${MVA},stock,$MK,$CTX,$MVA,,,,,,,${CUB},,$P,$D,$DELTA,$STOCK_HASH,$ST" >> "$LEDGER"
                     STOCK_DONE=1
                 fi
 
@@ -161,8 +165,14 @@ for MDL in $MODELS_LIST; do
                 H=$(hash_gen "$RLOG.gen")
                 T0=$(grep -a "warmup_plan_reserves:   tier 0" "$RLOG" | head -1)
                 ACT=$(echo "$T0" | grep -aoE "bs=1[[:space:]]+[A-Z_]+" | awk '{print $2}')
-                NP=$(echo "$T0" | grep -aoE "n_pinned=[0-9]+" | cut -d= -f2)
+                NP=$(echo "$T0" | grep -aoE "(^| )n_pinned=[0-9]+" | cut -d= -f2)
                 OVL=$(grep -aoE "overlap=[01]" "$MP.tensor_overrides.pshard_registry" | head -1 | cut -d= -f2)
+                # prefill attribution: the bs=CUB tier's strategy can differ from tier 0
+                # (auto picks per tier), and the runtime may prefill at a smaller ubatch
+                SP=$(grep -aA1 "bs=$CUB\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "strategy=[A-Z_]+" | tail -1 | cut -d= -f2)
+                NA=$(grep -aA1 "bs=1\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "n_attn_pinned=[0-9]+" | head -1 | cut -d= -f2)
+                PUB=$(grep -aoE "pshard_prefill_ubatch_eff=[0-9]+" "$RLOG" | head -1 | cut -d= -f2)
+                [ -z "$PUB" ] && PUB=$CUB
                 if grep -aq "pshard DISABLED" "$RLOG"; then ACT="STOCK_FALLBACK"; fi
                 ST=OK
                 [ "$RC" != "0" ] && ST=FAIL
@@ -214,12 +224,17 @@ for MDL in $MODELS_LIST; do
                     PP_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_pshard_$CFG.log" | grep -aoE "[0-9.]+$")
                     if [ -n "$PS_" ] && [ -n "$PP_" ] &&                        awk -v a="$PS_" -v b="$PP_" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d <= 0.005*a)}'; then
                         ST=TOKEN_DIVERGED_PPL_OK
+                    elif [ -z "$PS_" ]; then
+                        # stock has no PPL here (typically the cell's stock baseline cannot
+                        # run at all) - that is a missing baseline, not a mismatch
+                        ST="NO_BASELINE(pshard=$PP_)"
                     else
                         ST="PPL_MISMATCH(stock=$PS_ pshard=$PP_)"
                     fi
                 fi
-                echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,$ACT,$OVL,$NP,$CUB,$P,$D,$DELTA,$H,$ST" >> "$LEDGER"
-                echo "    active=$ACT ovl=$OVL np=$NP prompt=$P decode=$D vram=+$DELTA $ST"
+                if [ "$RC" != "0" ]; then P=""; D=""; DELTA=""; H=""; fi
+                echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,$ACT,$SP,$OVL,$NP,$NA,$CUB,$PUB,$P,$D,$DELTA,$H,$ST" >> "$LEDGER"
+                echo "    active=$ACT prefill=$SP/ub$PUB ovl=$OVL np=$NP attn=$NA prompt=$P decode=$D vram=+$DELTA $ST"
             done
         done
     done

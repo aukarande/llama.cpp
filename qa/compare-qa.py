@@ -41,13 +41,25 @@ def main():
 
     hard, soft, better, info = [], [], [], []
 
+    PASS_CLASSES = ("OK", "TOKEN_DIVERGED_PPL_OK", "STOCK_UNAVAILABLE", "NO_BASELINE")
+
+    def status_class(s):
+        # statuses may embed per-run values, e.g. "PPL_MISMATCH(stock=... pshard=...)"
+        return (s or "").split("(", 1)[0]
+
     def normalize(rows, cfg, side, r):
-        # cells where STOCK itself cannot run (e.g. 16k ctx in a 2 GB budget) make the token/PPL
-        # gates unadjudicable - classify the pshard row as STOCK_UNAVAILABLE (pshard-only cell)
-        if side == "pshard" and r["status"] != "OK":
-            stock = rows.get((cfg.rsplit("-s", 1)[0], "stock"))
-            if stock is not None and stock["status"] == "FAIL":
-                return dict(r, status="STOCK_UNAVAILABLE")
+        if side != "pshard":
+            return r
+        stock = rows.get((cfg.rsplit("-s", 1)[0], "stock"))
+        # the token hash is the ground truth: if it matches the cell's CURRENT stock hash
+        # the generation is identical, whatever status was recorded when the row was made
+        if (stock is not None and r.get("token_hash") and
+                r["token_hash"] == stock.get("token_hash")):
+            return dict(r, status="OK")
+        # cells where STOCK itself cannot run (e.g. 16k ctx in a 2 GB budget) make the
+        # token/PPL gates unadjudicable - classify as STOCK_UNAVAILABLE (pshard-only cell)
+        if r["status"] != "OK" and stock is not None and stock["status"] == "FAIL":
+            return dict(r, status="STOCK_UNAVAILABLE")
         return r
 
     for (cfg, side), r in sorted(new.items()):
@@ -55,13 +67,13 @@ def main():
             info.append(f"{cfg}: stock cannot run this cell (pshard-only)")
             continue
         r = normalize(new, cfg, side, r)
-        if r["status"] not in ("OK", "TOKEN_DIVERGED_PPL_OK", "STOCK_UNAVAILABLE"):
-            # a bad status that exactly matches the reference is a tracked known issue -
+        if status_class(r["status"]) not in PASS_CLASSES:
+            # a bad status whose class matches the reference is a tracked known issue -
             # report it, but only NEW breakage hard-fails the gate
             rr = ref.get((cfg, side))
             if rr is not None:
                 rr = normalize(ref, cfg, side, rr)
-            if rr is not None and rr["status"] == r["status"]:
+            if rr is not None and status_class(rr["status"]) == status_class(r["status"]):
                 info.append(f"{cfg}/{side}: KNOWN ISSUE (unchanged): {r['status'][:70]}")
             else:
                 hard.append(f"{cfg}/{side}: status={r['status'][:70]}")
@@ -73,11 +85,13 @@ def main():
             info.append(f"{cfg}: no reference row (new config)")
             continue
         rr = normalize(ref, cfg, side, rr)
-        if r["status"] != rr["status"]:
+        if status_class(r["status"]) != status_class(rr["status"]):
             hard.append(f"{cfg}: token-gate class drift {rr['status']} -> {r['status']}")
-        if r["strategy_active"] != rr["strategy_active"] or r["overlap"] != rr["overlap"]:
-            hard.append(f"{cfg}: active plan drift {rr['strategy_active']}/ovl{rr['overlap']} -> "
-                        f"{r['strategy_active']}/ovl{r['overlap']}")
+        # plan attribution drift; only compare fields the (possibly older) reference has
+        for k in ("strategy_active", "strategy_prefill", "overlap", "n_pinned",
+                  "n_attn_pinned", "prefill_ub"):
+            if rr.get(k) not in (None, "") and r.get(k) not in (None, "") and r[k] != rr[k]:
+                hard.append(f"{cfg}: plan drift {k}: {rr[k]} -> {r[k]}")
         dv, rv = fnum(r["vram_peak_delta"]), fnum(rr["vram_peak_delta"])
         if dv is not None and rv is not None and dv > rv + VRAM_SLACK:
             hard.append(f"{cfg}: VRAM {dv:.0f} MiB > reference {rv:.0f} + {VRAM_SLACK}")
