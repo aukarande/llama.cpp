@@ -63,6 +63,12 @@ struct llama_benchmark_stats {
     // GPU (from gpu profiler header)
     double peak_gpu_mem_bw  = 0.0;   // peak GPU memory BW (GB/s)
     double peak_gpu_compute = 0.0;   // peak GPU compute (GFLOP/s)
+
+    // derived at load: the slowest measured CPU matmul rate. Quantized matmuls with
+    // no benchmark entry for their type (e.g. IQ quants) are dequant-compute-bound;
+    // pricing them by memory bandwidth alone under-charges 10-20x, so the fallback
+    // uses max(bytes/bw, ops/this) as a conservative compute floor.
+    double cpu_matmul_floor_gflops = 0.0;
 };
 
 // Aggregate timing prediction for a set of graph nodes (typically one sched split).

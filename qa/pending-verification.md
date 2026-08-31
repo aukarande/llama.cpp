@@ -38,10 +38,22 @@ and corrupt concurrent measurements).
    Then compare-qa vs reference, refresh ledger (schema v2), commit, push.
 2. **Nemotron full slice** - from scratch: `QA_MODELS_LIST="nem:nvidia_Nemotron-3-Nano-30B-A3B-Q4_0" ...`
    Seeds the nem reference rows.
-3. **Switch-cost behavioral check** - rides the grid: short prompts prefer
-   residency-coherent tiers; spot-check one short-prompt cell vs old numbers.
-4. **DSv4 predictor tuning** - FFNCPU tier predicted 100 tps, measures ~22 on
-   MLA/dense-lead layers; also add a DSv4 A/B-vs-stock cell once grid-class runs resume.
+3. ~~Switch-cost behavioral check~~ **VERIFIED 2026-08-31**: switch_ms fields
+   populated (0 for tier-0, 83-105ms for residency deltas); prompt-1500 -> ub 2048
+   and prompt-16k -> ub 8192 both hand-verify as argmin of n_iters*ts/tps +
+   2*switch_ms. CAVEAT (small follow-up): strategies that pin attention
+   structurally (ATTNPIN/LAYERSTREAM) do not record it in n_attn_pinned, so
+   switch_ms between them can overcharge; fine for 0-vs-100ms discrimination.
+4. ~~DSv4 predictor tuning~~ **FIXED 2026-08-31**: IQ-quant expert matmuls had no
+   benchmark entries -> priced by memory bandwidth alone (118 nodes for 224ms)
+   while dequant-compute-bound at batch. Added a compute floor for quantized CPU
+   matmuls without a same-type entry: max(bytes/bw, ops/floor) where floor = the
+   slowest BATCH-measured (B>=32) CPU matmul rate, applied only at M>=32 rows
+   (bs=1 matvecs are genuinely memory-bound - the first floor version overcharged
+   them and flipped tier-0; caught by ladder inspection). Result: DSv4 ladder all
+   coherent STATIC, tier-0 predicted 10.89 vs measured 10.87 (0.2%!), auto prompt
+   21.7 -> 46.6 t/s (+115%), within ~10% of forced-s3. A/B-vs-stock cell rides
+   the held grid-class runs.
 5. **ALTERNATE adjudication (user question)** - after the full grid rerun under the
    fixed predictor + ids-cross: does s4 ever win a cell against re-planned s1/s3?
    If auto never picks it and forced-s4 never beats the best alternative, ALTERNATE

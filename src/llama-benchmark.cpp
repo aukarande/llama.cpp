@@ -227,6 +227,20 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
     if (stats.eff_system_bw == 0.0) { stats.eff_system_bw = stats.peak_system_bw; }
     if (stats.eff_pcie_bw   == 0.0) { stats.eff_pcie_bw   = stats.peak_pcie_bw;   }
 
+    // conservative compute floor for quantized matmuls with no benchmark entry:
+    // the slowest measured CPU matmul rate (any quant, any shape)
+    stats.cpu_matmul_floor_gflops = 0.0;
+    for (const auto & e : cpu_entries) {
+        if (e.op_name != "MUL_MAT" && e.op_name != "MUL_MAT_ID") continue;
+        if (e.peak_gflops <= 0.0) continue;
+        // only batch entries: a bs=1 matvec runs memory-bound and its observed GFLOPS
+        // is an artifact of bandwidth, not a compute measurement
+        if (e.B < 32) continue;
+        if (stats.cpu_matmul_floor_gflops == 0.0 || e.peak_gflops < stats.cpu_matmul_floor_gflops) {
+            stats.cpu_matmul_floor_gflops = e.peak_gflops;
+        }
+    }
+
     build_maps();
 
     LLAMA_LOG_INFO("%s: loaded %zu CPU entries for %d threads"
@@ -475,6 +489,22 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                 if (bw > 0.0) {
                     op_time_ms = (m.bytes / 1e9) / bw * 1000.0;
                     price_branch = "fall-mem";
+                }
+                // quantized CPU matmuls with no benchmark entry (e.g. IQ quants) are
+                // dequant-compute-bound at batch; memory bandwidth alone under-charges
+                // them 10-20x. Floor with the slowest measured CPU matmul rate.
+                // batch only: at small row counts the matmul is memory-bound (dequant
+                // streams at DRAM speed) and bytes/bw is already the right price
+                if (!is_gpu && m.ops > 0.0 && m.M >= 32 && stats.cpu_matmul_floor_gflops > 0.0 &&
+                        (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+                        m.quant_type != nullptr &&
+                        strcmp(m.quant_type, "f32") != 0 && strcmp(m.quant_type, "f16") != 0 &&
+                        strcmp(m.quant_type, "bf16") != 0) {
+                    const double comp_ms = (m.ops / 1e9) / stats.cpu_matmul_floor_gflops * 1000.0;
+                    if (comp_ms > op_time_ms) {
+                        op_time_ms = comp_ms;
+                        price_branch = "fall-comp";
+                    }
                 }
                 if (!is_gpu && stats.eff_pcie_bw > 0.0) {
                     pcie_contrib = op_time_ms * stats.eff_pcie_bw;
