@@ -54,16 +54,21 @@ and corrupt concurrent measurements).
    coherent STATIC, tier-0 predicted 10.89 vs measured 10.87 (0.2%!), auto prompt
    21.7 -> 46.6 t/s (+115%), within ~10% of forced-s3. A/B-vs-stock cell rides
    the held grid-class runs.
-5. **Slot carve-out follow-up (per-slot fence redesign)** - infrastructure landed
-   opt-in (GGML_SLOT_REGIONS=1): weight slots allocate in dedicated per-backend
-   regions (dump: 45602 slot-vs-activation overlaps -> 0). The narrowed per-bid
-   fence was UNSOUND (one-split race on same-shard slot reuse -> degenerate output,
-   caught by hash gate) and is reverted to the conservative fence; perf therefore
-   baseline-equal, VRAM +0.5-1GB per streamed config when enabled (why opt-in).
-   Next attempt: address-keyed per-slot events - slot reuse is a strict 3-address
-   rotation per shard (gate/up/down classes), so 3 events/bid keyed by slot address
-   suffice; also audit writeback-staging cross-eval ordering, the suspected real
-   hole. The reserve_n_size caller-array overrun fix and the fold are always-on.
+5. ~~Slot carve-out / per-slot fence~~ **CLOSED 2026-08-30, carve-out DELETED
+   (30d3f4ed1)**: ceiling probe with the prefetch fence removed entirely recovered
+   nothing (437 vs 447 ms/token, with or without slot regions) - the q8d-s4
+   serialization is host-DRAM-bandwidth bound (~445 ms/token invariant across
+   fence-off / async-handoff / defer-prefetch / no-mmap), so a finer fence has no
+   headroom and the carve-out lost its purpose. Attribution instrumentation
+   (sched_sync/sched_copy under GGML_SCHED_TIMING, 371d99dab) and env-gated
+   ordering experiments (GGML_DEFER_PREFETCH, GGML_ASYNC_HANDOFF, ca622d5b5)
+   retained. Sanity: token-identical s4/s0 output, clean exit.
+5b. **Defer-prefetch grid A/B** - GGML_DEFER_PREFETCH=1 collapses s4's download
+   wait 172ms -> 1ms/token (downloads no longer queue behind layer uploads on the
+   single copy queue) but only nets +2.7% on q8d (DRAM contention moves the cost
+   into CPU FFN). On MoE cells with small CPU-side reads (oss/q35 sliced-expert
+   configs) the contention term shrinks, so it may win there. Ride one env-on
+   column on the held full-grid rerun; keep or delete by the same rule.
 6. **ALTERNATE adjudication (user question)** - after the full grid rerun under the
    fixed predictor + ids-cross: does s4 ever win a cell against re-planned s1/s3?
    If auto never picks it and forced-s4 never beats the best alternative, ALTERNATE
