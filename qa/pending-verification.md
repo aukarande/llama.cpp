@@ -54,7 +54,17 @@ and corrupt concurrent measurements).
    coherent STATIC, tier-0 predicted 10.89 vs measured 10.87 (0.2%!), auto prompt
    21.7 -> 46.6 t/s (+115%), within ~10% of forced-s3. A/B-vs-stock cell rides
    the held grid-class runs.
-5. **ALTERNATE adjudication (user question)** - after the full grid rerun under the
+5. **Slot carve-out follow-up (per-slot fence redesign)** - infrastructure landed
+   opt-in (GGML_SLOT_REGIONS=1): weight slots allocate in dedicated per-backend
+   regions (dump: 45602 slot-vs-activation overlaps -> 0). The narrowed per-bid
+   fence was UNSOUND (one-split race on same-shard slot reuse -> degenerate output,
+   caught by hash gate) and is reverted to the conservative fence; perf therefore
+   baseline-equal, VRAM +0.5-1GB per streamed config when enabled (why opt-in).
+   Next attempt: address-keyed per-slot events - slot reuse is a strict 3-address
+   rotation per shard (gate/up/down classes), so 3 events/bid keyed by slot address
+   suffice; also audit writeback-staging cross-eval ordering, the suspected real
+   hole. The reserve_n_size caller-array overrun fix and the fold are always-on.
+6. **ALTERNATE adjudication (user question)** - after the full grid rerun under the
    fixed predictor + ids-cross: does s4 ever win a cell against re-planned s1/s3?
    If auto never picks it and forced-s4 never beats the best alternative, ALTERNATE
    earns retirement from the decode tiers (stays as a prefill design point).
