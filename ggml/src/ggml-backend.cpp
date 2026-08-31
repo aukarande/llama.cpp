@@ -848,17 +848,6 @@ struct ggml_backend_sched {
     ggml_backend_t       copy_backends[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS];
 
-    // dedicated slot regions: weight input-copies allocate through per-backend wrapper
-    // buffer types so galloc's dedup-by-buft cannot alias slot bytes with activations.
-    // galloc_bufts = [ bufts[0..n) | slot wrappers[0..n) ]; alloc id (backend_id + n)
-    // selects the slot region for backend_id.
-    struct ggml_backend_buffer_type slot_buft_objs[GGML_SCHED_MAX_BACKENDS];
-    ggml_backend_buffer_type_t      galloc_bufts[2 * GGML_SCHED_MAX_BACKENDS];
-
-    // per-backend "last consumer of this backend's slots finished" marker: lets the
-    // prefetch copy fence on ONE split instead of all prior compute (real overlap)
-    ggml_backend_event_t slot_release_events[GGML_SCHED_MAX_BACKENDS];
-    bool                 slot_release_recorded[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_event_t compute_events[GGML_SCHED_MAX_BACKENDS];
 
     // GGML_ASYNC_HANDOFF=1: pinned staging for device->host input handoffs, so the
@@ -1704,14 +1693,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             graph_copy->nodes[graph_copy->n_nodes++] = input_dep;
 
 
-            // add a dependency to the input copy so that it is allocated at the start of the
-            // split. Streamed-weight copies allocate in the backend's dedicated SLOT region
-            // so their bytes can never alias activations (prereq for per-slot fencing).
-            const bool is_weight_slot = getenv("GGML_SLOT_REGIONS") != NULL && input->buffer != NULL &&
-                ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                ggml_backend_buffer_is_host(input->buffer);
-            sched->node_backend_ids[graph_copy->n_nodes] =
-                is_weight_slot ? split->backend_id + sched->n_backends : split->backend_id;
+            // add a dependency to the input copy so that it is allocated at the start of the split
+            sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
             graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
         }
 
@@ -1805,13 +1788,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             for (int j = 0; j < split->n_inputs; j++) {
                 struct ggml_tensor * input = split->inputs[j];
                 size_t id = hash_id(input);
-                const bool is_weight_slot = getenv("GGML_SLOT_REGIONS") != NULL && input->buffer != NULL &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer);
                 for (int c = 0; c < sched->n_copies; c++) {
                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
-                    sched->leaf_backend_ids[graph_copy->n_leafs] =
-                        is_weight_slot ? backend_id + sched->n_backends : backend_id;
+                    sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
                     assert(graph_copy->size > graph_copy->n_leafs);
                     graph_copy->leafs[graph_copy->n_leafs++] = input_cpy;
                 }
@@ -1837,7 +1816,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
-            sched->galloc_bufts[sched->node_backend_ids[i]] != sched->galloc_bufts[sched->prev_node_backend_ids[i]]) {
+            sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
             break;
         }
@@ -1845,7 +1824,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     if (!backend_ids_changed) {
         for (int i = 0; i < sched->graph.n_leafs; i++) {
             if (sched->leaf_backend_ids[i] != sched->prev_leaf_backend_ids[i] &&
-                sched->galloc_bufts[sched->leaf_backend_ids[i]] != sched->galloc_bufts[sched->prev_leaf_backend_ids[i]]) {
+                sched->bufts[sched->leaf_backend_ids[i]] != sched->bufts[sched->prev_leaf_backend_ids[i]]) {
                 backend_ids_changed = true;
                 break;
             }
@@ -2107,10 +2086,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // and N+2's slot bytes are typically N's own slot (verified: narrowed fence
             // produced degenerate output on streamed cells). A sound per-slot fence needs
             // previous-same-bytes-tenant tracking - future work.
-            // GGML_SLOT_FENCE_OFF=1: timing-only probe, skips the reuse fence (UNSOUND -
-            // output is garbage; measures the upper bound of upload/compute overlap)
-            static const bool slot_fence_off = getenv("GGML_SLOT_FENCE_OFF") != NULL;
-            if (!slot_fence_off) {
+            // (probe result, q8d-s4: removing this fence entirely recovers nothing -
+            // the transfer/compute serialization is host-DRAM-bandwidth bound, so a
+            // finer-grained per-slot fence has no headroom either)
+            {
                 const int fence_bid = sched->redirect_target[next_gpu->backend_id];
                 if (fence_bid >= 0 && sched->compute_events[fence_bid] != NULL) {
                     ggml_backend_event_wait(next_copy, sched->compute_events[fence_bid]);
@@ -2544,37 +2523,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
-// ---- slot-region wrapper buffer type: forwards everything to the wrapped buft, but
-// its distinct identity keeps galloc from merging slot allocations with activations ----
-static const char * ggml_backend_slot_buft_get_name(ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(buft);
-    return "SlotRegion";
-}
-static ggml_backend_buffer_t ggml_backend_slot_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    return ggml_backend_buft_alloc_buffer((ggml_backend_buffer_type_t) buft->context, size);
-}
-static size_t ggml_backend_slot_buft_get_alignment(ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_get_alignment((ggml_backend_buffer_type_t) buft->context);
-}
-static size_t ggml_backend_slot_buft_get_max_size(ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_get_max_size((ggml_backend_buffer_type_t) buft->context);
-}
-static size_t ggml_backend_slot_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
-    return ggml_backend_buft_get_alloc_size((ggml_backend_buffer_type_t) buft->context, tensor);
-}
-static bool ggml_backend_slot_buft_is_host(ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host((ggml_backend_buffer_type_t) buft->context);
-}
-static const struct ggml_backend_buffer_type_i ggml_backend_slot_buft_iface = {
-    /* .get_name       = */ ggml_backend_slot_buft_get_name,
-    /* .alloc_buffer   = */ ggml_backend_slot_buft_alloc_buffer,
-    /* .get_alignment  = */ ggml_backend_slot_buft_get_alignment,
-    /* .get_max_size   = */ ggml_backend_slot_buft_get_max_size,
-    /* .get_alloc_size = */ ggml_backend_slot_buft_get_alloc_size,
-    /* .is_host        = */ ggml_backend_slot_buft_is_host,
-};
-
-
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -2650,8 +2598,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->copy_backends[i] = NULL;
         sched->copy_events[i] = NULL;
         sched->compute_events[i] = NULL;
-        sched->slot_release_events[i] = NULL;
-        sched->slot_release_recorded[i] = false;
         sched->handoff_staging[i] = NULL;
         sched->handoff_staging_size[i] = 0;
         ggml_backend_dev_t dev_i = ggml_backend_get_device(backends[i]);
@@ -2672,21 +2618,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
             sched->copy_backends[i]  = ggml_backend_dev_init(dev_i, NULL);
             sched->copy_events[i]    = ggml_backend_event_new(dev_i);
             sched->compute_events[i] = ggml_backend_event_new(dev_i);
-            sched->slot_release_events[i] = ggml_backend_event_new(dev_i);
         }
     }
 
-    // dedicated slot regions: galloc separates allocators by buft identity, so give the
-    // weight input-copies per-backend wrapper bufts (distinct pointers over the same
-    // device memory). Ids [0..n) = shared activation pools, [n..2n) = slot regions.
-    for (int i = 0; i < n_backends; i++) {
-        sched->galloc_bufts[i] = sched->bufts[i];
-        sched->slot_buft_objs[i].iface   = ggml_backend_slot_buft_iface;
-        sched->slot_buft_objs[i].device  = sched->bufts[i]->device;
-        sched->slot_buft_objs[i].context = (void *) sched->bufts[i];
-        sched->galloc_bufts[n_backends + i] = &sched->slot_buft_objs[i];
-    }
-    sched->galloc = ggml_gallocr_new_n(sched->galloc_bufts, 2 * n_backends);
+    sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
 
     ggml_backend_sched_reset(sched);
@@ -2704,7 +2639,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
         ggml_backend_event_free(sched->copy_events[b]);
         ggml_backend_event_free(sched->compute_events[b]);
-        ggml_backend_event_free(sched->slot_release_events[b]);
         if (sched->handoff_staging[b] != NULL) {
             ggml_backend_buffer_free(sched->handoff_staging[b]);
         }
@@ -2759,15 +2693,7 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
-    // the galloc has one entry per backend PLUS one slot region per backend, but the
-    // caller's sizes[] is per-backend: gather into a 2n scratch and fold each backend's
-    // slot region into its activation entry (writing 2n entries into the caller's array
-    // was a heap overrun - STATUS_HEAP_CORRUPTION at teardown)
-    size_t all_sizes[2 * GGML_SCHED_MAX_BACKENDS] = { 0 };
-    ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, all_sizes);
-    for (int i = 0; i < sched->n_backends; i++) {
-        sizes[i] = all_sizes[i] + all_sizes[sched->n_backends + i];
-    }
+    ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -2861,9 +2787,6 @@ void ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool en
                 sched->copy_backends[b]  = ggml_backend_dev_init(dev, NULL);
                 sched->copy_events[b]    = ggml_backend_event_new(dev);
                 sched->compute_events[b] = ggml_backend_event_new(dev);
-                if (sched->slot_release_events[b] == NULL) {
-                    sched->slot_release_events[b] = ggml_backend_event_new(dev);
-                }
             }
         }
     } else {
@@ -2872,9 +2795,6 @@ void ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool en
             sched->copy_events[b] = NULL;
             ggml_backend_event_free(sched->compute_events[b]);
             sched->compute_events[b] = NULL;
-            ggml_backend_event_free(sched->slot_release_events[b]);
-            sched->slot_release_events[b] = NULL;
-            sched->slot_release_recorded[b] = false;
             if (sched->copy_backends[b] != NULL) {
                 ggml_backend_free(sched->copy_backends[b]);
                 sched->copy_backends[b] = NULL;
@@ -3092,9 +3012,7 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
-    // activation pool + this backend's dedicated slot region
-    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index)
-         + ggml_gallocr_get_buffer_size(sched->galloc, sched->n_backends + backend_index);
+    return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
