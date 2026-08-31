@@ -1952,6 +1952,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         free(buf);
     };
 
+    // GGML_SCHED_DUMP_ALLOC=1: one-shot dump of every weight-slot (input copy) and node
+    // allocation range, for offline overlap analysis of slot bytes vs activation bytes
+    {
+        static bool dump_alloc = getenv("GGML_SCHED_DUMP_ALLOC") != nullptr;
+        if (dump_alloc) {
+            dump_alloc = false;  // once per process
+            for (int i = 0; i < sched->n_splits; i++) {
+                struct ggml_backend_sched_split * sp = &splits[i];
+                for (int j = 0; j < sp->n_inputs; j++) {
+                    struct ggml_tensor * inp = sp->inputs[j];
+                    struct ggml_tensor * cp  = tensor_copy(inp, sp->backend_id, sched->cur_copy);
+                    if (cp == NULL || cp->data == NULL) continue;
+                    const bool w = inp->buffer != NULL &&
+                        ggml_backend_buffer_get_usage(inp->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                    GGML_LOG_INFO("sched_alloc: %s split=%d bid=%d %p %zu %s\n",
+                        w ? "SLOT" : "ICPY", i, sp->backend_id, cp->data, ggml_nbytes(cp), inp->name);
+                }
+                for (int j = 0; j < sp->graph.n_nodes; j++) {
+                    struct ggml_tensor * t = sp->graph.nodes[j];
+                    if (t->data == NULL || t->view_src != NULL) continue;
+                    if (t->buffer != NULL &&
+                        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) continue;
+                    GGML_LOG_INFO("sched_alloc: NODE split=%d bid=%d %p %zu %s\n",
+                        i, sp->backend_id, t->data, ggml_nbytes(t), t->name);
+                }
+            }
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
