@@ -1921,6 +1921,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // host-side phase timing (GGML_SCHED_TIMING=1): totals per compute_splits call, in us
     static const bool sched_timing = getenv("GGML_SCHED_TIMING") != nullptr;
     int64_t tt_redirect = 0, tt_inputs = 0, tt_precomp = 0, tt_prefetch = 0, tt_launch = 0, tt_postcomp = 0;
+    // per-callsite host-blocking attribution (which exact sync eats the wall time)
+    int64_t tt_s_prev = 0, tt_s_flagin = 0, tt_s_wait = 0, tt_s_sliced = 0, tt_s_cpy = 0, tt_s_post = 0;
+    int64_t tt_c_flagin = 0, tt_c_fallback = 0, tt_c_setasync = 0, tt_c_slicedcp = 0;
+    #define SCHED_SYNC_TIMED(acc, stmt) do {         const int64_t ts_ = sched_timing ? ggml_time_us() : 0;         stmt;         if (sched_timing) (acc) += ggml_time_us() - ts_;     } while (0)
     int nn_redirected = 0, nn_prefetched = 0;
     const int64_t tt_start = sched_timing ? ggml_time_us() : 0;
 
@@ -2013,9 +2017,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+                SCHED_SYNC_TIMED(tt_s_prev, ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]));
             } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                SCHED_SYNC_TIMED(tt_s_prev, ggml_backend_synchronize(sched->backends[prev_backend_id]));
             }
         }
 
@@ -2139,17 +2143,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    SCHED_SYNC_TIMED(tt_s_flagin, ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]));
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    SCHED_SYNC_TIMED(tt_s_flagin, ggml_backend_synchronize(split_backend));
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                SCHED_SYNC_TIMED(tt_c_flagin, ggml_backend_tensor_copy(input, input_cpy));
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    SCHED_SYNC_TIMED(tt_s_wait, ggml_backend_synchronize(split_backend));
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -2162,7 +2166,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    ggml_backend_synchronize(input_backend);
+                    SCHED_SYNC_TIMED(tt_s_sliced, ggml_backend_synchronize(input_backend));
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -2181,7 +2185,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                        SCHED_SYNC_TIMED(tt_s_sliced, ggml_backend_synchronize(ids_backend));
 
                         // find the used experts
                         used_ids.clear();
@@ -2238,25 +2242,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         first_id = id;
                         last_id = id;
                     }
-                    copy_experts(first_id, last_id);
+                    SCHED_SYNC_TIMED(tt_c_slicedcp, copy_experts(first_id, last_id));
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     bool copied = split_backend->iface.cpy_tensor_async &&
                         split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
                     if (!copied) {
-                        ggml_backend_synchronize(input_backend);
+                        SCHED_SYNC_TIMED(tt_s_cpy, ggml_backend_synchronize(input_backend));
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                            SCHED_SYNC_TIMED(tt_s_cpy, ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]));
                         } else {
-                            ggml_backend_synchronize(split_backend);
+                            SCHED_SYNC_TIMED(tt_s_cpy, ggml_backend_synchronize(split_backend));
                         }
                         if (sched->has_redirects && input->data != NULL &&
                             ggml_backend_buffer_is_host(input->buffer)) {
-                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                            SCHED_SYNC_TIMED(tt_c_setasync, ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input)));
                             ggml_backend_sched_zero_copy_padding(split_backend, input_cpy);
                         } else {
-                            ggml_backend_tensor_copy(input, input_cpy);
+                            // device->host handoff. NOTE (measured, q8d-s4): this synchronous copy
+                            // is a device-wide barrier and each call drains ~one queued streamed-
+                            // weight upload (~5 ms). A stream-scoped async get on input_backend is
+                            // UNSOUND here (produces wrong output): the producer may be a different
+                            // pipe-shard backend, so input_backend's stream is not the producer's.
+                            SCHED_SYNC_TIMED(tt_c_fallback, ggml_backend_tensor_copy(input, input_cpy));
                         }
                     }
                 }
@@ -2416,7 +2425,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // post-compute: download stateful cache (KV/RS) for WRITEBACK tensors in this split
         const int64_t t_wb0 = sched_timing ? ggml_time_us() : 0;
         if (sched->split_post_compute != NULL && split->n_writeback > 0) {
-            ggml_backend_synchronize(split_backend);
+            SCHED_SYNC_TIMED(tt_s_post, ggml_backend_synchronize(split_backend));
             for (int w = 0; w < split->n_writeback; w++) {
                 sched->split_post_compute(split->writeback[w], split_backend, sched->split_cb_user_data);
             }
@@ -2444,6 +2453,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             sched->n_splits, nn_redirected, nn_prefetched, (long long)(ggml_time_us() - tt_start),
             (long long)tt_redirect, (long long)tt_inputs, (long long)tt_precomp,
             (long long)tt_prefetch, (long long)tt_launch, (long long)tt_postcomp);
+        GGML_LOG_INFO("sched_copy: flagin_cpy=%lld fallback_cpy=%lld set_async=%lld sliced_cpy=%lld us\n",
+            (long long)tt_c_flagin, (long long)tt_c_fallback, (long long)tt_c_setasync, (long long)tt_c_slicedcp);
+        GGML_LOG_INFO("sched_sync: prev=%lld flag_in=%lld else_wait=%lld sliced=%lld cpy_fallback=%lld postcomp=%lld us\n",
+            (long long)tt_s_prev, (long long)tt_s_flagin, (long long)tt_s_wait,
+            (long long)tt_s_sliced, (long long)tt_s_cpy, (long long)tt_s_post);
     }
 
     return GGML_STATUS_SUCCESS;
