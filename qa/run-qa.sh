@@ -62,7 +62,7 @@ FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -
 MODELS_LIST="q35:Qwen3.6-35B-A3B-UD-Q4_K_M oss:gpt-oss-20b-Q4_0 q8d:Qwen3.6-27B-Q8_0"
 if [ "$GRID" = "full" ]; then
     CTX_LIST="2048 16384"
-    MVA_LIST="2000 4000 8000 12000"
+    MVA_LIST="4000 12000"
     STRAT_LIST="auto 0 1 2 3 4"
 else
     CTX_LIST="2048"
