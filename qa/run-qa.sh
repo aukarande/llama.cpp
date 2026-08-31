@@ -188,30 +188,31 @@ for MDL in $MODELS_LIST; do
                     # placement reproduces pshard's PPL to 5 digits (3440.80 vs 3440.82).
                     CH=8; [ "$CTX" -ge 16384 ] && CH=2
                     PPLC="$PROMPTS/prompt-256k.txt"
-                    # run the PSHARD side FIRST at its natural shape (the runtime resets
-                    # batch/ubatch to the plan cache's cache_ubatch, so forcing a ubatch
-                    # from here is unreliable), then mirror stock to the ACTUAL eval shape
-                    # and the executing tier's placement. Shape AND placement must both
-                    # match: different matmul shapes alone drift logits enough to fail the
-                    # 0.5% gate on placement-hypersensitive models (gpt-oss raw-text PPL).
+                    # run the PSHARD side FIRST (verbose: the mirror needs its EXECUTED
+                    # prefill tier), then mirror stock to the actual executed config.
+                    # Three deltas proven to matter (gpt-oss@16k certified to 5 digits
+                    # once all matched, 39368.10 vs 39367.59): the executed tier's
+                    # placement class, its ubatch, and SWA cache sizing (pshard allocates
+                    # the full SWA cache; stock defaults to window+batch - that alone was
+                    # a 2.6% PPL delta on gpt-oss@16k).
                     if [ "$STRAT" = "auto" ]; then
                         ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
-                            -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
+                            -pshard -mva "$MVA" -v > "$OUT/ppl_pshard_$CFG.log" 2>&1
                     else
                         env PSHARD_STRATEGY=$STRAT ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
-                            -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
+                            -pshard -mva "$MVA" -v > "$OUT/ppl_pshard_$CFG.log" 2>&1
                     fi
                     PP_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_pshard_$CFG.log" | grep -aoE "[0-9.]+$")
-                    # mirror stock at the gen run's EFFECTIVE prefill tier (bs=PUB). Known
-                    # residual: the pshard perplexity process selects its own n_batch
-                    # (cache_ubatch of ITS registry variant) and executing tier, which can
-                    # differ from PUB; on gpt-oss@16k this leaves ~3% PPL residual (see
-                    # pending-verification: oss-16k parity calibration). Do NOT key on the
-                    # ppl log's batch_size= - that is n_batch, not the executing tier.
-                    PB=${PUB:-$CUB}
+                    # executed prefill ubatch + the strategy that actually ran at it
+                    PB=$(grep -aoE "pshard_prefill_ubatch_eff=[0-9]+" "$OUT/ppl_pshard_$CFG.log" | head -1 | cut -d= -f2)
+                    [ -z "$PB" ] && PB=${PUB:-$CUB}
+                    SPP=$(grep -a "pshard_apply_plan: strategy=" "$OUT/ppl_pshard_$CFG.log" | grep -a "bs=$PB " | tail -1 | grep -aoE "strategy=[A-Z_]+" | cut -d= -f2)
                     STOCK_PPL_ARGS="-fitt $FITT"
-                    SPP=$(grep -aA1 "bs=$PB\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "strategy=[A-Z_]+" | tail -1 | cut -d= -f2)
                     case "$SPP" in
+                      GPUONLY_*)
+                        # streamed weights compute on the GPU: math == fully resident
+                        STOCK_PPL_ARGS="-ngl 99"
+                        ;;
                       DYNAMIC_FFNCPU*|DYNAMIC_FFN_ALTERNATE|STATIC_ATTNPRIO_ALLMODELS)
                         # CPU-delegate + static-split strategies: give stock the same expert
                         # placement (MoE models; dense placements have no _exps match and
@@ -233,8 +234,9 @@ for MDL in $MODELS_LIST; do
                         fi
                         ;;
                     esac
+                    # --swa-full: match pshard's full-size SWA cache (no-op for non-SWA)
                     ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
-                        $STOCK_PPL_ARGS -ub "$PB" -b "$PB" > "$OUT/ppl_stock_$CFG.log" 2>&1
+                        $STOCK_PPL_ARGS -ub "$PB" -b "$PB" --swa-full > "$OUT/ppl_stock_$CFG.log" 2>&1
                     PS_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_stock_$CFG.log" | grep -aoE "[0-9.]+$")
                     if [ -n "$PS_" ] && [ -n "$PP_" ] &&                        awk -v a="$PS_" -v b="$PP_" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d <= 0.005*a)}'; then
                         ST=TOKEN_DIVERGED_PPL_OK

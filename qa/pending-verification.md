@@ -37,8 +37,8 @@ and corrupt concurrent measurements).
 1. **Full 144-grid rerun** - restart FRESH (plans changed under items 5/1/7 +
    DSA fix; the 42 pre-change rows are stale): `sh qa/run-qa.sh /tmp/qa-full-v3 full`.
    Then compare-qa vs reference, refresh ledger (schema v2), commit, push.
-2. **Nemotron full slice** - from scratch: `QA_MODELS_LIST="nem:nvidia_Nemotron-3-Nano-30B-A3B-Q4_0" ...`
-   Seeds the nem reference rows.
+2. ~~Nemotron full slice~~ **REMOVED 2026-08-31** (user): subsumed by the full
+   grid rerun, which includes nem.
 3. ~~Switch-cost behavioral check~~ **VERIFIED 2026-08-31**: switch_ms fields
    populated (0 for tier-0, 83-105ms for residency deltas); prompt-1500 -> ub 2048
    and prompt-16k -> ub 8192 both hand-verify as argmin of n_iters*ts/tps +
@@ -87,17 +87,22 @@ and corrupt concurrent measurements).
    auto 18.5 -> 29.0 (+58%, new attn=24 plan); oss-16k-4000 control 36.2 ~= 35.0.
    NOTE: qa-full-v3's 81 grid rows are STALE (planner + N_GEN + gate all changed);
    the full grid needs a fresh restart on the fixed stack.
-8. **oss-16k PPL parity calibration (OPEN)** - with 256-token windows the token
-   hashes diverge routinely, so the PPL gate now decides; on gpt-oss@16k the
-   stock mirror still misses by ~3% (39.5k vs 38.4k at best construction).
-   Forensics: pshard's perplexity process selects its own n_batch (its variant's
-   cache_ubatch, seen 8192 AND 16384) and executing tier, which need not be the
-   gen run's PUB tier; mirroring the wrong tier (bs=8192 = ATTNPIN) gave 90k.
-   Evidence the plans are fine: pshard PPL is plan-invariant to 0.5% (np=0 vs
-   np=5: 39570 vs 39367) and deterministic across rounds. Fix direction: verbose
-   PPL run to capture the executed tier + force both sides to one exact
-   (ubatch, placement) pair, targeting the 5-digit parity proven at 2k. Until
-   then, oss 16k PPL_MISMATCH rows need manual adjudication.
+8. ~~oss-16k PPL parity calibration~~ **MOSTLY CLOSED 2026-08-31**: gate now
+   mirrors the pshard PPL run's ACTUAL executed config (verbose pshard side ->
+   parse prefill_ubatch_eff + apply_plan tier; GPUONLY_* tiers -> plain -ngl 99,
+   CPU-delegate tiers -> exps=CPU list; stock always gets --swa-full + matched
+   -ub). Certified: ATTNPIN@4096 mirror agrees to FIVE DIGITS (39368.10 vs
+   39367.59); oss-16k-mva4000 formally TOKEN_DIVERGED_PPL_OK. Root causes were
+   (a) executed-tier visibility, (b) executed ubatch, (c) SWA cache sizing
+   (pshard allocates full SWA cache, stock defaults window+batch = 2.6% alone).
+8b. **RESIDUAL (narrow, OPEN)**: tight-budget cells whose executed prefill tier
+   is LAYERSTREAM (streamed ATTENTION weights): oss-16k-mva2000 sits 0.51% over
+   the certified all-GPU mirror (39570.7748 vs 39368.0990, deterministic;
+   n_batch ruled out - b=8192 mirror is bit-identical to b=4096). Suspects:
+   streamed-attn slot-upload numerics or host-side KV at tight budget; needs
+   logit-level bisection. Manual adjudication meanwhile: the pshard value is
+   deterministic - compare against the recorded reference (39570.7748 for this
+   cell); reproduction = benign, drift = real.
 7. **Selector-gap audit (2026-08-31, grid stopped at 81 rows for this)** - verified
    findings from the q35/oss slice (workflow-verified, 3 adversarial lenses):
    (a) BENCH ARTIFACT: 31-token decode window swallows the prefill->decode
