@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -69,6 +70,38 @@ struct llama_benchmark_stats {
     // pricing them by memory bandwidth alone under-charges 10-20x, so the fallback
     // uses max(bytes/bw, ops/this) as a conservative compute floor.
     double cpu_matmul_floor_gflops = 0.0;
+
+    // gathered-slice upload bandwidth curve (from cpu profiler header, measured under
+    // concurrent CPU memory load): effective host->device BW for small strided chunks.
+    // Sliced expert uploads (0.3-13 MB per expert) run far below peak PCIe; pricing
+    // them at peak over-predicted sliced strategies by 10-24% (selector-gap audit).
+    static constexpr int    n_sliced_bw = 4;
+    static constexpr double sliced_bw_chunk_mb[n_sliced_bw] = { 0.5, 2.0, 8.0, 32.0 };
+    double sliced_bw[n_sliced_bw] = { 0.0, 0.0, 0.0, 0.0 };
+
+    // interpolated gathered-upload BW for a chunk size; falls back to the measured
+    // concurrent rate (eff_pcie_bw), then peak, when the curve is not in the profile
+    double slice_bw(double chunk_bytes) const {
+        if (sliced_bw[0] <= 0.0) {
+            return eff_pcie_bw > 0.0 ? eff_pcie_bw : peak_pcie_bw;
+        }
+        const double mb = chunk_bytes / (1024.0 * 1024.0);
+        if (mb <= sliced_bw_chunk_mb[0]) {
+            return sliced_bw[0];
+        }
+        for (int i = 1; i < n_sliced_bw; i++) {
+            if (sliced_bw[i] <= 0.0) {
+                return sliced_bw[i - 1];
+            }
+            if (mb <= sliced_bw_chunk_mb[i]) {
+                // log-linear in chunk size (bandwidth ramps with transfer size)
+                const double t = (std::log(mb) - std::log(sliced_bw_chunk_mb[i - 1])) /
+                                 (std::log(sliced_bw_chunk_mb[i]) - std::log(sliced_bw_chunk_mb[i - 1]));
+                return sliced_bw[i - 1] + t * (sliced_bw[i] - sliced_bw[i - 1]);
+            }
+        }
+        return sliced_bw[n_sliced_bw - 1];
+    }
 };
 
 // Aggregate timing prediction for a set of graph nodes (typically one sched split).

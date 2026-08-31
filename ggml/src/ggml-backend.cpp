@@ -2930,6 +2930,7 @@ bool ggml_backend_sched_get_split_info(
     out->input_weight_bytes          = 0;
     out->input_weight_copy_bytes     = 0;
     out->input_weight_sliced_bytes   = 0;
+    out->input_weight_sliced_chunk_bytes = 0;
     out->input_weight_prefetch_bytes = 0;
     out->input_activ_bytes           = 0;
     for (int j = 0; j < s->n_inputs; j++) {
@@ -2945,6 +2946,14 @@ bool ggml_backend_sched_get_split_info(
                 const size_t sliced = sliced_weight_copy_bytes(inp, inp_cpy);
                 out->input_weight_copy_bytes   += sliced;
                 out->input_weight_sliced_bytes += sliced;
+                // per-expert granularity: the runtime uploads one contiguous run of
+                // used experts per copy; consecutive hits are rare at low top-k, so
+                // one expert per transfer is the representative chunk size
+                const size_t chunk = inp->ne[2] > 0 ? inp->nb[2] : sliced;
+                if (chunk > 0 && (out->input_weight_sliced_chunk_bytes == 0 ||
+                                  chunk < out->input_weight_sliced_chunk_bytes)) {
+                    out->input_weight_sliced_chunk_bytes = chunk;
+                }
             } else {
                 out->input_weight_copy_bytes     += full;
                 out->input_weight_prefetch_bytes += full;

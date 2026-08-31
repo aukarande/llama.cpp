@@ -294,6 +294,14 @@ struct llama_pshard_tier_prune {
             }
         }
     }
+
+    // an attn-pin bound proven at a larger batch is INVALID at bs=1: activation
+    // scratch shrinks ~350x between bs=8192 and bs=1, so far more attention fits.
+    // (q35-16k-mva2000: inherited hi_attn=11 hid the attn=40 STATIC winner, 12.1
+    // vs 29.6 predicted tps.) Search the decode tier with a fresh bound.
+    uint32_t attn_hint(uint32_t n_batch) const {
+        return n_batch <= 1 ? UINT32_MAX : hi_attn;
+    }
 };
 
 static llama_pshard_plan llama_pshard_search_strategy(
@@ -1486,7 +1494,7 @@ static llama_pshard_plan llama_pshard_search_tier(
 
         if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
             strategy == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
-            plan = llama_pshard_search_attn_pin(ctx, strategy, prune.hi_attn, prune.hi_pinned[s]);
+            plan = llama_pshard_search_attn_pin(ctx, strategy, prune.attn_hint(cparams->n_batch), prune.hi_pinned[s]);
         } else {
             plan = llama_pshard_search_strategy(ctx, strategy, prune.hi_pinned[s]);
         }
@@ -1497,7 +1505,7 @@ static llama_pshard_plan llama_pshard_search_tier(
             llama_pshard_plan p2;
             if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
                 strategy == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
-                p2 = llama_pshard_search_attn_pin(ctx, strategy, prune.hi_attn, prune.hi_pinned[s],
+                p2 = llama_pshard_search_attn_pin(ctx, strategy, prune.attn_hint(cparams->n_batch), prune.hi_pinned[s],
                         0, /*overlap=*/false);
             } else {
                 p2 = llama_pshard_search_strategy(ctx, strategy, prune.hi_pinned[s],
@@ -1542,7 +1550,7 @@ static llama_pshard_plan llama_pshard_search_tier(
         llama_pshard_plan forced_noovl;
         if (force_strategy == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
             forced_noovl = llama_pshard_search_attn_pin(ctx, (llama_pshard_strategy)force_strategy,
-                    prune.hi_attn, UINT32_MAX, 0, /*overlap=*/false);
+                    prune.attn_hint(cparams->n_batch), UINT32_MAX, 0, /*overlap=*/false);
         } else {
             forced_noovl = llama_pshard_search_strategy(ctx, (llama_pshard_strategy)force_strategy,
                     UINT32_MAX, 0, /*overlap=*/false);
@@ -1553,7 +1561,7 @@ static llama_pshard_plan llama_pshard_search_tier(
             return forced_noovl;
         }
         llama_pshard_plan fallback = llama_pshard_attn_pin_fallback(
-            ctx, force_strategy, prune.hi_attn, prune.hi_pinned[LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS]);
+            ctx, force_strategy, prune.attn_hint(cparams->n_batch), prune.hi_pinned[LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS]);
         prune.update(LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS, fallback);
         if (fallback.is_viable) {
             best = fallback;
@@ -1612,9 +1620,9 @@ static void llama_pshard_strategy_sweep(
 
             if (strat == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
                 strat == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
-                plan = llama_pshard_search_attn_pin(ctx, strat, prune.hi_attn, UINT32_MAX, lo_hint);
+                plan = llama_pshard_search_attn_pin(ctx, strat, prune.attn_hint(cp_tier.n_batch), UINT32_MAX, lo_hint);
                 if (!plan.is_viable && !llama_pshard_strategy_delegates_compute(strat)) {
-                    llama_pshard_plan p2 = llama_pshard_search_attn_pin(ctx, strat, prune.hi_attn,
+                    llama_pshard_plan p2 = llama_pshard_search_attn_pin(ctx, strat, prune.attn_hint(cp_tier.n_batch),
                             UINT32_MAX, lo_hint, /*overlap=*/false);
                     if (p2.is_viable) { plan = p2; }
                 }

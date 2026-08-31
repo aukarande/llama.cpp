@@ -398,6 +398,7 @@ extern "C" {
         size_t               input_weight_bytes;          // full size of all host-weight inputs
         size_t               input_weight_copy_bytes;     // consume-time copy estimate (sliced experts + full others)
         size_t               input_weight_sliced_bytes;   // consume-time sliced-expert copies only (still paid when prefetched)
+        size_t               input_weight_sliced_chunk_bytes; // per-expert slice granularity (min across sliced tensors; 0 = none)
         size_t               input_weight_prefetch_bytes; // what the prefetch pass would move (excludes sliced-eligible experts)
         size_t               input_activ_bytes;
         size_t               writeback_bytes;             // total (kv + rs)

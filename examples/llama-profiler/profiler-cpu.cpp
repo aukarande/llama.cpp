@@ -115,6 +115,69 @@ static void pcie_stress_loop(pcie_stress_ctx * pcie) {
     pcie->active.store(false, std::memory_order_release);
 }
 
+// gathered-slice upload bandwidth: many small strided host->device chunks per burst
+// (mirrors the runtime's sliced-by-used-ids expert copies: ~top-k experts x 3 expert
+// tensors enqueued back-to-back, one synchronize per split), measured under
+// concurrent CPU DRAM load (decode runs the CPU FFN while slices upload). Small
+// chunks run far below peak PCIe; the predictor interpolates this curve to price
+// sliced uploads (pricing them at peak mis-ranked 6 of 14 audited cells).
+static void calibrate_pcie_sliced(pcie_stress_ctx * pcie, int threads, double sliced_bw[4]) {
+    static const double chunk_mb[4] = { 0.5, 2.0, 8.0, 32.0 };
+    printf("Calibrating gathered-slice upload bandwidth (concurrent CPU load)...\n");
+
+    std::atomic<bool> stress_stop{false};
+    const size_t pool_bytes = 512ULL * 1024 * 1024;
+    std::vector<uint8_t> pool(pool_bytes);
+    for (size_t i = 0; i < pool.size(); i += 4096) {
+        pool[i] = (uint8_t)(i & 0xFF);
+    }
+    std::vector<std::thread> workers;
+    const int n_stress = std::max(1, threads - 1);  // leave one core for the enqueue thread
+    for (int tid = 0; tid < n_stress; ++tid) {
+        workers.emplace_back([&pool, &stress_stop, tid, n_stress, pool_bytes]() {
+            const size_t chunk = pool_bytes / n_stress;
+            const size_t start = tid * chunk;
+            const size_t limit = start + chunk - sizeof(uint64_t);
+            volatile uint64_t sink = 0;
+            while (!stress_stop.load(std::memory_order_acquire)) {
+                for (size_t off = start; off + 64 <= limit; off += 64) {
+                    sink += *(const uint64_t *)(pool.data() + off);
+                }
+            }
+            (void)sink;
+        });
+    }
+
+    for (int c = 0; c < 4; c++) {
+        const size_t chunk  = (size_t)(chunk_mb[c] * 1024.0 * 1024.0);
+        const int    burst  = 24;                      // ~ top-k(8) experts x gate/up/down
+        const size_t stride = chunk + 1024 * 1024;     // gathered: non-adjacent sources
+        const size_t span   = pcie->transfer_size - chunk;
+        const int    iters  = std::max(2, (int)(3.0e9 / ((double)burst * chunk)));
+        bench_timer t;
+        t.start();
+        double bytes = 0.0;
+        for (int it = 0; it < iters; ++it) {
+            for (int b = 0; b < burst; b++) {
+                const size_t off = ((size_t)(it * burst + b) * stride) % span;
+                ggml_backend_tensor_set_async(pcie->gpu_backend, pcie->d_tensor,
+                    (const char *)pcie->h_tensor->data + off, off, chunk);
+            }
+            ggml_backend_synchronize(pcie->gpu_backend);
+            bytes += (double)burst * chunk;
+        }
+        const double elapsed = t.stop();
+        sliced_bw[c] = bytes / elapsed / 1e9;
+        printf("  %4.1fMB chunks: %.1f GB/s\n", chunk_mb[c], sliced_bw[c]);
+    }
+
+    stress_stop.store(true, std::memory_order_release);
+    for (auto & w : workers) {
+        w.join();
+    }
+    printf("\n");
+}
+
 static void calibrate_pcie(pcie_stress_ctx * pcie) {
     printf("Calibrating standalone PCIe bandwidth...\n");
     bench_timer t;
@@ -442,7 +505,7 @@ static void save_results_cpu(
         const std::vector<bench_result_cpu> & results,
         const std::vector<int32_t> & batch_sizes,
         int threads, double dram_bw, double pcie_standalone_bw, double pcie_concurrent_bw, double cpu_eff,
-        bool has_gpu) {
+        bool has_gpu, const double sliced_bw[4]) {
 
     FILE * f = fopen(path, "w");
     if (!f) { fprintf(stderr, "Failed to open %s for writing\n", path); return; }
@@ -456,6 +519,10 @@ static void save_results_cpu(
     if (has_gpu) {
         fprintf(f, "#   Threads=%d: DRAM_BW=%.1f GB/s, PCIe_Standalone=%.1f GB/s, PCIe_Concurrent=%.1f GB/s (CPU_Eff=%.1f%%)\n",
             threads, dram_bw, pcie_standalone_bw, pcie_concurrent_bw, cpu_eff);
+        if (sliced_bw != NULL && sliced_bw[0] > 0.0) {
+            fprintf(f, "#   PCIe_Sliced: 0.5MB=%.1f 2MB=%.1f 8MB=%.1f 32MB=%.1f GB/s\n",
+                sliced_bw[0], sliced_bw[1], sliced_bw[2], sliced_bw[3]);
+        }
     } else {
         fprintf(f, "#   Threads=%d: DRAM_BW=%.1f GB/s\n", threads, dram_bw);
     }
@@ -485,6 +552,7 @@ static void save_results_cpu(
 int main(int argc, char ** argv) {
     int32_t fixed_threads = -1;
     bool    fast_mode     = true;
+    bool    sliced_only   = false;
     const char * output_path = "cpu_profile.txt";
 
     for (int i = 1; i < argc; ++i) {
@@ -497,6 +565,8 @@ int main(int argc, char ** argv) {
             fast_mode = true;
         } else if (!strcmp(argv[i], "--full")) {
             fast_mode = false;
+        } else if (!strcmp(argv[i], "--sliced-only")) {
+            sliced_only = true;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [options]\n", argv[0]);
             printf("\n");
@@ -504,6 +574,8 @@ int main(int argc, char ** argv) {
             printf("  -h, --help\n");
             printf("  --fast              fast mode with fewer configs (default)\n");
             printf("  --full              full mode with all configs\n");
+            printf("  --sliced-only       run only the PCIe calibrations and print the\n");
+            printf("                      PCIe_Sliced header line (no table regeneration)\n");
             printf("  --threads <n>       number of CPU threads (default: auto)\n");
             printf("  --output <path>     output file (default: cpu_profile.txt)\n");
             return 0;
@@ -562,6 +634,25 @@ int main(int argc, char ** argv) {
     printf("  DRAM BW: %.1f GB/s\n", dram_bw);
     if (has_gpu) calibrate_pcie(&pcie);
 
+    double sliced_bw[4] = { 0.0, 0.0, 0.0, 0.0 };
+    if (has_gpu) calibrate_pcie_sliced(&pcie, threads, sliced_bw);
+
+    if (sliced_only) {
+        // print the exact header line for splicing into an existing profile
+        printf("PCIe_Sliced header line (paste into the profile header block):\n");
+        printf("#   PCIe_Sliced: 0.5MB=%.1f 2MB=%.1f 8MB=%.1f 32MB=%.1f GB/s\n",
+            sliced_bw[0], sliced_bw[1], sliced_bw[2], sliced_bw[3]);
+        if (has_gpu) {
+            if (pcie.ctx) ggml_free(pcie.ctx);
+            if (pcie.host_buf) ggml_backend_buffer_free(pcie.host_buf);
+            if (pcie.dev_buf) ggml_backend_buffer_free(pcie.dev_buf);
+            ggml_backend_free(pcie.gpu_backend);
+        }
+        ggml_backend_free(cpu_be);
+        ggml_quantize_free();
+        return 0;
+    }
+
     std::vector<bench_result_cpu> all_results;
     bench_timer overall;
     overall.start();
@@ -581,7 +672,7 @@ int main(int argc, char ** argv) {
     printf("\nTotal time: %.1f s, %zu benchmarks\n", overall.stop(), all_results.size());
 
     save_results_cpu(output_path, all_results, batch_sizes, threads, dram_bw,
-        pcie.calibrated_bw_gb_s, pcie_concurrent_bw, cpu_eff, has_gpu);
+        pcie.calibrated_bw_gb_s, pcie_concurrent_bw, cpu_eff, has_gpu, sliced_bw);
 
     if (has_gpu) {
         if (pcie.ctx) ggml_free(pcie.ctx);

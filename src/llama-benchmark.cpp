@@ -191,6 +191,15 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                 if (tc == n_threads) {
                     stats.peak_system_bw = dram_bw;
                 }
+            } else {
+                double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+                if (sscanf(line, "#   PCIe_Sliced: 0.5MB=%lf 2MB=%lf 8MB=%lf 32MB=%lf GB/s",
+                           &s0, &s1, &s2, &s3) == 4) {
+                    stats.sliced_bw[0] = s0;
+                    stats.sliced_bw[1] = s1;
+                    stats.sliced_bw[2] = s2;
+                    stats.sliced_bw[3] = s3;
+                }
             }
             continue;
         }
@@ -661,13 +670,24 @@ double llama_benchmark_predictor::predict_tps(
         double input_copy_bytes = 0.0;
         if (is_gpu && pcie_bw > 0.0) {
             // a prefetched split still pays its sliced-by-used-ids expert copies at
-            // consume time (the prefetch pass skips those tensors on purpose)
-            input_copy_bytes = copy_prefetched
-                ? (double)si.input_weight_sliced_bytes
-                : (double)si.input_weight_copy_bytes
+            // consume time (the prefetch pass skips those tensors on purpose).
+            // Sliced expert uploads are many small gathered transfers and run far
+            // below peak PCIe (measured 29.5 GB/s at 0.6MB chunks vs 45 peak);
+            // pricing them at peak over-predicted sliced strategies by 10-24% and
+            // mis-ranked 6 of 14 audited cells. Price the sliced share at the
+            // profiled chunk-size-dependent rate, the contiguous rest at peak.
+            const double sliced_bytes = (double)si.input_weight_sliced_bytes;
+            const double rest_bytes = copy_prefetched
+                ? 0.0
+                : std::max(0.0, (double)si.input_weight_copy_bytes - sliced_bytes)
                     + (double)si.writeback_kv_bytes * kv_ratio
                     + (double)si.writeback_rs_bytes;
-            input_copy_ms = (input_copy_bytes / 1e9 / pcie_bw) * 1000.0;
+            input_copy_bytes = sliced_bytes + rest_bytes;
+            const double sliced_bw = sliced_bytes > 0.0
+                ? stats.slice_bw((double)si.input_weight_sliced_chunk_bytes)
+                : pcie_bw;
+            input_copy_ms = (rest_bytes / 1e9 / pcie_bw) * 1000.0
+                          + (sliced_bw > 0.0 ? (sliced_bytes / 1e9 / sliced_bw) * 1000.0 : 0.0);
         }
 
         // peek at next split to determine if async prefetch will overlap with this split
