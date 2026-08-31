@@ -30,8 +30,9 @@ and corrupt concurrent measurements).
    bs=512 FFNCPU tier's predicted 100 tps measures ~22; predictor accuracy on
    MLA/dense-lead architectures is untuned. Value A/B vs stock rides the held
    grid-class runs.
-0b. **Harness nit**: strategy_prefill parses empty when the top (bs=CUB) tier is
-   not_viable - key the parse off the effective prefill tier (bs=PUB) instead.
+0b. ~~Harness nit: strategy_prefill parse~~ **CLOSED 2026-08-31** as part of the
+   PPL-gate rework (item 8): the gate now keys placement off the effective
+   prefill tier (bs=PUB) and includes STATIC in the placement-match case.
 
 1. **Full 144-grid rerun** - restart FRESH (plans changed under items 5/1/7 +
    DSA fix; the 42 pre-change rows are stale): `sh qa/run-qa.sh /tmp/qa-full-v3 full`.
@@ -73,6 +74,54 @@ and corrupt concurrent measurements).
    fixed predictor + ids-cross: does s4 ever win a cell against re-planned s1/s3?
    If auto never picks it and forced-s4 never beats the best alternative, ALTERNATE
    earns retirement from the decode tiers (stays as a prefill design point).
+7a. **Selector-gap fixes LANDED + VERIFIED 2026-08-31** (user-approved, all three):
+   (1) hi_attn fresh bound at bs=1 (llama-pshard-plan.cpp: tier_prune::attn_hint);
+   (2) sliced-upload repricing (profiler gathered-slice microbench, measured
+   23.3/29.6/30.0/29.4 GB/s at 0.5/2/8/32MB chunks vs 45 peak; curve in
+   cpu_profile.txt header, log-interpolated at the split's per-expert chunk size);
+   (3) N_GEN=256 decode window (switch cost stays in, amortized - user rule).
+   Planner verification: all 8 q35 cells now pick STATIC attn=40 (predictions
+   0.3-4.2% on measured cells); oss controls byte-identical (16k-4000 same plan).
+   GPU verification (4 cells): q35-16k-2000 auto 19.9 -> 30.4 t/s (+53%, pred
+   29.6); q35-2k-8000 auto 45.0 -> 57.0 (+27%, now BEATS stock 53.7); oss-16k-2000
+   auto 18.5 -> 29.0 (+58%, new attn=24 plan); oss-16k-4000 control 36.2 ~= 35.0.
+   NOTE: qa-full-v3's 81 grid rows are STALE (planner + N_GEN + gate all changed);
+   the full grid needs a fresh restart on the fixed stack.
+8. **oss-16k PPL parity calibration (OPEN)** - with 256-token windows the token
+   hashes diverge routinely, so the PPL gate now decides; on gpt-oss@16k the
+   stock mirror still misses by ~3% (39.5k vs 38.4k at best construction).
+   Forensics: pshard's perplexity process selects its own n_batch (its variant's
+   cache_ubatch, seen 8192 AND 16384) and executing tier, which need not be the
+   gen run's PUB tier; mirroring the wrong tier (bs=8192 = ATTNPIN) gave 90k.
+   Evidence the plans are fine: pshard PPL is plan-invariant to 0.5% (np=0 vs
+   np=5: 39570 vs 39367) and deterministic across rounds. Fix direction: verbose
+   PPL run to capture the executed tier + force both sides to one exact
+   (ubatch, placement) pair, targeting the 5-digit parity proven at 2k. Until
+   then, oss 16k PPL_MISMATCH rows need manual adjudication.
+7. **Selector-gap audit (2026-08-31, grid stopped at 81 rows for this)** - verified
+   findings from the q35/oss slice (workflow-verified, 3 adversarial lenses):
+   (a) BENCH ARTIFACT: 31-token decode window swallows the prefill->decode
+       pshard_apply_plan re-upload (up to 8.3 GiB = 190ms); auto pays more switch
+       bytes than forced runs -> fake gaps. Fix: exclude switch from perf window or
+       decode >=256 tokens. Resolves the q35-16k-12000 same-strategy anomaly
+       (steady 55.3 vs 56.2; true winner there is s3 at 62.1 steady).
+   (b) PLAN-SEARCH BUG (the 43% cell): llama-pshard-plan.cpp:286-290 tier prune
+       inherits hi_attn from large-batch tiers into bs=1 (scratch shrinks ~350x,
+       monotonicity invalid) -> auto's STATIC candidate capped attn=11 (12.1 tps)
+       while forced-s1's fallback searches attn=40 fresh (29.6 pred/28.44 meas).
+       Fix: re-search tier 0 with hi_attn=UINT32_MAX.
+   (c) TIME-MODEL BIAS (6 mis-ranked cells): consume-time sliced expert uploads
+       priced at peak PCIe 45 GB/s; measured concurrent rate 29.5 (0.6MB slices)
+       to ~38 (9-13MB slices). Repricing at profiled chunk-size-aware bw flips all
+       6 mis-ranked cells, flips zero controls. s3 STATIC already calibrated at 2k.
+   (d) REFUTED sub-fix: serializing CPU-split prefetch "per q8d conservation"
+       over-corrects dense-ALTERNATE by 21-36% (q8d predictor is already 5-8%
+       pessimistic; conservation datum implies whole-token DRAM closure at PEAK
+       45.7 GB/s, not serialization stacked on derated terms). Needs redesign
+       gated off dense-symmetric plans; do NOT land as specified.
+   (e) Secondary: FLASH_ATTN@16k over-priced ~2.4ms/tok (STATIC -13.5% under at
+       16k); fully-GPU-resident plans +35% over (ranking-neutral); the
+       oss-c16384-mva2000 cell spans a harness restart (weak comparability).
 
 ## Contamination note (2026-08-30)
 

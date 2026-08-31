@@ -31,7 +31,10 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${QA_BIN:-$ROOT/build/bin/Release}
 MODELS=${QA_MODELS_DIR:-/c/Aditya/Models}
 PROMPTS=${QA_PROMPTS_DIR:-/c/Aditya/Prompts}
-N_GEN=32
+# 256: the prefill->decode plan-switch re-upload (up to ~8 GiB) lands inside the decode
+# timer; at 32 tokens it distorted decode_tps by up to 27%. Longer decode amortizes it
+# (the switch cost stays IN the measurement - it is real - just at realistic weight).
+N_GEN=256
 mkdir -p "$OUT"
 cd "$BIN" || exit 1
 
@@ -185,22 +188,43 @@ for MDL in $MODELS_LIST; do
                     # placement reproduces pshard's PPL to 5 digits (3440.80 vs 3440.82).
                     CH=8; [ "$CTX" -ge 16384 ] && CH=2
                     PPLC="$PROMPTS/prompt-256k.txt"
+                    # run the PSHARD side FIRST at its natural shape (the runtime resets
+                    # batch/ubatch to the plan cache's cache_ubatch, so forcing a ubatch
+                    # from here is unreliable), then mirror stock to the ACTUAL eval shape
+                    # and the executing tier's placement. Shape AND placement must both
+                    # match: different matmul shapes alone drift logits enough to fail the
+                    # 0.5% gate on placement-hypersensitive models (gpt-oss raw-text PPL).
+                    if [ "$STRAT" = "auto" ]; then
+                        ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
+                            -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
+                    else
+                        env PSHARD_STRATEGY=$STRAT ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
+                            -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
+                    fi
+                    PP_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_pshard_$CFG.log" | grep -aoE "[0-9.]+$")
+                    # mirror stock at the gen run's EFFECTIVE prefill tier (bs=PUB). Known
+                    # residual: the pshard perplexity process selects its own n_batch
+                    # (cache_ubatch of ITS registry variant) and executing tier, which can
+                    # differ from PUB; on gpt-oss@16k this leaves ~3% PPL residual (see
+                    # pending-verification: oss-16k parity calibration). Do NOT key on the
+                    # ppl log's batch_size= - that is n_batch, not the executing tier.
+                    PB=${PUB:-$CUB}
                     STOCK_PPL_ARGS="-fitt $FITT"
-                    case "$ACT" in
-                      DYNAMIC_FFNCPU*|DYNAMIC_FFN_ALTERNATE)
-                        # CPU-delegate strategies: give stock the same expert placement
-                        # (MoE models; dense CPU-delegate placement has no _exps match and
-                        # falls back to the budget-equalized stock baseline)
-                        # n_layer only prints in the VERBOSE (pshard) log; the parity placement
-                        # must mirror the bs=CUB tier's plan (its n_pinned differs from tier 0)
+                    SPP=$(grep -aA1 "bs=$PB\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "strategy=[A-Z_]+" | tail -1 | cut -d= -f2)
+                    case "$SPP" in
+                      DYNAMIC_FFNCPU*|DYNAMIC_FFN_ALTERNATE|STATIC_ATTNPRIO_ALLMODELS)
+                        # CPU-delegate + static-split strategies: give stock the same expert
+                        # placement (MoE models; dense placements have no _exps match and
+                        # fall back to the budget-equalized stock baseline)
+                        # n_layer only prints in the VERBOSE (pshard) log
                         NL=$(grep -aoE "n_layer += +[0-9]+" "$RLOG" | head -1 | grep -aoE "[0-9]+$")
                         # anchor: "n_attn_pinned=N" contains the substring "n_pinned=N"
-                        NPP=$(grep -aA1 "bs=$CUB\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "(^| )n_pinned=[0-9]+" | tail -1 | cut -d= -f2)
+                        NPP=$(grep -aA1 "bs=$PB\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "(^| )n_pinned=[0-9]+" | tail -1 | cut -d= -f2)
                         LIST=""
                         i=${NPP:-0}
                         while [ "$i" -lt "${NL:-0}" ]; do
                             # ALTERNATE delegates only even unpinned layers to the CPU
-                            if [ "$ACT" = "DYNAMIC_FFN_ALTERNATE" ] && [ $((i % 2)) -ne 0 ]; then i=$((i+1)); continue; fi
+                            if [ "$SPP" = "DYNAMIC_FFN_ALTERNATE" ] && [ $((i % 2)) -ne 0 ]; then i=$((i+1)); continue; fi
                             LIST="$LIST${LIST:+|}$i"
                             i=$((i+1))
                         done
@@ -210,18 +234,8 @@ for MDL in $MODELS_LIST; do
                         ;;
                     esac
                     ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
-                        $STOCK_PPL_ARGS -ub "$CUB" -b "$CUB" > "$OUT/ppl_stock_$CFG.log" 2>&1
+                        $STOCK_PPL_ARGS -ub "$PB" -b "$PB" > "$OUT/ppl_stock_$CFG.log" 2>&1
                     PS_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_stock_$CFG.log" | grep -aoE "[0-9.]+$")
-                    # pin pshard's prefill ubatch to CUB so both sides eval at the same shape
-                    # (the runtime otherwise picks the predicted-ttft-optimal tier, e.g. 512)
-                    if [ "$STRAT" = "auto" ]; then
-                        env PSHARD_FORCE_PREFILL_UB=$CUB ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
-                            -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
-                    else
-                        env PSHARD_STRATEGY=$STRAT PSHARD_FORCE_PREFILL_UB=$CUB ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
-                            -pshard -mva "$MVA" > "$OUT/ppl_pshard_$CFG.log" 2>&1
-                    fi
-                    PP_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_pshard_$CFG.log" | grep -aoE "[0-9.]+$")
                     if [ -n "$PS_" ] && [ -n "$PP_" ] &&                        awk -v a="$PS_" -v b="$PP_" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d <= 0.005*a)}'; then
                         ST=TOKEN_DIVERGED_PPL_OK
                     elif [ -z "$PS_" ]; then
