@@ -536,11 +536,19 @@ bool llama_memory_pshard::download_if_owned(ggml_tensor * t, ggml_backend_t back
 }
 
 void llama_memory_pshard::upload_for_switch(int32_t il, ggml_backend_t be) {
+    // F4d: a switch upload must restore ALL sequences' cells. Newly-pinned layers
+    // were zeroed, and write_cells still holds the PREVIOUS ubatch's write set (the
+    // switch runs before this ubatch's write_cells update), so filtering by it drops
+    // every other sequence's KV under n_seq_max>1. Bypass the filter for the switch;
+    // uploads stay bounded per-stream by on_cells_used().
+    const auto * saved_wc = write_cells;
+    write_cells = nullptr;
     if (mode == FULL) {
         upload_full(il, be);
     } else {
         upload_cells(il, be, false);
     }
+    write_cells = saved_wc;
 }
 
 void llama_memory_pshard::download_for_switch(int32_t il, ggml_backend_t be) {
