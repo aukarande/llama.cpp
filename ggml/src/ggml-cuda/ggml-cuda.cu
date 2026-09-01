@@ -4681,9 +4681,9 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 }
 
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
-        return;
-    }
+    // no env gate (unlike register): callers only unregister regions they registered,
+    // and the env may legitimately be unset by then (e.g. pshard stock-fallback) -
+    // gating here would silently leak the page-lock
 
     cudaError_t err = cudaHostUnregister(buffer);
     if (err != cudaSuccess) {

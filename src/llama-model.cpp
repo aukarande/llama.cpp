@@ -1164,6 +1164,10 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // mmap regions we page-locked for pshard streaming; unregistered on model free
+    // (long-lived servers load/free multiple models - leaking pins pageable-locks RAM)
+    std::vector<void *> pshard_host_registered;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
@@ -1221,6 +1225,21 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
+    }
+    // release pshard's page-locks BEFORE the mappings themselves are torn down
+    if (!pimpl->pshard_host_registered.empty()) {
+        auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (gpu_dev) {
+            auto * reg = ggml_backend_dev_backend_reg(gpu_dev);
+            auto unregister_fn = (void (*)(void *))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+            if (unregister_fn) {
+                for (void * addr : pimpl->pshard_host_registered) {
+                    unregister_fn(addr);
+                }
+            }
+        }
+        pimpl->pshard_host_registered.clear();
     }
     if (pimpl->dev_preload_backend) {
         ggml_backend_synchronize(pimpl->dev_preload_backend);
@@ -1939,6 +1958,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     for (const auto & mapping : pimpl->mappings) {
                         const int64_t t0 = ggml_time_us();
                         if (register_fn(mapping->addr(), mapping->size())) {
+                            pimpl->pshard_host_registered.push_back(mapping->addr());
                             LLAMA_LOG_INFO("%s: pshard: page-locked %.1f MiB mmap region in %.1f ms\n",
                                 __func__, mapping->size() / (1024.0 * 1024.0),
                                 (ggml_time_us() - t0) / 1000.0);
