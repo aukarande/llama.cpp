@@ -514,6 +514,13 @@ void llama_params_fit_pshard(
         return;
     }
 
+    // mirror the plan path (llama_params_fit_pshard_plan step 8): the load-time
+    // delegate flag must match the active plan's strategy, or the initial context
+    // and scheduler reserves are built un-delegated - a different scheduling
+    // regime than the one the planner's probes priced (first plan apply would
+    // correct the model flag, but the early reserve graphs are already shaped)
+    mparams->pshard_delegate_compute = llama_pshard_strategy_delegates_compute(best->strategy);
+
     const int32_t cpu_bid = pshard_dev_layout::compute_cpu_backend_id(devs.size());
     const pshard_dev_layout layout = pshard_dev_layout::for_device(0, cpu_bid);
     llama_pshard_generate_overrides(
