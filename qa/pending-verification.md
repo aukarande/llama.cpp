@@ -162,6 +162,18 @@ and corrupt concurrent measurements).
    2150) - s3-from-cache runs a different scheduling regime than the one
    priced; mirror in llama-pshard-cache.cpp.
 
+10. ~~Fused-GLU certification~~ **CLOSED 2026-09-01 (8afa86ccf)**: root cause =
+   galloc frees sched weight copies mid-split; the GLU dst legally lands in the
+   just-freed slot bytes; the FUSED kernel reads gate/up while writing that dst
+   (WAR hazard); the fusion memory-range check skipped op-NONE srcs and never saw
+   it. Probe: 114 aliasing pairs (ffn_moe_swiglu inside ffn_gate_exps' slot).
+   Check fixed; blanket env force-set removed (fusion ON by default for pshard;
+   env = manual lever, value-based). PPL parity exact (1.2619 both), perf neutral.
+   NOTE for grid: fusion numerics may shift temp-0 token hashes vs pre-fusion
+   references - PPL parity is the gate; references refresh with the next grid.
+   The deleted slot carve-out had masked this class by construction; its deletion
+   stands (the range check now covers it soundly). Upstreamable fix.
+
 ## Contamination note (2026-08-30)
 
 Two "stopped" harness runs kept running detached and overlapped each other and
