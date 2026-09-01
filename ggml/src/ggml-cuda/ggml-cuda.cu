@@ -2995,7 +2995,15 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE) {
+                // op NONE srcs must be checked too: scheduler input copies (streamed
+                // weights in recycled slot regions) are op NONE yet live in the same
+                // galloc-managed memory the fused dst may legally reuse - the allocator
+                // frees a weight copy at its last consumer, so the (unfused-safe) dst
+                // placement lands inside bytes the FUSED kernel is still reading
+                // (measured: ffn_moe_swiglu allocated inside ffn_gate_exps' slot).
+                // Weights in dedicated model buffers cannot overlap compute
+                // allocations, so including them here is harmless.
+                if (!src) {
                     continue;
                 }
 
@@ -3042,12 +3050,15 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     std::initializer_list<enum ggml_op> mul_mat_id_glu_ops = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
     std::initializer_list<enum ggml_op> mul_mat_glu_ops    = { GGML_OP_MUL_MAT,    GGML_OP_MUL_MAT,    GGML_OP_GLU };
 
-    // the gated-FFN fusion family corrupts decode on pshard split graphs whose weight srcs are
-    // scheduler copies in recycled scratch slots (bisected 2026-08-25; the memory-range check
-    // passes, so the defect is inside the fused execution path). pshard runs set this env at
-    // init until the fused path is certified for redirected splits. Other fusion families
-    // (rope+set_rows, rms_norm chains) stay enabled.
-    static const bool disable_glu_fusion = getenv("GGML_CUDA_DISABLE_FUSION_GLU") != nullptr;
+    // certified for pshard 2026-09-01: the corruption was the memory-range check
+    // skipping op-NONE srcs (sched slot copies), letting the fused dst legally land
+    // in just-freed weight-copy bytes the kernel still reads. The check sees them
+    // now; this env remains as a manual disable lever only.
+    // value-based: "0" force-ENABLES the fusion under pshard (certification/debug lever)
+    static const bool disable_glu_fusion = [] {
+        const char * v = getenv("GGML_CUDA_DISABLE_FUSION_GLU");
+        return v != nullptr && v[0] != '0';
+    }();
 
     if (!disable_glu_fusion &&
         (is_equal(mul_mat_bias_glu_ops, ops) || is_equal(mul_mat_id_bias_glu_ops, ops)) &&

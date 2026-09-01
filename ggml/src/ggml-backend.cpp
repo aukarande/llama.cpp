@@ -1148,6 +1148,11 @@ static bool ggml_backend_sched_prefer_sliced_expert_copy(
     if (node == NULL || node->src[1] == NULL) {
         return false;
     }
+    // GGML_SCHED_NO_SLICED=1: bisect lever - force full-tensor uploads
+    static const bool no_sliced = getenv("GGML_SCHED_NO_SLICED") != NULL;
+    if (no_sliced) {
+        return false;
+    }
     const int64_t n_expert = input->ne[2];
     // expert-token pairs this evaluation will actually gather
     const int64_t n_pairs  = ggml_nelements(node->src[1]) / std::max<int64_t>(node->src[1]->ne[0], 1);

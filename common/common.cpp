@@ -1328,15 +1328,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (params.pshard) {
         LOG_INF("%s: pshard enabled, probing and loading plan cache\n", __func__);
-        // the CUDA gated-FFN fusion family corrupts decode on pshard split graphs whose weight
-        // srcs are scheduler copies in recycled scratch slots; keep it off for pshard runs
-        // until the fused path is certified for redirected splits (stock runs are unaffected)
+        // fused-GLU is certified for pshard as of 2026-09-01: the fusion memory-range
+        // check now sees scheduler input copies, so fusion self-disables exactly on
+        // layers where the fused dst would alias recycled slot bytes. The
+        // GGML_CUDA_DISABLE_FUSION_GLU env remains available as a manual lever.
 #ifdef _WIN32
-        _putenv_s("GGML_CUDA_DISABLE_FUSION_GLU", "1");
         // page-lock mmap'd weights so streamed copies run at full async PCIe rate
-        _putenv_s("GGML_CUDA_REGISTER_HOST", "1");
+        if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+            _putenv_s("GGML_CUDA_REGISTER_HOST", "1");
+        }
 #else
-        setenv("GGML_CUDA_DISABLE_FUSION_GLU", "1", 0);
         setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
 #endif
         params.tensor_buft_overrides.resize(4096);
