@@ -2057,26 +2057,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 return;
             }
 
-            // GGML_DEFER_PREFETCH=1: if a CPU-executing split with pending inputs sits
-            // between here and the prefetch target, defer the (large) upload enqueue.
-            // On a single copy queue (submission-order FIFO) that split's tiny device->
-            // host downloads would otherwise wait out the full layer upload (~5ms
-            // measured on q8d-s4). The intermediate split's own prefetch call (post-
-            // inputs, pre-launch) re-enqueues, so the upload still overlaps its compute.
-            static const bool defer_prefetch = getenv("GGML_DEFER_PREFETCH") != NULL;
-            if (defer_prefetch) {
-                for (int s = split_id + 1; s < next_gpu_id; s++) {
-                    int eb = splits[s].backend_id;
-                    if (sched->redirect_target[eb] >= 0) {
-                        eb = sched->redirect_target[eb];
-                    }
-                    if (splits[s].n_inputs > 0 &&
-                        ggml_backend_dev_type(ggml_backend_get_device(sched->backends[eb])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                        return;
-                    }
-                }
-            }
-
             ggml_backend_t next_copy = sched->copy_backends[next_gpu->backend_id];
 
             // conservative fence: slot regions are now dedicated (no aliasing with

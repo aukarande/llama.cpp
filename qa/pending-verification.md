@@ -64,12 +64,12 @@ and corrupt concurrent measurements).
    (sched_sync/sched_copy under GGML_SCHED_TIMING, 371d99dab) and env-gated
    ordering experiments (GGML_DEFER_PREFETCH, GGML_ASYNC_HANDOFF, ca622d5b5)
    retained. Sanity: token-identical s4/s0 output, clean exit.
-5b. **Defer-prefetch grid A/B** - GGML_DEFER_PREFETCH=1 collapses s4's download
-   wait 172ms -> 1ms/token (downloads no longer queue behind layer uploads on the
-   single copy queue) but only nets +2.7% on q8d (DRAM contention moves the cost
-   into CPU FFN). On MoE cells with small CPU-side reads (oss/q35 sliced-expert
-   configs) the contention term shrinks, so it may win there. Ride one env-on
-   column on the held full-grid rerun; keep or delete by the same rule.
+5b. ~~Defer-prefetch grid A/B~~ **CLOSED 2026-08-31, code path DELETED**: A/B on
+   8 MoE s4 cells (q35+oss x 2ctx x mva 4000/12000, fixed stack, N_GEN=256):
+   decode deltas -1.1..+1.7% (noise), hashes identical on all cells. The MoE
+   hypothesis failed - with sliced expert uploads, decode prefetch traffic is
+   too small for submission order to matter. Dense (q8d) was already proven
+   DRAM-conserved (+2.7%). No cell near the bar -> deleted per no-speedup rule.
 6. **ALTERNATE adjudication (user question)** - after the full grid rerun under the
    fixed predictor + ids-cross: does s4 ever win a cell against re-planned s1/s3?
    If auto never picks it and forced-s4 never beats the best alternative, ALTERNATE
