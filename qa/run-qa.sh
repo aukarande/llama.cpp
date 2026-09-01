@@ -142,6 +142,13 @@ for MDL in $MODELS_LIST; do
                     P=$(perf_field "$SLOG" "prompt eval time"); D=$(perf_field "$SLOG" " eval time")
                     STOCK_HASH=$(hash_gen "$SLOG.gen")
                     ST=$([ "$RC" = "0" ] && echo OK || echo FAIL)
+                    # budget enforcement label: -fitt fits WEIGHTS to the target, KV+compute
+                    # land on top (measured up to 6.6x nominal at 16k). Such rows are still
+                    # a-fortiori references (stock over budget and pshard still compared),
+                    # but the "equal budget" claim needs the honest label.
+                    if [ "$ST" = "OK" ] && [ -n "$DELTA" ] && [ "$DELTA" -gt $((MVA * 110 / 100 + 512)) ]; then
+                        ST=STOCK_OVER_BUDGET
+                    fi
                     if [ "$RC" != "0" ]; then
                         # a failed run has no meaningful perf/hash/vram telemetry
                         P=""; D=""; DELTA=""; STOCK_HASH=""

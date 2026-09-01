@@ -41,7 +41,10 @@ def main():
 
     hard, soft, better, info = [], [], [], []
 
-    PASS_CLASSES = ("OK", "TOKEN_DIVERGED_PPL_OK", "STOCK_UNAVAILABLE", "NO_BASELINE")
+    PASS_CLASSES = ("OK", "TOKEN_DIVERGED_PPL_OK", "STOCK_UNAVAILABLE", "NO_BASELINE",
+                    # informational, not a failure: stock exceeded its nominal budget
+                    # (a-fortiori reference - stock over budget and pshard still compared)
+                    "STOCK_OVER_BUDGET")
 
     def status_class(s):
         # statuses may embed per-run values, e.g. "PPL_MISMATCH(stock=... pshard=...)"
