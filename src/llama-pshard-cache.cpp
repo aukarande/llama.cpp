@@ -99,6 +99,12 @@ void llama_pshard_generate_overrides(
         } else if (il >= il_pin_start && il < il_pin_end) {
             emit(patterns_layer[il].c_str(), host_buft, layout.compute);
         } else {
+            // MTP head layers: read concurrently by the stock-sched draft context -
+            // never slot-streamed (pinned or CPU only)
+            if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
+                emit(patterns_layer[il].c_str(), host_buft, layout.cpu);
+                continue;
+            }
             // overlap=1: alternating shard slots (double-buffering lets the copy of layer i+1
             // overlap compute that still reads layer i's slot). overlap=0: one slot, no
             // prefetch - cheaper plan for budgets that cannot fund the second slot
@@ -206,6 +212,8 @@ uint64_t pshard_registry_fingerprint(
     // an MTP-loaded model has one extra placeable layer (the nextn head), so its
     // plans are not interchangeable with the trunk-only variant
     mix((uint64_t)(mparams->load_mtp ? 1 : 0));
+    // verify-tier shape: spec runs advertise n_draft+1 outputs per sequence
+    mix((uint64_t)cparams->n_outputs_max_per_seq);
 
     mix(cparams->n_ctx);
     mix(cparams->n_seq_max);
@@ -220,9 +228,9 @@ uint64_t pshard_registry_fingerprint(
 }
 
 
-llama_pshard_plan_registry * llama_pshard_registry_create(uint32_t n_tier_max, uint32_t n_seq_max) {
+llama_pshard_plan_registry * llama_pshard_registry_create(uint32_t n_tier_max, uint32_t n_seq_max, uint32_t n_draft) {
     auto * registry = new llama_pshard_plan_registry();
-    registry->init(n_tier_max, n_seq_max);
+    registry->init(n_tier_max, n_seq_max, n_draft);
     return registry;
 }
 
@@ -286,6 +294,7 @@ static bool llama_pshard_probe_model_only(
     if (mparams->load_mtp) {
         probe.n_layers += model->hparams.n_layer_nextn;
     }
+    g_pshard_n_layers_mtp = mparams->load_mtp ? model->hparams.n_layer_nextn : 0;
 
     if (!probe.devs.empty()) {
         ggml_backend_dev_t dev = probe.devs[0].dev;
@@ -403,8 +412,11 @@ void llama_params_fit_pshard(
     const uint32_t tier_max_auto = std::min(std::max(cparams->n_batch, (uint32_t) 16384), n_ctx_plan);
     const uint32_t tier_max = std::min(requested_tier_max > 0 ? requested_tier_max : tier_max_auto, n_ctx_plan);
 
+    // speculative verify batches: the target context advertises n_draft+1
+    // outputs per sequence; give that batch size its own priced tier
+    const uint32_t n_draft_tier = cparams->n_outputs_max_per_seq > 1 ? cparams->n_outputs_max_per_seq - 1 : 0;
     if (registry->cache_ubatch != tier_max) {
-        registry->init(tier_max, cparams->n_seq_max);
+        registry->init(tier_max, cparams->n_seq_max, n_draft_tier);
     }
 
     registry->budget_mib = pshard_bytes_to_mib_ceil(vram_free);

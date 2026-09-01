@@ -1340,7 +1340,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
 #endif
         params.tensor_buft_overrides.resize(4096);
-        mparams.pshard_registry = llama_pshard_registry_create(params.pshard_tier_max, cparams.n_seq_max);
+        // spec verify tier: the target context advertises n_draft+1 outputs per sequence
+        const uint32_t n_draft_tier = cparams.n_outputs_max_per_seq > 1 ? cparams.n_outputs_max_per_seq - 1 : 0;
+        mparams.pshard_registry = llama_pshard_registry_create(params.pshard_tier_max, cparams.n_seq_max, n_draft_tier);
         const size_t fit_target_mb = params.fit_params_target.empty() ? 0 : params.fit_params_target[0] / (1024 * 1024);
         llama_params_fit_pshard(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_buft_overrides.data(), params.max_vram_alloc, fit_target_mb);

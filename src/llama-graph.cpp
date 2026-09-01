@@ -3433,7 +3433,9 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
 
     GGML_UNUSED(rs_size);
-    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+    // rows from nelements, not ne[1]: the pshard RS shadow is a 1-D tensor holding
+    // the same bytes (stock 2-D: nelements/state_size == ne[1], unchanged)
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, ggml_nelements(s)/state_size);
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
@@ -3451,7 +3453,8 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_build_forward_expand(gf,
         ggml_cpy(ctx0,
             states_extra,
-            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs), s->nb[1], (rs_head + n_seqs)*s->nb[1])));
+            ggml_view_2d(ctx0, s, state_size, (n_rs - n_seqs),
+                ggml_row_size(s->type, state_size), (rs_head + n_seqs)*ggml_row_size(s->type, state_size))));
 
     return output_states;
 }

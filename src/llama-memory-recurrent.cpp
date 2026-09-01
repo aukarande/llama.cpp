@@ -80,8 +80,11 @@ llama_memory_recurrent::llama_memory_recurrent(
                 /*.il       =*/ (uint32_t)i,
                 /*.type_t1  =*/ type_r,
                 /*.type_t2  =*/ type_s,
-                /*.dim_t1   =*/ (uint32_t)(hparams.n_embd_r() * mem_size),
-                /*.dim_t2   =*/ (uint32_t)(hparams.n_embd_s() * mem_size),
+                // (1 + n_rs_seq): rollback snapshots (speculative decoding) multiply the
+                // row count - must mirror the stock allocation below, or the delta-net
+                // snapshot views (s_slot up to n_rs_seq) overrun the pshard shadow
+                /*.dim_t1   =*/ (uint32_t)(hparams.n_embd_r() * mem_size * (1 + n_rs_seq)),
+                /*.dim_t2   =*/ (uint32_t)(hparams.n_embd_s() * mem_size * (1 + n_rs_seq)),
                 /*.seq_len  =*/ 0,
                 /*.n_stream =*/ 1,
                 /*.is_1d    =*/ true,

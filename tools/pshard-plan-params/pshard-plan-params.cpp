@@ -3,6 +3,7 @@
 #include "arg.h"
 #include "common.h"
 #include "log.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -201,7 +202,16 @@ static void plan_pshard_context(common_params & params, uint32_t n_ctx, uint32_t
     const uint32_t tier_max_user = params.pshard_tier_max > 0 ? std::min(params.pshard_tier_max, tier_max_auto) : tier_max_auto;
     const uint32_t tier_max      = bench_plan ? tier_max_user : std::min(tier_max_user, cparams.n_ctx);
 
-    mparams.pshard_registry        = llama_pshard_registry_create(tier_max, cparams.n_seq_max);
+    // spec verify tier: mirror the runtime's output-limits derivation
+    const auto output_limits = common_speculative_get_output_limits(
+            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+    params.n_outputs_max = output_limits.total;
+    params.n_outputs_max_per_seq = output_limits.per_seq;
+    cparams.n_outputs_max = output_limits.total;
+    cparams.n_outputs_max_per_seq = output_limits.per_seq;
+    const uint32_t n_draft_tier = output_limits.per_seq > 1 ? (uint32_t) output_limits.per_seq - 1 : 0;
+
+    mparams.pshard_registry        = llama_pshard_registry_create(tier_max, cparams.n_seq_max, n_draft_tier);
     mparams.pshard_cache_skip_load = true;
 
     const size_t fit_target_mb = params.fit_params_target.empty() ? 0 : params.fit_params_target[0] / (1024 * 1024);

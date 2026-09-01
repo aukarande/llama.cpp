@@ -580,7 +580,7 @@ extern "C" {
                                          size_t   max_vram_mb,
                                          size_t   fit_target_mb);
 
-    LLAMA_API struct llama_pshard_plan_registry * llama_pshard_registry_create(uint32_t n_tier_max, uint32_t n_seq_max);
+    LLAMA_API struct llama_pshard_plan_registry * llama_pshard_registry_create(uint32_t n_tier_max, uint32_t n_seq_max, uint32_t n_draft);
     LLAMA_API void                         llama_pshard_registry_free(struct llama_pshard_plan_registry * registry);
 
     // Pipelined sharding planner: probes VRAM usage for each strategy/tier combination,
@@ -600,7 +600,7 @@ extern "C" {
     // mparams->pshard_registry before calling llama_params_fit_pshard.
     // n_tier_max: largest batch size to probe (determines tier range, typically max(n_batch, 16384)).
     // n_seq_max: for speculative decoding tiers.
-    LLAMA_API struct llama_pshard_plan_registry * llama_pshard_registry_create(uint32_t n_tier_max, uint32_t n_seq_max);
+    LLAMA_API struct llama_pshard_plan_registry * llama_pshard_registry_create(uint32_t n_tier_max, uint32_t n_seq_max, uint32_t n_draft);
     LLAMA_API void                         llama_pshard_registry_free(struct llama_pshard_plan_registry * registry);
 
     LLAMA_API int64_t llama_time_us(void);

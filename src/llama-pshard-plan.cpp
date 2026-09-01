@@ -100,6 +100,12 @@ static void llama_pshard_generate_overrides(
         } else if (il >= il_pin_start && il < il_pin_end) {
             emit(patterns_layer[il].c_str(), gpu_buft, layout.compute);
         } else {
+            // MTP head layers: read concurrently by the stock-sched draft context -
+            // never slot-streamed (pinned or CPU only)
+            if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
+                emit(patterns_layer[il].c_str(), host_buft, layout.cpu);
+                continue;
+            }
             // overlap=1: alternating shard slots (double-buffering). overlap=0: one slot,
             // no prefetch - cheaper plan for budgets that cannot fund the second slot
             const int32_t shard_bid = overlap ? layout.shard(il) : layout.shard_a;
@@ -1864,8 +1870,11 @@ void llama_params_fit_pshard_plan(
         const uint32_t tier_max_auto = std::min(std::max(cparams->n_batch, (uint32_t) 16384), n_ctx_plan);
         const uint32_t tier_max = std::min(requested_tier_max > 0 ? requested_tier_max : tier_max_auto, n_ctx_plan);
 
+        // speculative verify batches: the target context advertises n_draft+1
+        // outputs per sequence; give that batch size its own priced tier
+        const uint32_t n_draft_tier = cparams->n_outputs_max_per_seq > 1 ? cparams->n_outputs_max_per_seq - 1 : 0;
         if (registry->cache_ubatch != tier_max) {
-            registry->init(tier_max, cparams->n_seq_max);
+            registry->init(tier_max, cparams->n_seq_max, n_draft_tier);
         }
 
         registry->budget_mib = pshard_bytes_to_mib_ceil(vram_free);

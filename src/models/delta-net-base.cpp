@@ -489,7 +489,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         ggml_tensor * conv_state_update =
             ggml_view_2d(ctx0, conv_states_all,
-                    row_count, n_seqs, conv_states_all->nb[1],
+                    row_count, n_seqs, row_size,
                     (s_slot * mem_size + kv_head) * row_size);
         cb(conv_state_update, "conv_state_update", il);
 
@@ -514,7 +514,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
             ggml_tensor * conv_state_update =
                 ggml_view_2d(ctx0,
                         conv_states_all, row_count, n_seqs,
-                        conv_states_all->nb[1],
+                        row_size,
                         (s_slot * mem_size + kv_head) * row_size);
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
@@ -554,7 +554,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs,
+                        hparams.n_embd_s() * ggml_element_size(ssm_states_all),
                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
         return output;
@@ -596,7 +597,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
         D, n_seqs, n_written,
-        ssm_states_all->nb[1],
+        row_size,
         (size_t) mem_size * row_size,
         (size_t) kv_head * row_size);
 

@@ -113,6 +113,12 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
 
     devs           = model->devices;
     hp_ngl         = model->hparams.n_layer();
+    // MTP: the nextn head is a real placeable layer (mirrors common/fit.cpp)
+    g_pshard_n_layers_mtp = 0;
+    if (mparams->load_mtp) {
+        hp_ngl    += model->hparams.n_layer_nextn;
+        g_pshard_n_layers_mtp = model->hparams.n_layer_nextn;
+    }
     hp_n_ctx_train = model->hparams.n_ctx_train;
     hp_n_expert    = model->hparams.n_expert;
     hp_n_embd_r    = model->hparams.n_embd_r();

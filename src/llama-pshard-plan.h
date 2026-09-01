@@ -58,6 +58,13 @@ inline int pshard_strategy_from_env() {
 }
 
 // cached tensor override entry
+// trailing nextn/MTP layers (0 when not load_mtp): the stock-sched MTP draft
+// context reads these weights concurrently with the target's decode, so the
+// emitters must never place them in streamed slots (slot bytes are rewritten
+// under the reader -> CUDA launch failures). Set by the planning/apply entry
+// points; single-threaded within a planning pass.
+inline thread_local uint32_t g_pshard_n_layers_mtp = 0;
+
 struct llama_pshard_override {
     std::string                pattern;
     ggml_backend_buffer_type_t buft;
@@ -238,12 +245,16 @@ struct llama_pshard_plan_registry {
         // decode tiers
         if (n_parallel <= 1) {
             tier_sizes.push_back(1);
+            // speculative verify batches (n_draft+1, realistically 3-9) get their own
+            // exactly-priced tier: the ceiling tier pick would otherwise execute them
+            // on the bs=16 plan, whose placement was priced for 16 independent tokens
+            const uint32_t verify_tier = n_draft > 0 ? n_draft + 1 : 0;
+            if (verify_tier > 1 && verify_tier < 16) {
+                tier_sizes.push_back(verify_tier);
+            }
             tier_sizes.push_back(16);
-            if (n_draft > 0) {
-                uint32_t verify_tier = n_draft + 1;
-                if (verify_tier > 16) {
-                    tier_sizes.push_back(verify_tier);
-                }
+            if (verify_tier > 16) {
+                tier_sizes.push_back(verify_tier);
             }
         } else {
             for (uint32_t t = 1; t <= 64 && t < 512; t *= 4) {
