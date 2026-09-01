@@ -152,12 +152,15 @@ and corrupt concurrent measurements).
    garbage history whenever the plan PINNED the nextn attn; nextn layers
    now always CPU-resident; [e] server spec path untested; [f] plan-tool
    arg parse now LLAMA_EXAMPLE_SPECULATIVE (accepts --spec-type /
-   --spec-draft-n-max); [g] STRUCTURAL: gate pipe-shard memory
-   per-context, not per-model - thread cparams.pshard into
-   llama_memory_params and change llama-kv-cache.cpp:163 +
-   llama-memory-recurrent.cpp:75 to model.is_pshard() && params.pshard
-   (then nextn could pin again and the draft gets a stock GPU KV, matching
-   stock+MTP's 63% config); [h] ~~delegate-compute
+   --spec-draft-n-max); [g] ~~per-context memory gating~~ CLOSED
+   2026-09-01 (ed7136c04): pipe-shard KV/RS branches gated on the creating ctx's
+   cparams.pshard (thread_local set in llama_model::create_memory), so the
+   draft ctx gets stock backed KV and the MTP head pins again (pin-priority
+   in both emitters); union enforcer demotes every violator per round with
+   doubling cuts (46 MiB overshoot stalled the old single-cut loop), head-CPU
+   only as the fallback lever (persisted mtp_head_cpu). wmtp draft-mtp n=2:
+   4000 MiB 52.8 -> 56.9 t/s (117/155 accept), 12000 MiB 72.1 -> 83.0 t/s
+   (114/158); s1@4000 single-ctx output byte-identical; [h] ~~delegate-compute
    parity~~ CLOSED 2026-09-01 (1dd7582c4): cache loader now mirrors the plan
    path; cached delegate-strategy plans no longer build early reserves
    un-delegated (s3-from-cache 46.5-47.1 vs 46.3-46.4 pre-fix, coherent).
