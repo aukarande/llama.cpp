@@ -1070,3 +1070,30 @@ void common_fit_print(
     printf("%zu ", dmd.back().mb.compute/1024/1024);
     printf("\n");
 }
+
+common_device_memory_need common_get_device_memory_need(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        ggml_log_level log_level) {
+    common_device_memory_need need;
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
+    std::vector<llama_device_memory_data> dmds;
+    try {
+        dmds = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    } catch (const std::runtime_error & e) {
+        LOG_WRN("%s: cannot measure device memory of '%s': %s\n", __func__, path_model, e.what());
+        return need;
+    }
+    // pshard budgets, plans and pins are device-0 scoped (pshard_dev_layout::for_device(0));
+    // report device 0's share only, so a layer-split draft on a multi-GPU host is not charged
+    // to device 0 for bytes that land elsewhere (the last entry is host memory)
+    if (dmds.size() >= 2) {
+        need.model   = (size_t) dmds[0].mb.model;
+        need.context = (size_t) dmds[0].mb.context;
+        need.compute = (size_t) dmds[0].mb.compute;
+    }
+    need.ok = true;
+    return need;
+}

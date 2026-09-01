@@ -1535,9 +1535,18 @@ static void pshard_enforce_union_budget(
                 size_t so = align_up(common_end);
                 for (const auto & [name, sz] : extras) { so = align_up(so + sz); }
 
-                const size_t need = so + plan.cache_measured;
-                LLAMA_LOG_INFO("%s: [tier bs=%u] union scratch_off=%.2f MiB + pinned cache=%.2f MiB = %.2f / %.2f MiB budget %s\n",
+                // the tier's compute scratch (streaming slots + graph temporaries, probe-measured)
+                // must fit above the packed weights and the pinned cache too: otherwise the
+                // runtime reserve falls back to constrained packing and galloc spills into an
+                // overflow chunk OUTSIDE the arena (measured +496 MiB at a 3929 MiB budget)
+                // + margin: the runtime canonical packing (pshard_compute_scratch_off) rounds
+                // differently from this metadata pass by up to a few tens of MiB (seen +29.7 MiB
+                // at a 2024 MiB budget: a tier that passed here by 1.2 MiB was marked unviable at
+                // load, and every verify batch then ran in the 512-token streaming plan)
+                const size_t need = so + plan.cache_measured + plan.scratch_measured + margin;
+                LLAMA_LOG_INFO("%s: [tier bs=%u] union scratch_off=%.2f MiB + pinned cache=%.2f MiB + compute=%.2f MiB + margin=%.0f MiB = %.2f / %.2f MiB budget %s\n",
                     __func__, plan.batch_size, so / (1024.0*1024.0), plan.cache_measured / (1024.0*1024.0),
+                    plan.scratch_measured / (1024.0*1024.0), margin / (1024.0*1024.0),
                     need / (1024.0*1024.0), budget_bytes / (1024.0*1024.0),
                     need <= budget_bytes ? "OK" : "OVERSHOOT");
                 if (need > budget_bytes) { violators.emplace_back(t, need - budget_bytes); }
@@ -1549,7 +1558,7 @@ static void pshard_enforce_union_budget(
             // 4. demote every violator: re-plan it at its (escalating) reduced budget
             for (const auto & [t, over] : violators) {
                 auto & plan = registry->best_plans[t];
-                reductions[t] = std::max(reductions[t] * 2, over + margin);
+                reductions[t] = std::max(reductions[t] * 2, over);  // `over` already carries the margin
                 const size_t new_bud = budget_bytes > reductions[t] ? budget_bytes - reductions[t] : 0;
                 LLAMA_LOG_WARN("%s: canonical union overshoots by %.2f MiB; re-planning tier bs=%u at %.0f MiB\n",
                     __func__, over / (1024.0*1024.0), plan.batch_size, new_bud / (1024.0*1024.0));

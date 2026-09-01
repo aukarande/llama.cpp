@@ -336,6 +336,10 @@ struct common_params_speculative_draft {
     llama_context * ctx_dft = nullptr;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+    int32_t pshard_reserve_mb = 0; // MiB carved out of the target's pshard budget for this context (self-check at teardown)
+    int32_t n_ubatch     = 0;  // ubatch for the draft/MTP context; 0 = inherit the target's. pshard records
+                               // the pre-plan value here so draft contexts do not reserve compute buffers at
+                               // the target's tier ubatch (a dflash draft at ubatch 2048 reserved 4.3 GiB)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -933,6 +937,21 @@ private:
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+
+// pshard ONE-BUDGET rule for speculative contexts: a separate draft model (dflash/dspark/
+// generic draft) or the MTP draft context is created AFTER the target, in whatever VRAM the
+// plan left, so its device footprint must come out of the -mva budget BEFORE the target
+// plan runs (draft: weights + KV + compute; MTP context: KV + compute, the head weights
+// are target tensors already planned).
+//   - spec contexts run at the pre-plan ubatch (recorded in speculative.draft.n_ubatch)
+//   - big MoE drafts (> 2 GiB with expert stacks) spill their experts to CPU through the
+//     draft override list when the user gave none (-otd) and reserve dense bytes only
+//   - measured with the fit's memory probe; drafts that need a target context to build
+//     their graph fall back to gguf metadata + a fixed margin
+// Returns the reserve in MiB (0 without speculation). Both the runtime
+// (common_init_from_params) and llama-pshard-plan-params call this, so plan and run
+// price the same effective budget.
+size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

@@ -1345,8 +1345,22 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         const uint32_t n_draft_tier = cparams.n_outputs_max_per_seq > 1 ? cparams.n_outputs_max_per_seq - 1 : 0;
         mparams.pshard_registry = llama_pshard_registry_create(params.pshard_tier_max, cparams.n_seq_max, n_draft_tier);
         const size_t fit_target_mb = params.fit_params_target.empty() ? 0 : params.fit_params_target[0] / (1024 * 1024);
+        // one-budget rule: a separate draft model's device footprint comes out of the budget
+        size_t mva_eff = params.max_vram_alloc, fit_target_eff = fit_target_mb;
+        if (const size_t dres = common_pshard_draft_reserve_mb(params, cparams.n_ctx); dres > 0) {
+            if (mva_eff > 0) {
+                if (mva_eff <= dres) {
+                    LOG_WRN("%s: the spec context reserve (%zu MiB) leaves nothing of the %zu MiB pshard budget for the target; pshard will fall back to stock\n", __func__, dres, mva_eff);
+                }
+                mva_eff = mva_eff > dres ? mva_eff - dres : 1;  // 1 MiB: non-viable -> stock fallback, never free-VRAM mode
+                LOG_INF("%s: pshard target budget after draft reserve: %zu MiB\n", __func__, mva_eff);
+            } else {
+                fit_target_eff += dres;
+                LOG_INF("%s: pshard fit target after draft reserve: %zu MiB\n", __func__, fit_target_eff);
+            }
+        }
         llama_params_fit_pshard(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_buft_overrides.data(), params.max_vram_alloc, fit_target_mb);
+            params.tensor_buft_overrides.data(), mva_eff, fit_target_eff);
         if (!mparams.pshard) {
             // this process continues on the STOCK path: undo the pshard-only env gates so the
             // fallback run keeps stock fusion behavior
@@ -1478,6 +1492,174 @@ void common_init_result::reset_samplers() {
 
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
+}
+
+// gguf metadata helpers for the one-budget reserve (no weights touched)
+static uint32_t common_gguf_arch_u32(gguf_context * g, const char * arch, const char * suffix, uint32_t def) {
+    const std::string key = std::string(arch) + "." + suffix;
+    const int64_t k = gguf_find_key(g, key.c_str());
+    if (k < 0) return def;
+    switch (gguf_get_kv_type(g, k)) {
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(g, k);
+        case GGUF_TYPE_INT32:  return (uint32_t) gguf_get_val_i32(g, k);
+        case GGUF_TYPE_UINT16: return gguf_get_val_u16(g, k);
+        default:               return def;  // per-layer arrays etc.: keep the default
+    }
+}
+
+size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
+    const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (!has_draft && !spec_mtp) {
+        return 0;
+    }
+    const size_t mib = 1024ULL * 1024ULL;
+
+    // spec contexts run at the pre-plan ubatch (the user's -ub or the stock default), not at
+    // the target's tier ubatch the pshard fit selects below: their compute buffers scale
+    // with it and they never see batches that large (drafts chunk by llama_n_ubatch)
+    // 128 covers every per-step batch a spec context sees (dflash block 16+1, MTP/eagle
+    // n_draft+1); prompt injection is chunked by the implementations at llama_n_ubatch
+    if (params.speculative.draft.n_ubatch <= 0) {
+        params.speculative.draft.n_ubatch = std::min<int32_t>(params.n_ubatch, 128);
+    }
+    const int32_t ubatch = params.speculative.draft.n_ubatch;
+
+    // n_ctx == 0 means "the target's trained context" (resolved later by the fit): the spec
+    // contexts follow the target's n_ctx, so resolve it here from the target's metadata
+    if (n_ctx == 0) {
+        gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+        if (gguf_context * g = gguf_init_from_file(params.model.path.c_str(), ip)) {
+            const int64_t ka = gguf_find_key(g, "general.architecture");
+            if (ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING) {
+                n_ctx = common_gguf_arch_u32(g, gguf_get_val_str(g, ka), "context_length", 0);
+            }
+            gguf_free(g);
+        }
+        if (n_ctx == 0) { n_ctx = 4096; }
+    }
+
+    // ---- separate draft gguf: metadata footprint over ALL shards + analytical KV bytes/token
+    size_t w_total = 0, w_exps = 0, kv_bytes_per_token = 0;
+    bool   spill = false, user_ovr = false;
+    const std::string path = has_draft ? params.speculative.draft.mparams.path : params.model.path;
+    if (has_draft) {
+        gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+        gguf_context * g = gguf_init_from_file(path.c_str(), ip);
+        if (!g) {
+            LOG_WRN("%s: cannot read draft gguf '%s', no budget reserve applied\n", __func__, path.c_str());
+            return 0;
+        }
+        // KV per token: n_layer x (k + v rows) at the draft's cache types (sliding-window
+        // layers make this an upper bound)
+        {
+            const int64_t ka = gguf_find_key(g, "general.architecture");
+            if (ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING) {
+                const char * arch = gguf_get_val_str(g, ka);
+                const uint32_t n_layer  = common_gguf_arch_u32(g, arch, "block_count", 0);
+                const uint32_t n_head   = common_gguf_arch_u32(g, arch, "attention.head_count", 0);
+                const uint32_t n_headkv = common_gguf_arch_u32(g, arch, "attention.head_count_kv", n_head);
+                const uint32_t n_embd   = common_gguf_arch_u32(g, arch, "embedding_length", 0);
+                const uint32_t k_len    = common_gguf_arch_u32(g, arch, "attention.key_length",   n_head ? n_embd / n_head : 0);
+                const uint32_t v_len    = common_gguf_arch_u32(g, arch, "attention.value_length", k_len);
+                if (n_layer && n_headkv && k_len) {
+                    kv_bytes_per_token = (size_t) n_layer *
+                        (ggml_row_size(params.speculative.draft.cache_type_k, (int64_t) n_headkv * k_len) +
+                         ggml_row_size(params.speculative.draft.cache_type_v, (int64_t) n_headkv * v_len));
+                }
+            }
+        }
+        // weights over every shard of a split gguf
+        int split_count = 1, split_no = 0;
+        if (const int64_t kc = gguf_find_key(g, "split.count"); kc >= 0 && gguf_get_kv_type(g, kc) == GGUF_TYPE_UINT16) {
+            split_count = gguf_get_val_u16(g, kc);
+        }
+        if (const int64_t kn = gguf_find_key(g, "split.no"); kn >= 0 && gguf_get_kv_type(g, kn) == GGUF_TYPE_UINT16) {
+            split_no = gguf_get_val_u16(g, kn);
+        }
+        auto sum_tensors = [&](gguf_context * gg) {
+            for (int64_t i = 0; i < gguf_get_n_tensors(gg); i++) {
+                const char * name = gguf_get_tensor_name(gg, i);
+                const size_t sz   = gguf_get_tensor_size(gg, i);
+                w_total += sz;
+                if (strstr(name, "ffn_") && strstr(name, "exps")) { w_exps += sz; }
+            }
+        };
+        sum_tensors(g);
+        gguf_free(g);
+        if (split_count > 1) {
+            char prefix[4096];
+            if (llama_split_prefix(prefix, sizeof(prefix), path.c_str(), split_no, split_count) > 0) {
+                for (int sn = 0; sn < split_count; sn++) {
+                    if (sn == split_no) continue;
+                    char shard[4096];
+                    llama_split_path(shard, sizeof(shard), prefix, sn, split_count);
+                    if (gguf_context * gs = gguf_init_from_file(shard, ip)) { sum_tensors(gs); gguf_free(gs); }
+                    else { LOG_WRN("%s: cannot read draft shard '%s', weights undercounted\n", __func__, shard); }
+                }
+            }
+        }
+
+        // a big MoE draft spills its expert stacks to CPU - the dense bytes are the highest
+        // value-density bytes on the card, the experts are read once per drafted token.
+        // The user's own -otd list wins; a spill applied by an earlier call is recognized.
+        auto & ovr = params.speculative.draft.tensor_buft_overrides;
+        for (const auto & o : ovr) {
+            if (o.pattern && strcmp(o.pattern, LLM_FFN_EXPS_REGEX) == 0) { spill = true; }
+        }
+        user_ovr = !ovr.empty() && !spill;
+        if (!user_ovr && !spill && w_total > (2ULL << 30) && w_exps > 0) {
+            spill = true;
+            ovr.push_back(llm_ffn_exps_cpu_override());
+            ovr.push_back({ nullptr, nullptr, -1 });
+        }
+    }
+
+    // ---- measured device need: the probe the stock fit runs for its extra model. The MTP
+    //      context shares the target's weights (model bytes excluded); drafts whose graph
+    //      taps a target context (dflash/eagle) cannot be measured standalone -> model below
+    common_params params_dft = common_base_params_to_speculative(params);
+    auto mparams_dft = common_model_params_to_llama(params_dft);
+    auto cparams_dft = common_context_params_to_llama(params_dft);
+    cparams_dft.n_ctx    = n_ctx;
+    cparams_dft.n_rs_seq = 0;
+    if (!has_draft) {
+        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    }
+    const common_device_memory_need m = common_get_device_memory_need(path.c_str(), &mparams_dft, &cparams_dft, GGML_LOG_LEVEL_ERROR);
+
+    size_t need = 0;
+    char how[192];
+    if (m.ok) {
+        need = (has_draft ? m.model : 0) + m.context + m.compute;
+        snprintf(how, sizeof(how), "measured: weights %.1f + ctx %.1f + compute %.1f MiB",
+            (has_draft ? m.model : 0) / (double) mib, m.context / (double) mib, m.compute / (double) mib);
+    } else {
+        // analytical model: device weights + KV(n_ctx) + compute(ubatch). The compute term is
+        // affine in the ubatch the context is reserved for, calibrated on the 35B dflash draft
+        // (taps + block decoder): 520 MiB at ubatch 128, 1373 MiB at 512 -> ~236 + 2.22/token;
+        // rounded up to 256 + 2.25/token. The MTP context has no weights of its own. The
+        // context reports its real footprint at teardown (pshard one-budget check).
+        const size_t w_dev    = has_draft ? (spill ? w_total - w_exps : w_total) : 0;
+        const size_t kv       = kv_bytes_per_token * (size_t) n_ctx;
+        const size_t compute  = 256 * mib + (size_t) (2.25 * mib * (double) ubatch);
+        need = w_dev + kv + compute;
+        snprintf(how, sizeof(how), "modeled: weights %.1f + kv %.1f + compute %.1f MiB",
+            w_dev / (double) mib, kv / (double) mib, compute / (double) mib);
+    }
+    const size_t reserve_mb = (need + mib - 1) / mib;
+    params.speculative.draft.pshard_reserve_mb = (int32_t) reserve_mb;
+    if (has_draft) {
+        LOG_INF("%s: one-budget reserve for draft '%s': weights %.1f MiB (experts %.1f MiB%s), n_ctx %u, ubatch %d, device need %.1f MiB (%s) -> %zu MiB reserved from the pshard budget\n",
+            __func__, path.c_str(), w_total / (double) mib, w_exps / (double) mib,
+            spill ? ", spilled to CPU" : (user_ovr ? ", user -otd" : ""), n_ctx, ubatch,
+            need / (double) mib, how, reserve_mb);
+    } else {
+        LOG_INF("%s: one-budget reserve for the MTP draft context: n_ctx %u, ubatch %d, device need %.1f MiB (%s) -> %zu MiB reserved from the pshard budget\n",
+            __func__, n_ctx, ubatch, need / (double) mib, how, reserve_mb);
+    }
+    return reserve_mb;
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {

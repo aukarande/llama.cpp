@@ -592,8 +592,16 @@ void llama_context::pshard_switch_plan(
 
 // restore saved alloc state for the active plan
 void llama_context::pshard_reapply_active_plan() {
-    if (!pshard_active_plan || !pshard_active_plan->alloc_state.valid) {
+    if (!pshard_active_plan) {
         return;
+    }
+    if (!pshard_active_plan->alloc_state.valid) {
+        // invalidated by a scheduler rebuild (sched_reserve): the plan is landed, so the
+        // reserve under its current placement is the correct one - take it now
+        pshard_reserve_and_save(*pshard_active_plan);
+        if (!pshard_active_plan->alloc_state.valid) {
+            return;
+        }
     }
     const llama_pshard_plan & plan = *pshard_active_plan;
 

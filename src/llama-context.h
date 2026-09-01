@@ -377,6 +377,10 @@ private:
 
     const llama_pshard_plan * pshard_active_plan = nullptr;
     bool pshard_memory_dirty = false;
+    // tiers reserved + initial plan landed; a later scheduler rebuild (sched_need_reserve
+    // set after creation, e.g. by a draft context enabling layer-input extraction on this
+    // target) must redo both - the cached per-plan alloc states belong to the old galloc
+    bool pshard_runtime_ready = false;
     pshard_dev_layout   pshard_layout = {};
 
     ggml_backend_t backend_cpu = nullptr;

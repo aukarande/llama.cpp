@@ -2346,6 +2346,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = std::min(result.n_ubatch, params_spec.n_ubatch);
+        result.n_batch  = std::max(result.n_batch,  result.n_ubatch);
+    }
+
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
@@ -2372,6 +2377,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
 }
 
 struct common_speculative_init_result::impl {
+    int32_t pshard_reserve_mb = 0;  // one-budget reserve this context was priced at (0 = none)
+    bool    shares_model      = false;
     impl() = default;
     ~impl() = default;
 
@@ -2404,6 +2411,9 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    pimpl->pshard_reserve_mb = params.speculative.draft.pshard_reserve_mb;
+    pimpl->shares_model      = !has_draft;
 
     std::string model_path;
     if (has_draft) {
@@ -2440,7 +2450,23 @@ common_speculative_init_result::common_speculative_init_result(
     }
 }
 
-common_speculative_init_result::~common_speculative_init_result() = default;
+common_speculative_init_result::~common_speculative_init_result() {
+    // pshard one-budget self-check: what this context really took on device (final, after
+    // the implementation's own re-reserves) against what was carved out of the target's budget
+    if (pimpl && pimpl->context && pimpl->pshard_reserve_mb > 0) {
+        size_t model = 0, context = 0, compute = 0;
+        for (const auto & [buft, mb] : llama_get_memory_breakdown(pimpl->context.get())) {
+            if (ggml_backend_buft_is_host(buft)) continue;
+            model += mb.model; context += mb.context; compute += mb.compute;
+        }
+        const double mib  = 1024.0 * 1024.0;
+        const size_t wts  = pimpl->shares_model ? 0 : model;
+        const size_t used = wts + context + compute;
+        LOG_INF("%s: pshard one-budget check: %s context used %.1f MiB on device (weights %.1f, ctx %.1f, compute %.1f) vs %d MiB reserved (%+.1f MiB)\n",
+            __func__, pimpl->shares_model ? "MTP" : "draft", used / mib, wts / mib, context / mib, compute / mib,
+            pimpl->pshard_reserve_mb, used / mib - pimpl->pshard_reserve_mb);
+    }
+}
 
 llama_model * common_speculative_init_result::model() {
     return pimpl->model.get();

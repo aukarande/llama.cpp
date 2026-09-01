@@ -502,6 +502,7 @@ llama_context::llama_context(
             pshard_warmup_plan_reserves();
             const_cast<llama_model &>(model).sync_dev_preload();
             pshard_apply_initial_plan();
+            pshard_runtime_ready = true;
         }
 
         if (!cparams.flash_attn) {
@@ -771,6 +772,29 @@ void llama_context::sched_reserve() {
         }
 
     } // !cparams.pshard
+
+    if (cparams.pshard && !model.hparams.no_alloc && pshard_runtime_ready) {
+        // the scheduler was rebuilt after the tiers were reserved (e.g. a dflash/eagle draft
+        // context enabled layer-input extraction on this target, or a backend sampler was
+        // installed): every plan's cached allocation state was captured against the previous
+        // galloc and graph shape, and restoring it would hand the new graph stale addresses
+        // (the extracted hidden states get overwritten by later nodes -> the draft sees
+        // garbage -> n_accept=0). Invalidate them all; each tier re-reserves lazily on its
+        // next apply, under its own correctly landed placement (pshard_apply_plan /
+        // pshard_reapply_active_plan). NOT a warmup re-walk: that toggles KV pins without
+        // moving data, harmless on the empty cache at construction, destructive on a live one.
+        auto * registry = model.get_plan_registry();
+        if (registry) {
+            for (auto & plan : registry->best_plans) {
+                plan.alloc_state.valid = false;
+            }
+        }
+        LLAMA_LOG_INFO("%s: pshard scheduler rebuilt - tier plans re-reserve on their next apply\n", __func__);
+        // decode runs pshard_maybe_switch BEFORE sched_reserve, so the active plan was just
+        // landed (and its stale state restored into the OLD scheduler): reserve + restore it
+        // against the new scheduler now, before the first graph is built
+        pshard_reapply_active_plan();
+    }
 
     const int64_t t_end_us = ggml_time_us();
 

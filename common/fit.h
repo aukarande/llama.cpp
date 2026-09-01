@@ -65,3 +65,19 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
+
+// Measured device-memory need of a model + context at the given params, summed over
+// the GPU devices, in bytes (ok=false if it could not be measured - e.g. drafts whose
+// graph needs a target context). Used by pshard's one-budget rule for spec contexts.
+struct common_device_memory_need {
+    size_t model   = 0;
+    size_t context = 0;
+    size_t compute = 0;
+    bool   ok      = false;
+};
+
+common_device_memory_need common_get_device_memory_need(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+                     ggml_log_level   log_level);

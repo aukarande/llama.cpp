@@ -222,8 +222,22 @@ static void plan_pshard_context(common_params & params, uint32_t n_ctx, uint32_t
     } else {
         LOG_INF("%s: planning pshard tensor overrides for n_ctx=%u tier_max=%u...\n", __func__, n_ctx, tier_max);
     }
+    // one-budget rule: mirror the runtime - a separate draft's device footprint comes out of the budget
+    size_t mva_eff = params.max_vram_alloc, fit_target_eff = fit_target_mb;
+    if (const size_t dres = common_pshard_draft_reserve_mb(params, cparams.n_ctx); dres > 0) {
+        if (mva_eff > 0) {
+            if (mva_eff <= dres) {
+                LOG_WRN("%s: the spec context reserve (%zu MiB) leaves nothing of the %zu MiB pshard budget for the target; pshard will fall back to stock\n", __func__, dres, mva_eff);
+            }
+            mva_eff = mva_eff > dres ? mva_eff - dres : 1;  // 1 MiB: non-viable -> stock fallback, never free-VRAM mode
+            LOG_INF("%s: pshard target budget after draft reserve: %zu MiB\n", __func__, mva_eff);
+        } else {
+            fit_target_eff += dres;
+            LOG_INF("%s: pshard fit target after draft reserve: %zu MiB\n", __func__, fit_target_eff);
+        }
+    }
     llama_params_fit_pshard_plan(params.model.path.c_str(), &mparams, &cparams,
-        params.tensor_buft_overrides.data(), params.max_vram_alloc, fit_target_mb);
+        params.tensor_buft_overrides.data(), mva_eff, fit_target_eff);
 
     llama_pshard_registry_free(mparams.pshard_registry);
 }
