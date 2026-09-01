@@ -128,6 +128,20 @@ and corrupt concurrent measurements).
        16k); fully-GPU-resident plans +35% over (ranking-neutral); the
        oss-c16384-mva2000 cell spans a harness restart (weak comparability).
 
+9. **pshard+MTP LANDED 2026-09-01** (overnight; commits 3c8e0a48c ddb019848
+   24237a489 7fcd9e136 12b3f837c): speculative decoding works under -pshard.
+   Five stacked root causes fixed (see 12b3f837c message). Verified wmtp
+   c2048/mva4000: no-spec 45.4 -> +MTP n_max=2 52.8 t/s (+16%, accept 78.3%);
+   single-seq non-spec byte-identical. REMAINING (queued): [a] draft VRAM
+   reserve for separate-gguf drafts (dflash/dspark/DSv4-dspark untested;
+   would OOM at tight budgets - pass extra-reserve into fit); [b] FNV
+   logits-hash spec test port (cordis tests/test_pshard_spec.cpp shape);
+   [c] stock+MTP equal-budget QA cell (stock-fallback+MTP at DEFAULT fit hit
+   ~83 t/s - budget-equalized comparison pending); [d] forced-s3+MTP
+   n_accept=0 anomaly seen once on a pre-fix build - cheap retest;
+   [e] server spec path untested; [f] plan-tool arg parse now
+   LLAMA_EXAMPLE_SPECULATIVE (accepts --spec-type / --spec-draft-n-max).
+
 ## Contamination note (2026-08-30)
 
 Two "stopped" harness runs kept running detached and overlapped each other and
