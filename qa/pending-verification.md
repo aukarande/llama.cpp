@@ -157,10 +157,10 @@ and corrupt concurrent measurements).
    llama_memory_params and change llama-kv-cache.cpp:163 +
    llama-memory-recurrent.cpp:75 to model.is_pshard() && params.pshard
    (then nextn could pin again and the draft gets a stock GPU KV, matching
-   stock+MTP's 63% config); [h] runtime cache loader never sets
-   mparams->pshard_delegate_compute (planner does, llama-pshard-plan.cpp:
-   2150) - s3-from-cache runs a different scheduling regime than the one
-   priced; mirror in llama-pshard-cache.cpp.
+   stock+MTP's 63% config); [h] ~~delegate-compute
+   parity~~ CLOSED 2026-09-01 (1dd7582c4): cache loader now mirrors the plan
+   path; cached delegate-strategy plans no longer build early reserves
+   un-delegated (s3-from-cache 46.5-47.1 vs 46.3-46.4 pre-fix, coherent).
 
 10. ~~Fused-GLU certification~~ **CLOSED 2026-09-01 (8afa86ccf)**: root cause =
    galloc frees sched weight copies mid-split; the GLU dst legally lands in the
