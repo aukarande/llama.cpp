@@ -2325,6 +2325,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 
+    // pshard is owned by the TARGET context only. The draft/MTP context must not
+    // re-run pshard init over the same model: it would re-probe every tier, clobber
+    // the thread_local split-callback state, and fight the target's plan switching.
+    // The MTP context simply computes over the model's current (plan-stamped)
+    // placement; a separate draft model loads without pshard entirely.
+    result.pshard          = false;
+    result.max_vram_alloc  = 0;
+    result.pshard_tier_max = 0;
+
     if (has_draft) {
         result.devices               = params_spec.devices;
         result.model                 = params_spec.mparams;

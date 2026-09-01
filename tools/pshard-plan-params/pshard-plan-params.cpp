@@ -233,7 +233,9 @@ int main(int argc, char ** argv) {
         forwarded_argv.push_back(arg.data());
     }
 
-    if (!common_params_parse((int) forwarded_argv.size(), forwarded_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
+    // SPECULATIVE example set: planning must accept --spec-type so MTP-loaded models
+    // (load_mtp -> one extra placeable nextn layer) get their own keyed plan variant
+    if (!common_params_parse((int) forwarded_argv.size(), forwarded_argv.data(), params, LLAMA_EXAMPLE_SPECULATIVE)) {
         return 1;
     }
 

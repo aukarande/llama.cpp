@@ -200,10 +200,12 @@ uint64_t pshard_registry_fingerprint(
         const struct llama_context_params * cparams,
         int64_t model_file_size) {
 
-    (void) mparams;
-
     uint64_t h = 0xcbf29ce484222325ULL;
     auto mix = [&](uint64_t v) { h ^= v; h *= 0x100000001b3ULL; };
+
+    // an MTP-loaded model has one extra placeable layer (the nextn head), so its
+    // plans are not interchangeable with the trunk-only variant
+    mix((uint64_t)(mparams->load_mtp ? 1 : 0));
 
     mix(cparams->n_ctx);
     mix(cparams->n_seq_max);
@@ -276,6 +278,14 @@ static bool llama_pshard_probe_model_only(
     probe.n_layers    = model->hparams.n_layer();
     probe.n_ctx_train = model->hparams.n_ctx_train;
     probe.n_expert    = model->hparams.n_expert;
+
+    // MTP: the nextn head is a full extra layer (attn + experts) WITHIN block_count.
+    // When it will actually be loaded, plan it like any other layer - leaving it out
+    // let blk.<nextn> fall to the loader's dev_layer default (wholesale on GPU,
+    // outside the budget) and crashed warmup reserves with plan-blind view sizes.
+    if (mparams->load_mtp) {
+        probe.n_layers += model->hparams.n_layer_nextn;
+    }
 
     if (!probe.devs.empty()) {
         ggml_backend_dev_t dev = probe.devs[0].dev;
