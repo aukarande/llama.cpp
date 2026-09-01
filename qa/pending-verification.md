@@ -140,9 +140,24 @@ and corrupt concurrent measurements).
    24237a489 7fcd9e136 12b3f837c): speculative decoding works under -pshard.
    Five stacked root causes fixed (see 12b3f837c message). Verified wmtp
    c2048/mva4000: no-spec 45.4 -> +MTP n_max=2 52.8 t/s (+16%, accept 78.3%);
-   single-seq non-spec byte-identical. REMAINING (queued): [a] draft VRAM
-   reserve for separate-gguf drafts (dflash/dspark/DSv4-dspark untested;
-   would OOM at tight budgets - pass extra-reserve into fit); [b] FNV
+   single-seq non-spec byte-identical. REMAINING (queued): [a] ~~draft VRAM
+   reserve~~ CLOSED 2026-09-01 (2d368c4ed): one-budget reserve for spec contexts
+   (runtime + plan tool price the same effective budget; MTP ctx measured,
+   dflash/eagle modeled from gguf metadata + affine compute, spec ctx ubatch
+   <= 128, footprint self-check at teardown). dflash pair @4000: 0/576
+   accepted + 9067 MiB peak -> 121/219, 50.5 t/s, 4315 MiB peak (single-ctx
+   pshard @4000 = 4318). Found + fixed on the way: (i) the MTP ctx and a galloc
+   overflow chunk sat OUTSIDE the budget (56.9 t/s @ 5063 MiB -> 56.3 t/s @
+   4367 MiB): the union enforcer now counts probe-measured compute scratch +
+   a 32 MiB runtime-packing margin; (ii) a scheduler rebuild after a draft
+   enables layer-input extraction left stale per-plan alloc states
+   (n_accept=0) -> lazy re-reserve + immediate re-land of the active plan.
+   STILL OPEN: dspark and DSv4+dspark (big-draft expert-spill rule) untested;
+   a tier marked unviable at load should fall back to the nearest viable tier
+   (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
+   budget before the margin fix); joint target+draft planning (cordis v2)
+   deferred until v1 shows a case where leftover budget could pin draft
+   experts; [b] FNV
    logits-hash spec test port (cordis tests/test_pshard_spec.cpp shape);
    [c] stock+MTP equal-budget QA cell (stock-fallback+MTP at DEFAULT fit hit
    ~83 t/s - budget-equalized comparison pending); [d] ~~forced-s3+MTP
