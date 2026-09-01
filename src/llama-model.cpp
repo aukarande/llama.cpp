@@ -2941,6 +2941,13 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+    // pipe-shard memory only for contexts that actually run pshard (see g_llama_memory_pshard_ctx)
+    struct pshard_ctx_gate {
+        bool saved;
+        explicit pshard_ctx_gate(bool v) : saved(g_llama_memory_pshard_ctx) { g_llama_memory_pshard_ctx = v; }
+        ~pshard_ctx_gate() { g_llama_memory_pshard_ctx = saved; }
+    } gate(cparams.pshard);
+
     llama_memory_i * res;
 
     switch (arch) {

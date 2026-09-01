@@ -90,16 +90,6 @@ void llama_pshard_generate_overrides(
         if (patterns_layer_attn[il].empty()) { patterns_layer_attn[il] = "blk\\." + std::to_string(il) + "\\.attn_(q|k|v|output|q_norm|k_norm).*"; }
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
 
-        // MTP head layers: ALWAYS CPU-resident. The stock-sched draft context reads
-        // them concurrently (never slot-streamed), and its layer-40 KV cache picks
-        // CPU mirrors only when is_cpu_only(il) - a PINNED nextn layer would select
-        // pipe-shard GPU KV tensors that nothing packs for the draft ctx (unbacked ->
-        // per-graph scratch -> garbage history -> n_accept=0).
-        if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
-            emit(patterns_layer[il].c_str(), host_buft, layout.cpu);
-            continue;
-        }
-
         if (il == il_boundary) {
             const char * overflow_pat = llama_get_overflow_pattern(il, overflow_type);
             if (overflow_pat) {
@@ -109,6 +99,16 @@ void llama_pshard_generate_overrides(
         } else if (il >= il_pin_start && il < il_pin_end) {
             emit(patterns_layer[il].c_str(), host_buft, layout.compute);
         } else {
+            // MTP head layers: read every draft step by the stock-sched draft context.
+            // Never slot-streamed (concurrent reader); PIN-PRIORITY: whenever the plan
+            // pins anything at all, the head goes to the compute GPU first (the probes
+            // price it, so viability shrinks the trunk pins accordingly). Pinned is
+            // sound now that the draft ctx gets stock, backed KV (per-context gate).
+            if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
+                const bool pin_head = !g_pshard_mtp_head_cpu && (n_pinned > 0 || n_attn_pinned > 0);
+                emit(patterns_layer[il].c_str(), host_buft, pin_head ? layout.compute : layout.cpu);
+                continue;
+            }
             // overlap=1: alternating shard slots (double-buffering lets the copy of layer i+1
             // overlap compute that still reads layer i's slot). overlap=0: one slot, no
             // prefetch - cheaper plan for budgets that cannot fund the second slot
@@ -520,6 +520,10 @@ void llama_params_fit_pshard(
     // regime than the one the planner's probes priced (first plan apply would
     // correct the model flag, but the early reserve graphs are already shaped)
     mparams->pshard_delegate_compute = llama_pshard_strategy_delegates_compute(best->strategy);
+
+    // the variant records whether the union enforcer demoted the MTP head to CPU;
+    // regenerate the load overrides under the placement the plans were priced with
+    g_pshard_mtp_head_cpu = registry->mtp_head_cpu;
 
     const int32_t cpu_bid = pshard_dev_layout::compute_cpu_backend_id(devs.size());
     const pshard_dev_layout layout = pshard_dev_layout::for_device(0, cpu_bid);

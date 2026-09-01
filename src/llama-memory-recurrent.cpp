@@ -72,7 +72,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
 
-    if (model.is_pshard()) {
+    if (model.is_pshard() && g_llama_memory_pshard_ctx) {
         std::vector<llama_memory_pshard::tensor_spec> specs;
         for (int i = 0; i < n_layer; i++) {
             if (filter && !filter(i)) continue;

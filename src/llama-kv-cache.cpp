@@ -160,7 +160,7 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
-    if (model.is_pshard()) {
+    if (model.is_pshard() && g_llama_memory_pshard_ctx) {
         std::vector<llama_memory_pshard::tensor_spec> specs;
         for (uint32_t il = 0; il < n_layer; il++) {
             if (!hparams.has_kv(il)) continue;

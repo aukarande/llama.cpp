@@ -64,6 +64,10 @@ inline int pshard_strategy_from_env() {
 // under the reader -> CUDA launch failures). Set by the planning/apply entry
 // points; single-threaded within a planning pass.
 inline thread_local uint32_t g_pshard_n_layers_mtp = 0;
+// MTP head placement lever: false = pin-priority (head on the compute GPU whenever the
+// plan pins anything), true = head CPU-resident (the union-budget enforcer flips this
+// variant-wide when the pinned head overshoots; persisted in the registry header)
+inline thread_local bool g_pshard_mtp_head_cpu = false;
 
 struct llama_pshard_override {
     std::string                pattern;
@@ -197,6 +201,7 @@ struct llama_pshard_plan_registry {
     float switch_attn_frac = 0.0f;  // attention share of a layer's bytes
     float switch_head_mb   = 0.0f;  // est. MB of the output head
     float switch_pcie_gb_s = 0.0f;  // upload rate for pinned weights
+    bool  mtp_head_cpu     = false; // MTP head demoted to CPU by union-budget enforcement
 
     // one-way cost of switching pinned residency between two plans, in ms.
     // Falls back to the tier0-anchored per-plan estimate for legacy caches.

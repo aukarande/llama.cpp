@@ -92,16 +92,6 @@ static void llama_pshard_generate_overrides(
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
         if (patterns_layer_router[il].empty()) { patterns_layer_router[il] = "blk\\." + std::to_string(il) + "\\.(ffn_gate_inp|ffn_exp_probs_b).*"; }
 
-        // MTP head layers: ALWAYS CPU-resident. The stock-sched draft context reads
-        // them concurrently (never slot-streamed), and its layer-40 KV cache picks
-        // CPU mirrors only when is_cpu_only(il) - a PINNED nextn layer would select
-        // pipe-shard GPU KV tensors that nothing packs for the draft ctx (unbacked ->
-        // per-graph scratch -> garbage history -> n_accept=0).
-        if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
-            emit(patterns_layer[il].c_str(), host_buft, layout.cpu);
-            continue;
-        }
-
         if (il == il_boundary) {
             const char * overflow_pat = llama_get_overflow_pattern(il, overflow_type);
             if (overflow_pat) {
@@ -111,6 +101,16 @@ static void llama_pshard_generate_overrides(
         } else if (il >= il_pin_start && il < il_pin_end) {
             emit(patterns_layer[il].c_str(), gpu_buft, layout.compute);
         } else {
+            // MTP head layers: read every draft step by the stock-sched draft context.
+            // Never slot-streamed (concurrent reader); PIN-PRIORITY: whenever the plan
+            // pins anything at all, the head goes to the compute GPU first (the probes
+            // price it, so viability shrinks the trunk pins accordingly). Pinned is
+            // sound now that the draft ctx gets stock, backed KV (per-context gate).
+            if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
+                const bool pin_head = !g_pshard_mtp_head_cpu && (n_pinned > 0 || n_attn_pinned > 0);
+                emit(patterns_layer[il].c_str(), host_buft, pin_head ? layout.compute : layout.cpu);
+                continue;
+            }
             // overlap=1: alternating shard slots (double-buffering). overlap=0: one slot,
             // no prefetch - cheaper plan for budgets that cannot fund the second slot
             const int32_t shard_bid = overlap ? layout.shard(il) : layout.shard_a;
@@ -1003,10 +1003,11 @@ bool pshard_registry_save(
 
     // trailing fields after cache_ubatch are ignored by older parsers (sscanf assigns
     // the two %u before the literal ']' mismatch and still returns 2)
-    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f]\n",
+    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d]\n",
         budget_mib, cache_ubatch,
         registry->switch_layer_mb, registry->switch_attn_frac,
-        registry->switch_head_mb, registry->switch_pcie_gb_s);
+        registry->switch_head_mb, registry->switch_pcie_gb_s,
+        registry->mtp_head_cpu ? 1 : 0);
     if (registry->pshard_disabled) {
         fprintf(f, "pshard_disabled=1 baseline_vram=%.1f\n", registry->baseline_vram_req / (1024.0 * 1024.0));
     } else {
@@ -1074,6 +1075,7 @@ bool pshard_registry_load(
         float switch_attn_frac = 0.0f;
         float switch_head_mb = 0.0f;
         float switch_pcie_gb_s = 0.0f;
+        bool  mtp_head_cpu     = false;
         std::vector<tier_data> tiers;
     };
     std::vector<variant_data> variants;
@@ -1103,6 +1105,7 @@ bool pshard_registry_load(
             if ((p = strstr(s.c_str(), "attn_frac=")) != NULL) cur_variant->switch_attn_frac = (float)atof(p + 10);
             if ((p = strstr(s.c_str(), "head_mb="))   != NULL) cur_variant->switch_head_mb   = (float)atof(p + 8);
             if ((p = strstr(s.c_str(), "pcie="))      != NULL) cur_variant->switch_pcie_gb_s = (float)atof(p + 5);
+            if ((p = strstr(s.c_str(), "mtp_head_cpu=")) != NULL) cur_variant->mtp_head_cpu = atoi(p + 13) != 0;
             continue;
         }
         if (!cur_variant) continue;
@@ -1341,6 +1344,7 @@ bool pshard_registry_load(
         registry->switch_attn_frac = best_whole->switch_attn_frac;
         registry->switch_head_mb   = best_whole->switch_head_mb;
         registry->switch_pcie_gb_s = best_whole->switch_pcie_gb_s;
+        registry->mtp_head_cpu     = best_whole->mtp_head_cpu;
     }
 
     for (auto & item : selected) {
@@ -1454,92 +1458,118 @@ static void pshard_enforce_union_budget(
         return out;
     };
 
-    const int max_rounds = 6;
-    for (int round = 0; round < max_rounds; round++) {
-        // 1. common = intersection of viable plans' resident sets
-        std::vector<size_t> viable;
-        std::vector<std::set<std::string>> residents(registry->best_plans.size());
-        for (size_t t = 0; t < registry->best_plans.size(); t++) {
-            if (!registry->best_plans[t].is_viable) continue;
-            residents[t] = resident_set(registry->best_plans[t]);
-            viable.push_back(t);
-        }
-        if (viable.empty()) return;
+    // demotion levers, cheapest first:
+    //   pass 0: shave the violating tiers' own pins - re-plan each violator at an
+    //           escalating reduced budget (every violator per round, so tied decode
+    //           tiers converge together; doubling beats a search granularity coarser
+    //           than the overshoot)
+    //   pass 1: MTP only - the pinned head could not be paid for by trunk shaving;
+    //           demote it to CPU variant-wide, re-plan every tier at the full budget,
+    //           then shave again
+    const int    max_rounds = 6;
+    const size_t margin     = 32ULL * 1024 * 1024;
+    std::vector<bool> orig_viable(registry->best_plans.size(), false);
+    for (size_t t = 0; t < registry->best_plans.size(); t++) { orig_viable[t] = registry->best_plans[t].is_viable; }
 
-        std::set<std::string> common = residents[viable[0]];
-        for (size_t vi = 1; vi < viable.size(); vi++) {
-            std::set<std::string> next;
-            for (const auto & n : common) {
-                if (residents[viable[vi]].count(n)) next.insert(n);
-            }
-            common.swap(next);
-        }
-
-        // 2. pack the common set (loader order): common_end = unpadded end of last tensor
-        std::vector<std::pair<std::string, size_t>> common_sorted;
-        for (const auto & [name, sz] : tensors) {
-            if (common.count(name)) common_sorted.emplace_back(name, sz);
-        }
-        std::sort(common_sorted.begin(), common_sorted.end(), pshard_union_weight_less);
-        size_t cursor = 0, common_end = 0;
-        for (const auto & [name, sz] : common_sorted) {
-            common_end = cursor + sz;
-            cursor    += align_up(sz);
-        }
-
-        // 3. per viable plan: stamp extras above common_end, add its pinned cache
-        size_t worst_t = SIZE_MAX, worst_over = 0;
-        for (size_t t : viable) {
-            const auto & plan = registry->best_plans[t];
-            std::vector<std::pair<std::string, size_t>> extras;
-            for (const auto & [name, sz] : tensors) {
-                if (residents[t].count(name) && !common.count(name)) extras.emplace_back(name, sz);
-            }
-            std::sort(extras.begin(), extras.end(), pshard_union_weight_less);
-            size_t so = align_up(common_end);
-            for (const auto & [name, sz] : extras) { so = align_up(so + sz); }
-
-            const size_t need = so + plan.cache_measured;
-            LLAMA_LOG_INFO("%s: [tier bs=%u] union scratch_off=%.2f MiB + pinned cache=%.2f MiB = %.2f / %.2f MiB budget %s\n",
-                __func__, plan.batch_size, so / (1024.0*1024.0), plan.cache_measured / (1024.0*1024.0),
-                need / (1024.0*1024.0), budget_bytes / (1024.0*1024.0),
-                need <= budget_bytes ? "OK" : "OVERSHOOT");
-            if (need > budget_bytes && need - budget_bytes > worst_over) {
-                worst_over = need - budget_bytes;
-                worst_t    = t;
-            }
-        }
-        if (worst_t == SIZE_MAX) {
-            return;  // every viable tier fits the canonical layout
-        }
-
-        // 4. demote the worst violator: re-plan it at a reduced budget
-        auto & plan = registry->best_plans[worst_t];
-        const size_t margin  = 32ULL * 1024 * 1024;
-        const size_t new_bud = budget_bytes > worst_over + margin ? budget_bytes - worst_over - margin : 0;
-        LLAMA_LOG_WARN("%s: canonical union overshoots by %.2f MiB; re-planning tier bs=%u at %.0f MiB\n",
-            __func__, worst_over / (1024.0*1024.0), plan.batch_size, new_bud / (1024.0*1024.0));
-        if (new_bud == 0) { plan.is_viable = false; continue; }
-
+    auto replan_tier = [&](size_t t, size_t vram_free) {
         llama_pshard_search_ctx ctx_t = ctx;
-        ctx_t.vram_free = new_bud;
+        ctx_t.vram_free = vram_free;
         // probes must not take the canonical-preload path (best_plans is non-empty now)
         llama_model_params mp_replan = *mparams;
         mp_replan.pshard_registry = nullptr;
         ctx_t.mparams = &mp_replan;
         llama_context_params cp_tier = *cparams_base;
-        cp_tier.n_batch  = registry->tier_sizes[worst_t];
+        cp_tier.n_batch  = registry->tier_sizes[t];
         cp_tier.n_ubatch = cp_tier.n_batch;
         ctx_t.cparams = &cp_tier;
-
         llama_pshard_tier_prune prune;
         prune.init(ctx.n_layers);
         llama_pshard_plan p = llama_pshard_search_tier(ctx_t, force_strategy, dmds, prune);
-        if (p.is_viable) {
-            registry->best_plans[worst_t] = p;
-        } else {
-            plan.is_viable = false;
+        registry->best_plans[t] = p;
+        registry->best_plans[t].is_viable = p.is_viable;
+    };
+
+    for (int pass = 0; pass < 2; pass++) {
+        std::vector<size_t> reductions(registry->best_plans.size(), 0);  // per-tier escalating budget cut
+        for (int round = 0; round < max_rounds; round++) {
+            // 1. common = intersection of viable plans' resident sets
+            std::vector<size_t> viable;
+            std::vector<std::set<std::string>> residents(registry->best_plans.size());
+            for (size_t t = 0; t < registry->best_plans.size(); t++) {
+                if (!registry->best_plans[t].is_viable) continue;
+                residents[t] = resident_set(registry->best_plans[t]);
+                viable.push_back(t);
+            }
+            if (viable.empty()) return;
+
+            std::set<std::string> common = residents[viable[0]];
+            for (size_t vi = 1; vi < viable.size(); vi++) {
+                std::set<std::string> next;
+                for (const auto & n : common) {
+                    if (residents[viable[vi]].count(n)) next.insert(n);
+                }
+                common.swap(next);
+            }
+
+            // 2. pack the common set (loader order): common_end = unpadded end of last tensor
+            std::vector<std::pair<std::string, size_t>> common_sorted;
+            for (const auto & [name, sz] : tensors) {
+                if (common.count(name)) common_sorted.emplace_back(name, sz);
+            }
+            std::sort(common_sorted.begin(), common_sorted.end(), pshard_union_weight_less);
+            size_t cursor = 0, common_end = 0;
+            for (const auto & [name, sz] : common_sorted) {
+                common_end = cursor + sz;
+                cursor    += align_up(sz);
+            }
+
+            // 3. per viable plan: stamp extras above common_end, add its pinned cache
+            std::vector<std::pair<size_t, size_t>> violators;  // tier -> overshoot bytes
+            for (size_t t : viable) {
+                const auto & plan = registry->best_plans[t];
+                std::vector<std::pair<std::string, size_t>> extras;
+                for (const auto & [name, sz] : tensors) {
+                    if (residents[t].count(name) && !common.count(name)) extras.emplace_back(name, sz);
+                }
+                std::sort(extras.begin(), extras.end(), pshard_union_weight_less);
+                size_t so = align_up(common_end);
+                for (const auto & [name, sz] : extras) { so = align_up(so + sz); }
+
+                const size_t need = so + plan.cache_measured;
+                LLAMA_LOG_INFO("%s: [tier bs=%u] union scratch_off=%.2f MiB + pinned cache=%.2f MiB = %.2f / %.2f MiB budget %s\n",
+                    __func__, plan.batch_size, so / (1024.0*1024.0), plan.cache_measured / (1024.0*1024.0),
+                    need / (1024.0*1024.0), budget_bytes / (1024.0*1024.0),
+                    need <= budget_bytes ? "OK" : "OVERSHOOT");
+                if (need > budget_bytes) { violators.emplace_back(t, need - budget_bytes); }
+            }
+            if (violators.empty()) {
+                return;  // every viable tier fits the canonical layout
+            }
+
+            // 4. demote every violator: re-plan it at its (escalating) reduced budget
+            for (const auto & [t, over] : violators) {
+                auto & plan = registry->best_plans[t];
+                reductions[t] = std::max(reductions[t] * 2, over + margin);
+                const size_t new_bud = budget_bytes > reductions[t] ? budget_bytes - reductions[t] : 0;
+                LLAMA_LOG_WARN("%s: canonical union overshoots by %.2f MiB; re-planning tier bs=%u at %.0f MiB\n",
+                    __func__, over / (1024.0*1024.0), plan.batch_size, new_bud / (1024.0*1024.0));
+                if (new_bud == 0) { plan.is_viable = false; continue; }
+                replan_tier(t, new_bud);
+            }
         }
+
+        // trunk shaving did not converge: MTP head lever (once), then shave again
+        if (g_pshard_n_layers_mtp > 0 && !g_pshard_mtp_head_cpu) {
+            LLAMA_LOG_WARN("%s: union still overshoots after %d rounds with the MTP head pinned; re-planning all tiers with the head on CPU\n",
+                __func__, max_rounds);
+            g_pshard_mtp_head_cpu  = true;
+            registry->mtp_head_cpu = true;
+            for (size_t t = 0; t < registry->best_plans.size(); t++) {
+                if (orig_viable[t]) { replan_tier(t, ctx.vram_free); }
+            }
+            continue;
+        }
+        break;
     }
     LLAMA_LOG_WARN("%s: union still overshoots after %d demotion rounds; leaving runtime degrade as backstop\n",
         __func__, max_rounds);
@@ -1994,6 +2024,9 @@ void llama_params_fit_pshard_plan(
     }
     const int32_t           cpu_bid = pshard_dev_layout::compute_cpu_backend_id(devs.size());
     const pshard_dev_layout layout  = pshard_dev_layout::for_device(0, cpu_bid);
+    // every variant starts with the MTP head pin-priority placement; the union-budget
+    // enforcer flips this (and records it in the registry) only when the pinned head overshoots
+    g_pshard_mtp_head_cpu = false;
 
     std::unique_ptr<llama_benchmark_predictor> predictor;
     {

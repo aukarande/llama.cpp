@@ -585,6 +585,13 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+// per-context gate for pipe-shard memory: set by llama_model::create_memory from
+// the creating context's cparams.pshard. A second context over a pshard model
+// (e.g. the MTP draft context) must get STOCK memory - pipe-shard KV/RS tensors
+// defer their device addresses to the pshard-only cache packing and would
+// otherwise stay unbacked (per-graph scratch -> garbage attention history).
+inline thread_local bool g_llama_memory_pshard_ctx = true;
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
