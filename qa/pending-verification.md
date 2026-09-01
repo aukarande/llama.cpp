@@ -37,6 +37,14 @@ and corrupt concurrent measurements).
 1. **Full 144-grid rerun** - restart FRESH (plans changed under items 5/1/7 +
    DSA fix; the 42 pre-change rows are stale): `sh qa/run-qa.sh /tmp/qa-full-v3 full`.
    Then compare-qa vs reference, refresh ledger (schema v2), commit, push.
+1b. ~~Planner canonical-union accounting~~ **CLOSED 2026-09-01 (4fadc725f)**:
+   plan-time union enforcement (loader-parity packing simulation, byte-exact
+   common_end 1729.71 MiB; per-tier scratch_off + measured pinned cache <=
+   budget; bounded demotion loop) + the actual root cause: measurement probes
+   carrying a partially-populated registry took the canonical-preload path and
+   measured cache=0, mispricing fallback plans. Repro cell q8d-16k@2000-s1:
+   STOCK_FALLBACK -> 6 viable tiers, all union-OK, runs rc=0. Invariants held
+   (q35 pick identical, s4 smoke byte-identical, wmtp MTP unchanged).
 2. ~~Nemotron full slice~~ **REMOVED 2026-08-31** (user): subsumed by the full
    grid rerun, which includes nem.
 3. ~~Switch-cost behavioral check~~ **VERIFIED 2026-08-31**: switch_ms fields
