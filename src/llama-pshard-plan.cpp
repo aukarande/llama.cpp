@@ -91,6 +91,16 @@ static void llama_pshard_generate_overrides(
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
         if (patterns_layer_router[il].empty()) { patterns_layer_router[il] = "blk\\." + std::to_string(il) + "\\.(ffn_gate_inp|ffn_exp_probs_b).*"; }
 
+        // MTP head layers: ALWAYS CPU-resident. The stock-sched draft context reads
+        // them concurrently (never slot-streamed), and its layer-40 KV cache picks
+        // CPU mirrors only when is_cpu_only(il) - a PINNED nextn layer would select
+        // pipe-shard GPU KV tensors that nothing packs for the draft ctx (unbacked ->
+        // per-graph scratch -> garbage history -> n_accept=0).
+        if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
+            emit(patterns_layer[il].c_str(), host_buft, layout.cpu);
+            continue;
+        }
+
         if (il == il_boundary) {
             const char * overflow_pat = llama_get_overflow_pattern(il, overflow_type);
             if (overflow_pat) {
@@ -100,12 +110,6 @@ static void llama_pshard_generate_overrides(
         } else if (il >= il_pin_start && il < il_pin_end) {
             emit(patterns_layer[il].c_str(), gpu_buft, layout.compute);
         } else {
-            // MTP head layers: read concurrently by the stock-sched draft context -
-            // never slot-streamed (pinned or CPU only)
-            if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
-                emit(patterns_layer[il].c_str(), host_buft, layout.cpu);
-                continue;
-            }
             // overlap=1: alternating shard slots (double-buffering). overlap=0: one slot,
             // no prefetch - cheaper plan for budgets that cannot fund the second slot
             const int32_t shard_bid = overlap ? layout.shard(il) : layout.shard_a;
