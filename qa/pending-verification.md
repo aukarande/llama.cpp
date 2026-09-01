@@ -137,10 +137,22 @@ and corrupt concurrent measurements).
    would OOM at tight budgets - pass extra-reserve into fit); [b] FNV
    logits-hash spec test port (cordis tests/test_pshard_spec.cpp shape);
    [c] stock+MTP equal-budget QA cell (stock-fallback+MTP at DEFAULT fit hit
-   ~83 t/s - budget-equalized comparison pending); [d] forced-s3+MTP
-   n_accept=0 anomaly seen once on a pre-fix build - cheap retest;
-   [e] server spec path untested; [f] plan-tool arg parse now
-   LLAMA_EXAMPLE_SPECULATIVE (accepts --spec-type / --spec-draft-n-max).
+   ~83 t/s - budget-equalized comparison pending); [d] ~~forced-s3+MTP
+   n_accept=0 anomaly~~ RESOLVED (070d9fb27): the draft ctx's layer-40 KV
+   cache takes the pipe-shard branch (gated on model.is_pshard()) and its
+   GPU k/v stay unbacked (nothing packs a non-pshard ctx) -> scratch KV ->
+   garbage history whenever the plan PINNED the nextn attn; nextn layers
+   now always CPU-resident; [e] server spec path untested; [f] plan-tool
+   arg parse now LLAMA_EXAMPLE_SPECULATIVE (accepts --spec-type /
+   --spec-draft-n-max); [g] STRUCTURAL: gate pipe-shard memory
+   per-context, not per-model - thread cparams.pshard into
+   llama_memory_params and change llama-kv-cache.cpp:163 +
+   llama-memory-recurrent.cpp:75 to model.is_pshard() && params.pshard
+   (then nextn could pin again and the draft gets a stock GPU KV, matching
+   stock+MTP's 63% config); [h] runtime cache loader never sets
+   mparams->pshard_delegate_compute (planner does, llama-pshard-plan.cpp:
+   2150) - s3-from-cache runs a different scheduling regime than the one
+   priced; mirror in llama-pshard-cache.cpp.
 
 ## Contamination note (2026-08-30)
 
