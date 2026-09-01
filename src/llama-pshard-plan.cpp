@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <memory>
 #include <regex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -259,6 +260,13 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
     std::vector<llama_device> devs;
     uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0, hp_n_embd_r = 0;
 
+    // probes must never take the canonical-preload path: once best_plans is
+    // partially populated (fallbacks, demotion re-plans), a registry-carrying
+    // probe load packs pinned KV into the external preload buffer and the
+    // measurement no longer attributes it to mb.context (measured cache = 0)
+    llama_model_params mparams_probe_clean = mparams;
+    mparams_probe_clean.pshard_registry = nullptr;
+
     const uint32_t probe_n_tokens  = std::max<uint32_t>(1, cparams.n_batch ? cparams.n_batch : cparams.n_ubatch);
     const uint32_t probe_n_outputs = probe_n_tokens;
 
@@ -270,7 +278,7 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
     }
 
     return llama_get_device_memory_data_safe(
-        ctx.path_model, &mparams, &cparams_probe, devs,
+        ctx.path_model, &mparams_probe_clean, &cparams_probe, devs,
         hp_ngl, hp_n_ctx_train, hp_n_expert, hp_n_embd_r,
         log_level, probe_hook, probe_hook_data,
         probe_n_tokens, probe_n_outputs);
@@ -1353,6 +1361,190 @@ bool pshard_registry_load(
     return true;
 }
 
+static llama_pshard_plan llama_pshard_search_tier(
+        const llama_pshard_search_ctx & ctx,
+        int force_strategy,
+        const std::vector<llama_device_memory_data> & dmds,
+        llama_pshard_tier_prune & prune);
+
+// ---- plan-time canonical-union accounting ----
+//
+// The loader builds ONE canonical GPU layout for all tier plans: the COMMON set
+// (tensors resident in EVERY viable plan) is packed first, each plan's extras are
+// stamped above it, and the pinned KV cache sits at the top of the buffer. Each
+// plan was budget-checked ALONE by the search probes, so at tight budgets the
+// combined layout can overshoot although every tier fits individually - the
+// runtime then degrades to stock (llama-context-pshard.cpp pshard_setup_sched)
+// or trips the per-tier assert at apply. Replicate the loader's arithmetic here
+// (same sort, alignment and alloc-size rules) and demote tiers until every
+// viable plan satisfies: stamped_scratch_off(plan) + pinned_cache(plan) <= budget.
+static bool pshard_union_weight_less(const std::pair<std::string, size_t> & a,
+                                     const std::pair<std::string, size_t> & b) {
+    // mirrors llama-model.cpp pshard_weight_less: category, then layer, then name
+    auto category = [](const std::string & n) -> int {
+        if (n.find("attn_") != std::string::npos) return 0;
+        if (n.find("exps")  != std::string::npos) return 4;
+        if (n.find("ffn_")  != std::string::npos) return 1;
+        if (n.find("norm")  != std::string::npos) return 2;
+        return 3;
+    };
+    auto layer = [](const std::string & n) -> int {
+        const size_t p = n.find("blk.");
+        return p != std::string::npos ? atoi(n.c_str() + p + 4) : 9999;
+    };
+    const int ca = category(a.first), cb = category(b.first);
+    if (ca != cb) return ca < cb;
+    const int la = layer(a.first), lb = layer(b.first);
+    if (la != lb) return la < lb;
+    return a.first < b.first;
+}
+
+static void pshard_enforce_union_budget(
+        llama_pshard_plan_registry * registry,
+        llama_pshard_search_ctx    & ctx,
+        const llama_context_params * cparams_base,
+        const std::vector<llama_device_memory_data> & dmds,
+        int force_strategy,
+        const char * path_model,
+        const llama_model_params * mparams) {
+    if (!registry || registry->best_plans.empty() || mparams->max_vram_alloc == 0 || !ctx.gpu_buft) {
+        return;
+    }
+
+    // tensor metadata (names + device alloc sizes), one cheap metadata-only load
+    std::vector<std::pair<std::string, size_t>> tensors;  // name -> gpu alloc size
+    {
+        llama_model_params mp = *mparams;
+        mp.no_alloc        = true;
+        mp.load_mode       = LLAMA_LOAD_MODE_NONE;
+        mp.pshard          = false;
+        mp.pshard_registry = nullptr;
+        llama_model * model = llama_model_load_from_file(path_model, mp);
+        if (!model) {
+            LLAMA_LOG_WARN("%s: metadata load failed, skipping union accounting\n", __func__);
+            return;
+        }
+        tensors.reserve(model->tensors_by_name.size());
+        for (const auto & [name, tensor] : model->tensors_by_name) {
+            tensors.emplace_back(name, ggml_backend_buft_get_alloc_size(ctx.gpu_buft, tensor));
+        }
+        llama_model_free(model);
+    }
+
+    const size_t alignment    = ggml_backend_buft_get_alignment(ctx.gpu_buft);
+    const size_t budget_bytes = (size_t) mparams->max_vram_alloc * 1024ULL * 1024ULL;
+    auto align_up = [alignment](size_t off) { return ((off + alignment - 1) / alignment) * alignment; };
+
+    // resident set of a plan: first override (emission order) with backend_id >= 0
+    // whose pattern matches the tensor name; resident iff that bid == 0 (compute)
+    auto resident_set = [&](const llama_pshard_plan & plan) {
+        std::vector<std::regex> res;
+        res.reserve(plan.overrides.size());
+        for (const auto & ov : plan.overrides) { res.emplace_back(ov.pattern); }
+        std::set<std::string> out;
+        for (const auto & [name, sz] : tensors) {
+            for (size_t i = 0; i < plan.overrides.size(); i++) {
+                if (plan.overrides[i].backend_id < 0) continue;
+                if (std::regex_search(name, res[i])) {
+                    if (plan.overrides[i].backend_id == 0) { out.insert(name); }
+                    break;
+                }
+            }
+        }
+        return out;
+    };
+
+    const int max_rounds = 6;
+    for (int round = 0; round < max_rounds; round++) {
+        // 1. common = intersection of viable plans' resident sets
+        std::vector<size_t> viable;
+        std::vector<std::set<std::string>> residents(registry->best_plans.size());
+        for (size_t t = 0; t < registry->best_plans.size(); t++) {
+            if (!registry->best_plans[t].is_viable) continue;
+            residents[t] = resident_set(registry->best_plans[t]);
+            viable.push_back(t);
+        }
+        if (viable.empty()) return;
+
+        std::set<std::string> common = residents[viable[0]];
+        for (size_t vi = 1; vi < viable.size(); vi++) {
+            std::set<std::string> next;
+            for (const auto & n : common) {
+                if (residents[viable[vi]].count(n)) next.insert(n);
+            }
+            common.swap(next);
+        }
+
+        // 2. pack the common set (loader order): common_end = unpadded end of last tensor
+        std::vector<std::pair<std::string, size_t>> common_sorted;
+        for (const auto & [name, sz] : tensors) {
+            if (common.count(name)) common_sorted.emplace_back(name, sz);
+        }
+        std::sort(common_sorted.begin(), common_sorted.end(), pshard_union_weight_less);
+        size_t cursor = 0, common_end = 0;
+        for (const auto & [name, sz] : common_sorted) {
+            common_end = cursor + sz;
+            cursor    += align_up(sz);
+        }
+
+        // 3. per viable plan: stamp extras above common_end, add its pinned cache
+        size_t worst_t = SIZE_MAX, worst_over = 0;
+        for (size_t t : viable) {
+            const auto & plan = registry->best_plans[t];
+            std::vector<std::pair<std::string, size_t>> extras;
+            for (const auto & [name, sz] : tensors) {
+                if (residents[t].count(name) && !common.count(name)) extras.emplace_back(name, sz);
+            }
+            std::sort(extras.begin(), extras.end(), pshard_union_weight_less);
+            size_t so = align_up(common_end);
+            for (const auto & [name, sz] : extras) { so = align_up(so + sz); }
+
+            const size_t need = so + plan.cache_measured;
+            LLAMA_LOG_INFO("%s: [tier bs=%u] union scratch_off=%.2f MiB + pinned cache=%.2f MiB = %.2f / %.2f MiB budget %s\n",
+                __func__, plan.batch_size, so / (1024.0*1024.0), plan.cache_measured / (1024.0*1024.0),
+                need / (1024.0*1024.0), budget_bytes / (1024.0*1024.0),
+                need <= budget_bytes ? "OK" : "OVERSHOOT");
+            if (need > budget_bytes && need - budget_bytes > worst_over) {
+                worst_over = need - budget_bytes;
+                worst_t    = t;
+            }
+        }
+        if (worst_t == SIZE_MAX) {
+            return;  // every viable tier fits the canonical layout
+        }
+
+        // 4. demote the worst violator: re-plan it at a reduced budget
+        auto & plan = registry->best_plans[worst_t];
+        const size_t margin  = 32ULL * 1024 * 1024;
+        const size_t new_bud = budget_bytes > worst_over + margin ? budget_bytes - worst_over - margin : 0;
+        LLAMA_LOG_WARN("%s: canonical union overshoots by %.2f MiB; re-planning tier bs=%u at %.0f MiB\n",
+            __func__, worst_over / (1024.0*1024.0), plan.batch_size, new_bud / (1024.0*1024.0));
+        if (new_bud == 0) { plan.is_viable = false; continue; }
+
+        llama_pshard_search_ctx ctx_t = ctx;
+        ctx_t.vram_free = new_bud;
+        // probes must not take the canonical-preload path (best_plans is non-empty now)
+        llama_model_params mp_replan = *mparams;
+        mp_replan.pshard_registry = nullptr;
+        ctx_t.mparams = &mp_replan;
+        llama_context_params cp_tier = *cparams_base;
+        cp_tier.n_batch  = registry->tier_sizes[worst_t];
+        cp_tier.n_ubatch = cp_tier.n_batch;
+        ctx_t.cparams = &cp_tier;
+
+        llama_pshard_tier_prune prune;
+        prune.init(ctx.n_layers);
+        llama_pshard_plan p = llama_pshard_search_tier(ctx_t, force_strategy, dmds, prune);
+        if (p.is_viable) {
+            registry->best_plans[worst_t] = p;
+        } else {
+            plan.is_viable = false;
+        }
+    }
+    LLAMA_LOG_WARN("%s: union still overshoots after %d demotion rounds; leaving runtime degrade as backstop\n",
+        __func__, max_rounds);
+}
+
 static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current) {
     if (!current.is_viable) return true;
     const bool candidate_has_tps = candidate.tps > 0.0f;
@@ -2100,6 +2292,8 @@ void llama_params_fit_pshard_plan(
             }
         }
 
+        pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
+            path_model, mparams);
         pshard_compute_switch_costs(registry, model_file_size, n_layers, ctx.is_moe,
             predictor ? predictor->stats.peak_pcie_bw : 25.0);
         pshard_registry_save(registry, fp, cache_path.c_str(), host_buft, cparams);
@@ -2128,6 +2322,8 @@ void llama_params_fit_pshard_plan(
                 if (registry->tier_sizes[t] == best_plan.batch_size) {
                     registry->best_plans[t] = best_plan;
                     registry->active_plan = &registry->best_plans[t];
+                    pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
+                        path_model, mparams);
                     pshard_compute_switch_costs(registry, model_file_size, n_layers, ctx.is_moe,
                         predictor ? predictor->stats.peak_pcie_bw : 25.0);
                     pshard_registry_save(registry, fp, cache_path.c_str(), host_buft, cparams);
