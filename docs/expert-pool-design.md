@@ -199,12 +199,12 @@ Predictor terms per candidate:
 | s1 GPUONLY_ATTNPIN_FFNSTREAM | 0 | pin-first | `fetch` | `ab_stream` |
 | s2 DYNAMIC_FFNCPU_ATTNSTREAM | 0 as drafted (note) | stream (pin if budget) | `cpu_exec` | `ab_stream + cpu_tail` |
 | s3 STATIC_ATTNPRIO_ALLMODELS | 0 as drafted (note) | pin-first | `cpu_exec` / `fetch_on_2nd_miss` | `ab_stream + cpu_tail` |
-| s4 DYNAMIC_FFN_ALTERNATE | - | - | - | dissolves (3b.5) |
+| s4 DYNAMIC_FFN_ALTERNATE | - | - | - | dissolves (3b.6) |
 
 - Note on s2/s3 K = 0: drops today's `n_pinned` there (ledger: s2 `n_pinned` 7 @ 4000,
   qa/reference-ledger.csv:14, :42; s3 12 @ 8000, :46). K free 0..L is the same pricing
   rule as s0; whether `cpu_exec` makes pool slots dominate whole-layer residency is
-  settled in the s2/s3 partitions (3b.5, TBD: derive).
+  settled in the s2/s3 partitions (3b.6, TBD: derive).
 - A strategy fixes which variables the search may move; nothing else. Every variable is
   a per-tier field of `llama_pshard_plan` (src/llama-pshard-plan.h:115), written one
   line per tier in the registry exactly like today's
@@ -274,7 +274,7 @@ Planner picks X (K = 0). One whole-layer pin (569 MB) buys one layer's expert
 residency; the same bytes as attn+KV pins remove ~2 ms/token for ~5 layers. Attention
 coverage beats expert residency per byte at decode. Today (auto, STATIC attn=40):
 43.27 t/s @16k (qa/reference-ledger.csv:46, pre-selector-fix; post-fix all q35 cells
-pick STATIC attn=40, so >= that), 57.0 t/s @2k (qa/pending-verification.md:129);
+pick STATIC attn=40, so >= that), 57.0 t/s @2k (qa/pending-verification.md:131);
 forced s0 @16k: 3.01 t/s (ledger :47).
 
 ```
@@ -447,7 +447,7 @@ layers x ~2 ms ~= 70 ms -> ~12-13 t/s ceiling from attention alone; misses at 12
 slots/layer (h ~0.5 -> ~4/layer -> 160 x 70 us ~= 11 ms) secondary. (Discussion map:
 staging 63 = 2 x ~30 MB attn-only, 7 pins / 33 streamed / 66 ms - pre-KV-correction;
 recomputed here with the 240 MB attn+KV pair.) Today's auto (STATIC attn=40, FFN on
-CPU): 30.4 t/s (qa/pending-verification.md:128) beats it: CPU-FFN needs no expert VRAM,
+CPU): 30.4 t/s (qa/pending-verification.md:130) beats it: CPU-FFN needs no expert VRAM,
 freeing bytes for attn pins -> s2/s3 territory (`miss_policy = cpu_exec`, pool below
 the A/B minimum at decode).
 
@@ -457,12 +457,101 @@ the A/B minimum at decode).
 | KV traffic | 0 MB | delta for 35 layers |
 | expert misses | ~64 x 70 us ~= 4.5 ms | ~160 x 70 us ~= 11 ms |
 | est. decode (s0 pool, before head term) | ~110-130 t/s | ~12-13 t/s |
-| today, auto STATIC attn=40 (measured) | 43.27 t/s (qa/reference-ledger.csv:46, pre-selector-fix; post-fix >= that) | 30.4 t/s (qa/pending-verification.md:128) |
+| today, auto STATIC attn=40 (measured) | 43.27 t/s (qa/reference-ledger.csv:46, pre-selector-fix; post-fix >= that) | 30.4 t/s (qa/pending-verification.md:130) |
 | today, forced s0 (measured) | 3.01 t/s (ledger :47) | 2.17 t/s (ledger :33) |
 
-### 3b.5 Other strategies
+### 3b.5 s1 = GPUONLY_ATTNPIN_FFNSTREAM, q35 @ 8000 / 2000 MB
 
-- s1 GPUONLY_ATTNPIN_FFNSTREAM: pending (K = 0, attn pin-first, `fetch`, `ab_stream`).
+Identity (3b.3): K = 0 fixed; attn pin-first (pin = attn weights + that layer's KV: 55 + 64 = 119 MB/layer @16k, ~63 MB/layer @2k); `miss_policy = fetch` only (GPU-only, no -1 skip in the layer's 2-3 MUL_MAT_ID nodes (12.corrected; src/llama-graph.cpp:2119/2138/2151/2255) -> hard decode floor `s_l >= min(E, top_k x bs)` = 8 slots/layer at bs=1 = 8 x 1.76 x 40 = 563.2 MB); `prefill_mode = ab_stream` only (prefill pool >= A/B minimum 900 MB). All h(s) figures Zipf-assumed ranges (TBD: measured counters, 11.B.6).
+
+**Allocation order.** Marginal value of the same 119 MB at decode (@16k):
+
+| buy | decode value / token | prefill value (B < B*) | prefill value (B >= B*) |
+|---|---|---|---|
+| +1 attn+KV pin | -~2 ms (55 MB weights + KV delta at 30 GB/s, 3b.1) | -119 MB/pass exposed upload on its layer (~4 ms/pass) | ~0 (hidden) |
+| +119 MB pool, steep region (s ~8-16) | delta-h ~0.02-0.05 -> 320 x delta-h = 6-16 fewer fetches x 70 us = 0.45-1.1 ms | -119 MB/pass of expert upload, spread over layers - exact byte tie with the pin | ~0 |
+| same, flat region (s ~43) | delta-h ~0.005-0.01 -> 0.1-0.2 ms | same tie | ~0 |
+
+- Decode: pin (2 ms) beats pool (0.45-1.1 ms) per 119 MB across the assumed h slope. Prefill: exact per-byte tie below B*, both ~0 above -> prefill indifferent at every budget; the decode tier decides, switch coherence copies its pins into the prefill tiers (zero residency delta per prompt).
+- **Staging quantum.** While >= 1 attn layer streams, the A/B pair is held; staging = 2 x (55 + 64) = 238 MB = exactly two pin-widths (the doc's ~240 elsewhere is this figure rounded), so the 40th pin nets 119 - 238 = -119 MB - a wash with the 39th. Shapes @16k (exact staging): 38 pins = 180 + 563.2 + 238 + 4522 = 5503.2 MB; 39 pins = 5622.2 MB; 40 pins = 180 + 563.2 + 4760 = 5503.2 MB. The 38-pin and 40-pin shapes tie exactly - same structure as @2k below; under the doc's ~240 rounding a 2 MB pseudo-gap appears, which is rounding noise, not a real ordering - and 39 is dominated. Search consequence unchanged: the per-tier binary search on `n_attn_pinned` is non-monotone at the top - probe the 40/40 corner explicitly, bisection misses it.
+- **Order (holds at every budget under assumed h):** fixed (measured scratch + 80 MB routers/norms) -> decode fetch floor 563.2 MB (hard viability, not value: without it the fetch-only tier cannot execute) -> attn+KV pins until 40/40 (staging ~240 MB carried while any attn streams) -> remainder = pool slots (head-on-GPU, est. 885 MB TBD: measure, priced against slots only once the pool is large).
+- **Caveat (priced, not ruled):** the order flips where measured delta-h > ~0.09 per 1.7 slots/layer (= 2 ms / 22.4 ms per unit delta-h; equivalently delta-h > 0.42 across the 8 -> 16 slot bump that the floor's 563.2 MB = 4.7 pins ~= 9.5 ms would buy). The doc's assumed h(16) ~0.5-0.8 plus this section's extrapolated h(8) ~0.3-0.5 (introduced in the @2000 table below; the doc itself assumes h(12)/h(16)/h(43) only) straddle exactly that threshold; one measured counter set (11.B.6) adjudicates. A cliff would be priced by the predictor, not ruled out.
+
+**Worked map @ 8000 MB, ctx 16k.** Re-derived from unit costs; byte-identical to s0 plan X and the s0 K=0 prefill map (3b.4) - verified, not copied. That identity is the dedupe motivation below.
+
+Decode bs=1: fixed 100 + 80 = 180 MB -> 7820 MB; pins 40 x 119 = 4760 MB (40/40 -> no staging); pool = 3060 MB -> 3060 / 70.4 = 43 slots/layer (5.4 x top_k, >= floor 8).
+
+```
+DECODE TIER (bs=1)                                               8000 MB
+| scratch                                     100 |
+| routers / norms                              80 |
+| head                                          0 |  CPU as drawn; GPU head = -885 est. from pool
+| attn+KV, 40 layers (40 x 119)              4760 |  all pinned; no staging
+| pool                                       3060 |  43 slots/layer
+|   volatile 900 (A/B span) + 1300 (scratch delta)|  reclaimed by prefill
+|   preserved 860                                 |  survives prompts
+```
+Per token: attn traffic 0 MB; h(43) ~0.7-0.8 (Zipf-assumed, TBD) -> 8 x (1-h) x 40 = 64-96 fetches x 70 us = 4.5-6.7 ms + GPU compute ~3 ms + head (CPU, TBD) -> **~103-134 t/s before head** (the doc's ~110-130 band sits inside it).
+
+Prefill bs=8192: fixed 1400 + 80 = 1480 MB -> 6520 MB; same pins 4760 (indifference above B* ~6-8k -> switch coherence); pool 1760 MB = 900 A/B + 860 preserved (~488 slots ~= 12/layer; s = 25). Check: 1400 + 80 + 4760 + 900 + 860 = 8000 exactly.
+
+```
+PREFILL TIER (bs=8192)                                           8000 MB
+| scratch 1400 | routers/norms 80 | head 0 |
+| attn+KV pinned, 40 layers                  4760 |
+| pool A/B span 900 | pool preserved 860 |
+```
+Per layer: upload 450 - 12 x 1.76 ~= 429 MB ~= 14.3 ms < ~23 ms compute -> hidden. Per pass ~17.1 GB (18 GB - 0.86 GB preserved hits); 16384 / 8192 = 2 passes. Switch 8192 <-> 1: residency identical -> relabel + lazy volatile fill (<= ~20 ms) via `switch_ms`; decode pool 3060 = prefill pool 1760 + scratch delta 1300.
+
+**Worked map @ 2000 MB, ctx 16k, decode bs=1.** Fixed 180 -> 1820 MB. Two legal shapes, depending on whether the pool region may shrink below the prefill tier's 900 MB A/B span at tier switch (resize machinery unpriced - open residue; the s0 @2000 map in 3b.4 drew shape (i)):
+
+| | (i) pool held at 900 MB (region fixed) | (ii) pool at decode floor 563.2 MB (needs region resize) |
+|---|---|---|
+| staging | 240 MB | 240 MB |
+| pins | floor((1820-240-900)/119) = **5** (595 MB), spare 85 MB | floor((1820-240-563.2)/119) = **8** (952 MB), spare 64.8 MB -> pool |
+| pool | 900 MB = 12 slots/layer | 628 MB ~= 8-9 slots/layer (floor 8) |
+| streamed attn | 35 x ~2 ms = 70 ms | 32 x ~2 ms = 64 ms |
+| misses (thrash regime, s ~= top_k: consecutive-token expert overlap is the only hit source; h assumed, TBD) | h(12) ~0.4-0.6 -> 128-192 fetches -> 9.0-13.4 ms | h(8-9) ~0.3-0.5 -> 160-224 fetches -> 11.2-15.7 ms |
+| total (+~3 ms compute, head TBD) | 82-86 ms -> 11.6-12.2 t/s | 78-83 ms -> 12.0-12.8 t/s |
+
+**s1 pool decode @2000/16k ~= 11.6-12.8 t/s** - the shapes agree within noise (the one budget where pin-vs-slot pricing gets close: the shapes differ by 3 pins = 357 MB ~= 6 ms of streamed attn, against the 337 MB pool delta (900 - 563.2) = +4-5 slots/layer ~ 2-3 ms). Note: 11.A.1's old "33 streamed layers" was the stale pre-KV-correction figure (attn-only 63 MB staging); with the 240 MB attn+KV pair it is 32-35 depending on the pool-floor choice; the ~13 t/s cap stands.
+
+Measured today (q35; all q35-16k rows are PPL_MISMATCH-status, pre-recipe, stale per qa/pending-verification.md item 1):
+- forced s1 @16k/2000: **falls back, `strategy_active = STATIC_ATTNPRIO`, 28.21 t/s decode / 103.44 prompt, n_pinned 0** (qa/reference-ledger.csv:34) - today's planner already refuses real ATTNPIN there. Same fallback @2k/2000: 28.51 (:6).
+- real s1 @16k: 29.30 t/s @4000 (:41), 31.82 @8000 (:48), 38.55 @12000 (:55); @2k: 28.53 (:13), 32.64 (:20), 36.27 (:27).
+- auto @16k: 13.33 @2000 DYNAMIC_FFNCPU (:32, pre-selector-fix, stale), 14.50 @4000 (:39), 43.27 @8000 STATIC (:46), 52.92 @12000 (:53); @2k auto: 26.57 / 42.36 / 51.46 / 65.64 (:4, :11, :18, :25).
+- **TBD-cite resolved: the "30.4 t/s auto STATIC" cell is q35, ctx 16384, mva 2000 MB** - qa/pending-verification.md:130-131, item 7a, post-selector-fix 2026-08-31 (pred 29.6; the ctx-2048 cell on the same lines is q35-2k-8000, 57.0 t/s; the forced-s1 fallback at the attn=40 shape measured 28.44, :158-162). NOT ctx 2048, and not yet a ledger row (:32 still holds the stale 13.33). The doc's cites ":128/:129" (3b.4) are off by two lines (actual :130/:131). Honesty note: @16k, 40 x 55 = 2200 MB attn weights alone and 40 x 64 = 2560 MB KV each exceed 2000 MB, so "attn=40" at this cell cannot be literal under the doc unit costs (its neighbor :34 shows vram_peak_delta 3084 MB at mva 2000) - the executed plan keeps unpinned-layer KV host-side (today's KV pipe-shard) or the accounting predates KV-with-attention pricing. The run's registry line is the arbiter (TBD: pull it).
+
+Verdict @2000/16k: derived pool-s1 ~11.6-12.8 t/s loses ~2.3-2.6x to today's measured 30.4 t/s auto STATIC (CPU-FFN frees expert VRAM for attn pins - s2/s3 territory), and today's machinery agrees by refusing to run s1 there.
+
+**Prefill viability @ tight budgets.** Pool-mode prefill tier viable iff `scratch(bs) + 80 + staging + 119 x pins + 900 <= budget` (pins >= 0; staging 240 unless pins = 40). At 2000 MB / 16k:
+
+| tier | check at pins = 0 | verdict |
+|---|---|---|
+| bs=8192 | 1400 + 80 + 240 + 900 = 2620 > 2000 | NOT viable |
+| bs=4096 | viable iff scratch <= 2000 - 1220 = 780 MB (bracketed 600-1400, TBD: measure) | TBD, likely NO |
+| bs=2048 | 600 + 80 + 240 + 900 = 1820 -> pins <= (2000-1820)/119 = 1.5 | VIABLE: 1 pin, used 1939 MB, spare 61 MB |
+| bs<=1024 | viable iff scratch(1024) <= 600 (assumes scratch monotone in bs; measured points are 8192/2048/1 only, TBD: measure) | viable under that assumption; dominated by 2048 regardless (more passes -> more exposure) |
+
+Surviving tier bs=2048 (B < B* -> exposure real), 1 pin + 39 streamed-attn layers, pool = 900 A/B only (no preserved hits). Per 16k prompt = 8 passes: streamed layer uploads attn 55 + experts 450 + KV writeback ~8 MB/pass (2048-token ctx share of the 64 MB; the <=64 MB figure is the full-ctx bound) ~= 513 MB ~= 17.1 ms - ~6 ms compute = ~11 ms exposed; pinned layer 450/30 = 15 - 6 = 9 ms. Per pass 39 x 11 + 9 ~= 438 ms; **per prompt ~3.5-4.1 s exposed** (upper end = KV writeback priced at the full-ctx bound) + ~1.9 s compute -> wall ~5.4-6.0 s, ~2700-3000 prompt t/s.
+
+Non-viable tiers -> **fallback = legacy streaming, today's path** (full 450 MB/layer uploads; sliced only if the `ids_cross` ALTERNATE gate is lifted for s1 streaming tiers - src/llama-pshard-plan.cpp:346, :549). Switch legacy <-> pool tier = ordinary residency delta via `switch_ms`; pool-side metadata relabel free; volatile refill charged as today (<= ~20 ms lazy). The fallback is not hypothetical and may WIN the ladder: legacy big-ubatch streaming measures 5107.91 prompt t/s at this cell (forced s0, :33) and 4040.60 (s1 @4000, :41) - above B* uploads hide regardless of residency. Whether a legacy bs>=8192 tier fits at 2000 MB under pool-era scratch accounting is TBD (the measured 1400 MB scratch says no; the ledger row says today's transient-galloc path ran) - reconcile from the fresh grid's per-tier scratch measurements.
+
+**All-pins threshold + crossover bound.**
+- 40-pin decode shape @16k: 180 + 40 x 119 + 563.2 = **5503.2 MB** (no staging). Every byte above -> pool slots. Non-monotone corner: 39 pins needs 5622.2 MB (dominated); 38 pins ties the 40-pin shape at 5503.2 MB with exact 238 staging (the doc's ~240 rounding shows a 2 MB pseudo-gap).
+- @2k ctx: 180 + 40 x 63 + 563.2 = **3263.2 MB**. Staging @2k = 2 x 63 = 126 MB = exactly two pin-widths, so the same pair effect holds exactly: 38 pins + staging = 3263.2 MB (= the 40-pin shape), 39 pins = 3326.2 MB (dominated). The quantum is structural (staging == 2 pins by construction), not a 16k artifact.
+- Minimum viable s1 decode tier @16k (0 pins): 180 + 563.2 + 240 = **983 MB**; below it no fetch-only decode tier exists (GPU-only cannot shrink the floor).
+- ~30 t/s bound (today's s3-class): solve 2 x n_streamed + miss_ms + ~3 ms ~= 33 ms with pool at floor (miss 11.2-15.7 ms, h 0.3-0.5 assumed) -> n_streamed = (30 - miss)/2 ~ 7-9.5 -> pins 30.6-32.9 (31-33 integer) -> budget = 180 + 240 + 563.2 + pins x 119 ~= **4.6-4.9 GB @16k**; below it pool-s1 decode falls under ~30 t/s. (A nominal 34-pin / 6-streamed shape gives 12 + 15.7 + 3 = 30.7 ms = 32.6 t/s - already above 30, so it is not on the crossover; a 5.0 GB endpoint does not reproduce.) Sanity: legacy s1 @4000/16k measures 29.30 t/s (:41) - supportive, not confirmatory. The **true s1-vs-s3 crossover stays blocked on the s3 partition** (11.A.3, 11.A.4): pool-s3 (cpu_exec frees the 563 MB floor and the 900 MB prefill minimum at decode) moves too.
+
+**Ledger dedupe rule.** When s0's search lands K = 0 it emits a plan byte-identical to s1's (same pins, pool, miss_policy, prefill_mode).
+- Auto: dedupe candidates by plan signature BEFORE measuring - signature = the plan-shape fields of the registry line src/llama-pshard-plan.cpp:1026 writes (n_pinned, n_attn_pinned, overflow, output_on_gpu, pin_from_back, overlap, ids_cross) extended with the pool-era columns still "(to add)" per the 11-intro and 12.13 (K, s/pool_mb, miss_policy, prefill_mode); the strategy label and the measured outputs on that line (tps, vram, switch_ms) are excluded - they are measurement results, not plan identity. Measure once; share {scratch_measured, cache_measured, predicted tps}.
+- Forced: keep both rows as a free invariant check - identical plans must produce identical token_hash and perf within noise (the ledger already records `strategy_active` vs `strategy_forced`: rows :6, :34); drift between the s0(K=0) and s1 rows is a harness or determinism bug caught for free.
+- Hook, named: candidate measurement = `llama_pshard_probe_memory` (src/llama-pshard-plan.cpp:252, serialized via `g_probe_mutex` :26/:38), called from the per-strategy binary searches (:367/:407/:449 in `llama_pshard_search_strategy` - the search s1 actually dispatches to, per the candidate-loop routing :1758-1762 and :1884-1894) and from s1's final measurement probes that write `plan.scratch_measured`/`plan.cache_measured` (:483-486/:511-514 in search_strategy) with the predictor hook `pshard_tps_probe_hook` (:242) - all inside the candidate loop `for (s = 0; s < LLAMA_PSHARD_COUNT; ...)` (:1751). `llama_pshard_search_attn_pin` (the `measure_vram` lambda :553; final probes :742-749) serves s3/s4 only - s1 reaches it solely via the forced-s1 STATIC fallback (:1722, :1827; the path behind ledger :34). If the pool-era 1-D `n_attn_pinned` search below is built by reusing search_attn_pin for s1, that is a proposal, not present-tense fact. Dedupe = a signature -> measurement memo consulted before each candidate's final probe; `prune.update` (:1804) and `pshard_plan_is_better` (:1806) unchanged.
+
+**What s1 buys vs s0 under the pool.** s1 is the K = 0, pin-first corner of s0's search space kept as its own strategy: at every budget >= the all-pins threshold the two produce the identical best-known shape (plan X), and s1 reaches it with one fewer search dimension - a 1-D search over `n_attn_pinned` (floor and staging quantum are constants; the 40/40 corner probed explicitly) instead of a joint (K, n_attn_pinned) search whose monotonicity in budget is unproven (11.B.5) - saving ~log L probe rounds per tier per ladder. s0 can only match it (K = 0 lands byte-identical -> the dedupe above makes the second measurement free) or beat it where whole-layer residency pays: exposed-prefill cells with attention residency unchanged by K (the bs~2048 equal-residency case - refuted at 8000 MB by the derived map) or per-layer exposure (DSv4 dense-lead layers). s1 doubles as the free cross-strategy invariant when the two collide.
+
+### 3b.6 Other strategies
+
 - s2 FFNCPU_ATTNSTREAM: pending (K = 0 as drafted - drops today's `n_pinned` 7 @ 4000,
   qa/reference-ledger.csv:14; price K free vs 0 here, TBD: derive; `cpu_exec`,
   `ab_stream + cpu_tail`; pool may drop below the A/B minimum at decode).
@@ -972,9 +1061,8 @@ prefill_mode in src/common/ggml).
 
 ### 11.A Budget partition still to do per strategy
 
-s0 is done (K free, worked at q35 @ 8000 MB for bs=8192 / 2048 / 1 and @ 2000 MB).
-s1, s2, s3 have a constraint row but no allocation order, no worked map, no crossover
-budget. s4 retires pending 11.D.21.
+s0 (3b.4) and s1 (3b.5) are done. s2, s3 have a constraint row but no allocation
+order, no worked map, no crossover budget. s4 retires pending 11.D.21.
 
 | variable          | s1 GPUONLY_ATTNPIN_FFNSTREAM        | s2 DYNAMIC_FFNCPU_ATTNSTREAM                 | s3 STATIC_ATTNPRIO_ALLMODELS                    |
 |-------------------|-------------------------------------|----------------------------------------------|-------------------------------------------------|
@@ -987,16 +1075,13 @@ budget. s4 retires pending 11.D.21.
 | KV                | rides with attention: pinned layers resident, streamed layers via the KV pipe-shard (llama_memory_pipe_shard_i) | same | same                        |
 | dense models      | classic placement (today's path), pool absent | same                               | same                                            |
 
-1. **P0 - s1 partition.** Open:
-   - allocation order: s0 steps with K=0 forced - does "finish attn+KV pins before growing
-     the pool" hold at every budget, or does a tier ever prefer preserved slots over the
-     last attn pin?
-   - worked maps at 8000 MB and 2000 MB: at 8000 MB the decode plan equals s0's decode
-     plan X (K=0, attn+KV 40 layers 4760 MB, pool 3060 MB; ~110-130 t/s predicted); at
-     2000 MB the 33 streamed attn layers cap decode at ~13 t/s and s2/s3 win.
-   - budget below which pool mode is not viable (prefill pool < 900 MB A/B minimum ->
-     fallback to today's streaming): rule and switch cost undefined.
-   - ledger dedupe when s0 with K=0 and s1 yield the identical plan.
+1. **s1 partition - RESOLVED (3b.5).** Allocation order: fixed -> fetch floor 563.2 MB -> attn+KV pins to 40/40 (staging quantum: 38-pin ties 40-pin exactly at both ctx, 39-pin dominated - probe the 40/40 corner) -> pool; holds at every budget under assumed h. Worked maps @8000 (= s0 plan X, byte-verified) and @2000 (~11.6-12.8 t/s, loses ~2.3-2.6x to measured 30.4 t/s auto STATIC at the same cell = q35-16k-2000, qa/pending-verification.md:130 - cite resolved, not ctx 2048). Viability rule + legacy fallback: 3b.5; all-pins thresholds 5503 MB @16k / 3263 MB @2k; ~30 t/s bound ~4.6-4.9 GB @16k. Dedupe rule + hook: 3b.5. Residue, still open:
+   - h(s) cliff caveat: order flips iff measured delta-h > ~0.09 per 1.7 slots/layer (0.42 across 8 -> 16 slots); the doc's h(16) plus this section's extrapolated h(8) straddle it - 11.B.6 counters adjudicate.
+   - pool-region resize at tier switch (decode pool 628 MB < prefill A/B 900 MB): new machinery, unpriced; the two @2000 shapes agree within noise so it is not blocking.
+   - scratch @ bs=4096 unmeasured -> that tier's viability at 2000 MB TBD; bs<=1024 viability additionally assumes scratch monotone in bs (unmeasured below 2048).
+   - the 30.4 t/s cell's executed n_attn_pinned / KV accounting contradicts the unit costs (2200 MB attn + 2560 MB KV > 2000 MB) - pull the run's registry line; ledger row :32 still stale.
+   - legacy bs>=8192 prefill tier at 2000 MB under pool-era scratch accounting (1400 MB says no, ledger :33 ran) - reconcile from fresh grid scratch measurements.
+
 2. **P0 - s2 partition.** Open:
    - attn stream-vs-pin threshold under the pool: each pin removes ~2 ms/token of
      streamed attn on q35 @16k.
@@ -1013,11 +1098,13 @@ budget. s4 retires pending 11.D.21.
    ALLMODELS on dense models = unchanged path, confirm the pool code is fully bypassed
    there.
 4. **P1 - crossover.** The planner must pick s1 vs s3 per cell by predicted tps. q35
-   @2000 MB: today's auto STATIC (attn=24-40 as quoted in the discussion; 40 x 55 MB =
-   2200 MB exceeds 2000 MB, so the upper end needs its ledger cell - TBD: cite
-   budget/ctx) at 30 t/s beats GPU-only s0 at ~13 t/s; @8000 MB GPU-only wins. Crossover
-   budget and its sensitivity to ctx (KV per pin 64 MB @16k vs ~8 MB @2k) not computed
-   (TBD: predict, then measure).
+   @2000 MB: today's auto STATIC at 30.4 t/s (q35-16k-2000, qa/pending-verification.md:130;
+   executed attn residency vs the unit costs unreconciled - registry pull pending,
+   11.A.1 residue) beats pool-s1 at ~11.6-12.8 t/s (3b.5); @8000 MB GPU-only wins.
+   s1-side bound computed: falls under ~30 t/s below ~4.6-4.9 GB @16k, all-pins shape at
+   5503 MB @16k / 3263 MB @2k (3b.5). The true crossover still needs the s3 partition
+   (11.A.3): pool-s3's cpu_exec frees both decode floors, so its side moves too
+   (TBD: derive s3, then predict + measure the pair).
 
 ### 11.B Planner
 
