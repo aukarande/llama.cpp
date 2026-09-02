@@ -566,6 +566,9 @@ void llama_params_fit_pshard(
 
     mparams->tensor_buft_overrides = tensor_buft_overrides;
     mparams->n_gpu_layers = n_layers + 1;
+    // the switch-cost model prices structural attention pins from the layer count, which
+    // the registry file does not carry: publish it in-memory exactly as the planner does
+    mparams->pshard_registry->n_layers = n_layers;
 
     LLAMA_LOG_INFO("%s: plan: %s, n_pinned=%u/%u, vram=%zu MiB, n_gpu_layers=%d\n",
         __func__, llama_pshard_strategy_name(best->strategy),

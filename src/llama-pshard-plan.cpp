@@ -846,9 +846,9 @@ static void pshard_compute_switch_costs(
     registry->switch_attn_frac = (float)attn_frac;
     registry->switch_head_mb   = (float)(head_bytes / 1e6);
     registry->switch_pcie_gb_s = (float)pcie_gb_s;
+    registry->n_layers         = n_layers;
 
-    const double base_attn_extra = (double)(base.n_attn_pinned > base.n_pinned
-                                            ? base.n_attn_pinned - base.n_pinned : 0);
+    const double base_attn_extra = (double)(registry->attn_resident(base) - base.n_pinned);
     for (auto & plan : registry->best_plans) {
         if (&plan == &registry->best_plans[0] || !plan.is_viable) {
             plan.switch_ms = 0.0f;
@@ -861,15 +861,19 @@ static void pshard_compute_switch_costs(
         } else {
             bytes += ((double)plan.n_pinned + (double)base.n_pinned) * layer_bytes;
         }
-        // attention-only pins (n_attn_pinned includes the fully pinned layers)
-        const double attn_extra = (double)(plan.n_attn_pinned > plan.n_pinned
-                                           ? plan.n_attn_pinned - plan.n_pinned : 0);
+        // attention-only pins: resident attention beyond the fully pinned layers
+        // (structural pins included, see llama_pshard_plan_registry::attn_resident)
+        const double attn_extra = (double)(registry->attn_resident(plan) - plan.n_pinned);
         bytes += std::abs(attn_extra - base_attn_extra) * layer_bytes * attn_frac;
         if (plan.output_on_gpu != base.output_on_gpu) {
             bytes += head_bytes;
         }
         plan.switch_ms = (float)(bytes / 1e9 / pcie_gb_s * 1000.0);
     }
+}
+
+size_t llama_pshard_registry_arena_bytes(const struct llama_pshard_plan_registry * registry, size_t budget_bytes) {
+    return registry ? registry->arena_bytes(budget_bytes) : budget_bytes;
 }
 
 bool pshard_registry_save(
@@ -1003,11 +1007,12 @@ bool pshard_registry_save(
 
     // trailing fields after cache_ubatch are ignored by older parsers (sscanf assigns
     // the two %u before the literal ']' mismatch and still returns 2)
-    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d]\n",
+    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d union_mb=%zu]\n",
         budget_mib, cache_ubatch,
         registry->switch_layer_mb, registry->switch_attn_frac,
         registry->switch_head_mb, registry->switch_pcie_gb_s,
-        registry->mtp_head_cpu ? 1 : 0);
+        registry->mtp_head_cpu ? 1 : 0,
+        (size_t) ((registry->union_bytes + 1024 * 1024 - 1) / (1024 * 1024)));  // whole MiB, rounded up
     if (registry->pshard_disabled) {
         fprintf(f, "pshard_disabled=1 baseline_vram=%.1f\n", registry->baseline_vram_req / (1024.0 * 1024.0));
     } else {
@@ -1076,6 +1081,7 @@ bool pshard_registry_load(
         float switch_head_mb = 0.0f;
         float switch_pcie_gb_s = 0.0f;
         bool  mtp_head_cpu     = false;
+        size_t union_bytes     = 0;
         std::vector<tier_data> tiers;
     };
     std::vector<variant_data> variants;
@@ -1106,6 +1112,7 @@ bool pshard_registry_load(
             if ((p = strstr(s.c_str(), "head_mb="))   != NULL) cur_variant->switch_head_mb   = (float)atof(p + 8);
             if ((p = strstr(s.c_str(), "pcie="))      != NULL) cur_variant->switch_pcie_gb_s = (float)atof(p + 5);
             if ((p = strstr(s.c_str(), "mtp_head_cpu=")) != NULL) cur_variant->mtp_head_cpu = atoi(p + 13) != 0;
+            if ((p = strstr(s.c_str(), "union_mb="))    != NULL) cur_variant->union_bytes = (size_t)(atof(p + 9) * 1024.0 * 1024.0);
             continue;
         }
         if (!cur_variant) continue;
@@ -1345,6 +1352,7 @@ bool pshard_registry_load(
         registry->switch_head_mb   = best_whole->switch_head_mb;
         registry->switch_pcie_gb_s = best_whole->switch_pcie_gb_s;
         registry->mtp_head_cpu     = best_whole->mtp_head_cpu;
+        registry->union_bytes      = best_whole->union_bytes;
     }
 
     for (auto & item : selected) {
@@ -1525,6 +1533,7 @@ static void pshard_enforce_union_budget(
 
             // 3. per viable plan: stamp extras above common_end, add its pinned cache
             std::vector<std::pair<size_t, size_t>> violators;  // tier -> overshoot bytes
+            size_t max_need = 0;  // the variant's canonical union (largest tier need)
             for (size_t t : viable) {
                 const auto & plan = registry->best_plans[t];
                 std::vector<std::pair<std::string, size_t>> extras;
@@ -1550,9 +1559,22 @@ static void pshard_enforce_union_budget(
                     need / (1024.0*1024.0), budget_bytes / (1024.0*1024.0),
                     need <= budget_bytes ? "OK" : "OVERSHOOT");
                 if (need > budget_bytes) { violators.emplace_back(t, need - budget_bytes); }
+                max_need = std::max(max_need, need);
             }
             if (violators.empty()) {
-                return;  // every viable tier fits the canonical layout
+                // every viable tier fits the canonical layout: this is what the arena must hold.
+                // A tier without probe measurements (cache-seeded) would undercount it: leave 0
+                // (= whole budget) rather than shrink the arena on a guess.
+                bool measured = true;
+                for (size_t t : viable) {
+                    if (registry->best_plans[t].scratch_measured == 0) { measured = false; }
+                }
+                registry->union_bytes = measured ? max_need : 0;
+                LLAMA_LOG_INFO("%s: canonical union %.2f MiB of the %.2f MiB budget (arena %.2f MiB, %.2f MiB leftover for a spec draft)\n",
+                    __func__, max_need / (1024.0*1024.0), budget_bytes / (1024.0*1024.0),
+                    registry->arena_bytes(budget_bytes) / (1024.0*1024.0),
+                    (budget_bytes - registry->arena_bytes(budget_bytes)) / (1024.0*1024.0));
+                return;
             }
 
             // 4. demote every violator: re-plan it at its (escalating) reduced budget

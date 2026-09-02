@@ -1789,7 +1789,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     std::unordered_set<ggml_tensor *> pshard_device_only_tensors;
     if (pshard_has_registry && n_common > 0) {
-        const size_t buf_size = params.max_vram_alloc * 1024ULL * 1024ULL;
+        // arena = the registry's canonical union + headroom, not the whole budget: the
+        // remainder is leftover device memory (one-budget rule: a spec draft may take it)
+        const size_t buf_size = pimpl->plan_registry->arena_bytes(params.max_vram_alloc * 1024ULL * 1024ULL);
         ml.preload_common_weights_to_device(
             preload_order, n_common, buf_size,
             &pimpl->dev_preload_buf,
@@ -1969,6 +1971,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
 
         size_t buf_size = params.max_vram_alloc * 1024ULL * 1024ULL;
+        if (pimpl->plan_registry != nullptr) {
+            buf_size = pimpl->plan_registry->arena_bytes(buf_size);  // see the preload above
+        }
 
         if (pimpl->dev_preload_buf != nullptr) {
             for (const auto & [tensor, bid] : preload_tensor_backend_ids) {
@@ -2408,6 +2413,10 @@ bool llama_model::pshard_delegates_compute() const {
 
 llama_pshard_plan_registry * llama_model::get_plan_registry() const {
     return pimpl->plan_registry;
+}
+
+bool llama_model_pshard_active(const struct llama_model * model) {
+    return model != nullptr && model->is_pshard();
 }
 
 const std::unordered_map<ggml_tensor *, int32_t> & llama_model::get_tensor_backend_ids() const {

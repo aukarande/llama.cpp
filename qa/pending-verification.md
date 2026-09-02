@@ -79,9 +79,15 @@ and corrupt concurrent measurements).
 3. ~~Switch-cost behavioral check~~ **VERIFIED 2026-08-31**: switch_ms fields
    populated (0 for tier-0, 83-105ms for residency deltas); prompt-1500 -> ub 2048
    and prompt-16k -> ub 8192 both hand-verify as argmin of n_iters*ts/tps +
-   2*switch_ms. CAVEAT (small follow-up): strategies that pin attention
-   structurally (ATTNPIN/LAYERSTREAM) do not record it in n_attn_pinned, so
-   switch_ms between them can overcharge; fine for 0-vs-100ms discrimination.
+   2*switch_ms. ~~CAVEAT: strategies that pin attention structurally
+   (ATTNPIN/LAYERSTREAM) do not record it in n_attn_pinned, so switch_ms between
+   them can overcharge~~ **CLOSED 2026-09-02**: the registry carries n_layers
+   in-memory (planner + runtime) and prices attention residency through
+   attn_resident(plan): ATTNPIN_FFNSTREAM = every layer, LAYERSTREAM/FFNCPU =
+   the fully pinned layers only (n_attn_pinned stays the ATTNPRIO/ALTERNATE
+   knob, so emitters and hi_attn pruning are untouched). Fresh q35+dflash
+   registry @4000: LAYERSTREAM tiers 96.6 ms from the ATTNPRIO decode tier
+   (2 layers + 40 attention pins + head), consistent with the formula.
 4. ~~DSv4 predictor tuning~~ **FIXED 2026-08-31**: IQ-quant expert matmuls had no
    benchmark entries -> priced by memory bandwidth alone (118 nodes for 224ms)
    while dequant-compute-bound at batch. Added a compute floor for quantized CPU
@@ -214,17 +220,65 @@ and corrupt concurrent measurements).
    limit) so DSv4 streaming runs on pageable copies - correct, slower; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
-   budget before the margin fix); joint target+draft planning (cordis v2)
+   budget before the margin fix); ~~joint target+draft planning (cordis v2)
    deferred until v1 shows a case where leftover budget could pin draft
-   experts; [b] FNV
-   logits-hash spec test port (cordis tests/test_pshard_spec.cpp shape);
+   experts~~ **v2 LANDED + MEASURED 2026-09-02 (greedy leftover form)**: the
+   planner's union enforcer persists the canonical union (variant header
+   union_mb=; max over viable tiers of packed weights + pinned cache + compute
+   scratch + 32 MiB margin), the arena is allocated at union + 64 MiB (whole
+   MiB) instead of the whole budget, and a MoE draft whose experts the v1 rule
+   spilled gets the leftover: leading layers' experts move to the device while
+   they fit (generated partial-spill regex; runtime-only, registry unaffected;
+   user -otd/-cmoed lists never rewritten; re-entry on the same params restores
+   the canonical spill before re-measuring, so server sleep/wake derives the
+   plan tool's budget). Measured: q35+dflash @4000 union 2475 -> arena 2539 of
+   2671 MiB, pair peak 4206 MiB (4315 before), 45.8 t/s, 64 accepted - no
+   experts to pin; DSv4+DSpark @12000 union 10120 -> arena 10184 of 10221 MiB,
+   37 MiB left vs a 3264 MiB first DSpark expert layer -> nothing pinned. The
+   layer granularity of the target plan leaves too little for any draft at
+   hand: v2 buys nothing on these models, as suspected; the mechanism stays
+   (it also releases the arena slack honestly). API: llama_pshard_registry_arena_bytes,
+   llama_model_pshard_active. [b] ~~FNV logits-hash spec test port~~ **LANDED
+   2026-09-02**: tests/test-pshard-spec.cpp (ctest, env-gated on
+   LLAMA_TEST_PSHARD_SPEC_TARGET [+_DRAFT], label model). Per strategy: plan
+   in-process (mirror of the plan tool), run the speculative-simple loop twice
+   - DETERMINISM is the hard bar (token stream, n_accept/n_drafted and an
+   FNV-1a hash over every verify step's full logits must match between the two
+   runs; held bitwise for s0/s1/auto with dflash and with the MTP head) - plus
+   pshard-engaged (llama_model_pshard_active) and n_accept > 0. Across
+   strategies the first verify step's logits are compared value-wise (pairwise
+   matrix + top-2 margins printed; tolerance per model via _TOL, token/hash
+   equality via _STRICT) and the stock side runs at -fitb MVA as reference.
+   FINDING: on q35 the GPU-only strategies s0 and s1 disagree at small-batch
+   tiers (first-step max |dlogit| ~1.0 in the spec test; ub-16 perplexity
+   2.8782 vs 2.8796 with no rollback ring) while plain bs=1 decode is
+   byte-identical s0 == s1 == stock over 64 tokens and the DENSE 27B is
+   bitwise identical at ub 16 too -> a MoE small-batch expert-path difference
+   between two GPU-only placements; root-cause hunt (eval-callback per-tensor
+   sums, first divergent op) recorded below under item 11.
    [c] stock+MTP equal-budget QA cell (stock-fallback+MTP at DEFAULT fit hit
-   ~83 t/s - budget-equalized comparison pending); [d] ~~forced-s3+MTP
+   ~83 t/s - budget-equalized comparison pending; harness cells now do this
+   at -fitb); [d] ~~forced-s3+MTP
    n_accept=0 anomaly~~ RESOLVED (070d9fb27): the draft ctx's layer-40 KV
    cache takes the pipe-shard branch (gated on model.is_pshard()) and its
    GPU k/v stay unbacked (nothing packs a non-pshard ctx) -> scratch KV ->
    garbage history whenever the plan PINNED the nextn attn; nextn layers
-   now always CPU-resident; [e] server spec path untested; [f] plan-tool
+   now always CPU-resident; [e] ~~server spec path untested~~ **TESTED
+   2026-09-02**: llama-server -np 2 -c 4096, two concurrent greedy completions
+   per case, clean device per case (pshard vs stock -fitb 4000):
+     MTP head:   pshard 4379 MiB, 31.6/32.5 t/s, acceptance 0.73/0.72 |
+                 stock  4485 MiB, 25.4/26.5 t/s, acceptance 0.76/0.77
+     dflash:     pshard 4332 MiB, 25.4/23.6 t/s, acceptance 0.55/0.49 |
+                 stock  6160 MiB (2.1 GB OVER budget: the stock fit cannot
+                 measure a dflash draft - "requires ctx_other" - so the draft
+                 loads outside -fitb; one-budget is pshard-only), 21.8/21.9 t/s
+   Both slots served in every case, no fallback, no errors under pshard.
+   Harness lessons: sh's $! is an MSYS pid, native servers ignore its kill and
+   taskkill by that pid hits nothing - stop llama-server BY IMAGE NAME and wait
+   for VRAM to return to idle before the next case (a stale server kept serving
+   the port and two rounds of "results" were its answers; a draft load once
+   failed with "invalid vector subscript" only while a stale server held 9 GB);
+   [f] plan-tool
    arg parse now LLAMA_EXAMPLE_SPECULATIVE (accepts --spec-type /
    --spec-draft-n-max); [g] ~~per-context memory gating~~ CLOSED
    2026-09-01 (ed7136c04): pipe-shard KV/RS branches gated on the creating ctx's
@@ -250,6 +304,45 @@ and corrupt concurrent measurements).
    references - PPL parity is the gate; references refresh with the next grid.
    The deleted slot carve-out had masked this class by construction; its deletion
    stands (the range check now covers it soundly). Upstreamable fix.
+
+11. **MoE small-batch parity between GPU-only strategies (OPEN, found by the spec
+    certification test 2026-09-02)**. Facts, all on q35 Q4_K_M @4000 unless noted:
+    - forced s0 (LAYERPIN_LAYERSTREAM) and s1 (ATTNPIN_FFNSTREAM) are each bitwise
+      deterministic run-to-run (tokens, n_accept, FNV over every verify step's logits);
+    - plain bs=1 greedy decode after a 346-token prompt: s0 == s1 == stock(-fitb) byte-
+      identical over 64 tokens (auto = STATIC_ATTNPRIO diverges at token ~35, CPU experts);
+    - DENSE Qwen3.6-27B-Q4_0 @6000: s0 == s1 == auto byte-identical at bs=1, and PPL at
+      ub 16 bitwise identical (2.6951, per-chunk 3.4747) -> GPU-only streaming itself is
+      consistent; the effect is MoE-only;
+    - MoE PPL at ub 16 (c=512, 4 chunks, no rollback ring): s0 2.8782 vs s1 2.8796 vs
+      stock 2.8862 - differs already in chunk 1;
+    - spec test (dflash, 36-token prompt then 9-token verify batches): first verify step
+      max |dlogit| s0-s1 1.05, s0-auto 0.61, s0-stock 0.95, s1-stock 0.55 (top-2 margins
+      0.76-1.10, so token 3 flips); MTP head: 0.54 / 0.38;
+    - eval-callback per-tensor SUMS (rel 1e-6), s0 vs s1: fresh 14-token batch identical
+      over 2667 tensors; fresh 43-token batch identical; 3 x 16-token KV-warm decodes
+      identical over 8001 tensors (LLAMA_EVAL_CB_CHUNK=16);
+    - tier switch (36-token prompt at tier 512, then a 9-token batch at tier 16) identical
+      over 5334 tensors; 346 tokens by 16 (KV to 346) identical over 58674; both again with
+      ALL logits (multi-output batches, LLAMA_EVAL_CB_ALL_LOGITS=1) identical incl. the
+      result_output sums -> the callback hunt sees no difference anywhere;
+    - ROOT CAUSE (CLASSIFIED, not a defect): an eval callback materializes every node and
+      thereby DISABLES CUDA op fusion, which is exactly what differs. With
+      GGML_CUDA_DISABLE_FUSION=1 the ub-16 PPL is bitwise identical, s0 == s1 == 2.8761
+      (per-chunk 3.3886), stock unchanged at 2.8862. Placement decides the scheduler
+      splits: LAYERSTREAM keeps a layer in one split (fused add+norm/GLU intact),
+      ATTNPIN_FFNSTREAM cuts attention|FFN inside the layer and breaks the fusions there;
+      the rounding difference flips MoE expert-routing near-ties and moves logits by O(1).
+      Dense has no routing to amplify (bitwise identical), and stock's CPU experts put the
+      same cut inside the layer (hence stock is closer to s1: 0.55 vs 0.95). Verdict: the
+      speculative-test bars are right as landed (determinism hard, cross-strategy parity
+      reported); do not chase cross-placement token equality on MoE.
+    Reproduce: `PSHARD_STRATEGY=0|1 llama-pshard-plan-params -m q35 -c 512 -mva 4000 -b 16
+    -ub 16` then `llama-perplexity ... -c 512 --chunks 4 -b 16 -ub 16 -pshard -mva 4000`;
+    the spec test with LLAMA_TEST_PSHARD_SPEC_STRATS=0,1 prints the matrix. Note: tensor
+    sums cannot resolve a ~1.0 delta in one of 248k logits (sum magnitude ~1e6, rel 1e-6
+    = 1.0 absolute) - an element-wise comparison of the printed elements normalized by
+    max|x| (memory item 12) is the tool for non-fusion questions; fusion questions need GGML_CUDA_DISABLE_FUSION=1 on the real workload.
 
 ## Contamination note (2026-08-30)
 

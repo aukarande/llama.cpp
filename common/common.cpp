@@ -1367,6 +1367,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
         llama_params_fit_pshard(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_buft_overrides.data(), mva_eff, fit_target_eff);
+        if (mparams.pshard && mparams.pshard_registry != nullptr && mparams.max_vram_alloc > 1) {
+            // the fit may have shrunk the arena budget below mva_eff (DeepSeek-V4 compressor state
+            // lives outside the arena): the leftover is what the ARENA's budget has beyond the arena
+            common_pshard_draft_leftover(params, mparams.pshard_registry, mparams.max_vram_alloc);
+        }
         if (!mparams.pshard) {
             // this process continues on the STOCK path: undo the pshard-only env gates so the
             // fallback run keeps stock fusion behavior
@@ -1596,12 +1601,21 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
         if (const int64_t kn = gguf_find_key(g, "split.no"); kn >= 0 && gguf_get_kv_type(g, kn) == GGUF_TYPE_UINT16) {
             split_no = gguf_get_val_u16(g, kn);
         }
+        auto & exps_per_layer = params.speculative.draft.exps_bytes_per_layer;
+        exps_per_layer.clear();
         auto sum_tensors = [&](gguf_context * gg) {
             for (int64_t i = 0; i < gguf_get_n_tensors(gg); i++) {
                 const char * name = gguf_get_tensor_name(gg, i);
                 const size_t sz   = gguf_get_tensor_size(gg, i);
                 w_total += sz;
-                if (strstr(name, "ffn_") && strstr(name, "exps")) { w_exps += sz; }
+                if (strstr(name, "ffn_") && strstr(name, "exps")) {
+                    w_exps += sz;
+                    unsigned il = 0;
+                    if (sscanf(name, "blk.%u.", &il) == 1) {
+                        if (exps_per_layer.size() <= il) { exps_per_layer.resize(il + 1, 0); }
+                        exps_per_layer[il] += sz;  // v2: per-layer expert bytes for leftover pinning
+                    }
+                }
             }
         };
         sum_tensors(g);
@@ -1623,12 +1637,24 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
         // value-density bytes on the card, the experts are read once per drafted token.
         // The user's own -otd list wins; a spill applied by an earlier call is recognized.
         auto & ovr = params.speculative.draft.tensor_buft_overrides;
-        for (const auto & o : ovr) {
-            if (o.pattern && strcmp(o.pattern, LLM_FFN_EXPS_REGEX) == 0) { spill = true; }
+        // a spill applied by an earlier call of THIS rule (possibly rewritten to a partial list
+        // by the v2 leftover pinning) is recognized by its flag, never by pattern text: an
+        // identical pattern from the user's own list must keep counting as the user's
+        spill = params.speculative.draft.exps_spill_auto;
+        if (spill) {
+            // re-entry (e.g. server sleep/wake): the v2 leftover step may have rewritten the
+            // list to a partial spill after the previous fit. Restore the canonical full spill
+            // the v1 rule prices, so this pass measures the same placement the plan tool did
+            // and derives the same budget; the leftover step re-applies its pins after the fit.
+            ovr.clear();
+            ovr.push_back(llm_ffn_exps_cpu_override());
+            ovr.push_back({ nullptr, nullptr, -1 });
+            params.speculative.draft.spill_pattern.clear();
         }
         user_ovr = !ovr.empty() && !spill;
         if (!user_ovr && !spill && w_total > (2ULL << 30) && w_exps > 0) {
             spill = true;
+            params.speculative.draft.exps_spill_auto = true;
             ovr.push_back(llm_ffn_exps_cpu_override());
             ovr.push_back({ nullptr, nullptr, -1 });
         }
@@ -1681,6 +1707,62 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
             __func__, n_ctx, ubatch, need / (double) mib, how, reserve_mb);
     }
     return reserve_mb;
+}
+
+// pshard one-budget v2 (joint target + draft, greedy): the target's plan is fixed by the
+// registry and its arena is sized to the canonical union, so whatever the budget has beyond
+// the arena is real device memory nobody uses. A separate MoE draft whose experts the v1 rule
+// spilled to the CPU gets that leftover: the leading layers' experts move back to the device
+// while they fit. Runtime-only (the registry does not depend on it); the plan tool still prices
+// the draft with the v1 reserve, so the pair stays inside the budget: arena + reserve + pinned
+// experts <= -mva. Drafts placed by a user -otd list are left alone.
+void common_pshard_draft_leftover(common_params & params, const struct llama_pshard_plan_registry * registry, size_t arena_budget_mb) {
+    const size_t mva_eff_mb = arena_budget_mb;  // the arena's budget after every shrink the fit applied
+    auto & d = params.speculative.draft;
+    if (!params.speculative.has_dft() || d.exps_bytes_per_layer.empty() || registry == nullptr) {
+        return;
+    }
+    if (!d.exps_spill_auto) {
+        return;  // small draft (fully on the device) or a user list (-otd / --spec-draft-cpu-moe): not ours to rewrite
+    }
+    const size_t mib    = 1024ULL * 1024ULL;
+    const size_t budget = mva_eff_mb * mib;
+    const size_t arena  = llama_pshard_registry_arena_bytes(registry, budget);
+    if (arena >= budget) {
+        LOG_INF("%s: pshard v2: the target's arena takes the whole %zu MiB budget, no leftover for the draft's experts\n", __func__, mva_eff_mb);
+        return;
+    }
+    const size_t leftover = budget - arena;
+    const size_t slack    = 16 * mib;  // device allocation granularity / buffer padding
+    const size_t n_layer  = d.exps_bytes_per_layer.size();
+    size_t k = 0, used = 0;
+    for (; k < n_layer; k++) {
+        const size_t b = d.exps_bytes_per_layer[k];
+        if (b == 0) { continue; }
+        if (used + b + slack > leftover) { break; }
+        used += b;
+    }
+    if (k == 0) {
+        LOG_INF("%s: pshard v2: %.1f MiB left after the target's canonical union (arena %.1f MiB) is below the draft's first expert layer (%.1f MiB): experts stay on CPU\n",
+            __func__, leftover / (double) mib, arena / (double) mib, d.exps_bytes_per_layer[0] / (double) mib);
+        return;
+    }
+    // spilled set = layers k..n_layer-1 (empty when every layer's experts fit)
+    d.tensor_buft_overrides.clear();
+    if (k < n_layer) {
+        std::string idx;
+        for (size_t il = k; il < n_layer; il++) {
+            if (d.exps_bytes_per_layer[il] == 0) { continue; }
+            idx += (idx.empty() ? "" : "|") + std::to_string(il);
+        }
+        d.spill_pattern = "blk\\.(" + idx + ")" + LLM_FFN_EXPS_REGEX;
+        d.tensor_buft_overrides.push_back({ d.spill_pattern.c_str(), ggml_backend_cpu_buffer_type(), -1 });
+    }
+    d.tensor_buft_overrides.push_back({ nullptr, nullptr, -1 });
+    d.pshard_reserve_mb += (int32_t) ((used + mib - 1) / mib);  // the teardown self-check prices them too
+    LOG_INF("%s: pshard v2: %.1f MiB left after the target's canonical union (arena %.1f MiB of the %zu MiB budget): pinning the experts of draft layers 0..%zu (%.1f MiB) on the device, %zu/%zu layers stay spilled, %.1f MiB unused\n",
+        __func__, leftover / (double) mib, arena / (double) mib, mva_eff_mb, k - 1, used / (double) mib,
+        n_layer - k, n_layer, (leftover - used) / (double) mib);
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {

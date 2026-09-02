@@ -350,6 +350,14 @@ struct common_params_speculative_draft {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    // pshard one-budget v2: the draft's expert bytes per layer (filled by the reserve from the
+    // draft gguf) and the storage for a generated partial-spill pattern (leftover budget after
+    // the target's canonical union pins the leading layers' experts, the rest stay on CPU)
+    std::vector<size_t> exps_bytes_per_layer;
+    std::string         spill_pattern;
+    bool                exps_spill_auto = false;  // the reserve's size rule spilled the experts (a user
+                                                  // list - -otd / --spec-draft-cpu-moe - is never rewritten)
 };
 
 struct common_params_speculative_ngram_mod {
@@ -957,6 +965,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 // (common_init_from_params) and llama-pshard-plan-params call this, so plan and run
 // price the same effective budget.
 size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx);
+
+// pshard one-budget v2: hand the budget left beyond the target arena's canonical union to a
+// spilled MoE draft's experts (leading layers first). Runtime-only; called after the fit.
+void common_pshard_draft_leftover(common_params & params, const struct llama_pshard_plan_registry * registry, size_t arena_budget_mb);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

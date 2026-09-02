@@ -603,6 +603,14 @@ extern "C" {
     LLAMA_API struct llama_pshard_plan_registry * llama_pshard_registry_create(uint32_t n_tier_max, uint32_t n_seq_max, uint32_t n_draft);
     LLAMA_API void                         llama_pshard_registry_free(struct llama_pshard_plan_registry * registry);
 
+    // device bytes the pshard arena is allocated with for a budget: the registry's canonical
+    // union (largest viable tier need) plus packing headroom, capped at the budget. Whatever
+    // the budget has beyond that is leftover the one-budget rule may hand to a spec draft.
+    LLAMA_API size_t llama_pshard_registry_arena_bytes(const struct llama_pshard_plan_registry * registry, size_t budget_bytes);
+
+    // true when the loaded model runs under pshard (false after a silent stock fallback)
+    LLAMA_API bool llama_model_pshard_active(const struct llama_model * model);
+
     LLAMA_API int64_t llama_time_us(void);
 
     LLAMA_API size_t llama_max_devices(void);

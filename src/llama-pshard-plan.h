@@ -228,6 +228,44 @@ struct llama_pshard_plan_registry {
     float switch_head_mb   = 0.0f;  // est. MB of the output head
     float switch_pcie_gb_s = 0.0f;  // upload rate for pinned weights
     bool  mtp_head_cpu     = false; // MTP head demoted to CPU by union-budget enforcement
+    uint32_t n_layers      = 0;     // trunk layer count (set in-memory by planner and runtime;
+                                    // 0 = unknown -> structural attention pins are not priced)
+    // canonical union of every viable tier (packed weights + pinned cache + compute scratch +
+    // enforcer margin), the largest device footprint any plan of this variant needs. Written
+    // by the planner's union enforcer, persisted as union_mb=. 0 = unknown (older registry,
+    // or the enforcer did not converge) -> the arena takes the whole budget as before.
+    size_t union_bytes     = 0;
+
+    // device bytes the pshard arena is allocated with: the union plus a packing headroom
+    // (the runtime's canonical packing rounds differently from the planner's metadata pass by
+    // up to a few tens of MiB), capped at the budget. Whatever the budget has beyond that is
+    // LEFTOVER: real device memory nobody uses, which the one-budget rule hands to a spilled
+    // speculative draft's experts (common_init_from_params) instead of idling inside the arena.
+    size_t arena_bytes(size_t budget_bytes) const {
+        const size_t mib      = 1024ULL * 1024;
+        const size_t headroom = 64 * mib;
+        if (union_bytes == 0) {
+            return budget_bytes;
+        }
+        // whole MiB: the buffer size positions the pinned cache region (buf_total - cache),
+        // so a fractional size would misalign every cache tensor (CUDA misaligned address)
+        const size_t want = ((union_bytes + headroom + mib - 1) / mib) * mib;
+        return want >= budget_bytes ? budget_bytes : want;
+    }
+
+    // layers whose ATTENTION is device-resident under a plan. n_attn_pinned is the
+    // ATTNPRIO/ALTERNATE budget knob and stays 0 for strategies that pin attention
+    // structurally: ATTNPIN_FFNSTREAM keeps every layer's attention resident, the
+    // LAYERSTREAM/FFNCPU_ATTNSTREAM strategies only the fully pinned layers'. Pricing a
+    // switch from the raw field charged an ATTNPIN <-> ATTNPRIO(attn=40) swap as 40
+    // layers of attention traffic that never moves (selector-gap audit caveat, 2026-08-31).
+    uint32_t attn_resident(const llama_pshard_plan & p) const {
+        uint32_t r = p.n_attn_pinned > p.n_pinned ? p.n_attn_pinned : p.n_pinned;
+        if (p.strategy == LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM && n_layers > 0) {
+            r = n_layers > r ? n_layers : r;
+        }
+        return r;
+    }
 
     // one-way cost of switching pinned residency between two plans, in ms.
     // Falls back to the tier0-anchored per-plan estimate for legacy caches.
@@ -243,9 +281,10 @@ struct llama_pshard_plan_registry {
         } else {
             mb += ((double)to.n_pinned + (double)from.n_pinned) * (double)switch_layer_mb;
         }
-        // attention-only pins (n_attn_pinned includes the fully pinned layers)
-        const double fa = from.n_attn_pinned > from.n_pinned ? from.n_attn_pinned - from.n_pinned : 0;
-        const double ta = to.n_attn_pinned   > to.n_pinned   ? to.n_attn_pinned   - to.n_pinned   : 0;
+        // attention-only pins: resident attention beyond the fully pinned layers (structural
+        // pins included, see attn_resident)
+        const double fa = (double)(attn_resident(from) - from.n_pinned);
+        const double ta = (double)(attn_resident(to)   - to.n_pinned);
         mb += (ta > fa ? ta - fa : fa - ta) * (double)switch_layer_mb * (double)switch_attn_frac;
         if (from.output_on_gpu != to.output_on_gpu) {
             mb += (double)switch_head_mb;
