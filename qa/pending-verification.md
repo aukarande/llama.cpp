@@ -173,11 +173,15 @@ and corrupt concurrent measurements).
    (3) compressed caches are graph-written -> whole-layer transfers. Text
    byte-identical to stock CPU for auto/s0/s1/s2 @12000, PPL 2.5408 vs CPU
    2.5443 with clears between chunks, DSpark pair 63/110 within budget,
-   decode 10.8 t/s. STILL OPEN: DSv4 not in the harness grid (grid held by
-   user; adding a 97 GB model roughly doubles grid time); compressor-state
-   VRAM (~a few hundred MiB) is allocated outside the pshard budget and not
-   planned; multi-sequence (seq_cp) on DSv4 under pshard is coded but
-   untested; page-locking fails for the 45 GB third shard (pinned-memory
+   decode 10.8 t/s. Follow-ups CLOSED 2026-09-01 (319bbc6b5): compressor-state
+   VRAM (11.64 MiB here; grows with n_seq_max*(1+n_rs_seq)) is now reserved
+   from the pshard budget by both probes (arena 11989 + state = 12000);
+   multi-sequence exercised with llama-parallel (2 clients, 4 seqs, shared
+   prompt -> seq_cp) under streamed attention: clean, deterministic, 3/4
+   greedy responses identical to CPU and the 4th prompt is greedy-unstable
+   in every configuration (differs CPU-vs-CPU too). STILL OPEN: DSv4 not in
+   the harness grid (grid held by user; a 97 GB model roughly doubles grid
+   time); page-locking fails for the 45 GB third shard (pinned-memory
    limit) so DSv4 streaming runs on pageable copies - correct, slower; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
