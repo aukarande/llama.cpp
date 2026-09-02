@@ -4,10 +4,19 @@
 # For every config (model x ctx x mva x strategy) this:
 #   1. wipes the model's plan registry and plans fresh (forced strategy via PSHARD_STRATEGY,
 #      or auto), reading cache_ubatch back from the registry,
-#   2. runs the STOCK baseline once per (model, ctx, mva) with -fitt equalized to the same
-#      budget and -ub matched to pshard's cache_ubatch (value-comparable),
-#   3. runs pshard with -v (tier summary => active strategy / overlap / n_pinned),
-#      sampling VRAM at 1 Hz,
+#   2. runs STOCK twice per (model, ctx, mva), both with -fitt equalized to the same budget:
+#        golden: -ub/-b matched to pshard's cache_ubatch, temp 0, ignore-eos -> token hash
+#                ONLY (eval shape changes numerics, so the correctness gate needs it),
+#        perf:   DEFAULTS ONLY -> prompt/decode t/s + VRAM delta,
+#   3. runs pshard twice per config:
+#        perf:        DEFAULTS ONLY -> prompt/decode t/s + VRAM delta,
+#        correctness: temp 0, ignore-eos, -lv 4 -> token hash + tier summary (active
+#                     strategy / n_pinned for the plan gate),
+#   PERF RULE (user, 2026-09-01): a perf run carries the workload (-m -f -n -c, -no-cnv
+#   for batch completion) and the budget (-fitt N | -pshard -mva N) and NOTHING else - no
+#   sampling, batch, cache or logging flags on either side. Both sides run exactly what a
+#   user runs. Everything the parsers need beyond WARN-level lines comes from the
+#   correctness runs or the registry.
 #   4. appends one CSV row per side to the run ledger.
 #
 # Generation goes to stdout (*.gen files, hashed for the token gate); logs go to stderr
@@ -35,8 +44,20 @@ PROMPTS=${QA_PROMPTS_DIR:-/c/Aditya/Prompts}
 # timer; at 32 tokens it distorted decode_tps by up to 27%. Longer decode amortizes it
 # (the switch cost stays IN the measurement - it is real - just at realistic weight).
 N_GEN=256
+# Perf runs sample at the model's default settings, so an EOS can end decode early. A
+# 2-token window measured 18 t/s on q35@4000 (the prefill->decode plan switch, nothing
+# else). A perf run whose decode window is shorter than MIN_DECODE is retried (new random
+# seed) up to PERF_TRIES times; the final window length lands in the ledger column
+# decode_tokens and compare-qa refuses to gate decode_tps on a short window.
+MIN_DECODE=$((N_GEN / 2))
+PERF_TRIES=3
 mkdir -p "$OUT"
 cd "$BIN" || exit 1
+
+# this build's default ubatch - the perf baselines run at defaults, so the ledger records
+# it from --help rather than from a logging flag on the perf run
+DEF_UB=$(./llama-completion.exe --help 2>&1 | grep -aE -- '-ub, +--ubatch-size' | grep -aoE 'default: [0-9]+' | grep -aoE '[0-9]+' | head -1)
+[ -z "$DEF_UB" ] && DEF_UB=default
 
 # single-instance lock: rival harnesses clobber each other's registries mid-flight
 LOCK="$OUT/../qa-run.lock"
@@ -52,7 +73,7 @@ LEDGER="$OUT/ledger.csv"
 if [ "${QA_RESUME:-0}" = "1" ] && [ -f "$LEDGER" ]; then
     echo "resuming: $(grep -c ',pshard,' "$LEDGER") pshard rows already present"
 else
-    echo "config,side,model,ctx,mva,strategy_forced,strategy_active,strategy_prefill,overlap,n_pinned,n_attn_pinned,cache_ubatch,prefill_ub,prompt_tps,decode_tps,vram_peak_delta,token_hash,status" > "$LEDGER"
+    echo "config,side,model,ctx,mva,strategy_forced,strategy_active,strategy_prefill,overlap,n_pinned,n_attn_pinned,cache_ubatch,prefill_ub,prompt_tps,decode_tps,decode_tokens,vram_peak_delta,token_hash,status" > "$LEDGER"
 fi
 
 IDLE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
@@ -80,6 +101,27 @@ hash_gen() { # generation file (pure stdout) -> hash
 }
 perf_field() { # log pattern -> tok/s
     grep -a "$2" "$1" | tail -1 | sed 's/.*, *//;s/ tokens per second.*//'
+}
+
+decode_runs() { # log -> number of decode steps in the perf print ("eval time = ... / N runs")
+    grep -a " eval time" "$1" | tail -1 | grep -aoE "/ +[0-9]+ runs" | grep -aoE "[0-9]+"
+}
+
+run_perf() { # samp-file log-file gen-file cmd... -> "rc delta runs"; retries short decode windows
+    SAMP=$1; LOG=$2; GENF=$3; shift 3
+    try=1
+    while :; do
+        RES=$(run_side "$SAMP" "$LOG" "$GENF" "$@")
+        RUNS=$(decode_runs "$LOG"); [ -z "$RUNS" ] && RUNS=0
+        RCp=${RES%% *}
+        if [ "$RCp" != "0" ] || [ "$RUNS" -ge "$MIN_DECODE" ] || [ "$try" -ge "$PERF_TRIES" ]; then
+            break
+        fi
+        echo "    decode window $RUNS < $MIN_DECODE tokens (EOS at default sampling), retry $((try+1))/$PERF_TRIES" >&2
+        cp "$LOG" "$LOG.try$try" 2>/dev/null; cp "$GENF" "$GENF.try$try" 2>/dev/null
+        try=$((try+1))
+    done
+    echo "$RES $RUNS"
 }
 
 run_side() { # samp-file log-file gen-file cmd...
@@ -127,21 +169,41 @@ for MDL in $MODELS_LIST; do
                 CUB=$(grep -aoE "cache_ubatch=[0-9]+" "$MP.tensor_overrides.pshard_registry" | head -1 | cut -d= -f2)
                 [ -z "$CUB" ] && CUB=$CTX
 
-                # 2. stock baseline (once per model/ctx/mva), ub matched to pshard's cache_ubatch
+                # 2. stock (once per model/ctx/mva) - TWO runs with different jobs:
+                #    golden: -ub/-b matched to pshard's cache_ubatch. Supplies the token hash
+                #            ONLY (evaluation shape changes numerics; README gate 1).
+                #    perf:   DEFAULTS ONLY (workload + -fitt budget; see PERF RULE above).
+                #            Supplies prompt/decode t/s and the VRAM delta. A ubatch forced
+                #            to cache_ubatch is NOT a perf baseline: at ub 2048 the 248k-vocab
+                #            q35 needs a ~2 GB logits scratch, the 4 GB fit drops from all
+                #            layers (experts on CPU) to 20/41 layers and decode halves
+                #            (21 vs 44 t/s, 2026-09-01). Default sampling means the token
+                #            stream is not reproducible and an EOS may end decode before
+                #            N_GEN; the reported rates are still per generated token.
+                GLOG="$OUT/stock_golden_${MK}-c${CTX}-mva${MVA}.log"
                 SLOG="$OUT/stock_${MK}-c${CTX}-mva${MVA}.log"
-                if [ "$STOCK_DONE" = "0" ] && [ -f "$SLOG.gen" ] && grep -q "^${MK}-c${CTX}-mva${MVA},stock," "$LEDGER"; then
-                    STOCK_HASH=$(hash_gen "$SLOG.gen")
+                if [ "$STOCK_DONE" = "0" ] && [ -f "$GLOG.gen" ] && grep -q "^${MK}-c${CTX}-mva${MVA},stock," "$LEDGER"; then
+                    STOCK_HASH=$(hash_gen "$GLOG.gen")
                     STOCK_DONE=1
                 fi
                 if [ "$STOCK_DONE" = "0" ]; then
-                    R=$(run_side "$OUT/vram_stock_${MK}-c${CTX}-mva${MVA}.txt" "$SLOG" "$SLOG.gen" \
+                    RG=$(run_side "$OUT/vram_stock_golden_${MK}-c${CTX}-mva${MVA}.txt" "$GLOG" "$GLOG.gen" \
                         ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" \
                         --temp 0 -no-cnv --ignore-eos --no-display-prompt \
                         -fitt "$FITT" -ub "$CUB" -b "$CUB")
-                    RC=${R%% *}; DELTA=${R##* }
+                    GRC=${RG%% *}
+                    STOCK_HASH=$(hash_gen "$GLOG.gen")
+                    [ "$GRC" != "0" ] && STOCK_HASH=""
+                    R=$(run_perf "$OUT/vram_stock_${MK}-c${CTX}-mva${MVA}.txt" "$SLOG" "$SLOG.gen" \
+                        ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" -no-cnv \
+                        -fitt "$FITT")
+                    RC=${R%% *}; DELTA=$(echo "$R" | awk '{print $2}'); NTOK=${R##* }
                     P=$(perf_field "$SLOG" "prompt eval time"); D=$(perf_field "$SLOG" " eval time")
-                    STOCK_HASH=$(hash_gen "$SLOG.gen")
+                    SUB=$DEF_UB
                     ST=$([ "$RC" = "0" ] && echo OK || echo FAIL)
+                    # perf baseline ran but the golden did not: the cell has numbers but no
+                    # token reference -> visible (not in compare-qa's PASS_CLASSES)
+                    [ "$ST" = "OK" ] && [ "$GRC" != "0" ] && ST=GOLDEN_FAIL
                     # budget enforcement label: -fitt fits WEIGHTS to the target, KV+compute
                     # land on top (measured up to 6.6x nominal at 16k). Such rows are still
                     # a-fortiori references (stock over budget and pshard still compared),
@@ -150,30 +212,38 @@ for MDL in $MODELS_LIST; do
                         ST=STOCK_OVER_BUDGET
                     fi
                     if [ "$RC" != "0" ]; then
-                        # a failed run has no meaningful perf/hash/vram telemetry
-                        P=""; D=""; DELTA=""; STOCK_HASH=""
+                        # a failed perf run has no meaningful perf/vram telemetry (the hash
+                        # comes from the golden run and stands on its own)
+                        P=""; D=""; DELTA=""; NTOK=""
                     fi
-                    echo "${MK}-c${CTX}-mva${MVA},stock,$MK,$CTX,$MVA,,,,,,,${CUB},,$P,$D,$DELTA,$STOCK_HASH,$ST" >> "$LEDGER"
+                    # stock row columns: cache_ubatch = the golden's matched shape,
+                    # prefill_ub = the perf baseline's effective (default) n_ubatch
+                    echo "${MK}-c${CTX}-mva${MVA},stock,$MK,$CTX,$MVA,,,,,,,${CUB},${SUB},$P,$D,$NTOK,$DELTA,$STOCK_HASH,$ST" >> "$LEDGER"
                     STOCK_DONE=1
                 fi
 
-                # 3. pshard run (stderr verbose for tier summary; stdout = generation)
+                PSH=""; [ "$STRAT" != "auto" ] && PSH="env PSHARD_STRATEGY=$STRAT"
+                # 3a. pshard PERF run - DEFAULTS ONLY (PERF RULE): perf + VRAM. WARN lines
+                #     are visible at default verbosity, so "pshard DISABLED" (STOCK_FALLBACK)
+                #     and pshard_prefill_ubatch_eff still parse from this log.
                 RLOG="$OUT/run_$CFG.log"
-                if [ "$STRAT" = "auto" ]; then
-                    R=$(run_side "$OUT/vram_$CFG.txt" "$RLOG" "$RLOG.gen" \
-                        ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" \
-                        --temp 0 -no-cnv --ignore-eos --no-display-prompt -v \
-                        -pshard -mva "$MVA")
-                else
-                    R=$(run_side "$OUT/vram_$CFG.txt" "$RLOG" "$RLOG.gen" \
-                        env PSHARD_STRATEGY=$STRAT ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" \
-                        --temp 0 -no-cnv --ignore-eos --no-display-prompt -v \
-                        -pshard -mva "$MVA")
-                fi
-                RC=${R%% *}; DELTA=${R##* }
+                R=$(run_perf "$OUT/vram_$CFG.txt" "$RLOG" "$RLOG.gen" \
+                    $PSH ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" -no-cnv \
+                    -pshard -mva "$MVA")
+                RC=${R%% *}; DELTA=$(echo "$R" | awk '{print $2}'); NTOK=${R##* }
                 P=$(perf_field "$RLOG" "prompt eval time"); D=$(perf_field "$RLOG" " eval time")
-                H=$(hash_gen "$RLOG.gen")
-                T0=$(grep -a "warmup_plan_reserves:   tier 0" "$RLOG" | head -1)
+                # 3b. pshard CORRECTNESS run - same shape as the stock golden (temp 0,
+                #     ignore-eos, no-display-prompt) -> token hash; -lv 4 (library INFO, no
+                #     DEBUG) -> tier summary for the plan gate. Not a perf measurement.
+                CLOG="$OUT/gen_$CFG.log"
+                RCg=$(run_side "$OUT/vram_gen_$CFG.txt" "$CLOG" "$CLOG.gen" \
+                    $PSH ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" \
+                    --temp 0 -no-cnv --ignore-eos --no-display-prompt -lv 4 \
+                    -pshard -mva "$MVA")
+                RCg=${RCg%% *}
+                H=$(hash_gen "$CLOG.gen")
+                [ "$RCg" != "0" ] && H=""
+                T0=$(grep -a "warmup_plan_reserves:   tier 0" "$CLOG" | head -1)
                 ACT=$(echo "$T0" | grep -aoE "bs=1[[:space:]]+[A-Z_]+" | awk '{print $2}')
                 NP=$(echo "$T0" | grep -aoE "(^| )n_pinned=[0-9]+" | cut -d= -f2)
                 OVL=$(grep -aoE "overlap=[01]" "$MP.tensor_overrides.pshard_registry" | head -1 | cut -d= -f2)
@@ -181,27 +251,23 @@ for MDL in $MODELS_LIST; do
                 # (auto picks per tier), and the runtime may prefill at a smaller ubatch
                 SP=$(grep -aA1 "bs=$CUB\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "strategy=[A-Z_]+" | tail -1 | cut -d= -f2)
                 NA=$(grep -aA1 "bs=1\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "n_attn_pinned=[0-9]+" | head -1 | cut -d= -f2)
-                PUB=$(grep -aoE "pshard_prefill_ubatch_eff=[0-9]+" "$RLOG" | head -1 | cut -d= -f2)
+                PUB=$(grep -aoE "pshard_prefill_ubatch_eff=[0-9]+" "$RLOG" "$CLOG" | head -1 | grep -aoE "[0-9]+$")
                 [ -z "$PUB" ] && PUB=$CUB
-                if grep -aq "pshard DISABLED" "$RLOG"; then ACT="STOCK_FALLBACK"; fi
+                if grep -aq "pshard DISABLED" "$RLOG" "$CLOG"; then ACT="STOCK_FALLBACK"; fi
                 ST=OK
-                [ "$RC" != "0" ] && ST=FAIL
+                # both pshard runs must succeed: no perf without a hash, no hash without perf
+                [ "$RC" != "0" ] || [ "$RCg" != "0" ] && ST=FAIL
                 if [ "$ST" = "OK" ] && [ -n "$STOCK_HASH" ] && [ "$H" != "$STOCK_HASH" ]; then
-                    # secondary gate: token streams may legitimately diverge across placements
-                    # at temp 0 (near-tie logits); PPL must agree once BOTH eval shape and
-                    # compute placement are matched. Proven on gpt-oss (raw-text PPL is
-                    # hypersensitive): STOCK alone spans 1401.9 (all-GPU) -> 4025.0 (experts
-                    # on CPU) at the same ubatch, and stock with the plan's exact expert
-                    # placement reproduces pshard's PPL to 5 digits (3440.80 vs 3440.82).
+                    # secondary gate: token streams may legitimately diverge at temp 0
+                    # (near-tie logits; q35 diverges at token ~35 of 256); PPL must then
+                    # agree within 0.5% at the SAME budget and the SAME eval shape.
                     CH=8; [ "$CTX" -ge 16384 ] && CH=2
                     PPLC="$PROMPTS/prompt-256k.txt"
                     # run the PSHARD side FIRST (verbose: the mirror needs its EXECUTED
-                    # prefill tier), then mirror stock to the actual executed config.
-                    # Three deltas proven to matter (gpt-oss@16k certified to 5 digits
-                    # once all matched, 39368.10 vs 39367.59): the executed tier's
-                    # placement class, its ubatch, and SWA cache sizing (pshard allocates
-                    # the full SWA cache; stock defaults to window+batch - that alone was
-                    # a 2.6% PPL delta on gpt-oss@16k).
+                    # prefill ubatch), then give stock the same eval shape. Two shape deltas
+                    # proven to matter on gpt-oss@16k: the executed ubatch, and SWA cache
+                    # sizing (pshard allocates the full SWA cache; stock defaults to
+                    # window+batch - that alone was a 2.6% PPL delta).
                     if [ "$STRAT" = "auto" ]; then
                         ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
                             -pshard -mva "$MVA" -v > "$OUT/ppl_pshard_$CFG.log" 2>&1
@@ -213,40 +279,23 @@ for MDL in $MODELS_LIST; do
                     # executed prefill ubatch + the strategy that actually ran at it
                     PB=$(grep -aoE "pshard_prefill_ubatch_eff=[0-9]+" "$OUT/ppl_pshard_$CFG.log" | head -1 | cut -d= -f2)
                     [ -z "$PB" ] && PB=${PUB:-$CUB}
-                    SPP=$(grep -a "pshard_apply_plan: strategy=" "$OUT/ppl_pshard_$CFG.log" | grep -a "bs=$PB " | tail -1 | grep -aoE "strategy=[A-Z_]+" | cut -d= -f2)
-                    STOCK_PPL_ARGS="-fitt $FITT"
-                    case "$SPP" in
-                      GPUONLY_*)
-                        # streamed weights compute on the GPU: math == fully resident
-                        STOCK_PPL_ARGS="-ngl 99"
-                        ;;
-                      DYNAMIC_FFNCPU*|DYNAMIC_FFN_ALTERNATE|STATIC_ATTNPRIO_ALLMODELS)
-                        # CPU-delegate + static-split strategies: give stock the same expert
-                        # placement (MoE models; dense placements have no _exps match and
-                        # fall back to the budget-equalized stock baseline)
-                        # n_layer only prints in the VERBOSE (pshard) log
-                        NL=$(grep -aoE "n_layer += +[0-9]+" "$RLOG" | head -1 | grep -aoE "[0-9]+$")
-                        # anchor: "n_attn_pinned=N" contains the substring "n_pinned=N"
-                        NPP=$(grep -aA1 "bs=$PB\]" "$MP.tensor_overrides.pshard_registry" | grep -aoE "(^| )n_pinned=[0-9]+" | tail -1 | cut -d= -f2)
-                        LIST=""
-                        i=${NPP:-0}
-                        while [ "$i" -lt "${NL:-0}" ]; do
-                            # ALTERNATE delegates only even unpinned layers to the CPU
-                            if [ "$SPP" = "DYNAMIC_FFN_ALTERNATE" ] && [ $((i % 2)) -ne 0 ]; then i=$((i+1)); continue; fi
-                            LIST="$LIST${LIST:+|}$i"
-                            i=$((i+1))
-                        done
-                        if [ -n "$LIST" ]; then
-                            STOCK_PPL_ARGS="-ngl 99 -ot blk\\.($LIST)\\.ffn_.*_exps=CPU --no-op-offload"
-                        fi
-                        ;;
-                    esac
-                    # --swa-full: match pshard's full-size SWA cache (no-op for non-SWA)
+                    # stock mirror = the SAME budget (-fitt), the SAME eval shape (pshard's
+                    # executed prefill ubatch) and the same SWA cache sizing (--swa-full).
+                    # Compute placement is deliberately NOT mirrored (no -ngl, no -ot;
+                    # 2026-09-01, user): stock runs the placement its own fit picks for the
+                    # budget, exactly as a user would (-ngl 99 also cannot load a model
+                    # larger than the card: q35 Q4_K_M is 20 GB on 16 GB). The residual
+                    # therefore includes GPU-vs-CPU kernel math for whatever pshard computes
+                    # on the GPU that stock's fit put on the CPU (q35@4000: pshard 1.2574 vs
+                    # stock 1.2618 = 0.35% of the 0.5% band). Raw-text-hypersensitive models
+                    # (gpt-oss: stock alone spans 1401.9 all-GPU -> 4025.0 experts-on-CPU at
+                    # one ubatch) can report PPL_MISMATCH from placement alone - read those
+                    # cells with that in mind.
                     ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
-                        $STOCK_PPL_ARGS -ub "$PB" -b "$PB" --swa-full > "$OUT/ppl_stock_$CFG.log" 2>&1
+                        -fitt "$FITT" -ub "$PB" -b "$PB" --swa-full > "$OUT/ppl_stock_$CFG.log" 2>&1
                     PS_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_stock_$CFG.log" | grep -aoE "[0-9.]+$")
                     if [ -n "$PS_" ] && [ -n "$PP_" ] &&                        awk -v a="$PS_" -v b="$PP_" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d <= 0.005*a)}'; then
-                        ST=TOKEN_DIVERGED_PPL_OK
+                        ST="TOKEN_DIVERGED_PPL_OK(stock=$PS_ pshard=$PP_)"
                     elif [ -z "$PS_" ]; then
                         # stock has no PPL here (typically the cell's stock baseline cannot
                         # run at all) - that is a missing baseline, not a mismatch
@@ -255,9 +304,9 @@ for MDL in $MODELS_LIST; do
                         ST="PPL_MISMATCH(stock=$PS_ pshard=$PP_)"
                     fi
                 fi
-                if [ "$RC" != "0" ]; then P=""; D=""; DELTA=""; H=""; fi
-                echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,$ACT,$SP,$OVL,$NP,$NA,$CUB,$PUB,$P,$D,$DELTA,$H,$ST" >> "$LEDGER"
-                echo "    active=$ACT prefill=$SP/ub$PUB ovl=$OVL np=$NP attn=$NA prompt=$P decode=$D vram=+$DELTA $ST"
+                if [ "$ST" = "FAIL" ]; then P=""; D=""; DELTA=""; H=""; NTOK=""; fi
+                echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,$ACT,$SP,$OVL,$NP,$NA,$CUB,$PUB,$P,$D,$NTOK,$DELTA,$H,$ST" >> "$LEDGER"
+                echo "    active=$ACT prefill=$SP/ub$PUB ovl=$OVL np=$NP attn=$NA prompt=$P decode=$D (${NTOK}tok) vram=+$DELTA $ST"
             done
         done
     done

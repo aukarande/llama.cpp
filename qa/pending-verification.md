@@ -37,6 +37,29 @@ and corrupt concurrent measurements).
 1. **Full 144-grid rerun** - restart FRESH (plans changed under items 5/1/7 +
    DSA fix; the 42 pre-change rows are stale): `sh qa/run-qa.sh /tmp/qa-full-v3 full`.
    Then compare-qa vs reference, refresh ledger (schema v2), commit, push.
+   **Perf recipe changed 2026-09-01 (user):** perf runs carry ONLY the workload and the
+   budget - no `-ub/-b`, no `--temp 0`, no `--ignore-eos`, no logging flags - on
+   either side. Stock: GOLDEN run (ub matched to cache_ubatch, temp 0, hash only) +
+   perf BASELINE at defaults. Pshard: perf run at defaults + CORRECTNESS run (temp 0,
+   `-lv 4`) for the hash and tier summary. One extra pshard run per config (~+2 h on
+   the 144 grid). Default sampling can EOS early (q35@4000 perf run: 2 tokens, 18 t/s);
+   short windows (< N_GEN/2) are retried up to 3x and recorded in the new ledger column
+   `decode_tokens` (compare-qa hard-fails what stays short). Whether `--ignore-eos`
+   should count as workload definition instead is an open question for the user.
+   Consequences for the rerun: (a) reference-ledger perf columns
+   pre-date the change - stock rows are not perf-gated, pshard rows will most likely
+   read as IMPROVEMENTS (DEBUG logging removed from the hot path), so refresh the
+   reference from the new run rather than treating deltas as drift; (b) the old
+   matched-ub stock numbers were not a baseline at tight budgets (q35@4000: ub 2048
+   forced a ~2 GB logits scratch, fit fell to 20/41 layers, 21 t/s; at defaults 44
+   t/s) - the "pshard beats stock at equal budget" claim must be re-read against the
+   new stock rows. (c) The PPL-parity mirror no longer mirrors placement (user,
+   2026-09-01: no `-ngl`, no `-ot`; stock uses `-fitt` + pshard's executed ubatch +
+   `--swa-full`). The old `-ngl 99` branch could not even load q35 (20 GB on 16 GB ->
+   NO_BASELINE, seen on the first cell run under the new recipe); the new residual
+   includes GPU-vs-CPU expert math (q35@4000: 0.35% of the 0.5% band). Expect gpt-oss
+   token-diverged cells to report PPL_MISMATCH from placement alone (calibration:
+   stock spans 1401.9 -> 4025.0 by placement) - those need a decision, not a fix.
 1b. ~~Planner canonical-union accounting~~ **CLOSED 2026-09-01 (4fadc725f)**:
    plan-time union enforcement (loader-parity packing simulation, byte-exact
    common_end 1729.71 MiB; per-tier scratch_off + measured pinned cache <=

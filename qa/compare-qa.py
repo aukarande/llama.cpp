@@ -5,10 +5,14 @@ Usage: python qa/compare-qa.py <new-ledger.csv> [reference-ledger.csv]
 Default reference: qa/reference-ledger.csv next to this script.
 
 Hard failures (exit 1):
-  - any row with status FAIL / TOKEN_MISMATCH / PLAN_FAILED
+  - any row with status FAIL / TOKEN_MISMATCH / PLAN_FAILED / GOLDEN_FAIL
   - pshard token hash != stock token hash for the same (model, ctx, mva)
   - active strategy or overlap differs from the reference row (silent-fallback drift)
   - sustained VRAM delta exceeds reference by more than VRAM_SLACK MiB
+  - a perf run's decode window (decode_tokens) is shorter than MIN_DECODE_TOKENS: its
+    decode_tps is the prefill->decode plan switch, not throughput (perf runs sample at
+    default settings, so an EOS can end decode early; the harness retries, this catches
+    what slipped through). decode_tps is not gated for such a row.
 Soft failures (exit 1 unless --perf-warn-only):
   - prompt or decode t/s below reference * (1 - PERF_TOL)
 
@@ -19,6 +23,7 @@ import csv, sys, os
 
 PERF_TOL   = 0.05   # 5% noise band
 VRAM_SLACK = 128    # MiB
+MIN_DECODE_TOKENS = 128   # half of the harness N_GEN=256 window
 
 def load(path):
     rows = {}
@@ -69,6 +74,11 @@ def main():
         if side == "stock" and r["status"] == "FAIL":
             info.append(f"{cfg}: stock cannot run this cell (pshard-only)")
             continue
+        # decode window check applies to both sides (the column is absent in old ledgers)
+        ntok = fnum(r.get("decode_tokens"))
+        short_decode = ntok is not None and ntok < MIN_DECODE_TOKENS
+        if short_decode and r["status"] not in ("FAIL",):
+            hard.append(f"{cfg}/{side}: decode window {ntok:.0f} < {MIN_DECODE_TOKENS} tokens - decode_tps not comparable")
         r = normalize(new, cfg, side, r)
         if status_class(r["status"]) not in PASS_CLASSES:
             # a bad status whose class matches the reference is a tracked known issue -
@@ -99,6 +109,8 @@ def main():
         if dv is not None and rv is not None and dv > rv + VRAM_SLACK:
             hard.append(f"{cfg}: VRAM {dv:.0f} MiB > reference {rv:.0f} + {VRAM_SLACK}")
         for k in ("prompt_tps", "decode_tps"):
+            if k == "decode_tps" and short_decode:
+                continue
             nv, ov = fnum(r[k]), fnum(rr[k])
             if nv is None or ov is None or ov == 0:
                 continue
