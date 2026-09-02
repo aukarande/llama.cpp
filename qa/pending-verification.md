@@ -152,12 +152,25 @@ and corrupt concurrent measurements).
    a 32 MiB runtime-packing margin; (ii) a scheduler rebuild after a draft
    enables layer-input extraction left stale per-plan alloc states
    (n_accept=0) -> lazy re-reserve + immediate re-land of the active plan.
-   STILL OPEN: dspark and DSv4+dspark (big-draft expert-spill rule) untested;
-   a tier marked unviable at load should fall back to the nearest viable tier
-   (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
-   budget before the margin fix); joint target+draft planning (cordis v2)
-   deferred until v1 shows a case where leftover budget could pin draft
-   experts; [b] FNV
+   dspark TESTED 2026-09-01 (82f78675f): q35+dspark runs clean under the budget
+   (4000: 30.9 t/s, peak 4194 MiB; 12000: 46.4 t/s, peak 12190 MiB; reserve
+   model within 20 MiB) but the draft is weak on this quant - 21% accepted
+   vs 16% in STOCK on the same pair, so not a pshard defect. DSv4+DSpark:
+   the big-draft spill rule fired as designed (9792 MiB experts -> CPU; 594
+   dense + 12 KV + 1126 compute reserved, self-check -11 MiB) BUT the
+   DeepSeek-V4 TARGET is broken under pshard: llama_kv_cache_dsv4 never
+   exposed its pipe shards (fixed), yet pinned-attention plans still produce
+   garbage from the first token and streamed-attention plans (s0/s2) hit a
+   CUDA illegal memory access; stock CPU text is coherent. pshard now REFUSES
+   DeepSeek-V4 loudly (WARN + stock fallback, text identical to stock). Never
+   in the harness grid; the 08-30 "DSv4" validation used a different file on
+   the dual-cache DSA classes. STILL OPEN: DSv4 compressed-cache support
+   (compressor-state tensors, comp-plan row copies, rollback planes, K-only
+   child shards); a tier marked unviable at load should fall back to the
+   nearest viable tier (decode stayed in the 512-token streaming plan: 6.3
+   t/s at a 2024 MiB budget before the margin fix); joint target+draft
+   planning (cordis v2) deferred until v1 shows a case where leftover budget
+   could pin draft experts; [b] FNV
    logits-hash spec test port (cordis tests/test_pshard_spec.cpp shape);
    [c] stock+MTP equal-budget QA cell (stock-fallback+MTP at DEFAULT fit hit
    ~83 t/s - budget-equalized comparison pending); [d] ~~forced-s3+MTP
