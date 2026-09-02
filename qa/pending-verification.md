@@ -164,13 +164,26 @@ and corrupt concurrent measurements).
    CUDA illegal memory access; stock CPU text is coherent. pshard now REFUSES
    DeepSeek-V4 loudly (WARN + stock fallback, text identical to stock). Never
    in the harness grid; the 08-30 "DSv4" validation used a different file on
-   the dual-cache DSA classes. STILL OPEN: DSv4 compressed-cache support
-   (compressor-state tensors, comp-plan row copies, rollback planes, K-only
-   child shards); a tier marked unviable at load should fall back to the
-   nearest viable tier (decode stayed in the 512-token streaming plan: 6.3
-   t/s at a 2024 MiB budget before the margin fix); joint target+draft
-   planning (cordis v2) deferred until v1 shows a case where leftover budget
-   could pin draft experts; [b] FNV
+   the dual-cache DSA classes. ~~DSv4 compressed-cache support~~ LANDED
+   2026-09-01 (b508ae660): three root causes - (1) pshard cache ctor skipped the
+   attention-rotation tail -> k_rot null -> deepseek4 silently built RAW
+   attention (localized by per-layer eval-callback vs CPU: first jump at
+   layer 2); (2) sched host-weight rules ignored VIEWS of host weights ->
+   streamed layers read hc_* slices from host memory (compute-sanitizer);
+   (3) compressed caches are graph-written -> whole-layer transfers. Text
+   byte-identical to stock CPU for auto/s0/s1/s2 @12000, PPL 2.5408 vs CPU
+   2.5443 with clears between chunks, DSpark pair 63/110 within budget,
+   decode 10.8 t/s. STILL OPEN: DSv4 not in the harness grid (grid held by
+   user; adding a 97 GB model roughly doubles grid time); compressor-state
+   VRAM (~a few hundred MiB) is allocated outside the pshard budget and not
+   planned; multi-sequence (seq_cp) on DSv4 under pshard is coded but
+   untested; page-locking fails for the 45 GB third shard (pinned-memory
+   limit) so DSv4 streaming runs on pageable copies - correct, slower; a
+   tier marked unviable at load should fall back to the nearest viable tier
+   (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
+   budget before the margin fix); joint target+draft planning (cordis v2)
+   deferred until v1 shows a case where leftover budget could pin draft
+   experts; [b] FNV
    logits-hash spec test port (cordis tests/test_pshard_spec.cpp shape);
    [c] stock+MTP equal-budget QA cell (stock-fallback+MTP at DEFAULT fit hit
    ~83 t/s - budget-equalized comparison pending); [d] ~~forced-s3+MTP
