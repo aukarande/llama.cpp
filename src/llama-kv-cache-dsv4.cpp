@@ -1435,6 +1435,17 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_full() {
     return std::make_unique<llama_kv_cache_dsv4_context>(this);
 }
 
+std::vector<llama_memory_pipe_shard_i *> llama_kv_cache_dsv4::get_pipe_shards() {
+    // order matters: pshard_update_write_cells indexes
+    //   [0]=raw base, [1]=raw swa, [2]=csa, [3]=hca, [4]=lid
+    std::vector<llama_memory_pipe_shard_i *> result = kv_raw ? kv_raw->get_pipe_shards()
+                                                             : std::vector<llama_memory_pipe_shard_i *>{};
+    if (kv_csa && kv_csa->get_pipe_shard()) result.push_back(kv_csa->get_pipe_shard());
+    if (kv_hca && kv_hca->get_pipe_shard()) result.push_back(kv_hca->get_pipe_shard());
+    if (kv_lid && kv_lid->get_pipe_shard()) result.push_back(kv_lid->get_pipe_shard());
+    return result;
+}
+
 llama_memory_context_ptr llama_kv_cache_dsv4::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_dsv4_context>(
             this,
@@ -1817,6 +1828,10 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
     ctx_swa_mem(nullptr),
     n_kv(kv_swa->get_size()),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
+}
+
+const llama_kv_cache_context * llama_kv_cache_dsv4_raw_context::get_base_ctx() const {
+    return dynamic_cast<const llama_kv_cache_context *>(ctx_base_mem.get());
 }
 
 bool llama_kv_cache_dsv4_raw_context::next() {

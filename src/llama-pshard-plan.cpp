@@ -1997,6 +1997,13 @@ void llama_params_fit_pshard_plan(
         LLAMA_LOG_ERROR("%s: no GPU devices found\n", __func__);
         return;
     }
+    if (g_pshard_unsupported_reason) {
+        LLAMA_LOG_WARN("%s: %s, disabling pshard\n", __func__, g_pshard_unsupported_reason);
+        mparams->pshard = false;
+        mparams->pshard_delegate_compute = false;
+        cparams->pshard = false;
+        return;
+    }
 
     const uint32_t n_layers         = hp_ngl;
     const size_t   mib              = 1024ULL * 1024ULL;

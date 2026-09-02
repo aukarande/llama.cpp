@@ -290,6 +290,7 @@ static bool llama_pshard_probe_model_only(
     probe.n_layers    = model->hparams.n_layer();
     probe.n_ctx_train = model->hparams.n_ctx_train;
     probe.n_expert    = model->hparams.n_expert;
+    g_pshard_unsupported_reason = llama_pshard_arch_unsupported(*model);
 
     // MTP: the nextn head is a full extra layer (attn + experts) WITHIN block_count.
     // When it will actually be loaded, plan it like any other layer - leaving it out
@@ -382,6 +383,12 @@ void llama_params_fit_pshard(
 
     if (probe.devs.empty()) {
         LLAMA_LOG_WARN("%s: no GPU devices found, disabling pshard\n", __func__);
+        mparams->pshard = false;
+        cparams->pshard = false;
+        return;
+    }
+    if (g_pshard_unsupported_reason) {
+        LLAMA_LOG_WARN("%s: %s, disabling pshard\n", __func__, g_pshard_unsupported_reason);
         mparams->pshard = false;
         cparams->pshard = false;
         return;

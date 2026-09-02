@@ -1543,6 +1543,9 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
     // ---- separate draft gguf: metadata footprint over ALL shards + analytical KV bytes/token
     size_t w_total = 0, w_exps = 0, kv_bytes_per_token = 0;
     bool   spill = false, user_ovr = false;
+    bool   needs_ctx_other = false;  // dflash/eagle3-class drafts cannot build a context alone
+    // per-token compute-buffer model terms (see the modeled branch below)
+    double compute_per_token = 2.25 * 1024.0 * 1024.0;
     const std::string path = has_draft ? params.speculative.draft.mparams.path : params.model.path;
     if (has_draft) {
         gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
@@ -1557,6 +1560,7 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
             const int64_t ka = gguf_find_key(g, "general.architecture");
             if (ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING) {
                 const char * arch = gguf_get_val_str(g, ka);
+                needs_ctx_other = strcmp(arch, "dflash") == 0 || strcmp(arch, "eagle3") == 0;
                 const uint32_t n_layer  = common_gguf_arch_u32(g, arch, "block_count", 0);
                 const uint32_t n_head   = common_gguf_arch_u32(g, arch, "attention.head_count", 0);
                 const uint32_t n_headkv = common_gguf_arch_u32(g, arch, "attention.head_count_kv", n_head);
@@ -1567,6 +1571,14 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
                     kv_bytes_per_token = (size_t) n_layer *
                         (ggml_row_size(params.speculative.draft.cache_type_k, (int64_t) n_headkv * k_len) +
                          ggml_row_size(params.speculative.draft.cache_type_v, (int64_t) n_headkv * v_len));
+                }
+                // compute buffer per token of ubatch: an activation term (~956 B per embedding
+                // element: the block decoder's residual/MLP temporaries) plus an attention term
+                // (~49 B per head per k+v element: projections and scores). Fitted on two drafts:
+                // q35 dflash (n_embd 2048, 32 heads, k+v 256) 2.25 MiB/token and the DSv4 DSpark
+                // (4096, 64 heads, k+v 1024) 6.80 MiB/token, both at ubatch 128.
+                if (n_embd && n_head && k_len) {
+                    compute_per_token = 956.0 * n_embd + 49.0 * n_head * (double) (k_len + v_len);
                 }
             }
         }
@@ -1627,7 +1639,10 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
     if (!has_draft) {
         cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
-    const common_device_memory_need m = common_get_device_memory_need(path.c_str(), &mparams_dft, &cparams_dft, GGML_LOG_LEVEL_ERROR);
+    common_device_memory_need m;
+    if (!needs_ctx_other) {
+        m = common_get_device_memory_need(path.c_str(), &mparams_dft, &cparams_dft, GGML_LOG_LEVEL_ERROR);
+    }
 
     size_t need = 0;
     char how[192];
@@ -1637,13 +1652,13 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
             (has_draft ? m.model : 0) / (double) mib, m.context / (double) mib, m.compute / (double) mib);
     } else {
         // analytical model: device weights + KV(n_ctx) + compute(ubatch). The compute term is
-        // affine in the ubatch the context is reserved for, calibrated on the 35B dflash draft
-        // (taps + block decoder): 520 MiB at ubatch 128, 1373 MiB at 512 -> ~236 + 2.22/token;
-        // rounded up to 256 + 2.25/token. The MTP context has no weights of its own. The
+        // affine in the ubatch the context is reserved for: a 256 MiB base (measured intercept
+        // on the q35 dflash draft: 520 MiB at ubatch 128, 1373 MiB at 512) plus the per-token
+        // architecture term computed above. The MTP context has no weights of its own. The
         // context reports its real footprint at teardown (pshard one-budget check).
         const size_t w_dev    = has_draft ? (spill ? w_total - w_exps : w_total) : 0;
         const size_t kv       = kv_bytes_per_token * (size_t) n_ctx;
-        const size_t compute  = 256 * mib + (size_t) (2.25 * mib * (double) ubatch);
+        const size_t compute  = 256 * mib + (size_t) (compute_per_token * (double) ubatch);
         need = w_dev + kv + compute;
         snprintf(how, sizeof(how), "modeled: weights %.1f + kv %.1f + compute %.1f MiB",
             w_dev / (double) mib, kv / (double) mib, compute / (double) mib);

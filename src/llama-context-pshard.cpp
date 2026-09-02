@@ -7,6 +7,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsa-iswa.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-pipe-shard.h"
@@ -704,6 +705,10 @@ void llama_context::pshard_update_write_cells(llama_memory_context_i * mctx) {
     //   hybrid_iswa:    [base_ps, swa_ps, rs_ps]
     //   DSA:            [mla_ps, lid_ps]
     //   DSA_iswa:       [mla_ps, lid_ps, swa_ps]
+    //   DSV4:           [raw_base_ps, raw_swa_ps, csa_ps, hca_ps, lid_ps] - only the raw base
+    //                   half writes through a KV context; the SWA half and the compressed
+    //                   caches (graph-output rows) keep no write-cell set, so their shards
+    //                   fall back to whole-layer downloads on a pin change
     auto assign_wc = [&](const llama_kv_cache_context * kv_ctx,
                          std::vector<std::vector<uint32_t>> & storage, size_t ps_idx) {
         if (!kv_ctx || ps_idx >= g_split_ctx.pipe_shards.size()) return;
@@ -741,6 +746,13 @@ void llama_context::pshard_update_write_cells(llama_memory_context_i * mctx) {
             assign_wc(dsa_ctx->get_lid(), g_lid_write_cells, 1);
         }
         assign_wc(dsa_iswa->get_swa(), g_swa_write_cells, 2);
+        return;
+    }
+
+    if (auto * d4 = dynamic_cast<llama_kv_cache_dsv4_context *>(mctx)) {
+        if (const auto * raw = d4->get_raw()) {
+            assign_wc(raw->get_base_ctx(), g_kv_write_cells, 0);
+        }
         return;
     }
 

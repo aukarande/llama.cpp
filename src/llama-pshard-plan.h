@@ -69,6 +69,21 @@ inline thread_local uint32_t g_pshard_n_layers_mtp = 0;
 // variant-wide when the pinned head overshoots; persisted in the registry header)
 inline thread_local bool g_pshard_mtp_head_cpu = false;
 
+// architecture support gate: both model probes (runtime cache loader and planner) set this
+// from the loaded model; nullptr = supported. pshard refuses LOUDLY (WARN + stock fallback)
+// rather than run a memory layout it cannot stream. DeepSeek-V4's compressed KV cache
+// (llama_kv_cache_dsv4: csa/hca/lid compressor states, K-only child shards, rollback
+// planes) is the known case: pinned-attention plans produced garbage from the first token
+// and streamed-attention plans an illegal memory access (2026-09-01 dspark test).
+inline thread_local const char * g_pshard_unsupported_reason = nullptr;
+
+inline const char * llama_pshard_arch_unsupported(const llama_model & model) {
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        return "DeepSeek-V4 compressed KV cache (csa/hca/lid) is not supported by pshard yet";
+    }
+    return nullptr;
+}
+
 struct llama_pshard_override {
     std::string                pattern;
     ggml_backend_buffer_type_t buft;

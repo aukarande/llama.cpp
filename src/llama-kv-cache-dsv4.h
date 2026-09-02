@@ -136,6 +136,11 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // pshard: every child cache builds a pipe-shard module; the composite must expose them
+    // or the whole pipe-shard machinery (packing, pins, streaming, write-cells) stays blind
+    // to this model's KV - see pshard_update_write_cells for the index order
+    std::vector<llama_memory_pipe_shard_i *> get_pipe_shards() override;
+
     //
     // llama_kv_cache_dsv4 specific API
     //
@@ -213,6 +218,11 @@ public:
     void set_input_k_idxs(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(ggml_tensor * dst) const;
+
+    // pshard write-cells binding: the base half is driven through a regular KV context
+    // (nullptr for full/update contexts); the SWA half writes through this context's own
+    // slot infos and carries no per-ubatch write-cell set (the shard downloads whole layers)
+    const llama_kv_cache_context * get_base_ctx() const;
 
 private:
     size_t i_next = 0;
