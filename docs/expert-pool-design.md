@@ -116,6 +116,40 @@ expert-diverse for the cache, too short to hide streaming) run A/B with partiall
 exposed transfer - today's behavior, still the best available; the tier ladder
 already routes them.
 
+### 5b. Transitions across strategies
+
+Once experts live in the pool, "decode strategy" collapses into a per-tier
+`miss_policy`; every transition is the same relabel:
+
+| old strategy                | pool translation                                  |
+|-----------------------------|---------------------------------------------------|
+| GPU-only decode (s1-like)   | cache mode, misses = fetch                        |
+| CPU-FFN decode (s3-like)    | cache mode, misses = CPU-execute (RFC hybrid);    |
+|                             | hits still run on GPU -> strictly better than s3  |
+| ALTERNATE-like mixes        | dissolve - nothing left to alternate              |
+
+CPU-execute misses do not warm the cache, so that mode needs the histogram warm
+start or an admit-on-second-miss upload policy. Attention is pinned in every
+winning plan, so the dense side has ~0 switch bytes; where a config differs, the
+existing pshard_switch_plan + switch_ms machinery handles it - orthogonal to the pool.
+
+**Volatile / preserved layout.** Fix the A/B span at one end of the region and mark
+its cache slots volatile; the remainder is the preserved sub-pool:
+
+```
+region: [ ...preserved slots (survive prompts)... ][ volatile = A/B span ]
+```
+
+Prefill reclaims only the volatile span (metadata drop, no copies); preserved
+slots ride through the prompt and are warm for the next decode. Allocation biases
+hot experts into preserved slots (promote-on-hit) so the cold fringe is what dies.
+Skip in v1: letting prefill skip uploading cached experts (hidden above B*, buys
+nothing).
+
+Concrete cycle (q35 @ mva8000): prefill 1 streams through the volatile span ->
+decode 1 relabels + histogram warm-load (~28 ms) -> prefill 2 reclaims volatile
+only -> decode 2 starts warm from the preserved core + prompt-2 histogram.
+
 ## 6. Miss policy
 
 - **bs=1 decode: fetch-on-miss (default).** ~1.8 MB into the LRU victim, ~40-60 us
