@@ -18,6 +18,26 @@
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
+size_t llama_kv_cache_dsv4_comp_state_bytes(const llama_model & model, uint32_t n_seq_max, uint32_t n_rs_seq) {
+    const auto & hp = model.hparams;
+    const uint32_t n_stream = n_seq_max;  // unified_compressed is hard-coded false in the constructor
+    const uint32_t n_planes = n_stream * (1 + n_rs_seq);
+    auto state_bytes = [&](uint32_t state_size, uint32_t n_embd_state) -> size_t {
+        return 2u * (size_t) n_embd_state * state_size * n_planes * sizeof(float);  // kv + score
+    };
+    size_t total = 0;
+    for (uint32_t il = 0; il < hp.n_layer(); il++) {
+        const uint32_t ratio = hp.dsv4_compress_ratios[il];
+        if (ratio == DSV4_CSA_RATIO) {
+            total += state_bytes(2*DSV4_CSA_RATIO, 2*hp.n_embd_head_k());     // csa state
+            total += state_bytes(2*DSV4_CSA_RATIO, 2*hp.indexer_head_size);   // lightning-indexer state
+        } else if (ratio == DSV4_HCA_RATIO) {
+            total += state_bytes(DSV4_HCA_RATIO, hp.n_embd_head_k());         // hca state
+        }
+    }
+    return total;
+}
+
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;

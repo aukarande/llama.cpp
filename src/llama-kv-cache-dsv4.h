@@ -85,6 +85,12 @@ private:
 // FIXME: currently the cache only supports non-unified mode even if unified flag is passed
 // FIXME: we currently conflate token_pos and buffer contents. See https://github.com/ggml-org/llama.cpp/pull/25521#discussion_r3558173819
 
+// device bytes of the compressor-state tensors (csa/hca/lid kv+score planes) that
+// llama_kv_cache_dsv4 allocates in their own device buffers, OUTSIDE any pipe shard and
+// therefore outside the pshard arena. pshard reserves them from its budget so that
+// arena + compressor state == -mva. Mirrors the constructor's sizing exactly.
+size_t llama_kv_cache_dsv4_comp_state_bytes(const llama_model & model, uint32_t n_seq_max, uint32_t n_rs_seq);
+
 class llama_kv_cache_dsv4 : public llama_memory_i {
 public:
     llama_kv_cache_dsv4(

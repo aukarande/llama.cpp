@@ -2009,9 +2009,16 @@ void llama_params_fit_pshard_plan(
     const size_t   mib              = 1024ULL * 1024ULL;
     const size_t   actual_vram_free = dmds[0].free;
     const size_t   fit_target_bytes = fit_target_mb * mib;
-    const size_t   vram_free        = max_vram_mb > 0
+    size_t         vram_free        = max_vram_mb > 0
         ? max_vram_mb * mib
         : (actual_vram_free > fit_target_bytes ? actual_vram_free - fit_target_bytes : 0);
+    if (g_pshard_extra_device_bytes > 0 && vram_free > g_pshard_extra_device_bytes) {
+        // same shrink as the runtime fit: the registry variant is keyed on this budget
+        LLAMA_LOG_INFO("%s: reserving %.2f MiB for device memory kept outside the pshard arena (compressor state): budget %.1f -> %.1f MiB\n",
+            __func__, g_pshard_extra_device_bytes / (1024.0 * 1024.0),
+            vram_free / (1024.0 * 1024.0), (vram_free - g_pshard_extra_device_bytes) / (1024.0 * 1024.0));
+        vram_free -= g_pshard_extra_device_bytes;
+    }
 
     mparams->max_vram_alloc = std::max<size_t>(1, pshard_bytes_to_mib_ceil(vram_free));
 

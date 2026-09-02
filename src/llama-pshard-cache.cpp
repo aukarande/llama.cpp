@@ -1,3 +1,4 @@
+#include "llama-kv-cache-dsv4.h"
 #include "llama-pshard-plan.h"
 #include "llama-impl.h"
 
@@ -253,9 +254,17 @@ struct llama_pshard_cache_probe {
     ggml_backend_buffer_type_t host_buft = nullptr;
 };
 
+size_t llama_pshard_extra_device_bytes(const llama_model & model, uint32_t n_seq_max, uint32_t n_rs_seq) {
+    if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        return llama_kv_cache_dsv4_comp_state_bytes(model, n_seq_max, n_rs_seq);
+    }
+    return 0;
+}
+
 static bool llama_pshard_probe_model_only(
         const char * path_model,
         const struct llama_model_params * mparams,
+        const struct llama_context_params * cparams,
         size_t max_vram_mb,
         size_t fit_target_mb,
         llama_pshard_cache_probe & probe) {
@@ -291,6 +300,7 @@ static bool llama_pshard_probe_model_only(
     probe.n_ctx_train = model->hparams.n_ctx_train;
     probe.n_expert    = model->hparams.n_expert;
     g_pshard_unsupported_reason = llama_pshard_arch_unsupported(*model);
+    g_pshard_extra_device_bytes = llama_pshard_extra_device_bytes(*model, cparams->n_seq_max, cparams->n_rs_seq);
 
     // MTP: the nextn head is a full extra layer (attn + experts) WITHIN block_count.
     // When it will actually be loaded, plan it like any other layer - leaving it out
@@ -374,7 +384,7 @@ void llama_params_fit_pshard(
     }
 
     llama_pshard_cache_probe probe;
-    if (!llama_pshard_probe_model_only(path_model, mparams, max_vram_mb, fit_target_mb, probe)) {
+    if (!llama_pshard_probe_model_only(path_model, mparams, cparams, max_vram_mb, fit_target_mb, probe)) {
         LLAMA_LOG_WARN("%s: failed to probe model metadata, disabling pshard\n", __func__);
         mparams->pshard = false;
         cparams->pshard = false;
@@ -396,7 +406,13 @@ void llama_params_fit_pshard(
 
     const auto &   devs      = probe.devs;
     const uint32_t n_layers  = probe.n_layers;
-    const size_t   vram_free = probe.vram_budget;
+    size_t         vram_free = probe.vram_budget;
+    if (g_pshard_extra_device_bytes > 0 && vram_free > g_pshard_extra_device_bytes) {
+        LLAMA_LOG_INFO("%s: reserving %.2f MiB for device memory kept outside the pshard arena (compressor state): budget %.1f -> %.1f MiB\n",
+            __func__, g_pshard_extra_device_bytes / (1024.0 * 1024.0),
+            vram_free / (1024.0 * 1024.0), (vram_free - g_pshard_extra_device_bytes) / (1024.0 * 1024.0));
+        vram_free -= g_pshard_extra_device_bytes;
+    }
 
     if (vram_free > 0) {
         mparams->max_vram_alloc = std::max<size_t>(1, pshard_bytes_to_mib_ceil(vram_free));

@@ -78,6 +78,13 @@ inline thread_local bool g_pshard_mtp_head_cpu = false;
 // layers read views of host weights directly. Keep the gate for the next such architecture.
 inline thread_local const char * g_pshard_unsupported_reason = nullptr;
 
+// device bytes the model's memory keeps OUTSIDE the pshard arena (today: DeepSeek-V4's
+// compressor-state tensors). Both probes set this; the runtime fit and the planner shrink
+// the arena budget by it so arena + extra == the user's -mva (the registry variant is keyed
+// on the shrunken budget, which both sides derive identically).
+inline thread_local size_t g_pshard_extra_device_bytes = 0;
+size_t llama_pshard_extra_device_bytes(const llama_model & model, uint32_t n_seq_max, uint32_t n_rs_seq);
+
 inline const char * llama_pshard_arch_unsupported(const llama_model & model) {
     // PSHARD_ALLOW_UNSUPPORTED=1: development lever - run a refused architecture anyway
     static const bool allow = getenv("PSHARD_ALLOW_UNSUPPORTED") != nullptr && getenv("PSHARD_ALLOW_UNSUPPORTED")[0] == '1';

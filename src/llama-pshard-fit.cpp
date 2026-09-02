@@ -123,6 +123,7 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
     hp_n_expert    = model->hparams.n_expert;
     hp_n_embd_r    = model->hparams.n_embd_r();
     g_pshard_unsupported_reason = llama_pshard_arch_unsupported(*model);
+    g_pshard_extra_device_bytes = llama_pshard_extra_device_bytes(*model, cparams->n_seq_max, cparams->n_rs_seq);
 
     // (breakdown print lives in common/fit at ToT; skipped here)
 
