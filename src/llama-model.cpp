@@ -1959,7 +1959,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (register_fn) {
                     for (const auto & mapping : pimpl->mappings) {
                         const int64_t t0 = ggml_time_us();
-                        if (register_fn(mapping->addr(), mapping->size())) {
+                        const bool locked = register_fn(mapping->addr(), mapping->size());
+                        if (!locked) {
+                            // pinned-memory ceiling (a 45 GB DeepSeek-V4 shard after a 47 GB one on 127 GB RAM)
+                            // or GGML_CUDA_REGISTER_HOST=0: streamed copies from this region run pageable
+                            LLAMA_LOG_WARN("%s: pshard: could not page-lock %.1f MiB mmap region - streamed copies from it will be pageable (slower)\n",
+                                __func__, mapping->size() / (1024.0 * 1024.0));
+                        }
+                        if (locked) {
                             pimpl->pshard_host_registered.push_back(mapping->addr());
                             LLAMA_LOG_INFO("%s: pshard: page-locked %.1f MiB mmap region in %.1f ms\n",
                                 __func__, mapping->size() / (1024.0 * 1024.0),

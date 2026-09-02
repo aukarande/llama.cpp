@@ -4701,7 +4701,8 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+    // unset or "0": do not page-lock (GGML_CUDA_REGISTER_HOST=0 is the pageable-copies lever)
+    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr || getenv("GGML_CUDA_REGISTER_HOST")[0] == '0') {
         return false;
     }
 

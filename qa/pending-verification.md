@@ -219,7 +219,7 @@ and corrupt concurrent measurements).
    in every configuration (differs CPU-vs-CPU too). STILL OPEN: DSv4 not in
    the harness grid (grid held by user; a 97 GB model roughly doubles grid
    time); page-locking fails for the 45 GB third shard (pinned-memory
-   limit) so DSv4 streaming runs on pageable copies - correct, slower; a
+   limit) so DSv4 streaming runs on pageable copies - correct, slower. MEASURED 2026-09-02 (q35 forced s0, GGML_CUDA_REGISTER_HOST=0 now forces pageable): pageable uploads are 3.3x slower (prompt 638 -> 189 t/s, decode 2.33 -> 0.76 t/s), i.e. ~13.5 vs 45 GB/s. It does NOT affect DSv4 @12000 today: the plan is STATIC_ATTNPRIO at every tier (attention pinned, experts on CPU), nothing streams. It would matter for a streaming plan (half the bytes pageable -> ~21 GB/s effective) and the planner prices ALL uploads at 45 GB/s - an honesty gap for such plans (follow-up: per-mapping lockability -> per-layer upload rate in the predictor). A user-space staging ring could recover part of the 3.3x on unpinnable regions (multi-threaded memcpy into a pinned ring, ~30 GB/s achievable) but buys nothing for the plans chosen today. The loader now WARNs when a page-lock fails; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
    budget before the margin fix); ~~joint target+draft planning (cordis v2)
