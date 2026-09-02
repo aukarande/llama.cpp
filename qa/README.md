@@ -27,19 +27,21 @@ Stock llama.cpp is the golden. Three gates, applied over the full config grid:
 3. **Perf**: prompt/decode t/s within 5% of the reference ledger; sustained VRAM delta
    within 128 MiB of reference. Improvements are reported so the reference can be
    intentionally refreshed.
-   **Perf rule (2026-09-01):** a perf run carries the workload (`-m -f -n -c`, `-no-cnv`
-   for batch completion) and the budget (`-fitt N` for stock, `-pshard -mva N` for pshard)
-   and nothing else — no sampling, batch, cache or logging flags on either side. Both
+   **Perf rule (2026-09-01):** a perf run carries the workload (`-m -f -n -c
+   --ignore-eos`, `-no-cnv` for batch completion) and the budget (`-fitt N` for stock,
+   `-pshard -mva N` for pshard) and nothing else — no sampling, batch, cache or logging
+   flags on either side. `--ignore-eos` is workload definition (exactly N_GEN decode
+   tokens) and touches no compute path. Both
    sides run exactly what a user runs. Perf and correctness are therefore separate runs
    on BOTH sides: stock golden + stock baseline, pshard correctness + pshard perf. Forcing
    `ub = cache_ubatch` on stock was never a baseline: at ub 2048 the 248k-vocab q35 needs a
    ~2 GB logits scratch, so the 4 GB fit fell from all layers (experts on CPU, 44 t/s) to
    20/41 layers (21 t/s). Default sampling makes perf-run token streams non-reproducible
-   and an EOS may end decode before N_GEN: a 2-token window measured 18 t/s on q35@4000
-   (the prefill->decode plan switch alone). A perf run with a decode window under
-   N_GEN/2 is retried up to 3 times (new random seed each time); the final window length
-   is the ledger column `decode_tokens`, and compare-qa hard-fails a row whose window is
-   still short and does not gate its decode_tps.
+   (they are not hashed). Without `--ignore-eos` an EOS ended decode early: a 2-token
+   window measured 18 t/s on q35@4000 (the prefill->decode plan switch alone). As a safety
+   net a perf run whose decode window still comes out under N_GEN/2 is retried up to 3
+   times; the final window length is the ledger column `decode_tokens`, and compare-qa
+   hard-fails a row whose window is short and does not gate its decode_tps.
    Stock ledger rows carry `cache_ubatch` = the golden's matched shape and `prefill_ub` =
    this build's default ubatch (read from `--help`).
 

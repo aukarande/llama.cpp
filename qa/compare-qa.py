@@ -10,9 +10,9 @@ Hard failures (exit 1):
   - active strategy or overlap differs from the reference row (silent-fallback drift)
   - sustained VRAM delta exceeds reference by more than VRAM_SLACK MiB
   - a perf run's decode window (decode_tokens) is shorter than MIN_DECODE_TOKENS: its
-    decode_tps is the prefill->decode plan switch, not throughput (perf runs sample at
-    default settings, so an EOS can end decode early; the harness retries, this catches
-    what slipped through). decode_tps is not gated for such a row.
+    decode_tps is the prefill->decode plan switch, not throughput (perf runs carry
+    --ignore-eos, so this should not happen; the harness also retries short windows -
+    this catches what slipped through). decode_tps is not gated for such a row.
 Soft failures (exit 1 unless --perf-warn-only):
   - prompt or decode t/s below reference * (1 - PERF_TOL)
 

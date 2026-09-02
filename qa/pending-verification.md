@@ -42,10 +42,10 @@ and corrupt concurrent measurements).
    either side. Stock: GOLDEN run (ub matched to cache_ubatch, temp 0, hash only) +
    perf BASELINE at defaults. Pshard: perf run at defaults + CORRECTNESS run (temp 0,
    `-lv 4`) for the hash and tier summary. One extra pshard run per config (~+2 h on
-   the 144 grid). Default sampling can EOS early (q35@4000 perf run: 2 tokens, 18 t/s);
-   short windows (< N_GEN/2) are retried up to 3x and recorded in the new ledger column
-   `decode_tokens` (compare-qa hard-fails what stays short). Whether `--ignore-eos`
-   should count as workload definition instead is an open question for the user.
+   the 144 grid). `--ignore-eos` IS workload (user, 2026-09-01) and is on both perf runs:
+   without it default sampling EOS'd early (q35@4000 perf run: 2 tokens, 18 t/s). Safety
+   net: windows < N_GEN/2 are retried up to 3x and recorded in the new ledger column
+   `decode_tokens` (compare-qa hard-fails what stays short).
    Consequences for the rerun: (a) reference-ledger perf columns
    pre-date the change - stock rows are not perf-gated, pshard rows will most likely
    read as IMPROVEMENTS (DEBUG logging removed from the hot path), so refresh the

@@ -12,11 +12,12 @@
 #        perf:        DEFAULTS ONLY -> prompt/decode t/s + VRAM delta,
 #        correctness: temp 0, ignore-eos, -lv 4 -> token hash + tier summary (active
 #                     strategy / n_pinned for the plan gate),
-#   PERF RULE (user, 2026-09-01): a perf run carries the workload (-m -f -n -c, -no-cnv
-#   for batch completion) and the budget (-fitt N | -pshard -mva N) and NOTHING else - no
-#   sampling, batch, cache or logging flags on either side. Both sides run exactly what a
-#   user runs. Everything the parsers need beyond WARN-level lines comes from the
-#   correctness runs or the registry.
+#   PERF RULE (user, 2026-09-01): a perf run carries the workload (-m -f -n -c
+#   --ignore-eos, -no-cnv for batch completion) and the budget (-fitt N | -pshard -mva N)
+#   and NOTHING else - no sampling, batch, cache or logging flags on either side. Both
+#   sides run exactly what a user runs. --ignore-eos is workload definition (exactly N_GEN
+#   decode tokens), not a knob: it touches no compute path. Everything the parsers need
+#   beyond WARN-level lines comes from the correctness runs or the registry.
 #   4. appends one CSV row per side to the run ledger.
 #
 # Generation goes to stdout (*.gen files, hashed for the token gate); logs go to stderr
@@ -44,11 +45,12 @@ PROMPTS=${QA_PROMPTS_DIR:-/c/Aditya/Prompts}
 # timer; at 32 tokens it distorted decode_tps by up to 27%. Longer decode amortizes it
 # (the switch cost stays IN the measurement - it is real - just at realistic weight).
 N_GEN=256
-# Perf runs sample at the model's default settings, so an EOS can end decode early. A
-# 2-token window measured 18 t/s on q35@4000 (the prefill->decode plan switch, nothing
-# else). A perf run whose decode window is shorter than MIN_DECODE is retried (new random
-# seed) up to PERF_TRIES times; the final window length lands in the ledger column
-# decode_tokens and compare-qa refuses to gate decode_tps on a short window.
+# Perf runs sample at the model's default settings; --ignore-eos (workload) pins the
+# decode window to N_GEN - without it a 2-token window measured 18 t/s on q35@4000 (the
+# prefill->decode plan switch, nothing else). Safety net: a perf run whose decode window
+# still comes out shorter than MIN_DECODE is retried up to PERF_TRIES times; the final
+# window length lands in the ledger column decode_tokens and compare-qa refuses to gate
+# decode_tps on a short window.
 MIN_DECODE=$((N_GEN / 2))
 PERF_TRIES=3
 mkdir -p "$OUT"
@@ -178,8 +180,8 @@ for MDL in $MODELS_LIST; do
                 #            q35 needs a ~2 GB logits scratch, the 4 GB fit drops from all
                 #            layers (experts on CPU) to 20/41 layers and decode halves
                 #            (21 vs 44 t/s, 2026-09-01). Default sampling means the token
-                #            stream is not reproducible and an EOS may end decode before
-                #            N_GEN; the reported rates are still per generated token.
+                #            stream is not reproducible (not hashed); --ignore-eos keeps the
+                #            decode window at N_GEN.
                 GLOG="$OUT/stock_golden_${MK}-c${CTX}-mva${MVA}.log"
                 SLOG="$OUT/stock_${MK}-c${CTX}-mva${MVA}.log"
                 if [ "$STOCK_DONE" = "0" ] && [ -f "$GLOG.gen" ] && grep -q "^${MK}-c${CTX}-mva${MVA},stock," "$LEDGER"; then
@@ -195,7 +197,7 @@ for MDL in $MODELS_LIST; do
                     STOCK_HASH=$(hash_gen "$GLOG.gen")
                     [ "$GRC" != "0" ] && STOCK_HASH=""
                     R=$(run_perf "$OUT/vram_stock_${MK}-c${CTX}-mva${MVA}.txt" "$SLOG" "$SLOG.gen" \
-                        ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" -no-cnv \
+                        ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" --ignore-eos -no-cnv \
                         -fitt "$FITT")
                     RC=${R%% *}; DELTA=$(echo "$R" | awk '{print $2}'); NTOK=${R##* }
                     P=$(perf_field "$SLOG" "prompt eval time"); D=$(perf_field "$SLOG" " eval time")
@@ -228,7 +230,7 @@ for MDL in $MODELS_LIST; do
                 #     and pshard_prefill_ubatch_eff still parse from this log.
                 RLOG="$OUT/run_$CFG.log"
                 R=$(run_perf "$OUT/vram_$CFG.txt" "$RLOG" "$RLOG.gen" \
-                    $PSH ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" -no-cnv \
+                    $PSH ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" --ignore-eos -no-cnv \
                     -pshard -mva "$MVA")
                 RC=${R%% *}; DELTA=$(echo "$R" | awk '{print $2}'); NTOK=${R##* }
                 P=$(perf_field "$RLOG" "prompt eval time"); D=$(perf_field "$RLOG" " eval time")
