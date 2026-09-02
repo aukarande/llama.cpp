@@ -65,7 +65,9 @@ and corrupt concurrent measurements).
    NO_BASELINE, seen on the first cell run under the new recipe); the new residual
    includes GPU-vs-CPU expert math (q35@4000: 0.35% of the 0.5% band). Expect gpt-oss
    token-diverged cells to report PPL_MISMATCH from placement alone (calibration:
-   stock spans 1401.9 -> 4025.0 by placement) - those need a decision, not a fix.
+   stock spans 1401.9 -> 4025.0 by placement). DECIDED 2026-09-02 (user): the gpt-oss
+   STOCK baseline is itself unreliable on raw-text PPL - nothing to fix on our side;
+   read gpt-oss PPL cells as informational, not as a gate.
 1b. ~~Planner canonical-union accounting~~ **CLOSED 2026-09-01 (4fadc725f)**:
    plan-time union enforcement (loader-parity packing simulation, byte-exact
    common_end 1729.71 MiB; per-tier scratch_off + measured pinned cache <=
