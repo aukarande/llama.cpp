@@ -1957,7 +1957,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 auto register_fn = (bool (*)(void *, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
                 if (register_fn) {
+                    // PSHARD_PAGELOCK_SKIP=<i>: leave mapping i pageable (measurement lever: attribute
+                    // the pageable-upload cost of one shard while the others stay page-locked)
+                    const char * skip_env = getenv("PSHARD_PAGELOCK_SKIP");
+                    const int skip_idx = skip_env ? atoi(skip_env) : -1;
+                    int mapping_idx = -1;
                     for (const auto & mapping : pimpl->mappings) {
+                        mapping_idx++;
+                        if (mapping_idx == skip_idx) {
+                            LLAMA_LOG_WARN("%s: pshard: PSHARD_PAGELOCK_SKIP=%d - leaving the %.1f MiB mmap region pageable\n",
+                                __func__, skip_idx, mapping->size() / (1024.0 * 1024.0));
+                            continue;
+                        }
                         const int64_t t0 = ggml_time_us();
                         const bool locked = register_fn(mapping->addr(), mapping->size());
                         if (!locked) {
