@@ -166,6 +166,21 @@ llama_kv_cache::llama_kv_cache(
             if (!hparams.has_kv(il)) continue;
             if (filter && !filter(il)) continue;
 
+            // same head-size bookkeeping as the stock loop below: the attention rotation
+            // (Hadamard K/V rotation, DeepSeek lightning-indexer inputs) keys off it
+            if (n_embd_head_k_all == 0) {
+                n_embd_head_k_all = (int32_t) hparams.n_embd_head_k(il);
+            } else if (n_embd_head_k_all > 0 && n_embd_head_k_all != (int32_t) hparams.n_embd_head_k(il)) {
+                n_embd_head_k_all = -1;
+            }
+            if (!is_mla) {
+                if (n_embd_head_v_all == 0) {
+                    n_embd_head_v_all = (int32_t) hparams.n_embd_head_v(il);
+                } else if (n_embd_head_v_all > 0 && n_embd_head_v_all != (int32_t) hparams.n_embd_head_v(il)) {
+                    n_embd_head_v_all = -1;
+                }
+            }
+
             map_layer_ids[il] = (int32_t)specs.size();
 
             // size rows with the SAME accessors as the stock allocation below - they are
@@ -193,26 +208,36 @@ llama_kv_cache::llama_kv_cache(
         }
 
         pipe_shard_kv = std::make_unique<llama_memory_pshard>();
+        // caches whose rows are written by graph ops rather than apply_ubatch (DeepSeek-V4
+        // csa/hca/lid) switch to FULL right after construction via pshard_set_full_transfer()
         pipe_shard_kv->mode = v_trans ? llama_memory_pshard::FULL : llama_memory_pshard::CELL_GRANULAR;
 
         auto * ps = pipe_shard_kv.get();
 
-        pipe_shard_kv->on_activate_gpu = [this, ps](int32_t il, ggml_tensor * k, ggml_tensor * v) {
+        // K-only caches (MLA, DeepSeek-V4 children) have no t2: keep v_stream nullptr-filled
+        // like the stock path (stream copies and state IO index it by stream before null checks)
+        auto pad_v_stream = [this](std::vector<ggml_tensor *> & vs) {
+            if (vs.size() < n_stream) vs.assign(n_stream, nullptr);
+        };
+
+        pipe_shard_kv->on_activate_gpu = [this, ps, pad_v_stream](int32_t il, ggml_tensor * k, ggml_tensor * v) {
             auto idx = map_layer_ids[il];
             layers[idx].k = k;
             layers[idx].v = v;
             const auto & sv = ps->get_stream(idx);
             layers[idx].k_stream = sv.t1_stream_gpu;
             layers[idx].v_stream = sv.t2_stream_gpu;
+            pad_v_stream(layers[idx].v_stream);
         };
 
-        pipe_shard_kv->on_activate_cpu = [this, ps](int32_t il, ggml_tensor * k, ggml_tensor * v) {
+        pipe_shard_kv->on_activate_cpu = [this, ps, pad_v_stream](int32_t il, ggml_tensor * k, ggml_tensor * v) {
             auto idx = map_layer_ids[il];
             layers[idx].k = k;
             layers[idx].v = v;
             const auto & sv = ps->get_stream(idx);
             layers[idx].k_stream = sv.t1_stream_cpu;
             layers[idx].v_stream = sv.t2_stream_cpu;
+            pad_v_stream(layers[idx].v_stream);
         };
 
         pipe_shard_kv->on_cells_used = [this](uint32_t s) -> uint32_t {
@@ -234,8 +259,14 @@ llama_kv_cache::llama_kv_cache(
             const auto & sv = ps->get_stream(i);
             layers[i].k_stream = cpu ? sv.t1_stream_cpu : sv.t1_stream_gpu;
             layers[i].v_stream = cpu ? sv.t2_stream_cpu : sv.t2_stream_gpu;
+            pad_v_stream(layers[i].v_stream);
             map_layer_ids[ps_layers[i].il] = (int32_t)i;
         }
+        // the constructor tail below (attention rotation + Hadamard tables) must run for
+        // pshard caches too: without it build_input_k_rot() returns nullptr and DeepSeek-V4
+        // silently builds RAW attention instead of its compressed-cache + lightning-indexer
+        // path (garbage from the first token, 2026-09-01)
+        init_attn_rot(other);
         return;
     }
 
@@ -382,6 +413,10 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
+    init_attn_rot(other);
+}
+
+void llama_kv_cache::init_attn_rot(const llama_kv_cache * other) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         n_embd_head_k_all = other->n_embd_head_k_all;
@@ -399,7 +434,7 @@ llama_kv_cache::llama_kv_cache(
         attn_rot_k =
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
-            ggml_is_quantized(type_k) &&
+            ggml_is_quantized(layers.empty() ? GGML_TYPE_F16 : layers[0].k->type) &&
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
@@ -412,7 +447,7 @@ llama_kv_cache::llama_kv_cache(
         attn_rot_v =
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
-            ggml_is_quantized(type_v) &&
+            ggml_is_quantized(layers.empty() || !layers[0].v ? GGML_TYPE_F16 : layers[0].v->type) &&
             hparams.n_embd_head_v() % 64 == 0;
     }
 
@@ -454,6 +489,27 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+        if (pipe_shard_kv) {
+            // pipe-sharded storage has no ctxs_bufs: clear the mirrors and the backed GPU copies
+            pipe_shard_kv->clear_data();
+        }
+    }
+}
+
+void llama_kv_cache::clear_k_stream(int32_t il, uint32_t stream) {
+    if (pipe_shard_kv) {
+        pipe_shard_kv->clear_stream(il, stream);
+        return;
+    }
+    ggml_tensor * k = get_k_storage(il);
+    GGML_ASSERT(k && ggml_is_contiguous(k) && k->ne[3] == 1 && stream < (uint32_t) k->ne[2]);
+    ggml_backend_tensor_memset(k, 0, stream * k->nb[2], k->nb[2]);
+}
+
+void llama_kv_cache::pshard_set_full_transfer() {
+    if (pipe_shard_kv) {
+        pipe_shard_kv->mode = llama_memory_pshard::FULL;
+        pipe_shard_kv->on_cells_used = nullptr;
     }
 }
 
@@ -937,6 +993,12 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
+
+                if (pipe_shard_kv) {
+                    // streamed layers have no backed GPU stream views; copy in every existing copy
+                    pipe_shard_kv->copy_stream((int32_t) layer.il, ssrc, sdst);
+                    continue;
+                }
 
                 ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
 

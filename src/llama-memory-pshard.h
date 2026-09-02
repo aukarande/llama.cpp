@@ -54,6 +54,14 @@ struct llama_memory_pshard : llama_memory_pipe_shard_i {
 
     bool is_cpu_only(int32_t il) const;
 
+    // data-plane helpers for the parent cache's clear/seq ops. Every copy that exists is
+    // touched: the CPU mirror always, the GPU tensor only while it is backed (pinned or
+    // externally addressed); a streamed layer's GPU tensor is a slot the next upload rewrites
+    // from the mirror, so the mirror is the persistent copy. Stream = index along ne[2].
+    void clear_stream(int32_t il, uint32_t stream);           // zero one stream of t1 (and t2)
+    void clear_data();                                        // zero every layer, every stream
+    void copy_stream(int32_t il, uint32_t ssrc, uint32_t sdst); // seq_cp: copy one stream to another
+
     ~llama_memory_pshard() override = default;
 
     // llama_memory_pipe_shard_i interface

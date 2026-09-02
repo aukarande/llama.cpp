@@ -71,16 +71,20 @@ inline thread_local bool g_pshard_mtp_head_cpu = false;
 
 // architecture support gate: both model probes (runtime cache loader and planner) set this
 // from the loaded model; nullptr = supported. pshard refuses LOUDLY (WARN + stock fallback)
-// rather than run a memory layout it cannot stream. DeepSeek-V4's compressed KV cache
-// (llama_kv_cache_dsv4: csa/hca/lid compressor states, K-only child shards, rollback
-// planes) is the known case: pinned-attention plans produced garbage from the first token
-// and streamed-attention plans an illegal memory access (2026-09-01 dspark test).
+// rather than run a memory layout it cannot stream. No architecture is refused today:
+// DeepSeek-V4 (llama_kv_cache_dsv4) was the case until 2026-09-01 - its wrapper hid its pipe
+// shards, the pshard cache constructor skipped the attention-rotation tail (so the compressed
+// attention + lightning indexer were silently never built), and the scheduler let streamed
+// layers read views of host weights directly. Keep the gate for the next such architecture.
 inline thread_local const char * g_pshard_unsupported_reason = nullptr;
 
 inline const char * llama_pshard_arch_unsupported(const llama_model & model) {
-    if (model.arch == LLM_ARCH_DEEPSEEK4) {
-        return "DeepSeek-V4 compressed KV cache (csa/hca/lid) is not supported by pshard yet";
+    // PSHARD_ALLOW_UNSUPPORTED=1: development lever - run a refused architecture anyway
+    static const bool allow = getenv("PSHARD_ALLOW_UNSUPPORTED") != nullptr && getenv("PSHARD_ALLOW_UNSUPPORTED")[0] == '1';
+    if (allow) {
+        return nullptr;
     }
+    (void) model;
     return nullptr;
 }
 

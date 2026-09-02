@@ -216,6 +216,64 @@ bool llama_memory_pshard::init(
     return true;
 }
 
+static void pshard_tensor_stream_op(ggml_tensor * t, uint32_t s, uint32_t sdst, bool copy) {
+    // t: 3-D [dim, seq_len, n_stream] (or 1-D RS: one stream)
+    if (!t || !t->data) return;
+    const size_t stream_size = t->ne[2] > 1 || ggml_n_dims(t) >= 3 ? t->nb[2] : ggml_nbytes(t);
+    if (s * stream_size >= ggml_nbytes(t)) return;
+    if (t->buffer) {
+        if (copy) {
+            std::vector<uint8_t> tmp(stream_size);
+            ggml_backend_tensor_get(t, tmp.data(), s * stream_size, stream_size);
+            ggml_backend_tensor_set(t, tmp.data(), sdst * stream_size, stream_size);
+        } else {
+            ggml_backend_tensor_memset(t, 0, s * stream_size, stream_size);
+        }
+    } else {
+        // host tensor without a backend buffer (CPU mirror created in a no_alloc context)
+        if (copy) {
+            memcpy((char *) t->data + sdst * stream_size, (char *) t->data + s * stream_size, stream_size);
+        } else {
+            memset((char *) t->data + s * stream_size, 0, stream_size);
+        }
+    }
+}
+
+void llama_memory_pshard::clear_stream(int32_t il, uint32_t stream) {
+    for (auto & l : layers) {
+        if ((int32_t) l.il != il) continue;
+        pshard_tensor_stream_op(l.t1_cpu, stream, 0, false);
+        pshard_tensor_stream_op(l.t2_cpu, stream, 0, false);
+        if (l.t1_gpu && l.t1_gpu->buffer) pshard_tensor_stream_op(l.t1_gpu, stream, 0, false);
+        if (l.t2_gpu && l.t2_gpu->buffer) pshard_tensor_stream_op(l.t2_gpu, stream, 0, false);
+        return;
+    }
+}
+
+void llama_memory_pshard::clear_data() {
+    for (auto & l : layers) {
+        for (ggml_tensor * t : { l.t1_cpu, l.t2_cpu }) {
+            if (!t || !t->data) continue;
+            if (t->buffer) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t)); else memset(t->data, 0, ggml_nbytes(t));
+        }
+        for (ggml_tensor * t : { l.t1_gpu, l.t2_gpu }) {
+            if (!t || !t->data || !t->buffer) continue;  // streamed slot: rewritten from the mirror
+            ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+        }
+    }
+}
+
+void llama_memory_pshard::copy_stream(int32_t il, uint32_t ssrc, uint32_t sdst) {
+    for (auto & l : layers) {
+        if ((int32_t) l.il != il) continue;
+        pshard_tensor_stream_op(l.t1_cpu, ssrc, sdst, true);
+        pshard_tensor_stream_op(l.t2_cpu, ssrc, sdst, true);
+        if (l.t1_gpu && l.t1_gpu->buffer) pshard_tensor_stream_op(l.t1_gpu, ssrc, sdst, true);
+        if (l.t2_gpu && l.t2_gpu->buffer) pshard_tensor_stream_op(l.t2_gpu, ssrc, sdst, true);
+        return;
+    }
+}
+
 bool llama_memory_pshard::is_cpu_only(int32_t il) const {
     auto it = layer_bids_.find((int)il);
     return it != layer_bids_.end() && it->second == cpu_bid_;

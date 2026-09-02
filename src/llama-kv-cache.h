@@ -169,6 +169,15 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    // zero one stream of layer il's K (both the pipe-shard mirror and the backed GPU copy under
+    // pshard; the plain tensor otherwise). DeepSeek-V4's compressed caches use it on seq_rm.
+    void clear_k_stream(int32_t il, uint32_t stream);
+
+    // pshard: transfer this cache's layers whole instead of by tracked cells. For caches whose
+    // rows are written by graph ops (DeepSeek-V4 csa/hca/lid) the cell bookkeeping never
+    // advances, so cell-granular transfers would move nothing. Call right after construction.
+    void pshard_set_full_transfer();
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     //
@@ -254,6 +263,10 @@ private:
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
     bool attn_rot_v = false;
+
+    // constructor tail shared by the stock and pshard construction paths: decides the
+    // attention rotation and pre-computes the Hadamard tables
+    void init_attn_rot(const llama_kv_cache * other);
 
     // if all layers participating in the cache have constant head size, the value is stored here
     // otherwise the value is -1

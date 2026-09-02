@@ -2426,6 +2426,34 @@ size_t llama_model::get_dev_preloaded_size() const {
     return pimpl->dev_preloaded_size;
 }
 
+void llama_model::pshard_verify_resident(const char * stage) const {
+    const auto & hashes = llama_pshard_verify_hashes();
+    if (hashes.empty()) return;
+    size_t n_checked = 0, n_bad = 0, n_moved = 0, n_shown = 0;
+    std::vector<uint8_t> buf;
+    for (const auto & [tensor, entry] : pimpl->weight_preload_map) {
+        if (!entry.device_only_common || !tensor || !tensor->data) continue;
+        auto it = hashes.find(ggml_get_name(tensor));
+        if (it == hashes.end()) continue;
+        const size_t n = ggml_nbytes(tensor);
+        buf.resize(n);
+        ggml_backend_tensor_get(tensor, buf.data(), 0, n);
+        const uint64_t h = llama_pshard_fnv1a(buf.data(), n);
+        n_checked++;
+        const bool moved = tensor->data != entry.gpu_addr;
+        if (moved) n_moved++;
+        if (h != it->second) {
+            n_bad++;
+            if (n_shown++ < 20) {
+                LLAMA_LOG_WARN("%s[%s]: MISMATCH %s type=%s bytes=%zu data=%p preload=%p%s\n", __func__, stage,
+                    ggml_get_name(tensor), ggml_type_name(tensor->type), n, tensor->data, entry.gpu_addr, moved ? " (MOVED)" : "");
+            }
+        }
+    }
+    LLAMA_LOG_WARN("%s[%s]: %zu/%zu resident tensors differ from their file hash, %zu have data != preload address\n",
+        __func__, stage, n_bad, n_checked, n_moved);
+}
+
 void llama_model::sync_dev_preload() {
     if (pimpl->dev_preload_backend) {
         ggml_backend_synchronize(pimpl->dev_preload_backend);
@@ -2874,6 +2902,24 @@ size_t llama_model::pshard_apply_plan(const llama_pshard_plan & plan, ggml_backe
                     tensor->data   = entry.cpu_addr;
                     tensor->buffer = entry.host_buffer;
                 }
+            }
+        }
+
+        // PSHARD_DEBUG_LAYER=<il>: development lever - dump every tensor of one layer after the
+        // plan apply (placement the scheduler will see: buffer, data, preload-map entry)
+        if (const char * dbg_il = getenv("PSHARD_DEBUG_LAYER")) {
+            const std::string pfx = std::string("blk.") + dbg_il + ".";
+            for (const auto & [name, tensor] : tensors_by_name) {
+                if (name.rfind(pfx, 0) != 0) continue;
+                auto it = pimpl->weight_preload_map.find(tensor);
+                LLAMA_LOG_WARN("PSHARD-LAYER %-40s type=%-8s bytes=%9zu buffer=%-12s data=%p | map=%s cpu=%p host_buf=%s dev_only=%d bid=%d\n",
+                    name.c_str(), ggml_type_name(tensor->type), ggml_nbytes(tensor),
+                    tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "NULL", tensor->data,
+                    it == pimpl->weight_preload_map.end() ? "absent" : "present",
+                    it == pimpl->weight_preload_map.end() ? nullptr : it->second.cpu_addr,
+                    (it == pimpl->weight_preload_map.end() || !it->second.host_buffer) ? "NULL" : ggml_backend_buffer_name(it->second.host_buffer),
+                    it == pimpl->weight_preload_map.end() ? -1 : (int) it->second.device_only_common,
+                    pimpl->tensor_backend_ids.count(tensor) ? pimpl->tensor_backend_ids.at(tensor) : -99);
             }
         }
 

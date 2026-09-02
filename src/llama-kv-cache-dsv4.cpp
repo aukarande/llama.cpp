@@ -1310,6 +1310,13 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
+    // pshard: compressed rows are graph outputs (cpy_k with plan-computed row ids), never
+    // apply_ubatch cells, so these children must be transferred whole (the raw iSWA halves
+    // keep cell-granular transfers - their cells are tracked)
+    kv_csa->pshard_set_full_transfer();
+    kv_hca->pshard_set_full_transfer();
+    kv_lid->pshard_set_full_transfer();
+
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
     csa_state = std::make_unique<llama_dsv4_comp_state>(
@@ -1750,7 +1757,9 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
             if (data) {
                 //TODO: do not clear the kv-cache during `seq_rm`, ref: https://github.com/ggml-org/llama.cpp/pull/26490#discussion_r3798143663
                 for (uint32_t il : kv->get_layer_ids()) {
-                    dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id);
+                    // pshard-aware: a streamed layer's GPU tensor is unbacked; the cache clears
+                    // its persistent copy (mirror) and the backed GPU copy when there is one
+                    kv->clear_k_stream((int32_t) il, (uint32_t) seq_id);
                 }
             }
         };

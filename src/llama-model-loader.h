@@ -25,6 +25,16 @@ struct weight_preload_entry {
     bool                      device_only_common = false;
 };
 
+// PSHARD_VERIFY_PRELOAD development lever: FNV-1a of every preloaded tensor's FILE bytes,
+// keyed by tensor name (filled by preload_common_weights_to_device, re-checked against the
+// live device bytes by llama_model::pshard_verify_resident at later stages)
+std::unordered_map<std::string, uint64_t> & llama_pshard_verify_hashes();
+inline uint64_t llama_pshard_fnv1a(const uint8_t * p, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
+
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
