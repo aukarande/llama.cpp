@@ -46,6 +46,12 @@ and corrupt concurrent measurements).
    without it default sampling EOS'd early (q35@4000 perf run: 2 tokens, 18 t/s). Safety
    net: windows < N_GEN/2 are retried up to 3x and recorded in the new ledger column
    `decode_tokens` (compare-qa hard-fails what stays short).
+   (d) Stock's budget is now `-fitb MVA` (new --fit-budget: fit target = free - budget, so
+   weights + KV + compute <= MVA), the same thing pshard's arena is. `-fitt (FREE - MVA)`
+   had handed stock ~560 MiB less on q35@4000 (3443 MiB fitted vs pshard's 4000 MiB
+   arena) because the fit's free-memory view already excludes the CUDA context.
+   CUDA-side overhead (~220 MiB context + ~80 MiB workspaces) is outside the budget on
+   both sides by decision (user, 2026-09-01).
    Consequences for the rerun: (a) reference-ledger perf columns
    pre-date the change - stock rows are not perf-gated, pshard rows will most likely
    read as IMPROVEMENTS (DEBUG logging removed from the hot path), so refresh the

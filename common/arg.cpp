@@ -2920,6 +2920,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_TARGET"));
     add_opt(common_arg(
+        { "-fitb", "--fit-budget" }, "MiB0,MiB1,MiB2,...",
+        "device memory budget for --fit: weights + KV + compute per device in MiB. The fit target becomes "
+        "(free - budget), so the fitted model uses at most this much device memory no matter what the process "
+        "already holds (CUDA context etc.); overrides --fit-target. With -pshard and no -mva it is the pshard "
+        "budget. comma-separated list, single value is broadcast across all devices, default: off",
+        [](common_params & params, const std::string & value) {
+            std::string arg_next = value;
+
+            // split string by , and /
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+            if (split_arg.size() == 1) {
+                std::fill(params.fit_params_budget.begin(), params.fit_params_budget.end(), std::stoull(split_arg[0]) * 1024*1024);
+                return;
+            }
+            for (size_t i = 0; i < split_arg.size(); i++) {
+                params.fit_params_budget[i] = std::stoull(split_arg[i]) * 1024*1024;
+            }
+        }
+    ).set_env("LLAMA_ARG_FIT_BUDGET"));
+    add_opt(common_arg(
         { "-fitc", "--fit-ctx" }, "N",
         string_format("minimum ctx size that can be set by --fit option, default: %" PRIu32, params.fit_params_min_ctx),
         [](common_params & params, int value) {

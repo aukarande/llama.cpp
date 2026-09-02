@@ -5,10 +5,13 @@ Stock llama.cpp is the golden. Three gates, applied over the full config grid:
 1. **Correctness**: pshard generation must be token-identical to stock at temp 0.
    The stock GOLDEN run has `-ub`/`-b` matched to pshard's planner-chosen `cache_ubatch`
    (evaluation shape changes numerics on some models — gpt-oss PPL moves 23% on ubatch
-   alone), and `-fitt (free - budget)` so both sides get the same effective VRAM budget.
+   alone), and `-fitb budget` so both sides get the same budget for weights + KV + compute
+   (pshard's `-mva` is exactly that for its arena; `-fitb` makes the stock fit target
+   `free - budget`, so what the process already holds - the CUDA context - is outside the
+   budget on both sides. The old `-fitt (free - budget)` handed stock ~560 MiB less.)
    The golden supplies the token hash only; it is not the perf baseline (see gate 3).
    When tokens diverge (near-tie logits at temp 0; q35 diverges at token ~35 of 256),
-   the PPL-parity fallback compares both sides at the SAME budget (`-fitt`) and the SAME
+   the PPL-parity fallback compares both sides at the SAME budget (`-fitb`) and the SAME
    eval shape: stock gets pshard's executed prefill ubatch as `-ub`/`-b` (read from the
    verbose pshard PPL log) and `--swa-full` (pshard allocates the full SWA cache; the
    stock default was a 2.6% PPL delta on gpt-oss@16k). Tolerance 0.5%.
@@ -28,7 +31,7 @@ Stock llama.cpp is the golden. Three gates, applied over the full config grid:
    within 128 MiB of reference. Improvements are reported so the reference can be
    intentionally refreshed.
    **Perf rule (2026-09-01):** a perf run carries the workload (`-m -f -n -c
-   --ignore-eos`, `-no-cnv` for batch completion) and the budget (`-fitt N` for stock,
+   --ignore-eos`, `-no-cnv` for batch completion) and the budget (`-fitb N` for stock,
    `-pshard -mva N` for pshard) and nothing else — no sampling, batch, cache or logging
    flags on either side. `--ignore-eos` is workload definition (exactly N_GEN decode
    tokens) and touches no compute path. Both

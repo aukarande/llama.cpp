@@ -475,6 +475,11 @@ struct common_params {
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+    // device memory budget for --fit per device in bytes (0 = off): weights + KV + compute of the
+    // fitted model stay <= budget. Implemented as fit target = free - budget, so the budget means the
+    // same thing regardless of what the process already holds on the device (CUDA context, other
+    // buffers) - exactly what pshard's -mva means for its arena. Overrides --fit-target when set.
+    std::vector<size_t> fit_params_budget = std::vector<size_t>(llama_max_devices(), 0);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model

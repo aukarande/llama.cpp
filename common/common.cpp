@@ -1323,7 +1323,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            params.fit_params_budget.data());
     };
 
     if (params.pshard) {
@@ -1347,6 +1348,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         const size_t fit_target_mb = params.fit_params_target.empty() ? 0 : params.fit_params_target[0] / (1024 * 1024);
         // one-budget rule: a separate draft model's device footprint comes out of the budget
         size_t mva_eff = params.max_vram_alloc, fit_target_eff = fit_target_mb;
+        if (mva_eff == 0 && !params.fit_params_budget.empty() && params.fit_params_budget[0] > 0) {
+            // -fitb and -mva mean the same thing: device memory for weights + KV + compute
+            mva_eff = params.fit_params_budget[0] / (1024 * 1024);
+            LOG_INF("%s: pshard budget taken from --fit-budget: %zu MiB\n", __func__, mva_eff);
+        }
         if (const size_t dres = common_pshard_draft_reserve_mb(params, cparams.n_ctx); dres > 0) {
             if (mva_eff > 0) {
                 if (mva_eff <= dres) {

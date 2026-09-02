@@ -4,7 +4,9 @@
 # For every config (model x ctx x mva x strategy) this:
 #   1. wipes the model's plan registry and plans fresh (forced strategy via PSHARD_STRATEGY,
 #      or auto), reading cache_ubatch back from the registry,
-#   2. runs STOCK twice per (model, ctx, mva), both with -fitt equalized to the same budget:
+#   2. runs STOCK twice per (model, ctx, mva), both with -fitb MVA - the SAME budget pshard
+#      gets: device memory for weights + KV + compute (the fit target becomes free - MVA;
+#      CUDA-side overhead is outside the budget on both sides, by decision 2026-09-01):
 #        golden: -ub/-b matched to pshard's cache_ubatch, temp 0, ignore-eos -> token hash
 #                ONLY (eval shape changes numerics, so the correctness gate needs it),
 #        perf:   DEFAULTS ONLY -> prompt/decode t/s + VRAM delta,
@@ -13,7 +15,7 @@
 #        correctness: temp 0, ignore-eos, -lv 4 -> token hash + tier summary (active
 #                     strategy / n_pinned for the plan gate),
 #   PERF RULE (user, 2026-09-01): a perf run carries the workload (-m -f -n -c
-#   --ignore-eos, -no-cnv for batch completion) and the budget (-fitt N | -pshard -mva N)
+#   --ignore-eos, -no-cnv for batch completion) and the budget (-fitb N | -pshard -mva N)
 #   and NOTHING else - no sampling, batch, cache or logging flags on either side. Both
 #   sides run exactly what a user runs. --ignore-eos is workload definition (exactly N_GEN
 #   decode tokens), not a knob: it touches no compute path. Everything the parsers need
@@ -80,7 +82,6 @@ fi
 
 IDLE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
 echo "# idle_used=$IDLE" >> "$LEDGER"
-FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
 
 MODELS_LIST="q35:Qwen3.6-35B-A3B-UD-Q4_K_M oss:gpt-oss-20b-Q4_0 q8d:Qwen3.6-27B-Q8_0"
 if [ "$GRID" = "full" ]; then
@@ -145,7 +146,9 @@ for MDL in $MODELS_LIST; do
         PROMPT="$PROMPTS/prompt-512.txt"
         [ "$CTX" -ge 16384 ] && PROMPT="$PROMPTS/prompt-16k.txt"
         for MVA in $MVA_LIST; do
-            FITT=$((FREE - MVA))
+            # stock budget == pshard budget: -fitb MVA bounds weights + KV + compute (the old
+            # -fitt (free - MVA) handed stock ~560 MiB less on q35@4000 because the fit's free
+            # memory view already excludes the CUDA context, which pshard's arena never paid)
             STOCK_DONE=0
             STOCK_HASH=""
             for STRAT in $STRAT_LIST; do
@@ -174,7 +177,7 @@ for MDL in $MODELS_LIST; do
                 # 2. stock (once per model/ctx/mva) - TWO runs with different jobs:
                 #    golden: -ub/-b matched to pshard's cache_ubatch. Supplies the token hash
                 #            ONLY (evaluation shape changes numerics; README gate 1).
-                #    perf:   DEFAULTS ONLY (workload + -fitt budget; see PERF RULE above).
+                #    perf:   DEFAULTS ONLY (workload + -fitb budget; see PERF RULE above).
                 #            Supplies prompt/decode t/s and the VRAM delta. A ubatch forced
                 #            to cache_ubatch is NOT a perf baseline: at ub 2048 the 248k-vocab
                 #            q35 needs a ~2 GB logits scratch, the 4 GB fit drops from all
@@ -192,13 +195,13 @@ for MDL in $MODELS_LIST; do
                     RG=$(run_side "$OUT/vram_stock_golden_${MK}-c${CTX}-mva${MVA}.txt" "$GLOG" "$GLOG.gen" \
                         ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" \
                         --temp 0 -no-cnv --ignore-eos --no-display-prompt \
-                        -fitt "$FITT" -ub "$CUB" -b "$CUB")
+                        -fitb "$MVA" -ub "$CUB" -b "$CUB")
                     GRC=${RG%% *}
                     STOCK_HASH=$(hash_gen "$GLOG.gen")
                     [ "$GRC" != "0" ] && STOCK_HASH=""
                     R=$(run_perf "$OUT/vram_stock_${MK}-c${CTX}-mva${MVA}.txt" "$SLOG" "$SLOG.gen" \
                         ./llama-completion.exe -m "$MP" -f "$PROMPT" -n $N_GEN -c "$CTX" --ignore-eos -no-cnv \
-                        -fitt "$FITT")
+                        -fitb "$MVA")
                     RC=${R%% *}; DELTA=$(echo "$R" | awk '{print $2}'); NTOK=${R##* }
                     P=$(perf_field "$SLOG" "prompt eval time"); D=$(perf_field "$SLOG" " eval time")
                     SUB=$DEF_UB
@@ -206,8 +209,9 @@ for MDL in $MODELS_LIST; do
                     # perf baseline ran but the golden did not: the cell has numbers but no
                     # token reference -> visible (not in compare-qa's PASS_CLASSES)
                     [ "$ST" = "OK" ] && [ "$GRC" != "0" ] && ST=GOLDEN_FAIL
-                    # budget enforcement label: -fitt fits WEIGHTS to the target, KV+compute
-                    # land on top (measured up to 6.6x nominal at 16k). Such rows are still
+                    # budget enforcement label: -fitb bounds weights + KV + compute as the fit
+                    # models them; CUDA context + workspaces (~300 MiB) and fit misestimates
+                    # land on top (up to 6.6x nominal at 16k under -fitt). Such rows are still
                     # a-fortiori references (stock over budget and pshard still compared),
                     # but the "equal budget" claim needs the honest label.
                     if [ "$ST" = "OK" ] && [ -n "$DELTA" ] && [ "$DELTA" -gt $((MVA * 110 / 100 + 512)) ]; then
@@ -281,7 +285,7 @@ for MDL in $MODELS_LIST; do
                     # executed prefill ubatch + the strategy that actually ran at it
                     PB=$(grep -aoE "pshard_prefill_ubatch_eff=[0-9]+" "$OUT/ppl_pshard_$CFG.log" | head -1 | cut -d= -f2)
                     [ -z "$PB" ] && PB=${PUB:-$CUB}
-                    # stock mirror = the SAME budget (-fitt), the SAME eval shape (pshard's
+                    # stock mirror = the SAME budget (-fitb MVA), the SAME eval shape (pshard's
                     # executed prefill ubatch) and the same SWA cache sizing (--swa-full).
                     # Compute placement is deliberately NOT mirrored (no -ngl, no -ot;
                     # 2026-09-01, user): stock runs the placement its own fit picks for the
@@ -294,7 +298,7 @@ for MDL in $MODELS_LIST; do
                     # one ubatch) can report PPL_MISMATCH from placement alone - read those
                     # cells with that in mind.
                     ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
-                        -fitt "$FITT" -ub "$PB" -b "$PB" --swa-full > "$OUT/ppl_stock_$CFG.log" 2>&1
+                        -fitb "$MVA" -ub "$PB" -b "$PB" --swa-full > "$OUT/ppl_stock_$CFG.log" 2>&1
                     PS_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_stock_$CFG.log" | grep -aoE "[0-9.]+$")
                     if [ -n "$PS_" ] && [ -n "$PP_" ] &&                        awk -v a="$PS_" -v b="$PP_" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d <= 0.005*a)}'; then
                         ST="TOKEN_DIVERGED_PPL_OK(stock=$PS_ pshard=$PP_)"
