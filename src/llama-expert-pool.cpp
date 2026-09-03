@@ -183,6 +183,13 @@ void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
     active = on;
     epoch++;   // pooled-layer graph topology changes with this flag
     reset_slots();
+    if (!on) {
+        // the next graphs will not bind these; stale pointers would alias whatever
+        // tensor the rebuilt graph places at the same address
+        for (auto & L : layers) {
+            L.ids_router = L.ids_gpu = L.ids_gpu_bias = L.ids_cpu = nullptr;
+        }
+    }
     if (sched != nullptr) {
         register_sched(sched);
     }

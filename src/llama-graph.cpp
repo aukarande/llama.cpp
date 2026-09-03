@@ -1548,8 +1548,18 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * mm_ids,
-          bool allow_skip) const {
+          bool allow_skip,
+          ggml_backend_t pin_backend) const {
+    // the CPU expert chain must own EVERY node here, including the w_s scale
+    // chain: an unpinned MUL_MAT_ID would anchor on the host weight's shard bid
+    // and read the pool view with expert ids
+    auto pin = [&](ggml_tensor * t) {
+        if (pin_backend != nullptr && sched != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, t, pin_backend);
+        }
+    };
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, mm_ids != nullptr ? mm_ids : ids);
+    pin(res);
     if (allow_skip) {
         // split hit/miss execution: -1 routes belong to the other chain
         ggml_mul_mat_id_set_allow_skip(res, true);
@@ -1560,9 +1570,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
+        pin(s);
         s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        pin(s);
         s = ggml_get_rows(ctx0, s, ids);
+        pin(s);
         res = ggml_mul(ctx0, res, s);
+        pin(res);
     }
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -2135,8 +2149,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * pool_mm_ids   = nullptr; // GPU chain mm: slot id | -1
     ggml_tensor * pool_bias_ids = nullptr; // GPU chain add_id: expert id | -1
     ggml_tensor * pool_cpu_ids  = nullptr; // CPU chain mm + add_id: expert id | -1
+    // whole-stack (A/B) tiers have every expert resident: no CPU routes, single chain
     const bool pool_dual = expert_pool != nullptr && expert_pool->active &&
-                           expert_pool->layer_pooled(il) && expert_pool->cpu_routes();
+                           expert_pool->layer_pooled(il) && expert_pool->cpu_routes() &&
+                           !expert_pool->ab_mode;
     if (expert_pool != nullptr && expert_pool->active && expert_pool->layer_pooled(il)) {
         auto ids_leaf = [&](const char * name) {
             ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32,
@@ -2179,7 +2195,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, x, selected_experts, up_exps_s, mm_ids, allow_skip); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, x, selected_experts, up_exps_s, mm_ids, allow_skip, on_cpu ? backend_cpu : nullptr); // [n_ff*2, n_expert_used, n_tokens]
             name(gate_up, "ffn_moe_gate_up");
 
             if (up_exps_s) {
@@ -2198,7 +2214,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             name(up_l, "ffn_moe_up");
         } else {
             // separate gate and up path
-            up_l = build_lora_mm_id(up_exps, x, selected_experts, up_exps_s, mm_ids, allow_skip); // [n_ff, n_expert_used, n_tokens]
+            up_l = build_lora_mm_id(up_exps, x, selected_experts, up_exps_s, mm_ids, allow_skip, on_cpu ? backend_cpu : nullptr); // [n_ff, n_expert_used, n_tokens]
             name(up_l, "ffn_moe_up");
 
             if (up_exps_s) {
@@ -2211,7 +2227,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (gate_exps) {
-                x = build_lora_mm_id(gate_exps, x, selected_experts, gate_exps_s, mm_ids, allow_skip); // [n_ff, n_expert_used, n_tokens]
+                x = build_lora_mm_id(gate_exps, x, selected_experts, gate_exps_s, mm_ids, allow_skip, on_cpu ? backend_cpu : nullptr); // [n_ff, n_expert_used, n_tokens]
                 name(x, "ffn_moe_gate");
             } else {
                 x = up_l;
@@ -2317,7 +2333,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 GGML_ABORT("fatal error");
         }
 
-        out = build_lora_mm_id(down_exps, x, selected_experts, down_exps_s, mm_ids, allow_skip); // [n_embd, n_expert_used, n_tokens]
+        out = build_lora_mm_id(down_exps, x, selected_experts, down_exps_s, mm_ids, allow_skip, on_cpu ? backend_cpu : nullptr); // [n_embd, n_expert_used, n_tokens]
         name(out, "ffn_moe_down");
 
         if (down_exps_s) {
@@ -2333,6 +2349,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * experts = nullptr;
     if (pool_dual) {
+        // ORDER MATTERS: the GPU chain is built first and is the ADD's src[0], so
+        // forward-expand visits it first and its split runs before the CPU chain's;
+        // the pool service (fired by the GPU split's expert input) writes the CPU
+        // chain's ids before that split executes
         ggml_tensor * experts_gpu = build_expert_chain(cur, pool_mm_ids,  pool_bias_ids, /*on_cpu=*/false, /*allow_skip=*/true);
         ggml_tensor * experts_cpu = build_expert_chain(cur, pool_cpu_ids, pool_cpu_ids,  /*on_cpu=*/true,  /*allow_skip=*/true);
         // exact two-partial sum: every route is a zero row in exactly one chain

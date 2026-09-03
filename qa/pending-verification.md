@@ -277,7 +277,17 @@ and corrupt concurrent measurements).
    choosing cpu_exec/hybrid below the fetch floors) is still manual via env; the
    predictor prices no miss policy yet; hybrid_frac comes from slice_bw/DRAM, the
    paired bench entry (11.B.10) is not built; per-layer h counters are collected but
-   not printed/ledgered. Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
+   not printed/ledgered. Split-op review (18 agents) confirmed 3, fixed in the follow-up commit: A/B
+   tiers are single-chain (every expert resident - the dual chain was a GiB-scale
+   dead CPU chain per layer); build_lora_mm_id pins EVERY node it creates on the CPU
+   chain (with a per-expert scale tensor the actual MUL_MAT_ID was unpinned and would
+   have anchored on the shard bid reading the pool view with expert ids - q35 has no
+   w_s so the gate could not see it); per-layer ids pointers are cleared on
+   deactivate and the pool tensor assignment guards on active (stale pointers
+   aliased rebuilt-graph tensors in mixed registries). Documented invariant: the GPU
+   chain is the ADD's src[0] so its split runs first and the service writes the CPU
+   ids in time. Refuted: LRU same-pass-hit (already fixed), hybrid trim order,
+   fetch_on_2nd_miss counter decay. Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
    budget before the margin fix); ~~joint target+draft planning (cordis v2)

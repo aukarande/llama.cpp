@@ -340,7 +340,7 @@ void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
 // the pool's remapped-ids leaves anchor on the same virtual backend as the
 // layer's expert tensors, so the mm split consumes them without a copy
 void llama_context::pshard_assign_pool_tensors() {
-    if (!expert_pool) {
+    if (!expert_pool || !expert_pool->active) {
         return;
     }
     for (auto & L : expert_pool->layers) {

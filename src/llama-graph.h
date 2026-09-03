@@ -1076,7 +1076,8 @@ struct llm_graph_context {
               ggml_tensor * ids,
               ggml_tensor * w_s = nullptr,
               ggml_tensor * mm_ids = nullptr,
-              bool allow_skip = false) const;
+              bool allow_skip = false,
+              ggml_backend_t pin_backend = nullptr) const; // pin every created node (CPU expert chain)
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
