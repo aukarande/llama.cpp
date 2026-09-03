@@ -228,6 +228,12 @@ uint64_t pshard_registry_fingerprint(
     mix((uint64_t)cparams->type_v);
     mix((uint64_t)model_file_size);
     mix((uint64_t)pshard_strategy_from_env());
+    // forced miss policy (QA override) plans differently; mixed only when set so
+    // existing registries keep their fingerprints
+    const int mp_env = pshard_miss_policy_from_env();
+    if (mp_env >= 0) {
+        mix((uint64_t)(mp_env + 1));
+    }
 
     return h;
 }

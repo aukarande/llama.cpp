@@ -1028,13 +1028,22 @@ bool pshard_registry_save(
                 continue;
             }
             fprintf(f, "[tier %zu bs=%u]\n", t, registry->tier_sizes[t]);
-            fprintf(f, "strategy=%s n_pinned=%u n_attn_pinned=%u overflow=%s tps=%.2f vram=%.1f output_on_gpu=%d pin_from_back=%d overlap=%d switch_ms=%.2f ids_cross=%d\n",
+            fprintf(f, "strategy=%s n_pinned=%u n_attn_pinned=%u overflow=%s tps=%.2f vram=%.1f output_on_gpu=%d pin_from_back=%d overlap=%d switch_ms=%.2f ids_cross=%d",
                 llama_pshard_strategy_name(plan.strategy),
                 plan.n_pinned, plan.n_attn_pinned,
                 pshard_overflow_name(plan.overflow),
                 plan.tps, plan.total_vram_req / (1024.0 * 1024.0),
                 (int)plan.output_on_gpu, (int)plan.pin_from_back, (int)plan.overlap,
                 plan.switch_ms, (int)plan.ids_cross);
+            if (plan.strategy == LLAMA_PSHARD_EXPERT_POOL) {
+                // POOL-only columns; legacy tier lines stay byte-identical
+                fprintf(f, " K=%u s=%u miss_policy=%s prefill_mode=%s hybrid_frac=%.3f",
+                    plan.pool_k, plan.pool_slots,
+                    llama_pshard_miss_policy_name((llama_pshard_miss_policy)plan.pool_miss),
+                    llama_pshard_prefill_mode_name((llama_pshard_prefill_mode)plan.pool_prefill),
+                    plan.pool_hybrid_frac);
+            }
+            fprintf(f, "\n");
             fprintf(f, "ot=%s\n", pshard_plan_to_ot(plan, host_buft).c_str());
         }
     }
@@ -1074,6 +1083,11 @@ bool pshard_registry_load(
         int overlap = 1;
         int ids_cross = 0;
         float switch_ms = 0.0f;
+        uint32_t pool_k = 0;
+        uint32_t pool_slots = 0;
+        int pool_miss = 0;
+        int pool_prefill = 0;
+        float pool_hybrid_frac = 0.0f;
         std::string ot_line;
     };
     struct variant_data {
@@ -1175,6 +1189,16 @@ bool pshard_registry_load(
             td.switch_ms = swm ? (float)atof(swm + 10) : 0.0f;
             const char * idc = strstr(s.c_str(), "ids_cross=");
             td.ids_cross = idc ? atoi(idc + 10) : 0;
+            const char * pk = strstr(s.c_str(), " K=");
+            td.pool_k = pk ? (uint32_t)atoi(pk + 3) : 0;
+            const char * pss = strstr(s.c_str(), " s=");
+            td.pool_slots = pss ? (uint32_t)atoi(pss + 3) : 0;
+            const char * pmp = strstr(s.c_str(), "miss_policy=");
+            td.pool_miss = pmp ? pshard_miss_policy_from_name(pmp + 12) : 0;
+            const char * ppm = strstr(s.c_str(), "prefill_mode=");
+            td.pool_prefill = ppm ? pshard_prefill_mode_from_name(ppm + 13) : 0;
+            const char * phf = strstr(s.c_str(), "hybrid_frac=");
+            td.pool_hybrid_frac = phf ? (float)atof(phf + 12) : 0.0f;
 
             td.overflow = pshard_overflow_from_name(overflow_name);
             bool found_strategy = false;
@@ -1210,9 +1234,13 @@ bool pshard_registry_load(
         plan.is_viable     = td.viable;
         plan.overlap       = td.overlap != 0;
         plan.ids_cross     = td.ids_cross != 0;
-        plan.ids_cross     = td.ids_cross != 0;
         plan.output_on_gpu = (bool)td.output_on_gpu;
         plan.pin_from_back = (bool)td.pin_from_back;
+        plan.pool_k           = td.pool_k;
+        plan.pool_slots       = td.pool_slots;
+        plan.pool_miss        = td.pool_miss;
+        plan.pool_prefill     = td.pool_prefill;
+        plan.pool_hybrid_frac = td.pool_hybrid_frac;
 
         if (!td.ot_line.empty()) {
             std::string remaining = td.ot_line;
@@ -1756,6 +1784,7 @@ static llama_pshard_plan llama_pshard_search_tier(
     for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
         if (force_strategy >= 0 && force_strategy != s) continue;
         if (prune.skip[s]) continue;
+        if (s == LLAMA_PSHARD_EXPERT_POOL) continue; // search lands with the pool module
 
         llama_pshard_strategy strategy = (llama_pshard_strategy)s;
         llama_pshard_plan plan;
@@ -1852,6 +1881,7 @@ static void llama_pshard_strategy_sweep(
         size_t first_tier) {
 
     if (force_strategy >= 0 && force_strategy != strategy) return;
+    if (strategy == LLAMA_PSHARD_EXPERT_POOL) return; // search lands with the pool module
 
     llama_model_tensor_buft_override local_overrides[4096];
     llama_pshard_search_ctx ctx = ctx_template;

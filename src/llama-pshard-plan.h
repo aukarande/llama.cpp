@@ -21,6 +21,10 @@ enum llama_pshard_strategy {
     // unpinned FFNs alternate CPU compute / GPU streaming: the PCIe copy of the next streamed
     // FFN overlaps CPU-FFN + pinned-attn compute, so DDR and PCIe bandwidth add up
     LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE               = 4,
+    // routed experts become a managed VRAM cache (docs/expert-pool-design.md):
+    // per-tier variables n_attn_pinned / K / miss_policy / prefill_mode; the
+    // pool region serves prefill A/B streaming and decode LRU slots
+    LLAMA_PSHARD_EXPERT_POOL                         = 5,
     LLAMA_PSHARD_COUNT
 };
 
@@ -32,6 +36,7 @@ inline const char * llama_pshard_strategy_name(llama_pshard_strategy s) {
         case LLAMA_PSHARD_DYNAMIC_FFNCPU_ATTNSTREAM:    return "DYNAMIC_FFNCPU_ATTNSTREAM";
         case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS:    return "STATIC_ATTNPRIO_ALLMODELS";
         case LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE:        return "DYNAMIC_FFN_ALTERNATE";
+        case LLAMA_PSHARD_EXPERT_POOL:                  return "EXPERT_POOL";
         default:                                        return "UNKNOWN";
     }
 }
@@ -52,6 +57,86 @@ inline int pshard_strategy_from_env() {
     char * end = nullptr;
     long v = strtol(env, &end, 10);
     if (end != env && *end == '\0' && v >= 0 && v < LLAMA_PSHARD_COUNT) {
+        return (int)v;
+    }
+    return -1;
+}
+
+// EXPERT_POOL: what a cache miss does at decode / small batch (per-tier field,
+// all values planner-priced - no per-strategy allowed-sets)
+enum llama_pshard_miss_policy {
+    LLAMA_PSHARD_MISS_FETCH        = 0,  // copy the expert RAM -> LRU victim slot, compute on GPU
+    LLAMA_PSHARD_MISS_CPU_EXEC     = 1,  // compute the miss on CPU from host weights (split-op)
+    LLAMA_PSHARD_MISS_FETCH_ON_2ND = 2,  // first miss cpu_exec (no admit), repeat miss fetches
+    LLAMA_PSHARD_MISS_HYBRID       = 3,  // q* split: fetch m*B_P/B_H by recency, CPU runs the rest
+    LLAMA_PSHARD_MISS_COUNT
+};
+
+// EXPERT_POOL: how a prefill tier moves an unpinned layer's experts
+enum llama_pshard_prefill_mode {
+    LLAMA_PSHARD_PREFILL_AB_STREAM = 0,  // whole expert set through the A/B span, hidden under GEMMs
+    LLAMA_PSHARD_PREFILL_CPU_TAIL  = 1,  // ab_stream + the ubatch's coldest experts computed on CPU
+    LLAMA_PSHARD_PREFILL_COUNT
+};
+
+inline const char * llama_pshard_miss_policy_name(llama_pshard_miss_policy p) {
+    switch (p) {
+        case LLAMA_PSHARD_MISS_FETCH:        return "fetch";
+        case LLAMA_PSHARD_MISS_CPU_EXEC:     return "cpu_exec";
+        case LLAMA_PSHARD_MISS_FETCH_ON_2ND: return "fetch_on_2nd_miss";
+        case LLAMA_PSHARD_MISS_HYBRID:       return "hybrid";
+        default:                             return "unknown";
+    }
+}
+
+inline const char * llama_pshard_prefill_mode_name(llama_pshard_prefill_mode m) {
+    switch (m) {
+        case LLAMA_PSHARD_PREFILL_AB_STREAM: return "ab_stream";
+        case LLAMA_PSHARD_PREFILL_CPU_TAIL:  return "cpu_tail";
+        default:                             return "unknown";
+    }
+}
+
+// parse a policy/mode name at the head of s (registry token: delimited by
+// space / eol). "fetch" is a prefix of "fetch_on_2nd_miss", so require the
+// terminator, not just the prefix.
+inline int pshard_miss_policy_from_name(const char * s) {
+    for (int i = LLAMA_PSHARD_MISS_COUNT - 1; i >= 0; i--) {
+        const char * n = llama_pshard_miss_policy_name((llama_pshard_miss_policy)i);
+        const size_t l = strlen(n);
+        if (strncmp(s, n, l) == 0 && (s[l] == '\0' || s[l] == ' ' || s[l] == '\n' || s[l] == '\r')) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+inline int pshard_prefill_mode_from_name(const char * s) {
+    for (int i = LLAMA_PSHARD_PREFILL_COUNT - 1; i >= 0; i--) {
+        const char * n = llama_pshard_prefill_mode_name((llama_pshard_prefill_mode)i);
+        const size_t l = strlen(n);
+        if (strncmp(s, n, l) == 0 && (s[l] == '\0' || s[l] == ' ' || s[l] == '\n' || s[l] == '\r')) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+// PSHARD_MISS_POLICY accepts a name or numeric id (QA override for EXPERT_POOL
+// tiers, same pattern as PSHARD_STRATEGY); "second" = fetch_on_2nd_miss alias.
+// Mixed into the registry fingerprint only when set.
+inline int pshard_miss_policy_from_env() {
+    const char * env = getenv("PSHARD_MISS_POLICY");
+    if (!env || !*env) return -1;
+    if (strcmp(env, "second") == 0) return LLAMA_PSHARD_MISS_FETCH_ON_2ND;
+    for (int i = 0; i < LLAMA_PSHARD_MISS_COUNT; i++) {
+        if (strcmp(env, llama_pshard_miss_policy_name((llama_pshard_miss_policy)i)) == 0) {
+            return i;
+        }
+    }
+    char * end = nullptr;
+    long v = strtol(env, &end, 10);
+    if (end != env && *end == '\0' && v >= 0 && v < LLAMA_PSHARD_MISS_COUNT) {
         return (int)v;
     }
     return -1;
@@ -123,6 +208,14 @@ struct llama_pshard_plan {
     bool                 overlap         = true;   // transport mode: double-buffer slots + prefetch scan-ahead
     bool                 ids_cross       = false;  // ALTERNATE only: pin routers on the compute GPU so
                                                    // expert ids cross a split boundary -> sliced uploads
+
+    // EXPERT_POOL per-tier variables (docs/expert-pool-design.md 3b.2); legacy
+    // strategies leave them at their defaults and never serialize them
+    uint32_t pool_k           = 0;     // layers whose experts are all resident (s_l = E, eviction off)
+    uint32_t pool_slots       = 0;     // pool slots per unpinned layer (v1 uniform s, from pool_mb)
+    int      pool_miss        = 0;     // llama_pshard_miss_policy
+    int      pool_prefill     = 0;     // llama_pshard_prefill_mode
+    float    pool_hybrid_frac = 0.0f;  // fetched share of misses under hybrid (B_P / B_H)
 
     std::vector<llama_pshard_override> overrides;
 
