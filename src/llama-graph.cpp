@@ -2149,11 +2149,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * pool_mm_ids   = nullptr; // GPU chain mm: slot id | -1
     ggml_tensor * pool_bias_ids = nullptr; // GPU chain add_id: expert id | -1
     ggml_tensor * pool_cpu_ids  = nullptr; // CPU chain mm + add_id: expert id | -1
-    // whole-stack (A/B) tiers have every expert resident: no CPU routes, single chain
-    const bool pool_dual = expert_pool != nullptr && expert_pool->active &&
-                           expert_pool->layer_pooled(il) && expert_pool->cpu_routes() &&
-                           !expert_pool->ab_mode;
-    if (expert_pool != nullptr && expert_pool->active && expert_pool->layer_pooled(il)) {
+    // whole-stack (A/B) tiers have every expert resident: no CPU routes, single chain.
+    // Gate on the DOWN tensor, not the layer: GroveMoE builds its chunk experts
+    // (ffn_*_chexps) through this same path on a pooled layer.
+    const bool pool_layer = expert_pool != nullptr && expert_pool->active &&
+                            expert_pool->tensor_pooled(il, down_exps);
+    const bool pool_dual  = pool_layer && expert_pool->cpu_routes() && !expert_pool->ab_mode;
+    if (pool_layer) {
         auto ids_leaf = [&](const char * name) {
             ggml_tensor * t = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32,
                 selected_experts->ne[0], selected_experts->ne[1]);

@@ -133,6 +133,20 @@ struct llama_expert_pool {
     bool layer_pooled(int32_t il) const {
         return il >= 0 && il < (int32_t) layers.size() && !layers[il].tensors.empty();
     }
+    // is THIS weight one of the layer's pooled tensors? A layer can carry a second,
+    // unpooled expert group (GroveMoE chunk experts) that builds through the same
+    // MoE FFN path: it must keep the router ids and stream normally.
+    bool tensor_pooled(int32_t il, const ggml_tensor * w) const {
+        if (!layer_pooled(il) || w == nullptr) {
+            return false;
+        }
+        for (const auto & e : layers[il].tensors) {
+            if (e.host == w) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // consume-time service (sched callback): reads the router ids, remaps,
     // fetches misses into victim slots (cache mode) or fills the layer half
