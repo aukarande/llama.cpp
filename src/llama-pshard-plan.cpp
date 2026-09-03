@@ -214,8 +214,13 @@ static bool pshard_alternate_ids_cross_wins(const struct llama_pshard_search_ctx
     if ((uint64_t) bs * ctx.n_expert_used * 2 >= ctx.n_expert) {
         return false;
     }
-    const double pcie = (ctx.predictor && ctx.predictor->stats.eff_pcie_bw > 0.0)
+    double pcie = (ctx.predictor && ctx.predictor->stats.eff_pcie_bw > 0.0)
         ? ctx.predictor->stats.eff_pcie_bw : 25.0;
+    if (ctx.predictor && ctx.predictor->stats.upload_bw > 0.0) {
+        // expert streams source from the mmap mappings; past the pin ceiling they
+        // move at the staged (host-DRAM-bound) rate, not the pinned-concurrent one
+        pcie = std::min(pcie, ctx.predictor->stats.upload_bw);
+    }
     const double dram = (ctx.predictor && ctx.predictor->stats.peak_system_bw > 0.0)
         ? ctx.predictor->stats.peak_system_bw : 40.0;
     const double b_full  = 0.85 * (double) ctx.model_size / ctx.n_layers;  // full expert set per layer
@@ -2115,8 +2120,93 @@ void llama_params_fit_pshard_plan(
     }
     const uint64_t fp = pshard_registry_fingerprint(mparams, cparams, model_file_size);
 
+    // per-mapping upload pricing: split files past the driver's host pin ceiling
+    // cannot be page-locked, and their streamed copies go through the pinned
+    // staging ring at a host-DRAM-bound rate. Predict which mappings lock (the
+    // runtime registers whole mappings greedily in split order, all-or-nothing)
+    // and reprice the predictor's weight-upload rate with the blended value.
+    // Also compute the TOTAL file size: the main split of a sharded gguf can be
+    // tiny (DeepSeek-V4's is 6 MB), which broke every file-size-derived
+    // heuristic downstream (ids-cross expert bytes, switch-cost layer bytes).
+    // NOTE: the registry fingerprint above stays on the MAIN split size - the
+    // runtime computes it the same way, and changing it would strand every
+    // cached registry into silent stock fallback.
+    int64_t total_file_size = model_file_size;
+    {
+        std::vector<int64_t> map_sizes;
+        map_sizes.push_back(model_file_size);
+        struct gguf_init_params gip_s = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };
+        if (struct gguf_context * g = gguf_init_from_file(path_model, gip_s)) {
+            int n_split = 0;
+            const int64_t ks = gguf_find_key(g, "split.count");
+            if (ks >= 0 && gguf_get_kv_type(g, ks) == GGUF_TYPE_UINT16) {
+                n_split = (int) gguf_get_val_u16(g, ks);
+            }
+            gguf_free(g);
+            if (n_split > 1) {
+                char prefix[1024];
+                if (llama_split_prefix(prefix, sizeof(prefix), path_model, 0, n_split) > 0) {
+                    for (int idx = 1; idx < n_split; idx++) {
+                        char split_path[1024];
+                        llama_split_path(split_path, sizeof(split_path), prefix, idx, n_split);
+                        if (FILE * sf = fopen(split_path, "rb")) {
+#ifdef _WIN32
+                            _fseeki64(sf, 0, SEEK_END);
+                            map_sizes.push_back(_ftelli64(sf));
+#else
+                            fseeko(sf, 0, SEEK_END);
+                            map_sizes.push_back(ftello(sf));
+#endif
+                            fclose(sf);
+                        } else {
+                            LLAMA_LOG_WARN("%s: split %d/%d not readable at %s - "
+                                "file-size heuristics fall back to the main split only\n",
+                                __func__, idx + 1, n_split, split_path);
+                        }
+                    }
+                } else {
+                    LLAMA_LOG_WARN("%s: model path does not match the split naming pattern - "
+                        "file-size heuristics fall back to the main split only\n", __func__);
+                }
+            }
+        }
+        total_file_size = 0;
+        for (int64_t s : map_sizes) {
+            total_file_size += s;
+        }
+        if (predictor && predictor->stats.host_pin_ceiling_gb > 0.0 &&
+                predictor->stats.peak_system_bw > 0.0 && predictor->stats.peak_pcie_bw > 0.0) {
+            const double pcie_r = predictor->stats.peak_pcie_bw;
+            // staging moves every byte three times over host DRAM (mapping read,
+            // ring write, DMA read), so the staged rate is a third of DRAM BW
+            const double staged_r = std::min(pcie_r, predictor->stats.peak_system_bw / 3.0);
+            // pinned allocations made outside the page-lock loop (load staging,
+            // the ring itself, the pinned KV shadow) share the driver's ceiling
+            double ceiling_b = (predictor->stats.host_pin_ceiling_gb - 2.0) * 1e9;
+            double pinned_b = 0.0, staged_b = 0.0;
+            for (int64_t s : map_sizes) {
+                if ((double) s <= ceiling_b) {   // greedy in split order, all-or-nothing
+                    ceiling_b -= (double) s;
+                    pinned_b  += (double) s;
+                } else {
+                    staged_b  += (double) s;
+                }
+            }
+            if (staged_b > 0.0) {
+                const double blended = (pinned_b + staged_b) / (pinned_b / pcie_r + staged_b / staged_r);
+                predictor->stats.upload_bw          = blended;
+                predictor->stats.upload_staged_bw   = staged_r;
+                predictor->stats.upload_staged_frac = staged_b / (pinned_b + staged_b);
+                LLAMA_LOG_INFO("%s: upload pricing: %.1f GB page-locks, %.1f GB staged (pin ceiling %.0f GB) -> "
+                    "pinned %.1f / staged %.1f -> blended %.1f GB/s\n",
+                    __func__, pinned_b / 1e9, staged_b / 1e9, predictor->stats.host_pin_ceiling_gb,
+                    pcie_r, staged_r, blended);
+            }
+        }
+    }
+
     // MoE geometry + model size for the per-tier ids-cross decision
-    ctx.model_size = model_file_size;
+    ctx.model_size = total_file_size;
     ctx.n_expert   = hp_nex;
     if (hp_nex > 0) {
         struct gguf_init_params gip = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };
@@ -2133,7 +2223,7 @@ void llama_params_fit_pshard_plan(
             gguf_free(g);
         }
         LLAMA_LOG_INFO("%s: ids-cross inputs: n_expert=%u n_expert_used=%u model_mb=%lld\n",
-            __func__, ctx.n_expert, ctx.n_expert_used, (long long)(model_file_size / (1024 * 1024)));
+            __func__, ctx.n_expert, ctx.n_expert_used, (long long)(total_file_size / (1024 * 1024)));
     }
 
     llama_pshard_plan_registry * registry  = mparams->pshard_registry;
@@ -2372,8 +2462,9 @@ void llama_params_fit_pshard_plan(
 
         pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
             path_model, mparams);
-        pshard_compute_switch_costs(registry, model_file_size, n_layers, ctx.is_moe,
-            predictor ? predictor->stats.peak_pcie_bw : 25.0);
+        pshard_compute_switch_costs(registry, total_file_size, n_layers, ctx.is_moe,
+            predictor ? (predictor->stats.upload_bw > 0.0
+                ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 25.0);
         pshard_registry_save(registry, fp, cache_path.c_str(), host_buft, cparams);
     }
 
@@ -2402,8 +2493,9 @@ void llama_params_fit_pshard_plan(
                     registry->active_plan = &registry->best_plans[t];
                     pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
                         path_model, mparams);
-                    pshard_compute_switch_costs(registry, model_file_size, n_layers, ctx.is_moe,
-                        predictor ? predictor->stats.peak_pcie_bw : 25.0);
+                    pshard_compute_switch_costs(registry, total_file_size, n_layers, ctx.is_moe,
+                        predictor ? (predictor->stats.upload_bw > 0.0
+                            ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 25.0);
                     pshard_registry_save(registry, fp, cache_path.c_str(), host_buft, cparams);
                     break;
                 }

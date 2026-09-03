@@ -200,6 +200,10 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                     stats.sliced_bw[2] = s2;
                     stats.sliced_bw[3] = s3;
                 }
+                double pc = 0.0;
+                if (sscanf(line, "#   Host_Pin_Ceiling: %lf GB", &pc) == 1) {
+                    stats.host_pin_ceiling_gb = pc;
+                }
             }
             continue;
         }
@@ -649,6 +653,11 @@ double llama_benchmark_predictor::predict_tps(
         __func__, n_splits, batch_size, kv_size, n_outputs, (int)has_rs);
 
     const double pcie_bw = stats.peak_pcie_bw;
+    // weight uploads may be repriced by the planner's per-mapping page-lock model
+    // (mappings past the driver's pin ceiling stage through the pinned ring at a
+    // host-DRAM-bound rate); KV/RS writebacks and activations always move through
+    // pinned pools at the full rate.
+    const double weight_bw = stats.upload_bw > 0.0 ? stats.upload_bw : pcie_bw;
     // per-class writeback ratios, matching what the runtime actually moves:
     //   attention KV: write-cells delta sync -> batch_size/kv_size in both directions
     //   recurrent state: FULL mode, entire tensor every eval -> 1.0
@@ -677,30 +686,40 @@ double llama_benchmark_predictor::predict_tps(
             // mis-ranked 6 of 14 audited cells. Price the sliced share at the
             // profiled chunk-size-dependent rate, the contiguous rest at peak.
             const double sliced_bytes = (double)si.input_weight_sliced_bytes;
-            const double rest_bytes = copy_prefetched
+            const double rest_weight_bytes = copy_prefetched
                 ? 0.0
-                : std::max(0.0, (double)si.input_weight_copy_bytes - sliced_bytes)
-                    + (double)si.writeback_kv_bytes * kv_ratio
+                : std::max(0.0, (double)si.input_weight_copy_bytes - sliced_bytes);
+            const double rest_wb_bytes = copy_prefetched
+                ? 0.0
+                : (double)si.writeback_kv_bytes * kv_ratio
                     + (double)si.writeback_rs_bytes;
-            input_copy_bytes = sliced_bytes + rest_bytes;
+            input_copy_bytes = sliced_bytes + rest_weight_bytes + rest_wb_bytes;
+            // sliced expert gathers source from the same mappings: a staged mapping
+            // gates them at the blended rate even when the chunk curve is faster
             const double sliced_bw = sliced_bytes > 0.0
-                ? stats.slice_bw((double)si.input_weight_sliced_chunk_bytes)
+                ? (stats.upload_bw > 0.0
+                    ? std::min(stats.slice_bw((double)si.input_weight_sliced_chunk_bytes), weight_bw)
+                    : stats.slice_bw((double)si.input_weight_sliced_chunk_bytes))
                 : pcie_bw;
-            input_copy_ms = (rest_bytes / 1e9 / pcie_bw) * 1000.0
+            input_copy_ms = (rest_weight_bytes / 1e9 / weight_bw) * 1000.0
+                          + (rest_wb_bytes / 1e9 / pcie_bw) * 1000.0
                           + (sliced_bw > 0.0 ? (sliced_bytes / 1e9 / sliced_bw) * 1000.0 : 0.0);
         }
 
         // peek at next split to determine if async prefetch will overlap with this split
         double prefetch_bytes = 0.0;
+        double prefetch_weight_bytes = 0.0;
+        double prefetch_wb_bytes = 0.0;
         bool next_copy_prefetched = false;
         if (i + 1 < n_splits) {
             struct ggml_backend_sched_split_info next_si = {};
             if (ggml_backend_sched_get_split_info(sched, i + 1, &next_si) &&
                 next_si.can_prefetch_weights) {
                 // the prefetch pass moves non-sliceable weights + writebacks only
-                prefetch_bytes = (double)next_si.input_weight_prefetch_bytes
-                               + (double)next_si.writeback_kv_bytes * kv_ratio
-                               + (double)next_si.writeback_rs_bytes;
+                prefetch_weight_bytes = (double)next_si.input_weight_prefetch_bytes;
+                prefetch_wb_bytes     = (double)next_si.writeback_kv_bytes * kv_ratio
+                                      + (double)next_si.writeback_rs_bytes;
+                prefetch_bytes = prefetch_weight_bytes + prefetch_wb_bytes;
                 next_copy_prefetched = prefetch_bytes > 0.0;
             }
         }
@@ -726,7 +745,9 @@ double llama_benchmark_predictor::predict_tps(
                     eff_bw = pcie_bw;
                 }
             }
-            prefetch_ms = (prefetch_bytes / 1e9 / eff_bw) * 1000.0;
+            const double pf_weight_bw = stats.upload_bw > 0.0 ? std::min(eff_bw, weight_bw) : eff_bw;
+            prefetch_ms = (prefetch_weight_bytes / 1e9 / pf_weight_bw) * 1000.0
+                        + (prefetch_wb_bytes / 1e9 / eff_bw) * 1000.0;
         }
 
         // output scaling: use the output rows in the reserved graph, then scale to
@@ -773,8 +794,25 @@ double llama_benchmark_predictor::predict_tps(
         // Prefetch is enqueued after current inputs/precompute and before graph compute,
         // so whatever remains can overlap the current split compute. CPU splits use the
         // effective PCIe BW above because DMA contends with CPU memory traffic.
+        const double comp_ms = t.time_ms + kv_dl_ms;
         double split_ms = input_copy_ms + activ_copy_ms;
-        split_ms += std::max(t.time_ms + kv_dl_ms, prefetch_ms);
+        if (stats.upload_staged_frac > 0.0 && stats.upload_staged_bw > 0.0 && prefetch_weight_bytes > 0.0) {
+            // mixture over mapping classes (see llama_benchmark_stats::upload_staged_frac)
+            double eff_bw2 = pcie_bw;
+            if (!is_gpu) {
+                eff_bw2 = std::max(t.eff_pcie_bw, stats.eff_pcie_bw);
+                if (eff_bw2 <= 0.0) {
+                    eff_bw2 = pcie_bw;
+                }
+            }
+            const double wb_ms     = (prefetch_wb_bytes / 1e9 / eff_bw2) * 1000.0;
+            const double pf_pinned = (prefetch_weight_bytes / 1e9 / std::min(eff_bw2, pcie_bw)) * 1000.0 + wb_ms;
+            const double pf_staged = (prefetch_weight_bytes / 1e9 / std::min(eff_bw2, stats.upload_staged_bw)) * 1000.0 + wb_ms;
+            const double f = std::min(1.0, stats.upload_staged_frac);
+            split_ms += f * std::max(comp_ms, pf_staged) + (1.0 - f) * std::max(comp_ms, pf_pinned);
+        } else {
+            split_ms += std::max(comp_ms, prefetch_ms);
+        }
         total_ms += split_ms;
         copy_prefetched = next_copy_prefetched;
 
@@ -792,7 +830,7 @@ double llama_benchmark_predictor::predict_tps(
     }
 
     double tps = (total_ms > 0.0) ? (batch_size * 1000.0 / total_ms) : 0.0;
-    LLAMA_LOG_DEBUG("%s: total=%.3f ms, kv_ratio=%.4f, pcie_bw=%.1f GB/s -> %.1f tps\n",
-        __func__, total_ms, kv_ratio, pcie_bw, tps);
+    LLAMA_LOG_DEBUG("%s: total=%.3f ms, kv_ratio=%.4f, pcie_bw=%.1f GB/s, weight_bw=%.1f GB/s -> %.1f tps\n",
+        __func__, total_ms, kv_ratio, pcie_bw, weight_bw, tps);
     return tps;
 }

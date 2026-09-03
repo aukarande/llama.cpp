@@ -79,6 +79,27 @@ struct llama_benchmark_stats {
     static constexpr double sliced_bw_chunk_mb[n_sliced_bw] = { 0.5, 2.0, 8.0, 32.0 };
     double sliced_bw[n_sliced_bw] = { 0.0, 0.0, 0.0, 0.0 };
 
+    // host pin ceiling (GB): how much ordinary process memory the driver will
+    // page-lock (cudaHostRegister), measured by the profiler by registering
+    // chunks until refusal. 0 = not in the profile -> assume every mmap
+    // mapping page-locks (the pre-per-mapping behavior).
+    double host_pin_ceiling_gb = 0.0;
+
+    // model-level blended weight-upload rate (GB/s), set by the planner from
+    // the per-mapping page-lock prediction: mappings past the pin ceiling
+    // stage through the pinned ring at a host-DRAM-bound rate instead of the
+    // pinned PCIe rate. 0 = unset -> weight uploads price at peak_pcie_bw.
+    double upload_bw = 0.0;
+
+    // mixture terms behind upload_bw: the staged mappings' rate and their byte
+    // fraction. A split's streamed weights come from ONE mapping (layers are
+    // contiguous in the file), so a pass mixes pinned-rate and staged-rate
+    // splits; pricing every split at the blended rate lets predicted compute
+    // hide the staged splits' stalls under the overlap max (measured 117 vs 84
+    // t/s on a half-staged model; the mixture prices ~100).
+    double upload_staged_bw   = 0.0;
+    double upload_staged_frac = 0.0;
+
     // interpolated gathered-upload BW for a chunk size; falls back to the measured
     // concurrent rate (eff_pcie_bw), then peak, when the curve is not in the profile
     double slice_bw(double chunk_bytes) const {

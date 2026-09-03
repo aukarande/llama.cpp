@@ -20,6 +20,16 @@
 #include <intrin.h>
 #endif
 
+// pin-ceiling probe: physical-memory query + env set
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <unistd.h>
+#include <cstdlib>
+#endif
+
 static std::vector<char> g_flush_buffer;
 
 static void flush_caches() {
@@ -176,6 +186,73 @@ static void calibrate_pcie_sliced(pcie_stress_ctx * pcie, int threads, double sl
         w.join();
     }
     printf("\n");
+}
+
+// host pin ceiling: how many bytes of ordinary process memory the driver will
+// page-lock (cudaHostRegister). pshard's streamed weights source from mmap
+// regions registered exactly this way; mappings past the ceiling stay pageable
+// and stage through a pinned ring at a host-DRAM-bound rate. Register 2 GiB
+// anonymous chunks until the driver refuses (or RAM runs short), report the total.
+static double calibrate_pin_ceiling(pcie_stress_ctx * pcie) {
+    printf("Probing host pin ceiling (cudaHostRegister until refusal)...\n");
+    ggml_backend_dev_t dev = ggml_backend_get_device(pcie->gpu_backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto register_fn = reg ? (bool (*)(void *, size_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;
+    auto unregister_fn = reg ? (void (*)(void *))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer") : nullptr;
+    if (!register_fn || !unregister_fn) {
+        printf("  backend does not expose host registration - skipping\n\n");
+        return 0.0;
+    }
+    // the CUDA implementation is gated on this env (the runtime's pageable-copies
+    // measurement lever); the profiler measures the real machine
+#ifdef _WIN32
+    _putenv_s("GGML_CUDA_REGISTER_HOST", "1");
+#else
+    setenv("GGML_CUDA_REGISTER_HOST", "1", 1);
+#endif
+    // stop short of AVAILABLE memory: past it the probe faults into swap and
+    // measures the pager (or feeds the OOM killer), not the driver
+    size_t avail = 0;
+#ifdef _WIN32
+    {
+        MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) avail = (size_t) ms.ullAvailPhys;
+    }
+#else
+    {
+        long pages = sysconf(_SC_AVPHYS_PAGES), psize = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && psize > 0) avail = (size_t) pages * (size_t) psize;
+    }
+#endif
+    const size_t cap = avail > 0 ? (size_t)(0.90 * avail) : (256ull << 30);
+    // descending chunk sizes: after a refusal, smaller chunks tighten the measured
+    // floor to 256 MiB granularity (a sub-2 GiB ceiling would otherwise read as 0
+    // = "not measured", and the planner would price everything at the pinned rate)
+    static const size_t chunk_sizes[] = { 2ull << 30, 1ull << 30, 512ull << 20, 256ull << 20 };
+    std::vector<std::pair<void *, size_t>> chunks;
+    size_t total = 0;
+    bool cap_hit = false;
+    for (size_t chunk : chunk_sizes) {
+        while (true) {
+            if (total + chunk > cap) { cap_hit = true; break; }
+            void * p = malloc(chunk);
+            if (!p) { cap_hit = true; break; }
+            memset(p, 1, chunk);   // fault the pages in - the driver locks real pages
+            if (!register_fn(p, chunk)) { free(p); break; }
+            chunks.push_back({ p, chunk });
+            total += chunk;
+        }
+    }
+    for (auto & [p, sz] : chunks) { unregister_fn(p); free(p); }
+    const double gb = total / 1e9;
+    if (cap_hit) {
+        printf("  Host pin ceiling: >= %.1f GB (stopped at 90%% of available RAM - a floor, not the driver's limit)\n\n", gb);
+    } else {
+        printf("  Host pin ceiling: %.1f GB\n\n", gb);
+    }
+    return gb;
 }
 
 static void calibrate_pcie(pcie_stress_ctx * pcie) {
@@ -505,7 +582,7 @@ static void save_results_cpu(
         const std::vector<bench_result_cpu> & results,
         const std::vector<int32_t> & batch_sizes,
         int threads, double dram_bw, double pcie_standalone_bw, double pcie_concurrent_bw, double cpu_eff,
-        bool has_gpu, const double sliced_bw[4]) {
+        bool has_gpu, const double sliced_bw[4], double pin_ceiling_gb) {
 
     FILE * f = fopen(path, "w");
     if (!f) { fprintf(stderr, "Failed to open %s for writing\n", path); return; }
@@ -522,6 +599,9 @@ static void save_results_cpu(
         if (sliced_bw != NULL && sliced_bw[0] > 0.0) {
             fprintf(f, "#   PCIe_Sliced: 0.5MB=%.1f 2MB=%.1f 8MB=%.1f 32MB=%.1f GB/s\n",
                 sliced_bw[0], sliced_bw[1], sliced_bw[2], sliced_bw[3]);
+        }
+        if (pin_ceiling_gb > 0.0) {
+            fprintf(f, "#   Host_Pin_Ceiling: %.1f GB\n", pin_ceiling_gb);
         }
     } else {
         fprintf(f, "#   Threads=%d: DRAM_BW=%.1f GB/s\n", threads, dram_bw);
@@ -553,6 +633,7 @@ int main(int argc, char ** argv) {
     int32_t fixed_threads = -1;
     bool    fast_mode     = true;
     bool    sliced_only   = false;
+    bool    no_pin_ceiling = false;
     const char * output_path = "cpu_profile.txt";
 
     for (int i = 1; i < argc; ++i) {
@@ -567,6 +648,8 @@ int main(int argc, char ** argv) {
             fast_mode = false;
         } else if (!strcmp(argv[i], "--sliced-only")) {
             sliced_only = true;
+        } else if (!strcmp(argv[i], "--no-pin-ceiling")) {
+            no_pin_ceiling = true;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [options]\n", argv[0]);
             printf("\n");
@@ -576,6 +659,8 @@ int main(int argc, char ** argv) {
             printf("  --full              full mode with all configs\n");
             printf("  --sliced-only       run only the PCIe calibrations and print the\n");
             printf("                      PCIe_Sliced header line (no table regeneration)\n");
+            printf("  --no-pin-ceiling    skip the host pin ceiling probe (registers RAM\n");
+            printf("                      in 2 GiB chunks until the driver refuses)\n");
             printf("  --threads <n>       number of CPU threads (default: auto)\n");
             printf("  --output <path>     output file (default: cpu_profile.txt)\n");
             return 0;
@@ -637,11 +722,17 @@ int main(int argc, char ** argv) {
     double sliced_bw[4] = { 0.0, 0.0, 0.0, 0.0 };
     if (has_gpu) calibrate_pcie_sliced(&pcie, threads, sliced_bw);
 
+    double pin_ceiling_gb = 0.0;
+    if (has_gpu && !no_pin_ceiling) pin_ceiling_gb = calibrate_pin_ceiling(&pcie);
+
     if (sliced_only) {
         // print the exact header line for splicing into an existing profile
         printf("PCIe_Sliced header line (paste into the profile header block):\n");
         printf("#   PCIe_Sliced: 0.5MB=%.1f 2MB=%.1f 8MB=%.1f 32MB=%.1f GB/s\n",
             sliced_bw[0], sliced_bw[1], sliced_bw[2], sliced_bw[3]);
+        if (pin_ceiling_gb > 0.0) {
+            printf("#   Host_Pin_Ceiling: %.1f GB\n", pin_ceiling_gb);
+        }
         if (has_gpu) {
             if (pcie.ctx) ggml_free(pcie.ctx);
             if (pcie.host_buf) ggml_backend_buffer_free(pcie.host_buf);
@@ -672,7 +763,7 @@ int main(int argc, char ** argv) {
     printf("\nTotal time: %.1f s, %zu benchmarks\n", overall.stop(), all_results.size());
 
     save_results_cpu(output_path, all_results, batch_sizes, threads, dram_bw,
-        pcie.calibrated_bw_gb_s, pcie_concurrent_bw, cpu_eff, has_gpu, sliced_bw);
+        pcie.calibrated_bw_gb_s, pcie_concurrent_bw, cpu_eff, has_gpu, sliced_bw, pin_ceiling_gb);
 
     if (has_gpu) {
         if (pcie.ctx) ggml_free(pcie.ctx);
