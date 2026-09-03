@@ -1686,6 +1686,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate_bias = nullptr,
                                           const ggml_tensor * ffn_up_scale = nullptr,
                                           const ggml_tensor * ffn_gate_scale = nullptr) {
+    // ids with -1 entries (skipped routes): the fused kernels' shared skip guard
+    // covers the mm result, but bias/scale/GLU fusion assumes every route is live
+    if (ffn_up->op == GGML_OP_MUL_MAT_ID && ffn_up->op_params[0] != 0) {
+        return false;
+    }
+
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1960,6 +1966,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // ids with -1 entries (skipped routes, split hit/miss expert execution): the
+    // compact-map paths (mmq/mmf) and the sorted fallback never write skipped dst
+    // rows, so those rows must be zeroed explicitly
+    const bool ids_allow_skip = dst->op_params[0] != 0;
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -1979,11 +1990,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            if (ids_allow_skip) {
+                CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+            }
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            if (ids_allow_skip) {
+                CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+            }
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2007,7 +2024,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     std::vector<int32_t> ids_to_sorted_host;
     ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    std::vector<int32_t> ids_from_sorted_host(ne_get_rows, -1);
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
 
@@ -2024,7 +2041,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                assert(expert_to_use < ne02 && (expert_to_use >= 0 || ids_allow_skip));
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -2034,7 +2051,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    const int64_t ne_matched = (int64_t) ids_to_sorted_host.size();
+    GGML_ASSERT(ids_allow_skip ? ne_matched <= (int64_t) ne_get_rows : ne_matched == (int64_t) ne_get_rows);
+    if (ne_matched < (int64_t) ne_get_rows) {
+        // -1 routes have no sorted row: gather token 0 into the unused sorted tail
+        // (never fed to a GEMM), zero one spare dst_sorted row and point every
+        // skipped route's scatter entry at it
+        for (int64_t j = 0; j < (int64_t) ne_get_rows; ++j) {
+            if (ids_from_sorted_host[j] < 0) {
+                ids_from_sorted_host[j] = (int32_t) ne_matched;
+            }
+        }
+        ids_to_sorted_host.resize(ne_get_rows, 0);
+        CUDA_CHECK(cudaMemsetAsync((char *) dst_sorted.ptr + ne_matched*ne0*ts_dst_sorted, 0, ne0*ts_dst_sorted, stream));
+    }
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 

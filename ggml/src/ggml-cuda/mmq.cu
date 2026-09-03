@@ -192,6 +192,14 @@ void ggml_cuda_mul_mat_q(
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
 
+    // ids may contain -1 (skipped routes): those routes get no compact entry, so
+    // pre-fill the maps - the inverse map with -1 (the quantize scatter skips it),
+    // the forward map with 0 (tail rows quantize token 0 and are never consumed:
+    // expert_bounds caps every read)
+    if (dst->op_params[0] != 0) {
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0x00, ne_get_rows*sizeof(int32_t), stream));
+    }
+
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);

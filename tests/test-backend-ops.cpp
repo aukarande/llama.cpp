@@ -3214,9 +3214,10 @@ struct test_add_id : public test_case {
     const int64_t n_experts;
     const int64_t n_experts_used;
     const int64_t n_token;
+    const int n_skipped; // -1 (dead) routes per token row: bias add passes src0 through
 
     std::string vars() override {
-        return VARS_TO_STR6(type_a, type_b, n_embd, n_experts, n_experts_used, n_token);
+        return VARS_TO_STR7(type_a, type_b, n_embd, n_experts, n_experts_used, n_token, n_skipped);
     }
 
     size_t op_size(ggml_tensor * t) override {
@@ -3228,9 +3229,11 @@ struct test_add_id : public test_case {
             int64_t n_embd = 128,
             int64_t n_experts = 16,
             int64_t n_experts_used = 8,
-            int64_t n_token = 10)
+            int64_t n_token = 10,
+            int n_skipped = 0)
         : type_a(type_a), type_b(type_b), n_embd(n_embd),
-          n_experts(n_experts), n_experts_used(n_experts_used), n_token(n_token) {}
+          n_experts(n_experts), n_experts_used(n_experts_used), n_token(n_token),
+          n_skipped(n_skipped) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, n_embd, n_experts_used, n_token);
@@ -3259,6 +3262,9 @@ struct test_add_id : public test_case {
                         data[i] = i % n_experts;
                     }
                     std::shuffle(data.begin(), data.end(), rng);
+                    for (int i = 0; i < n_skipped && i < (int) data.size(); i++) {
+                        data[i] = -1; // dead route
+                    }
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
                 }
             } else {
@@ -4649,7 +4655,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     }
 };
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, int n_skipped = 0) {
     std::random_device rd;
     std::default_random_engine rng(rd());
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -4662,6 +4668,11 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
                     data[i] = i % n_mats;
                 }
                 std::shuffle(data.begin(), data.end(), rng);
+                // -1 = skipped route (allow_skip): the first slots are inside the
+                // n_used view, so every token row carries n_skipped dead routes
+                for (int i = 0; i < n_skipped && i < (int) data.size(); i++) {
+                    data[i] = -1;
+                }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }
         } else {
@@ -4680,9 +4691,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const int n_skipped; // -1 (dead) routes per token row, needs allow_skip
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, n_skipped);
     }
 
     double max_nmse_err() override {
@@ -4704,10 +4716,11 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, int n_skipped = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), n_skipped(n_skipped) {
             GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(n_skipped <= n_used);
         }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4727,12 +4740,15 @@ struct test_mul_mat_id : public test_case {
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
+        if (n_skipped > 0) {
+            ggml_mul_mat_id_set_allow_skip(out, true);
+        }
 
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, n_skipped);
     }
 };
 
@@ -9435,6 +9451,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nr2 : {8, 16, 32}) {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
+    }
+
+    // ids with -1 entries (skipped routes, split hit/miss expert execution):
+    // one case per CUDA dispatch path - mmvq single-token, mmvq moe, mmf small
+    // and compacted, mmq, mmq dedup-broadcast scatter, sorted sync fallback
+    for (int n_skipped : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32,   8, 4, false, 32,   1, 256, n_skipped)); // mmvq single
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32,   8, 4, false, 32,   4, 256, n_skipped)); // mmvq moe
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F32,  GGML_TYPE_F32,   8, 4, false, 32,   1, 256, n_skipped)); // mmvf/mmf
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32,   8, 4, false, 32,   4, 256, n_skipped)); // mmf small
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32,   8, 4, false, 32,  64, 256, n_skipped)); // mmf compact
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 64, 260, 256, n_skipped)); // mmq
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 8, true,  64, 260, 256, n_skipped)); // mmq dedup scatter
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XS, GGML_TYPE_F32,  8, 4, false, 32, 64, 256, n_skipped)); // sorted fallback
+        test_cases.emplace_back(new test_add_id(GGML_TYPE_F32, GGML_TYPE_F32, 129, 16, 8, 10, n_skipped));
     }
 
     // add_id

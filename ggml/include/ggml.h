@@ -1449,6 +1449,12 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // mark a mul_mat_id whose ids may contain -1 entries: those routes are skipped
+    // and their dst rows are written as zeros (split hit/miss expert execution).
+    // add_id handles -1 unconditionally (passes src0 through for that route).
+    GGML_API void ggml_mul_mat_id_set_allow_skip(struct ggml_tensor * mmid, bool allow);
+    GGML_API bool ggml_mul_mat_id_get_allow_skip(const struct ggml_tensor * mmid);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

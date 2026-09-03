@@ -26,6 +26,7 @@ static __global__ void mul_mat_vec_f(
     int sample_dst;
 
     ggml_cuda_pdl_sync();
+    bool skip_row = false; // a -1 id (skipped route) computes against expert 0 and writes zeros
     if constexpr (is_multi_token_id) {
         // Multi-token MUL_MAT_ID path, adding these in the normal path causes a perf regression for n_tokens=1 case
         token_idx  = blockIdx.z;
@@ -37,6 +38,10 @@ static __global__ void mul_mat_vec_f(
         channel_x  = ids ? ids[blockIdx.y + token_idx * ids_stride]            : fastdiv((uint32_t) channel_dst, channel_ratio);
         channel_y  = ids ? fastmodulo(blockIdx.y, nchannels_y)                 : channel_dst;
         sample_dst = ids ? 0                                                   : blockIdx.z;
+    }
+    if (ids && channel_x < 0) {
+        skip_row  = true;
+        channel_x = 0;
     }
 
     const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
@@ -371,7 +376,7 @@ static __global__ void mul_mat_vec_f(
         }
     }
 
-    dst[tid*stride_col_dst + row] = value;
+    dst[tid*stride_col_dst + row] = skip_row ? 0.0f : value;
 
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);

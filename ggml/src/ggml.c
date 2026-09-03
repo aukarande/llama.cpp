@@ -3352,6 +3352,15 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_allow_skip(struct ggml_tensor * mmid, bool allow) {
+    GGML_ASSERT(mmid->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(mmid, 0, allow ? 1 : 0);
+}
+
+bool ggml_mul_mat_id_get_allow_skip(const struct ggml_tensor * mmid) {
+    return mmid->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(mmid, 0) != 0;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
