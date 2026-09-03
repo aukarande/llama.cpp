@@ -384,6 +384,9 @@ private:
     // registry's viable plans pool experts and PSHARD_POOL_RUNTIME is set
     std::unique_ptr<struct llama_expert_pool> expert_pool;
     size_t expert_pool_bytes = 0;  // region carved below the pinned KV cache
+    // compute scratch (+ margin) each EXPERT_POOL tier's graph really needs, measured
+    // at its first reserve: the pool region is everything the graph leaves
+    std::map<uint32_t, size_t> pshard_pool_scratch;
     bool pshard_memory_dirty = false;
     // tiers reserved + initial plan landed; a later scheduler rebuild (sched_need_reserve
     // set after creation, e.g. by a draft context enabling layer-input extraction on this

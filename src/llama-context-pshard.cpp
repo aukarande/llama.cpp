@@ -275,10 +275,11 @@ void llama_context::pshard_setup_expert_pool() {
     const size_t buf_total = ggml_backend_buffer_get_size(buf);
     const size_t preloaded = model.get_dev_preloaded_size();
     const size_t cache     = total_pinned_cache_size(memory.get());
-    if (preloaded + cache + scratch_need + 2 * pool->layer_full_bytes >= buf_total) {
-        LLAMA_LOG_WARN("%s: no room for the expert pool (weights %.1f + cache %.1f + scratch %.1f + A/B %.1f >= %.1f MiB)\n",
+    const size_t one_slot = pool->region_bytes_needed(1, /*with_ab=*/false);
+    if (preloaded + cache + scratch_need + one_slot >= buf_total) {
+        LLAMA_LOG_WARN("%s: no room for the expert pool (weights %.1f + cache %.1f + scratch %.1f + 1 slot/layer %.1f >= %.1f MiB)\n",
             __func__, preloaded / (1024.0 * 1024.0), cache / (1024.0 * 1024.0),
-            scratch_need / (1024.0 * 1024.0), 2 * pool->layer_full_bytes / (1024.0 * 1024.0),
+            scratch_need / (1024.0 * 1024.0), one_slot / (1024.0 * 1024.0),
             buf_total / (1024.0 * 1024.0));
         return;
     }
@@ -306,25 +307,42 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
     const size_t buf_total = ggml_backend_buffer_get_size(buf);
     const size_t preloaded = model.get_dev_preloaded_size();
     const size_t cache     = total_pinned_cache_size(memory.get());
-    const size_t scratch   = plan.scratch_measured + (64ull << 20);
+    // this tier's compute scratch: measured at its first reserve when available
+    // (registry plans carry no scratch, and the planner's probe streamed the
+    // experts so its number is not this graph's); before that, a 64 MiB provisional
+    size_t scratch = plan.scratch_measured + (64ull << 20);
+    {
+        const auto it = pshard_pool_scratch.find(plan.batch_size);
+        if (it != pshard_pool_scratch.end()) {
+            scratch = it->second;
+        }
+    }
     if (preloaded + cache + scratch >= buf_total) {
         return false;
     }
     const size_t avail = buf_total - preloaded - cache - scratch;
 
-    uint32_t slots = plan.pool_slots;
-    size_t   want  = expert_pool->region_bytes_needed(slots);
+    // whole-stack tiers need the 2-layer A/B pair in the region; cache tiers only
+    // their slots (the pair is not reserved for them: tight budgets turn it into slots)
+    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
+    // slots = what the window holds (the plan's count estimates the same quantity
+    // from the probe; the measured scratch here is the authority - the log shows both)
+    const size_t per_slot = expert_pool->region_bytes_needed(1, /*with_ab=*/false);
+    uint32_t slots = per_slot > 0 ? (uint32_t) std::min<size_t>(avail / per_slot, expert_pool->n_expert) : 0;
+    size_t   want  = expert_pool->region_bytes_needed(slots, ab);
     while (slots > 0 && want > avail) {
         slots--;
-        want = expert_pool->region_bytes_needed(slots);
+        want = expert_pool->region_bytes_needed(slots, ab);
     }
-    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
-    const uint32_t floor_slots = ab ? 0 : (uint32_t) std::min<uint64_t>(expert_pool->n_expert,
+    // fetch-only cache tiers need this pass's distinct experts resident at once;
+    // CPU-route policies spill the overflow to the CPU chain, so one slot suffices
+    const bool cpu_routes = plan.pool_miss != LLAMA_PSHARD_MISS_FETCH;
+    const uint32_t floor_slots = ab ? 0 : cpu_routes ? 1 : (uint32_t) std::min<uint64_t>(expert_pool->n_expert,
         (uint64_t) plan.batch_size * expert_pool->n_expert_used);
-    if (slots == 0 || want == 0 || 2 * expert_pool->layer_full_bytes > avail || slots < floor_slots) {
-        LLAMA_LOG_WARN("%s: tier bs=%u: pool does not fit (avail %.1f MiB, s=%u, floor %u, A/B %.1f MiB)\n",
+    if (slots == 0 || want == 0 || (ab && 2 * expert_pool->layer_full_bytes > avail) || slots < floor_slots) {
+        LLAMA_LOG_WARN("%s: tier bs=%u: pool does not fit (avail %.1f MiB, s=%u, floor %u, %s)\n",
             __func__, plan.batch_size, avail / (1024.0 * 1024.0), slots, floor_slots,
-            2 * expert_pool->layer_full_bytes / (1024.0 * 1024.0));
+            ab ? "needs the A/B pair" : "cache tier");
         return false;
     }
 
@@ -340,6 +358,16 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
     }
     expert_pool->epoch++;   // new view tensors: reused graphs must rebuild their bindings
     expert_pool_bytes = want;
+    if (expert_pool->active) {
+        // the sched's input-copy overrides point at the OLD view tensors (freed by
+        // set_region): rebind. (set_active registers when the flag flips; a switch
+        // between two pool tiers of different geometry does not flip it.)
+        expert_pool->register_sched(sched.get());
+    }
+    LLAMA_LOG_INFO("%s: tier bs=%u: pool region %.1f MiB = window %.1f - scratch %.1f (%s): s=%u slots/layer (plan %u)%s\n",
+        __func__, plan.batch_size, want / (1024.0 * 1024.0), (avail + scratch) / (1024.0 * 1024.0),
+        scratch / (1024.0 * 1024.0), pshard_pool_scratch.count(plan.batch_size) ? "measured" : "provisional",
+        slots, plan.pool_slots, ab ? ", A/B" : "");
     return true;
 }
 
@@ -359,7 +387,7 @@ void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
     expert_pool->set_active(on, sched.get());
     expert_pool->set_policy(plan.pool_miss, plan.pool_hybrid_frac, sched.get());
     const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
-    expert_pool->set_ab_mode(ab, sched.get());
+    expert_pool->set_ab_mode(on && ab, sched.get());
 }
 
 // the pool's remapped-ids leaves anchor on the same virtual backend as the
@@ -530,9 +558,36 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
     auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
 
     if (gf && external_buf) {
-        const int    n_chunks    = ggml_backend_sched_get_n_chunks(sched.get(), gpu);
-        const size_t chunk0_max  = (n_chunks >= 1) ? ggml_backend_sched_get_chunk_max_size(sched.get(), gpu, 0) : 0;
-        const size_t chunk0_used = (chunk0_max > scratch_off) ? chunk0_max - scratch_off : 0;
+        auto measure = [&]() -> size_t {
+            const int    n_chunks   = ggml_backend_sched_get_n_chunks(sched.get(), gpu);
+            const size_t chunk0_max = (n_chunks >= 1) ? ggml_backend_sched_get_chunk_max_size(sched.get(), gpu, 0) : 0;
+            return (chunk0_max > scratch_off) ? chunk0_max - scratch_off : 0;
+        };
+        size_t chunk0_used = measure();
+
+        // expert-pool tiers: the pool takes what the graph leaves. The registry carries
+        // no per-tier scratch and the planner's probe streamed the experts (its scratch
+        // is not this graph's), so the FIRST reserve of a tier measures the graph over
+        // a provisional region, the region is re-carved to window - scratch - 32 MiB,
+        // and the graph is reserved again over the new views. The graph's scratch does
+        // not depend on the slot count (pool views are preset, never allocated).
+        if (expert_pool && expert_pool->active && plan.strategy == LLAMA_PSHARD_EXPERT_POOL &&
+                pshard_pool_scratch.find(plan.batch_size) == pshard_pool_scratch.end()) {
+            pshard_pool_scratch[plan.batch_size] = chunk0_used + (32ull << 20);
+            if (pshard_pool_resize(plan)) {
+                const size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
+                scratch_avail = buf_total - scratch_off - total_pinned_cache_size(memory.get()) - expert_pool_bytes;
+                ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, SIZE_MAX/2);
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+                if (!gf) {
+                    LLAMA_LOG_ERROR("%s: graph_reserve failed after the pool re-carve (bs=%u); alloc state not saved\n",
+                        __func__, plan.batch_size);
+                    plan.alloc_state.valid = false;
+                    return;
+                }
+                chunk0_used = measure();
+            }
+        }
 
         if (chunk0_used <= scratch_avail) {
             ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, chunk0_used);
@@ -616,7 +671,10 @@ void llama_context::pshard_warmup_plan_reserves() {
         // buffer must degrade, not assert (seen: 24 MiB overshoot at a 2000 MiB budget)
         if (model.get_dev_preload_buf()) {
             const size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
-            const size_t pc        = total_pinned_cache_size(memory.get()) + expert_pool_bytes;
+            // no expert-pool charge here: the region is carved per tier from what
+            // THIS tier leaves (legacy tiers run without it; a pool tier's region is
+            // the remainder by construction, its floor is checked at apply)
+            const size_t pc        = total_pinned_cache_size(memory.get());
             if (plan.cached_scratch_off + pc > buf_total) {
                 LLAMA_LOG_WARN("%s: tier %zu (bs=%u, %s, n_pinned=%u) packing overshoots buffer by %.2f MiB; marking unviable\n",
                     __func__, t, registry->tier_sizes[t],

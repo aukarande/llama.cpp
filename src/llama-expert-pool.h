@@ -50,6 +50,9 @@ struct llama_expert_pool {
         uint64_t hits     = 0;
         uint64_t misses   = 0;
         uint64_t cache_passes = 0;          // cache-mode serve() passes (misses/token denominator)
+        uint64_t hits_1   = 0;              // the same, restricted to single-token passes (decode)
+        uint64_t misses_1 = 0;
+        uint64_t passes_1 = 0;
         uint64_t ab_pass  = 0;              // last pass this layer's A/B half was filled
         uint64_t serve_gen = 0;             // last generation serve() ran the full work
         std::vector<int32_t> mapped_buf;    // remapped-ids upload buffer: MUST outlive the
@@ -82,6 +85,7 @@ struct llama_expert_pool {
     size_t   region_bytes  = 0;
     size_t   layer_slot_bytes = 0;     // per-layer cache-mode footprint (all tensors)
     size_t   layer_full_bytes = 0;     // per-layer whole-expert-set footprint
+    bool     ab_capable       = false; // the region holds the A/B pair (set_region)
 
     std::vector<layer_state> layers;   // dense by il; tensors empty for non-moe layers
     ggml_context * ctx_views = nullptr;
@@ -98,7 +102,9 @@ struct llama_expert_pool {
     bool set_region(ggml_backend_buffer_t arena, void * base, size_t bytes, uint32_t slots_per_layer);
 
     // bytes the region needs for a given slot count (planner/carve agreement)
-    size_t region_bytes_needed(uint32_t slots_per_layer) const;
+    // bytes for slots_per_layer cache slots; with_ab also requires the 2-layer
+    // A/B pair (whole-stack tiers overlay it on the region start)
+    size_t region_bytes_needed(uint32_t slots_per_layer, bool with_ab = true) const;
 
     // register every layer's host tensors as sched input-copy overrides pointing
     // at the ACTIVE view set, and install the serving callback

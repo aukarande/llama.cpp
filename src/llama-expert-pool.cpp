@@ -70,16 +70,16 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
     return n_pooled > 0;
 }
 
-size_t llama_expert_pool::region_bytes_needed(uint32_t slots_per_layer) const {
+size_t llama_expert_pool::region_bytes_needed(uint32_t slots_per_layer, bool with_ab) const {
     // cache mode: slots_per_layer rows of every pooled tensor, per layer;
-    // A/B mode reuses the same span (2 whole layers) - take the max
+    // A/B mode reuses the same span (2 whole layers) - take the max when asked
     size_t cache_bytes = 0;
     for (const auto & L : layers) {
         for (const auto & e : L.tensors) {
             cache_bytes += ((size_t) slots_per_layer * e.row_bytes + 255) & ~(size_t) 255;
         }
     }
-    return std::max(cache_bytes, 2 * layer_full_bytes);
+    return with_ab ? std::max(cache_bytes, 2 * layer_full_bytes) : cache_bytes;
 }
 
 bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, size_t bytes, uint32_t slots_per_layer) {
@@ -100,7 +100,7 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
         return false;
     }
 
-    const size_t need = region_bytes_needed(slots_per_layer);
+    const size_t need = region_bytes_needed(slots_per_layer, /*with_ab=*/false);
     if (need > bytes) {
         LLAMA_LOG_WARN("%s: expert pool region too small: need %.1f MiB (s=%u), have %.1f MiB\n",
             __func__, need / (1024.0 * 1024.0), slots_per_layer, bytes / (1024.0 * 1024.0));
@@ -136,11 +136,19 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
         }
     }
 
-    // A/B halves: parity-alternating whole-layer sets at the region start
+    // A/B halves: parity-alternating whole-layer sets at the region start. Only
+    // when the region holds the pair - a cache tier's region can be smaller, and
+    // the whole-stack tiers get their own (larger) carve when they are applied
+    ab_capable = bytes >= 2 * layer_full_bytes;
     for (auto & L : layers) {
         size_t sub = 0;
         const size_t half = layer_full_bytes;
         for (auto & e : L.tensors) {
+            e.view_ab = nullptr;
+            e.ab_off[0] = e.ab_off[1] = 0;
+            if (!ab_capable) {
+                continue;
+            }
             e.ab_off[0] = 0    + sub;
             e.ab_off[1] = half + sub;
             sub += e.row_bytes * n_expert;
@@ -153,8 +161,9 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
         }
     }
 
-    LLAMA_LOG_INFO("%s: expert pool region %.1f MiB: s=%u slots/layer (cache) or 2x%.1f MiB A/B halves\n",
-        __func__, bytes / (1024.0 * 1024.0), n_slots, layer_full_bytes / (1024.0 * 1024.0));
+    LLAMA_LOG_INFO("%s: expert pool region %.1f MiB: s=%u slots/layer (cache)%s\n",
+        __func__, bytes / (1024.0 * 1024.0), n_slots,
+        ab_capable ? " + 2-layer A/B pair" : " (no A/B pair: cache tiers only)");
     return true;
 }
 
@@ -197,6 +206,11 @@ void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
 }
 
 void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
+    if (ab && active && !ab_capable) {
+        LLAMA_LOG_ERROR("%s: whole-stack tier on a region without the A/B pair (%.1f MiB) - staying in cache mode\n",
+            __func__, region_bytes / (1024.0 * 1024.0));
+        ab = false;
+    }
     if (ab == ab_mode) {
         return;
     }
@@ -499,6 +513,11 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             }
         }
         L.hits += n_hit;
+        if (n_ids_1 == 1) {
+            L.passes_1++;
+            L.hits_1   += n_hit;
+            L.misses_1 += miss_list.size();
+        }
         if (dual) {
             if (L.ids_gpu_bias != nullptr) { // only exists when an expert bias consumes it
                 ggml_backend_tensor_set_async(split_backend, L.ids_gpu_bias,
@@ -531,14 +550,18 @@ void llama_expert_pool::reset_slots() {
 
 void llama_expert_pool::log_counters() const {
     uint64_t hits = 0, misses = 0, passes = 0;
+    uint64_t hits_1 = 0, misses_1 = 0, passes_1 = 0;
     std::string per_layer;
     for (const auto & L : layers) {
         if (L.tensors.empty()) {
             continue;
         }
-        hits   += L.hits;
-        misses += L.misses;
-        passes  = std::max(passes, L.cache_passes);
+        hits     += L.hits;
+        misses   += L.misses;
+        passes    = std::max(passes, L.cache_passes);
+        hits_1   += L.hits_1;
+        misses_1 += L.misses_1;
+        passes_1  = std::max(passes_1, L.passes_1);
         const uint64_t n = L.hits + L.misses;
         char buf[16];
         snprintf(buf, sizeof(buf), " %.2f", n > 0 ? (double) L.hits / (double) n : 0.0);
@@ -554,4 +577,14 @@ void llama_expert_pool::log_counters() const {
     LLAMA_LOG_INFO("%s: expert pool: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
         __func__, (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) passes, h, mpt, n_slots);
     LLAMA_LOG_INFO("%s: expert pool h per layer:%s\n", __func__, per_layer.c_str());
+    if (passes_1 > 0 && passes_1 != passes) {
+        // decode-only view (single-token passes): what the planner's h(s) and
+        // misses/token model; the all-passes line above includes any multi-token
+        // ubatch a cache-mode tier served (e.g. the prompt when the prefill tiers
+        // fell back onto the decode plan). The QA ledger takes the LAST line.
+        const double h1   = hits_1 + misses_1 > 0 ? (double) hits_1 / (double) (hits_1 + misses_1) : 0.0;
+        const double mpt1 = (double) misses_1 / (double) passes_1;
+        LLAMA_LOG_INFO("%s: expert pool decode: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
+            __func__, (unsigned long long) hits_1, (unsigned long long) misses_1, (unsigned long long) passes_1, h1, mpt1, n_slots);
+    }
 }
