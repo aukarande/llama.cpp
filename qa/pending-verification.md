@@ -349,6 +349,24 @@ and corrupt concurrent measurements).
    planner ranks legacy > pool at both budgets, matching the measurements. Still
    open: hybrid at small s measures ~20% better than the serial-sum model (decode-
    only h under admission is not modelled), fetch_on_2nd_miss price is a placeholder.
+   FIRST POOL WIN + DSv4 CLASSIFICATION 2026-09-03: DeepSeek-V4-Flash UD-Q2_K_XL
+   @12000 (512+32 greedy): forced-5 pools 43 layers (10.38 MiB/expert, 2656 MiB/
+   layer), s=17, fetch at bs=1, hybrid at bs=16 (fetch floor 32 GB), A/B pair fits
+   at bs=512/1024 and not at 2048 (pool disengages there, tier streams normally):
+   80.2 prompt / 10.65 decode vs legacy auto (2 layers pinned) 79.1 / 9.17 (+16%
+   decode) vs stock -fitb 24.9 / 10.37. Counted decode h(17)=0.414 (prior 0.48),
+   151 misses/token. Tokens: pool fetch = pool cpu_exec = pool with fusion off =
+   LEGACY with fusion off (08b9d088f20a); legacy fused = stock (bda02a0d435a) ->
+   the pool/legacy divergence is the classified placement-fusion effect on the
+   legacy side (item 11), not a pool defect; the dual chain stays exact on DSv4.
+   Also landed: build_moe_ffn gates pool participation on the down tensor
+   (GroveMoE chunk experts on a pooled layer stream normally) and the upstream
+   CPU-kernel cherry-picks #22181 #22331 #25048 #27024 (test-backend-ops
+   MUL_MAT_ID 885/885, MUL_MAT 1193/1193 CUDA-vs-CPU; q35 CPU-route gates still
+   ecb043a95a14). REMAINING: (7) concurrent CPU chain (the max() handshake; bounded
+   by the 0.2 ms/layer handoff, so <=10% on hybrid at tight budgets), (8) hybrid
+   bench entry 11.B.10, QA grid -s5 cells (grid HELD), #24528 admission gate on
+   the fetch policy, fetch_on_2nd_miss pricing, per-slot generation stamps (#25294).
    Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
