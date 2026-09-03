@@ -256,7 +256,28 @@ and corrupt concurrent measurements).
    pending); decode 40 vs auto-legacy 51.5 @8000/2k needs h(s) counters + pricing;
    counters exist but are not yet printed/ledgered; miss policies beyond fetch and
    auto-ladder entry not implemented; graph reuse across pooled-layer changes
-   guarded only by the expert_pool pointer compare. Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
+   guarded only by the expert_pool pointer compare.
+   SPLIT-OP LANDED 2026-09-03 (e45601565): miss policies cpu_exec / hybrid /
+   fetch_on_2nd_miss execute via two expert-FFN chains per pooled layer (GPU over
+   pool slots, CPU over the host homes in place, -1 for the other side's routes,
+   one ADD at the down output). GATE: all three are TOKEN-IDENTICAL to fetch/legacy/
+   stock (md5 ecb043a95a14) on the 512-token workload - the two-partial sum is exact
+   since every route lives in exactly one chain, so the design's PPL-parity gate is
+   met with room to spare (PPL c2048/8: fetch = cpu_exec = hybrid = 1.2619, stock
+   1.2640 - the 0.17% is placement fusion, inside the 0.5% mirror gate). Decode
+   t/s at 17 slots/layer: fetch 40.0 > hybrid 33.5 ~ fetch_on_2nd_miss 33.0 >
+   cpu_exec 27.3 - fetch wins at ample slots as priced; CPU routes pay the CPU FFN
+   + the GPU->CPU->GPU handoff barrier (today's sched runs the chains serially, the
+   max() handshake of 6b/6e is not implemented). Prompt ~505 t/s under dual chains
+   (allow_skip disables GLU fusion + memsets on A/B tiers) vs 564 fetch-only.
+   PSHARD_MISS_POLICY selects the policy (fingerprinted when set). Bugs found by the
+   gate run and fixed in the same commit: same-pass hits must be LRU-stamped before
+   the fetch loop (latent in fetch mode too); an ids leaf nothing consumes is never
+   allocated (q35 has no expert biases). OPEN: the tight-budget flip (planner
+   choosing cpu_exec/hybrid below the fetch floors) is still manual via env; the
+   predictor prices no miss policy yet; hybrid_frac comes from slice_bw/DRAM, the
+   paired bench entry (11.B.10) is not built; per-layer h counters are collected but
+   not printed/ledgered. Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
    budget before the margin fix); ~~joint target+draft planning (cordis v2)
