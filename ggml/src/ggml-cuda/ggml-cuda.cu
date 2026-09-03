@@ -1688,7 +1688,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate_scale = nullptr) {
     // ids with -1 entries (skipped routes): the fused kernels' shared skip guard
     // covers the mm result, but bias/scale/GLU fusion assumes every route is live
-    if (ffn_up->op == GGML_OP_MUL_MAT_ID && ffn_up->op_params[0] != 0) {
+    if (ffn_up->op == GGML_OP_MUL_MAT_ID && ffn_up->op_params[1] != 0) {
         return false;
     }
 
@@ -1969,7 +1969,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // ids with -1 entries (skipped routes, split hit/miss expert execution): the
     // compact-map paths (mmq/mmf) and the sorted fallback never write skipped dst
     // rows, so those rows must be zeroed explicitly
-    const bool ids_allow_skip = dst->op_params[0] != 0;
+    const bool ids_allow_skip = dst->op_params[1] != 0; // op_params[0] is the precision field
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {

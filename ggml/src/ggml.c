@@ -3354,11 +3354,12 @@ struct ggml_tensor * ggml_mul_mat_id(
 
 void ggml_mul_mat_id_set_allow_skip(struct ggml_tensor * mmid, bool allow) {
     GGML_ASSERT(mmid->op == GGML_OP_MUL_MAT_ID);
-    ggml_set_op_params_i32(mmid, 0, allow ? 1 : 0);
+    // op_params[0] is the precision field (ggml_mul_mat_set_prec)
+    ggml_set_op_params_i32(mmid, 1, allow ? 1 : 0);
 }
 
 bool ggml_mul_mat_id_get_allow_skip(const struct ggml_tensor * mmid) {
-    return mmid->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(mmid, 0) != 0;
+    return mmid->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(mmid, 1) != 0;
 }
 
 // ggml_out_prod

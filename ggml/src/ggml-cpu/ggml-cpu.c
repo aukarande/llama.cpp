@@ -1631,7 +1631,7 @@ static void ggml_compute_forward_mul_mat_id(
                 if (i02 < 0) {
                     // -1 route (allow_skip): no expert computes it - the consumer sums
                     // per-route outputs, so the dst row must be zeros
-                    assert(dst->op_params[0] != 0);
+                    assert(dst->op_params[1] != 0); /* allow_skip; op_params[0] is precision */
                     memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
                     continue;
                 }

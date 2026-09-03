@@ -1806,6 +1806,10 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     plan.pool_k        = 0;
     plan.pool_prefill  = LLAMA_PSHARD_PREFILL_AB_STREAM;
     const int mp_env   = pshard_miss_policy_from_env();
+    if (mp_env < 0 && getenv("PSHARD_MISS_POLICY")) {
+        LLAMA_LOG_WARN("%s: invalid PSHARD_MISS_POLICY='%s', using fetch\n",
+            __func__, getenv("PSHARD_MISS_POLICY"));
+    }
     plan.pool_miss     = mp_env >= 0 ? mp_env : LLAMA_PSHARD_MISS_FETCH;
 
     if (!ctx.is_moe || ctx.n_expert == 0 || ctx.n_expert_used == 0 ||
@@ -1954,12 +1958,15 @@ static llama_pshard_plan llama_pshard_search_tier(
     }
 
     if (!best.is_viable && force_strategy >= 0 && force_strategy != LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS) {
-        // before abandoning the forced strategy, try it without the overlap machinery
+        // before abandoning the forced strategy, try it without the overlap machinery.
+        // The pool corner has no overlap variant and MUST NOT be re-searched through
+        // llama_pshard_search_strategy (its n_pinned dimension is meaningless for POOL
+        // and would return floor-unchecked "viable" plans) - straight to the fallback.
         llama_pshard_plan forced_noovl;
         if (force_strategy == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
             forced_noovl = llama_pshard_search_attn_pin(ctx, (llama_pshard_strategy)force_strategy,
                     prune.attn_hint(cparams->n_batch), UINT32_MAX, 0, /*overlap=*/false);
-        } else {
+        } else if (force_strategy != LLAMA_PSHARD_EXPERT_POOL) {
             forced_noovl = llama_pshard_search_strategy(ctx, (llama_pshard_strategy)force_strategy,
                     UINT32_MAX, 0, /*overlap=*/false);
         }

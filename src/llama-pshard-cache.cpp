@@ -502,6 +502,20 @@ void llama_params_fit_pshard(
             __func__, registry->tier_sizes.size(), registry->budget_mib, registry->cache_ubatch);
     }
 
+    // EXPERT_POOL plans cannot execute yet (the pool runtime lands in a later
+    // stage): bail BEFORE any cparams mutation so the stock fallback keeps the
+    // user's batch geometry
+    for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
+        const llama_pshard_plan * p = registry->get_best(t);
+        if (p && p->is_viable && p->strategy == LLAMA_PSHARD_EXPERT_POOL) {
+            LLAMA_LOG_WARN("%s: EXPERT_POOL plan in the registry but the pool runtime "
+                "is not implemented yet - disabling pshard\n", __func__);
+            mparams->pshard = false;
+            cparams->pshard = false;
+            return;
+        }
+    }
+
     // cached baseline fit for this budget
     // use the normal load path
     if (registry->pshard_disabled) {
@@ -537,16 +551,6 @@ void llama_params_fit_pshard(
         mparams->pshard = false;
         cparams->pshard = false;
         return;
-    }
-    for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
-        const llama_pshard_plan * p = registry->get_best(t);
-        if (p && p->is_viable && p->strategy == LLAMA_PSHARD_EXPERT_POOL) {
-            LLAMA_LOG_WARN("%s: EXPERT_POOL plan in the registry but the pool runtime "
-                "is not implemented yet - disabling pshard\n", __func__);
-            mparams->pshard = false;
-            cparams->pshard = false;
-            return;
-        }
     }
     if (default_tier < registry->tier_sizes.size() - 1) {
         LLAMA_LOG_INFO("%s: highest tier (bs=%u) not viable, falling back to bs=%u\n",
