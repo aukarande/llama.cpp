@@ -313,6 +313,42 @@ and corrupt concurrent measurements).
    floors; concurrent CPU chain (the max() handshake); hybrid bench entry,
    GROVEMOE chexps, MMQ ne0%512 padding, QA grid -s5; upstream cherry-picks
    #22181 #22331 #25048 #27024 and the #24528 admission gate (see the PR triage).
+   ITEM 6 LANDED 2026-09-03 (planner picks the miss policy + runtime region honesty):
+   cache tiers price fetch / hybrid / cpu_exec and keep the best admissible one
+   (fetch needs the distinct-experts floor; CPU-route policies spill overflow to the
+   CPU chain and need one slot per layer), PSHARD_MISS_POLICY still forces.
+   Recalibrated rates: cpu_exec never admits (h=0, s-independent: 27.0 t/s at s=75,
+   26.7 at s=7 = 8*t_cpu + t_split = 0.56 ms/layer) and hybrid s=75 (0.36 ms/layer)
+   solve to t_cpu = 0.044 ms/expert (~46 GB/s: the CPU chain IS DRAM-bound as the
+   design assumed) and t_split = 0.20 ms/layer (the handoff dominates: 8 ms/token);
+   hybrid_frac back to B_P/B_H. Runtime fixes found by the @2700 run: (a) the warmup
+   packing check charged the pool region against LEGACY tiers of a mixed registry
+   (STATIC fallback tiers "overshoot by 784 MiB" -> unviable -> the 512-token prompt
+   ran through the 7-slot decode plan at 187 t/s) - the pool is per tier, no charge
+   there; (b) cache tiers no longer reserve the 2-layer A/B pair (996 MiB at q35:
+   turned into slots; set_region builds A/B views only when the pair fits, set_ab_mode
+   refuses otherwise); (c) the registry carries no per-tier scratch, so the first
+   reserve of a pool tier measures the graph over a provisional region, re-carves
+   the pool to window - scratch - 32 MiB and reserves again (bs=1 graph: 4 MiB;
+   bs=512: 94 MiB - the pool graph has none of the streamed-expert dups); (d) a
+   switch between two pool tiers of different geometry left the sched's input-copy
+   overrides on freed view tensors (masked so far because every q35 switch flipped
+   A/B mode, which re-registers) - resize re-registers; (e) the runtime fills the
+   window instead of stopping at the plan's slot count, and the planner returns
+   the probe's transient expert dups (1 layer at bs=1, 2 on whole-stack tiers) to
+   its pool estimate so plan and runtime agree (81 vs 86 @8000, 13 vs 14 @2700;
+   the residual is UD dynamic quants: per-slot cost is the SUM over layers of each
+   layer's expert rows, 1.82 MiB, not 40 x the largest layer's 1.95 - fixed in the
+   same commit; A/B floor keeps the largest layer). Counters: single-token passes
+   reported separately when a multi-token ubatch went through a cache tier.
+   Measured (512+32 greedy, all md5 ecb043a95a14): @2700 forced-5 fetch s=14 37.4
+   t/s decode / 653 prompt (STATIC tiers) vs hybrid s=7 30.1 before the fixes vs
+   legacy auto 40.1 / 602; @8000 fetch s=86 44.7, cpu_exec 26.7. Counted h: s=7
+   0.344, s=14 0.475, s=75/86 0.70 -> Zipf alpha 0.9 x LRU shortfall (1 - 0.3 s/E)
+   gives 0.35 / 0.45 / 0.70 (alpha alone overshoots at large s: 0.78); the
+   planner ranks legacy > pool at both budgets, matching the measurements. Still
+   open: hybrid at small s measures ~20% better than the serial-sum model (decode-
+   only h under admission is not modelled), fetch_on_2nd_miss price is a placeholder.
    Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
