@@ -63,6 +63,7 @@ void llama_pshard_generate_overrides(
     thread_local std::array<std::string, 1000> patterns_layer_router;
     thread_local std::array<std::string, 1000> patterns_layer_attn;
     thread_local std::array<std::string, 1000> patterns_layer_ffn;
+    thread_local std::array<std::string, 1000> patterns_layer_moe_exps;
     thread_local std::string pat_output = "^output";
 
     const uint32_t il_pin_start = pin_from_back ? (n_layers - n_pinned) : 0;
@@ -90,6 +91,17 @@ void llama_pshard_generate_overrides(
         if (patterns_layer[il].empty())      { patterns_layer[il]      = "blk\\." + std::to_string(il) + "\\..*"; }
         if (patterns_layer_attn[il].empty()) { patterns_layer_attn[il] = "blk\\." + std::to_string(il) + "\\.attn_(q|k|v|output|q_norm|k_norm).*"; }
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
+
+        if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
+            // fetch corner: routed experts live in host RAM (the pool's home);
+            // everything else pins - see the planner copy for the rationale
+            if (patterns_layer_moe_exps[il].empty()) {
+                patterns_layer_moe_exps[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate|gate_up)_exps\\..*";
+            }
+            emit(patterns_layer_moe_exps[il].c_str(), host_buft, layout.cpu);
+            emit(patterns_layer[il].c_str(), host_buft, layout.compute);
+            continue;
+        }
 
         if (il == il_boundary) {
             const char * overflow_pat = llama_get_overflow_pattern(il, overflow_type);
@@ -525,6 +537,16 @@ void llama_params_fit_pshard(
         mparams->pshard = false;
         cparams->pshard = false;
         return;
+    }
+    for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
+        const llama_pshard_plan * p = registry->get_best(t);
+        if (p && p->is_viable && p->strategy == LLAMA_PSHARD_EXPERT_POOL) {
+            LLAMA_LOG_WARN("%s: EXPERT_POOL plan in the registry but the pool runtime "
+                "is not implemented yet - disabling pshard\n", __func__);
+            mparams->pshard = false;
+            cparams->pshard = false;
+            return;
+        }
     }
     if (default_tier < registry->tier_sizes.size() - 1) {
         LLAMA_LOG_INFO("%s: highest tier (bs=%u) not viable, falling back to bs=%u\n",

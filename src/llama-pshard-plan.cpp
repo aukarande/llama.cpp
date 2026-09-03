@@ -59,6 +59,7 @@ static void llama_pshard_generate_overrides(
     thread_local std::array<std::string, 1000> patterns_layer;
     thread_local std::array<std::string, 1000> patterns_layer_attn;
     thread_local std::array<std::string, 1000> patterns_layer_ffn;
+    thread_local std::array<std::string, 1000> patterns_layer_moe_exps;
     thread_local std::array<std::string, 1000> patterns_layer_router;
     thread_local std::string pat_output = "^output";
 
@@ -91,6 +92,19 @@ static void llama_pshard_generate_overrides(
         if (patterns_layer_attn[il].empty()) { patterns_layer_attn[il] = "blk\\." + std::to_string(il) + "\\.attn_(q|k|v|output|q_norm|k_norm).*"; }
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
         if (patterns_layer_router[il].empty()) { patterns_layer_router[il] = "blk\\." + std::to_string(il) + "\\.(ffn_gate_inp|ffn_exp_probs_b).*"; }
+
+        if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
+            // fetch corner: routed experts live in host RAM (the pool's home -
+            // never arena-packed as bid-0 weights, never shard-slot-streamed);
+            // everything else pins, which also covers the routers (ids_cross is
+            // structural for the pool) and the MTP head
+            if (patterns_layer_moe_exps[il].empty()) {
+                patterns_layer_moe_exps[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate|gate_up)_exps\\..*";
+            }
+            emit(patterns_layer_moe_exps[il].c_str(), host_buft, layout.cpu);
+            emit(patterns_layer[il].c_str(), gpu_buft, layout.compute);
+            continue;
+        }
 
         if (il == il_boundary) {
             const char * overflow_pat = llama_get_overflow_pattern(il, overflow_type);
@@ -1762,6 +1776,95 @@ static llama_pshard_plan llama_pshard_attn_pin_fallback(
     return fallback;
 }
 
+// EXPERT_POOL fetch corner (docs/expert-pool-design.md 3b.5): all attention
+// pinned, K = 0, miss_policy = fetch, prefill_mode = ab_stream. The placement
+// is closed-form - fixed weights + every layer's attention/router pinned - so
+// viability is ONE memory probe plus the tier's pool floor on the remainder:
+//   whole-stack tiers (bs*top_k*2 >= E): the prefill A/B pair, 2 expert-layers
+//   cache tiers: min(E, top_k*bs) slots/layer (one MUL_MAT_ID, no -1 skip, a
+//   token's experts must all be resident at once)
+// Expert bytes come from the same file-size heuristic as ids-cross (0.85 of
+// the total file over the layers). tps stays 0 until the pool predictor terms
+// land, so this is reached only under forced PSHARD_STRATEGY=5.
+static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx & ctx) {
+    const auto * mparams    = ctx.mparams;
+    const auto * cparams    = ctx.cparams;
+    auto * tensor_buft_overrides = ctx.overrides;
+    const auto   n_layers   = ctx.n_layers;
+    const auto   vram_free  = ctx.vram_free;
+    const auto   gpu_buft   = ctx.gpu_buft;
+    const auto   host_buft  = ctx.host_buft;
+    const auto & layout     = ctx.layout;
+
+    llama_pshard_plan plan;
+    plan.strategy      = LLAMA_PSHARD_EXPERT_POOL;
+    plan.batch_size    = cparams->n_batch;
+    plan.overlap       = true;
+    plan.ids_cross     = true;   // structural: remap + fetch-on-miss need ids at copy time
+    plan.n_pinned      = 0;
+    plan.n_attn_pinned = n_layers;
+    plan.pool_k        = 0;
+    plan.pool_prefill  = LLAMA_PSHARD_PREFILL_AB_STREAM;
+    const int mp_env   = pshard_miss_policy_from_env();
+    plan.pool_miss     = mp_env >= 0 ? mp_env : LLAMA_PSHARD_MISS_FETCH;
+
+    if (!ctx.is_moe || ctx.n_expert == 0 || ctx.n_expert_used == 0 ||
+            ctx.model_size <= 0 || n_layers == 0) {
+        return plan; // dense models: the pool is not a candidate
+    }
+
+    llama_pshard_generate_overrides(0, n_layers, gpu_buft, host_buft,
+        tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, LLAMA_PSHARD_EXPERT_POOL,
+        layout, false, /*output_on_gpu=*/false, n_layers, /*overlap=*/true, /*ids_cross=*/true);
+
+    llama_model_params mp = *mparams;
+    mp.pshard = true;
+    mp.pshard_delegate_compute = false;
+    mp.n_gpu_layers = n_layers + 1;
+    mp.tensor_buft_overrides = tensor_buft_overrides;
+
+    int64_t gpu_used = -1;
+    try {
+        const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, true);
+        gpu_used = d[0].mb.total();
+        plan.scratch_measured = d[0].mb.compute;
+        plan.cache_measured   = d[0].mb.context;
+    } catch (...) {
+        LLAMA_LOG_WARN("%s: [EXPERT_POOL] corner probe failed\n", __func__);
+        return plan;
+    }
+
+    const int64_t pool_bytes = (int64_t) vram_free - gpu_used;
+    const double  b_layer_exps = 0.85 * (double) ctx.model_size / n_layers; // routed experts per layer
+    const double  b_expert     = b_layer_exps / ctx.n_expert;
+    const uint32_t bs = cparams->n_batch;
+    const bool ab_tier = (uint64_t) bs * ctx.n_expert_used * 2 >= ctx.n_expert; // whole-stack regime
+    const uint64_t floor_slots = std::min<uint64_t>(ctx.n_expert, (uint64_t) bs * ctx.n_expert_used);
+    const double floor_bytes = ab_tier
+        ? 2.0 * b_layer_exps
+        : (double) floor_slots * b_expert * n_layers;
+
+    plan.total_vram_req = (size_t) vram_free;  // the pool absorbs the remainder by design
+    plan.pool_slots = pool_bytes > 0 && b_expert > 0.0
+        ? (uint32_t) ((double) pool_bytes / (b_expert * n_layers)) : 0;
+    plan.is_viable = pool_bytes >= (int64_t) floor_bytes;
+
+    // keep the emitted placement on the plan (the registry round-trips it as ot=,
+    // and the loader treats a viable plan without overrides as corruption)
+    for (const auto * ov = tensor_buft_overrides; ov->pattern != nullptr; ov++) {
+        plan.overrides.push_back({ov->pattern, ov->buft, ov->backend_id});
+    }
+
+    LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u fixed+pins=%.1f MiB pool=%.1f MiB floor=%.1f MiB (%s) "
+        "-> s=%u slots/layer, miss_policy=%s %s\n",
+        __func__, bs, gpu_used / (1024.0 * 1024.0), pool_bytes / (1024.0 * 1024.0),
+        floor_bytes / (1024.0 * 1024.0), ab_tier ? "A/B pair" : "fetch floor",
+        plan.pool_slots, llama_pshard_miss_policy_name((llama_pshard_miss_policy) plan.pool_miss),
+        plan.is_viable ? "VIABLE" : "NOT VIABLE");
+
+    return plan;
+}
+
 static llama_pshard_plan llama_pshard_search_tier(
         const llama_pshard_search_ctx & ctx,
         int force_strategy,
@@ -1784,12 +1887,16 @@ static llama_pshard_plan llama_pshard_search_tier(
     for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
         if (force_strategy >= 0 && force_strategy != s) continue;
         if (prune.skip[s]) continue;
-        if (s == LLAMA_PSHARD_EXPERT_POOL) continue; // search lands with the pool module
+        if (s == LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_EXPERT_POOL) {
+            continue; // auto entry lands with the pool pricing
+        }
 
         llama_pshard_strategy strategy = (llama_pshard_strategy)s;
         llama_pshard_plan plan;
 
-        if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
+        if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
+            plan = llama_pshard_search_pool(ctx);
+        } else if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
             strategy == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
             plan = llama_pshard_search_attn_pin(ctx, strategy, prune.attn_hint(cparams->n_batch), prune.hi_pinned[s]);
         } else {
@@ -1798,7 +1905,9 @@ static llama_pshard_plan llama_pshard_search_tier(
 
         // a strategy priced out by the overlap machinery (double slots + prefetch keepalives)
         // may still fit without it: keep the placement, drop the transport luxury
-        if (!plan.is_viable && !llama_pshard_strategy_delegates_compute(strategy)) {
+        // (the pool corner has no overlap luxury to drop - its placement is closed-form)
+        if (!plan.is_viable && strategy != LLAMA_PSHARD_EXPERT_POOL &&
+                !llama_pshard_strategy_delegates_compute(strategy)) {
             llama_pshard_plan p2;
             if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
                 strategy == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
@@ -1835,7 +1944,9 @@ static llama_pshard_plan llama_pshard_search_tier(
             }
         }
 
-        prune.update(s, plan);
+        if (strategy != LLAMA_PSHARD_EXPERT_POOL) {
+            prune.update(s, plan); // pool floors are not monotone in batch size
+        }
 
         if (plan.is_viable && pshard_plan_is_better(plan, best)) {
             best = plan;
@@ -1881,7 +1992,9 @@ static void llama_pshard_strategy_sweep(
         size_t first_tier) {
 
     if (force_strategy >= 0 && force_strategy != strategy) return;
-    if (strategy == LLAMA_PSHARD_EXPERT_POOL) return; // search lands with the pool module
+    if (strategy == LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_EXPERT_POOL) {
+        return; // auto entry lands with the pool pricing
+    }
 
     llama_model_tensor_buft_override local_overrides[4096];
     llama_pshard_search_ctx ctx = ctx_template;
@@ -1916,7 +2029,10 @@ static void llama_pshard_strategy_sweep(
 
             const uint32_t lo_hint = ctx.has_rs ? 0 : prev_n_pinned;
 
-            if (strat == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
+            if (strat == LLAMA_PSHARD_EXPERT_POOL) {
+                plan = llama_pshard_search_pool(ctx);
+                plan.batch_size = cp_tier.n_batch;
+            } else if (strat == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
                 strat == LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE) {
                 plan = llama_pshard_search_attn_pin(ctx, strat, prune.attn_hint(cp_tier.n_batch), UINT32_MAX, lo_hint);
                 if (!plan.is_viable && !llama_pshard_strategy_delegates_compute(strat)) {
@@ -1936,7 +2052,12 @@ static void llama_pshard_strategy_sweep(
             }
         }
 
-        prune.update(strategy, plan);
+        // the pool corner's floors are not monotone in batch size (the fetch floor
+        // grows with bs, the A/B floor does not), so an unviable large tier must
+        // not prune the small ones
+        if (strategy != LLAMA_PSHARD_EXPERT_POOL) {
+            prune.update(strategy, plan);
+        }
 
         if (plan.is_viable && plan.n_pinned > prev_n_pinned) {
             prev_n_pinned = plan.n_pinned;
