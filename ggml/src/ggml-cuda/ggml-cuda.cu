@@ -84,6 +84,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -2464,12 +2465,150 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// ---- pageable host->device staging ring -------------------------------------------------------
+// cudaMemcpyAsync from PAGEABLE host memory is host-synchronous and, on file-backed mmap pages,
+// runs at ~4 GB/s (Windows, DeepSeek-V4's 45 GB shard that exceeded the page-lock ceiling; pinned
+// copies run ~40 GB/s on the same box). Stage such copies through a small pinned ring: worker
+// threads memcpy chunk k+1 into the ring while the GPU DMAs chunk k from it. The call stays
+// host-synchronous for the duration (exactly like the pageable copy it replaces) but at memcpy
+// speed (~30 GB/s with 8 threads) instead of the driver's pageable path.
+//   GGML_CUDA_STAGE_RING_MB   ring size in MiB (default 512 = 8 x 64 MiB chunks; 0 disables)
+//   GGML_CUDA_STAGE_THREADS   memcpy threads per chunk (default 8)
+// Pinned/registered/device sources, copies < 1 MiB, and copies issued during graph capture take
+// the direct path. One ring per PHYSICAL device: a CUDA event can only be recorded on a stream of
+// the device it was created on, so the slot events are created under that device (review finding
+// 2026-09-02); the pinned buffers are portable and the host memcpy bandwidth is shared regardless.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+struct ggml_cuda_stage_ring {
+    size_t chunk     = 64ull << 20;
+    int    n_chunks  = 0;
+    int    n_threads = 8;   // measured: 2 -> 115, 4 -> 157, 8 -> 211, 12 -> 206 t/s prompt on an all-pageable
+                            // q35 (16 logical cores); DeepSeek-V4 4 -> 60, 8 -> 75, 12 -> 78 t/s
+    bool   disabled  = false;
+    bool   init_done = false;
+    char * base      = nullptr;
+    int    next      = 0;
+    std::vector<cudaEvent_t> ev;
+    std::mutex mu;
+
+    bool init(int device) {
+        if (init_done) {
+            return !disabled;
+        }
+        init_done = true;
+        const int prev_device = ggml_cuda_get_device();
+        ggml_cuda_set_device(device);
+        const char * e = getenv("GGML_CUDA_STAGE_RING_MB");
+        const size_t mb = e ? (size_t) atoll(e) : 512;
+        if (mb == 0) {
+            disabled = true;
+            return false;
+        }
+        if (const char * t = getenv("GGML_CUDA_STAGE_THREADS"); t && atoi(t) > 0) {
+            n_threads = atoi(t);
+        }
+        n_chunks = std::max<int>(2, (int) ((mb << 20) / chunk));
+        cudaError_t err = cudaHostAlloc((void **) &base, (size_t) n_chunks * chunk, cudaHostAllocPortable);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            GGML_LOG_WARN("%s: staging ring: cudaHostAlloc(%zu MiB) failed (%s) - pageable copies stay on the driver path\n",
+                __func__, ((size_t) n_chunks * chunk) >> 20, cudaGetErrorString(err));
+            base = nullptr;
+            disabled = true;
+            ggml_cuda_set_device(prev_device);
+            return false;
+        }
+        ev.resize(n_chunks);
+        for (auto & x : ev) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&x, cudaEventDisableTiming));
+        }
+        ggml_cuda_set_device(prev_device);
+        GGML_LOG_INFO("%s: staging ring for pageable uploads (device %d): %d x %zu MiB pinned, %d memcpy threads\n",
+            __func__, device, n_chunks, chunk >> 20, n_threads);
+        return true;
+    }
+};
+
+// one ring per physical device (virtual devices sharing a GPU share its ring and primary context)
+static ggml_cuda_stage_ring & ggml_cuda_get_stage_ring(int device) {
+    static ggml_cuda_stage_ring rings[GGML_CUDA_MAX_DEVICES];
+    return rings[ggml_cuda_get_physical_device(device)];
+}
+
+static void ggml_cuda_parallel_memcpy(void * dst, const void * src, size_t n, int n_threads) {
+    if (n_threads <= 1 || n < (16ull << 20)) {
+        memcpy(dst, src, n);   // below ~16 MiB the thread creations cost more than they save
+        return;
+    }
+    const size_t part = (n + n_threads - 1) / n_threads;
+    std::vector<std::thread> th;
+    th.reserve(n_threads);
+    for (int i = 0; i < n_threads; i++) {
+        const size_t off = (size_t) i * part;
+        if (off >= n) {
+            break;
+        }
+        const size_t len = std::min(part, n - off);
+        th.emplace_back([dst, src, off, len] { memcpy((char *) dst + off, (const char *) src + off, len); });
+    }
+    for (auto & t : th) {
+        t.join();
+    }
+}
+
+// returns true when the copy was fully issued through the ring
+static bool ggml_cuda_staged_h2d(int device, void * dst, const void * src, size_t size, cudaStream_t stream) {
+    if (size < (1ull << 20)) {
+        return false;
+    }
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, src) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (attr.type != cudaMemoryTypeUnregistered) {
+        return false;   // pinned, registered or device memory: the direct async copy is already fast
+    }
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+        return false;
+    }
+    (void) cudaGetLastError();
+    ggml_cuda_stage_ring & ring = ggml_cuda_get_stage_ring(device);
+    std::lock_guard<std::mutex> lock(ring.mu);
+    if (!ring.init(device)) {
+        return false;
+    }
+    for (size_t off = 0; off < size; off += ring.chunk) {
+        const size_t n    = std::min(ring.chunk, size - off);
+        const int    slot = ring.next;
+        ring.next = (ring.next + 1) % ring.n_chunks;
+        CUDA_CHECK(cudaEventSynchronize(ring.ev[slot]));   // the previous DMA out of this slot is done
+        char * stage = ring.base + (size_t) slot * ring.chunk;
+        ggml_cuda_parallel_memcpy(stage, (const char *) src + off, n, ring.n_threads);
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst + off, stage, n, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaEventRecord(ring.ev[slot], stream));
+    }
+    return true;
+}
+#else
+// HIP/MUSA: the vendor shims lack the pointer-attribute / host-alloc / capture-status mappings the
+// ring needs; pageable copies take the driver path there
+static bool ggml_cuda_staged_h2d(int device, void * dst, const void * src, size_t size, cudaStream_t stream) {
+    GGML_UNUSED(device); GGML_UNUSED(dst); GGML_UNUSED(src); GGML_UNUSED(size); GGML_UNUSED(stream);
+    return false;
+}
+#endif // !GGML_USE_HIP && !GGML_USE_MUSA
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (ggml_cuda_staged_h2d(cuda_ctx->device, (char *) tensor->data + offset, data, size, cuda_ctx->stream())) {
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -4701,7 +4840,9 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    // unset or "0": do not page-lock (GGML_CUDA_REGISTER_HOST=0 is the pageable-copies lever)
+    // unset or "0": do not page-lock (GGML_CUDA_REGISTER_HOST=0 is the pageable-copies lever;
+    // note that pageable uploads >= 1 MiB then go through the staging ring - add
+    // GGML_CUDA_STAGE_RING_MB=0 to measure the driver's raw pageable path)
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr || getenv("GGML_CUDA_REGISTER_HOST")[0] == '0') {
         return false;
     }
