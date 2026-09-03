@@ -212,7 +212,48 @@ struct llama_pshard_search_ctx {
     uint32_t                                   n_expert      = 0;
     uint32_t                                   n_expert_used = 0;
     int64_t                                    model_size    = 0;
+
+    // routed-expert bytes read from the gguf tensor table (0 = unknown -> the
+    // file-size heuristic): the largest layer's full expert set, one expert's rows
+    // summed over its tensors (up/gate/down or gate_up/down), and how many layers
+    // carry routed experts (DSv4-class models have dense lead layers)
+    size_t                                     exps_layer_bytes = 0;
+    size_t                                     exps_row_bytes   = 0;
+    uint32_t                                   n_layers_moe     = 0;
 };
+
+// accumulate routed-expert tensor bytes per layer from a gguf tensor table
+// (blk.N.ffn_(up|down|gate|gate_up)_exps.weight); per_layer[il] gets the sum,
+// per_expert gets the max over layers of the summed per-expert row bytes
+static void pshard_scan_expert_bytes(const struct gguf_context * g, uint32_t n_expert,
+        std::vector<size_t> & per_layer, size_t & per_expert) {
+    const int64_t n = gguf_get_n_tensors(g);
+    std::vector<size_t> row_this(per_layer.size(), 0);
+    for (int64_t i = 0; i < n; i++) {
+        const char * name = gguf_get_tensor_name(g, i);
+        if (strncmp(name, "blk.", 4) != 0) {
+            continue;
+        }
+        char * end = nullptr;
+        const long il = strtol(name + 4, &end, 10);
+        if (end == name + 4 || *end != '.' || il < 0 || (size_t) il >= per_layer.size()) {
+            continue;
+        }
+        const char * rest = end + 1;
+        if (strcmp(rest, "ffn_up_exps.weight") != 0 && strcmp(rest, "ffn_gate_exps.weight") != 0 &&
+            strcmp(rest, "ffn_down_exps.weight") != 0 && strcmp(rest, "ffn_gate_up_exps.weight") != 0) {
+            continue;
+        }
+        const size_t bytes = gguf_get_tensor_size(g, i);
+        per_layer[il] += bytes;
+        if (n_expert > 0) {
+            row_this[il] += bytes / n_expert;
+        }
+    }
+    for (size_t r : row_this) {
+        per_expert = std::max(per_expert, r);
+    }
+}
 
 // decide whether ALTERNATE's streamed layers should pin their routers on the compute GPU
 // (ids-crossing): sliced-by-used-ids uploads beat full-upload prefetch iff the sliced copy
@@ -1842,14 +1883,19 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     }
 
     const int64_t pool_bytes = (int64_t) vram_free - gpu_used;
-    const double  b_layer_exps = 0.85 * (double) ctx.model_size / n_layers; // routed experts per layer
-    const double  b_expert     = b_layer_exps / ctx.n_expert;
+    // routed-expert geometry: the gguf tensor table when the scan found it (the
+    // runtime carve uses the same real nb[2] bytes, so plan and runtime agree),
+    // else the ids-cross file-size heuristic
+    const bool     real_bytes   = ctx.exps_layer_bytes > 0 && ctx.exps_row_bytes > 0 && ctx.n_layers_moe > 0;
+    const double   b_layer_exps = real_bytes ? (double) ctx.exps_layer_bytes : 0.85 * (double) ctx.model_size / n_layers;
+    const double   b_expert     = real_bytes ? (double) ctx.exps_row_bytes   : b_layer_exps / ctx.n_expert;
+    const uint32_t n_layers_exp = real_bytes ? ctx.n_layers_moe : n_layers;
     const uint32_t bs = cparams->n_batch;
     const bool ab_tier = (uint64_t) bs * ctx.n_expert_used * 2 >= ctx.n_expert; // whole-stack regime
     const uint64_t floor_slots = std::min<uint64_t>(ctx.n_expert, (uint64_t) bs * ctx.n_expert_used);
     const double floor_bytes = ab_tier
         ? 2.0 * b_layer_exps
-        : (double) floor_slots * b_expert * n_layers;
+        : (double) floor_slots * b_expert * n_layers_exp;
 
     // hybrid q* share = gathered-fetch rate over host DRAM rate (design 4b);
     // the paired bench entry (11.B.10) refines this
@@ -1861,7 +1907,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
 
     plan.total_vram_req = (size_t) vram_free;  // the pool absorbs the remainder by design
     plan.pool_slots = pool_bytes > 0 && b_expert > 0.0
-        ? (uint32_t) ((double) pool_bytes / (b_expert * n_layers)) : 0;
+        ? (uint32_t) ((double) pool_bytes / (b_expert * n_layers_exp)) : 0;
     plan.is_viable = pool_bytes >= (int64_t) floor_bytes;
 
     // keep the emitted placement on the plan (the registry round-trips it as ot=,
@@ -1870,10 +1916,10 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         plan.overrides.push_back({ov->pattern, ov->buft, ov->backend_id});
     }
 
-    LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u fixed+pins=%.1f MiB pool=%.1f MiB floor=%.1f MiB (%s) "
+    LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u fixed+pins=%.1f MiB pool=%.1f MiB floor=%.1f MiB (%s, %s bytes) "
         "-> s=%u slots/layer, miss_policy=%s %s\n",
         __func__, bs, gpu_used / (1024.0 * 1024.0), pool_bytes / (1024.0 * 1024.0),
-        floor_bytes / (1024.0 * 1024.0), ab_tier ? "A/B pair" : "fetch floor",
+        floor_bytes / (1024.0 * 1024.0), ab_tier ? "A/B pair" : "fetch floor", real_bytes ? "real" : "heuristic",
         plan.pool_slots, llama_pshard_miss_policy_name((llama_pshard_miss_policy) plan.pool_miss),
         plan.is_viable ? "VIABLE" : "NOT VIABLE");
 
@@ -2301,6 +2347,8 @@ void llama_params_fit_pshard_plan(
     // runtime computes it the same way, and changing it would strand every
     // cached registry into silent stock fallback.
     int64_t total_file_size = model_file_size;
+    std::vector<size_t> exps_per_layer(n_layers, 0);
+    size_t exps_per_expert = 0;
     {
         std::vector<int64_t> map_sizes;
         map_sizes.push_back(model_file_size);
@@ -2311,6 +2359,7 @@ void llama_params_fit_pshard_plan(
             if (ks >= 0 && gguf_get_kv_type(g, ks) == GGUF_TYPE_UINT16) {
                 n_split = (int) gguf_get_val_u16(g, ks);
             }
+            pshard_scan_expert_bytes(g, hp_nex, exps_per_layer, exps_per_expert);
             gguf_free(g);
             if (n_split > 1) {
                 char prefix[1024];
@@ -2327,6 +2376,10 @@ void llama_params_fit_pshard_plan(
                             map_sizes.push_back(ftello(sf));
 #endif
                             fclose(sf);
+                            if (struct gguf_context * gs = gguf_init_from_file(split_path, gip_s)) {
+                                pshard_scan_expert_bytes(gs, hp_nex, exps_per_layer, exps_per_expert);
+                                gguf_free(gs);
+                            }
                         } else {
                             LLAMA_LOG_WARN("%s: split %d/%d not readable at %s - "
                                 "file-size heuristics fall back to the main split only\n",
@@ -2377,6 +2430,17 @@ void llama_params_fit_pshard_plan(
     // MoE geometry + model size for the per-tier ids-cross decision
     ctx.model_size = total_file_size;
     ctx.n_expert   = hp_nex;
+    for (size_t b : exps_per_layer) {
+        if (b > 0) {
+            ctx.n_layers_moe++;
+            ctx.exps_layer_bytes = std::max(ctx.exps_layer_bytes, b);
+        }
+    }
+    ctx.exps_row_bytes = exps_per_expert;
+    if (ctx.n_layers_moe > 0) {
+        LLAMA_LOG_INFO("%s: routed experts: %u layers, %.1f MiB per layer, %.2f MiB per expert (gguf tensor table)\n",
+            __func__, ctx.n_layers_moe, ctx.exps_layer_bytes / (1024.0 * 1024.0), ctx.exps_row_bytes / (1024.0 * 1024.0));
+    }
     if (hp_nex > 0) {
         struct gguf_init_params gip = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };
         if (struct gguf_context * g = gguf_init_from_file(path_model, gip)) {

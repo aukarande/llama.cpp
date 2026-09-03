@@ -334,11 +334,22 @@ struct llama_pshard_plan_registry {
     // up to a few tens of MiB), capped at the budget. Whatever the budget has beyond that is
     // LEFTOVER: real device memory nobody uses, which the one-budget rule hands to a spilled
     // speculative draft's experts (common_init_from_params) instead of idling inside the arena.
+    // any viable tier pools experts: the pool region is the budget remainder by
+    // design, so the arena must be the whole budget, not union + headroom
+    bool has_pool() const {
+        for (const auto & p : best_plans) {
+            if (p.is_viable && p.strategy == LLAMA_PSHARD_EXPERT_POOL) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     size_t arena_bytes(size_t budget_bytes) const {
         const size_t mib      = 1024ULL * 1024;
         const size_t headroom = 64 * mib;
-        if (union_bytes == 0) {
-            return budget_bytes;
+        if (union_bytes == 0 || has_pool()) {
+            return (budget_bytes / mib) * mib; // whole MiB, see below
         }
         // whole MiB: the buffer size positions the pinned cache region (buf_total - cache),
         // so a fractional size would misalign every cache tensor (CUDA misaligned address)
