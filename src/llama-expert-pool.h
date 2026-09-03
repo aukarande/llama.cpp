@@ -51,6 +51,9 @@ struct llama_expert_pool {
         uint64_t misses   = 0;
         uint64_t ab_pass  = 0;              // last pass this layer's A/B half was filled
         uint64_t serve_gen = 0;             // last generation serve() ran the full work
+        std::vector<int32_t> mapped_buf;    // remapped-ids upload buffer: MUST outlive the
+                                            // async copy (the staging worker may queue the
+                                            // host pointer behind pending staged fetches)
 
         // per-graph-build registration (rebound every build by build_moe_ffn)
         ggml_tensor * ids_router = nullptr; // selected_experts (device, original ids)
@@ -61,6 +64,9 @@ struct llama_expert_pool {
     uint32_t n_expert_used = 0;
     uint32_t n_slots       = 0;        // cache-mode slots per layer (v1 uniform)
     bool     ab_mode       = false;    // active tier is a whole-stack prefill tier
+    bool     active        = false;    // the ACTIVE plan is EXPERT_POOL (legacy tiers
+                                       // in a mixed registry must stream normally)
+    uint64_t epoch         = 0;        // bumped on active/ab flips; joins graph reuse
     uint64_t generation    = 0;        // bumped once per decode call; dedupes serve()
 
     void *   region_base   = nullptr;
@@ -93,6 +99,10 @@ struct llama_expert_pool {
     // mode round-trip only in the preserved span (v1: dropped - lazy refill)
     void set_ab_mode(bool ab, ggml_backend_sched_t sched);
 
+    // the ACTIVE plan pools experts; when false the overrides are cleared and
+    // pooled layers build/stream like any legacy plan
+    void set_active(bool on, ggml_backend_sched_t sched);
+
     // graph-build registration (called from build_moe_ffn via the graph channel)
     void bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu);
     ggml_tensor * mm_view(int32_t il, const ggml_tensor * host) const;
@@ -109,4 +119,9 @@ struct llama_expert_pool {
 
     void reset_slots();
     void log_counters() const;
+
+    // scratch for the device->host ids read (persistent: async-safe lifetime)
+    std::vector<char> ids_read_buf;
+    // pass-local distinct-expert marker (union guard)
+    std::vector<uint8_t> seen_gen;
 };

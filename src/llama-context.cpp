@@ -2629,6 +2629,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.expert_pool =*/ expert_pool.get(),
+        /*.expert_pool_epoch =*/ expert_pool ? expert_pool->epoch : 0,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

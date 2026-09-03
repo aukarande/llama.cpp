@@ -50,6 +50,21 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
         }
     }
 
+    // quantized-padding contract: the sliced/prefetch upload paths reserve and
+    // zero MMQ row padding for tensors whose ne0 is not a multiple of 512; the
+    // pool's slot views do not (yet) - refuse such models instead of computing
+    // with garbage tail scales
+    for (const auto & L : layers) {
+        for (const auto & e : L.tensors) {
+            if (ggml_is_quantized(e.host->type) && e.host->ne[0] % 512 != 0) {
+                LLAMA_LOG_WARN("%s: expert pool: %s has ne0=%lld %% 512 != 0 (MMQ padding "
+                    "contract unhandled) - pool disabled for this model\n",
+                    __func__, e.host->name, (long long) e.host->ne[0]);
+                return false;
+            }
+        }
+    }
+
     LLAMA_LOG_INFO("%s: expert pool: %zu pooled layers, %u experts (%u used), max layer %.1f MiB\n",
         __func__, n_pooled, n_expert, n_expert_used, layer_full_bytes / (1024.0 * 1024.0));
     return n_pooled > 0;
@@ -145,6 +160,10 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
 
 void llama_expert_pool::register_sched(ggml_backend_sched_t sched) {
     ggml_backend_sched_clear_input_copy_overrides(sched);
+    if (!active) {
+        // legacy tier active: pooled layers stream through the standard paths
+        return;
+    }
     for (auto & L : layers) {
         for (auto & e : L.tensors) {
             ggml_tensor * view = ab_mode ? e.view_ab : e.view_slots;
@@ -157,11 +176,24 @@ void llama_expert_pool::register_sched(ggml_backend_sched_t sched) {
     ggml_backend_sched_set_pool_input_cb(sched, sched_input_cb, this);
 }
 
+void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
+    if (on == active) {
+        return;
+    }
+    active = on;
+    epoch++;   // pooled-layer graph topology changes with this flag
+    reset_slots();
+    if (sched != nullptr) {
+        register_sched(sched);
+    }
+}
+
 void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
     if (ab == ab_mode) {
         return;
     }
     ab_mode = ab;
+    epoch++;   // stale view bindings must not survive a graph-reuse pass
     // v1 relabel: cache contents do not survive the A/B overlay (the halves alias
     // the slot arrays); drop the maps and refill lazily
     reset_slots();
@@ -230,11 +262,15 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
     const ggml_tensor * ids = L.ids_router;
     const int64_t n_ids_0 = ids->ne[0]; // n_expert_used
     const int64_t n_ids_1 = ids->ne[1]; // n_tokens
-    std::vector<char> idbuf(ggml_nbytes(ids));
+    ids_read_buf.resize(ggml_nbytes(ids));
+    std::vector<char> & idbuf = ids_read_buf;
     ggml_backend_tensor_get_async(backend_router, const_cast<ggml_tensor *>(ids), idbuf.data(), 0, idbuf.size());
     ggml_backend_synchronize(backend_router);
 
-    std::vector<int32_t> mapped((size_t) n_ids_0 * n_ids_1);
+    // per-layer persistent upload buffer: the async staging worker may queue this
+    // host pointer behind pending staged fetches and read it after serve() returns
+    L.mapped_buf.assign((size_t) n_ids_0 * n_ids_1, 0);
+    std::vector<int32_t> & mapped = L.mapped_buf;
 
     if (ab_mode) {
         // whole-stack tier: fill this layer's half once per pass, identity ids
@@ -252,11 +288,32 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             }
         }
     } else {
+        // one MUL_MAT_ID consumes every token's routes at once: the pass's distinct
+        // experts must ALL be resident, or same-pass LRU eviction would silently
+        // compute with the wrong experts. The planner floors guarantee this per
+        // tier, but the runtime clamp can undercut them - fail loudly instead.
+        seen_gen.assign(n_expert, 0);
+        uint32_t distinct = 0;
         for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
             for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
                 const int32_t e = *(const int32_t *)
                     (idbuf.data() + i1*ids->nb[1] + i0*ids->nb[0]);
                 GGML_ASSERT(e >= 0 && e < (int32_t) n_expert);
+                if (seen_gen[e] == 0) {
+                    seen_gen[e] = 1;
+                    distinct++;
+                }
+            }
+        }
+        if (distinct > n_slots) {
+            LLAMA_LOG_ERROR("%s: pool layer %d: %u distinct experts this pass > %u slots - "
+                "the runtime clamp undercut the plan floor\n", __func__, L.il, distinct, n_slots);
+            return false;
+        }
+        for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
+            for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
+                const int32_t e = *(const int32_t *)
+                    (idbuf.data() + i1*ids->nb[1] + i0*ids->nb[0]);
                 int32_t slot = L.expert_slot[e];
                 if (slot < 0) {
                     // LRU victim; the floor (n_slots >= min(E, top_k*bs)) keeps this

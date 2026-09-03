@@ -293,6 +293,27 @@ void llama_context::pshard_setup_expert_pool() {
         return;
     }
 
+    // the clamp must not undercut any cache-mode POOL tier's fetch floor (one
+    // MUL_MAT_ID needs the whole pass's distinct experts resident at once)
+    uint32_t floor_slots = 0;
+    for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
+        const llama_pshard_plan * p = registry->get_best(t);
+        if (p == nullptr || !p->is_viable || p->strategy != LLAMA_PSHARD_EXPERT_POOL) {
+            continue;
+        }
+        const uint64_t bs = registry->tier_sizes[t];
+        if (bs * model.hparams.n_expert_used * 2 >= model.hparams.n_expert) {
+            continue; // whole-stack tier: A/B mode, no slot floor
+        }
+        const uint32_t f = (uint32_t) std::min<uint64_t>(model.hparams.n_expert, bs * model.hparams.n_expert_used);
+        floor_slots = std::max(floor_slots, f);
+    }
+    if (slots < floor_slots) {
+        LLAMA_LOG_WARN("%s: expert pool clamped to %u slots/layer below the cache-tier floor %u - pool disabled\n",
+            __func__, slots, floor_slots);
+        return;
+    }
+
     char * base = (char *) ggml_backend_buffer_get_base(buf) + buf_total - cache - want;
     base = (char *) ((uintptr_t) base & ~(uintptr_t) 255);
     want = (size_t) ((char *) ggml_backend_buffer_get_base(buf) + buf_total - cache - base);
@@ -309,6 +330,8 @@ void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
     if (!expert_pool) {
         return;
     }
+    // legacy tiers in a mixed registry stream normally: the pool disengages
+    expert_pool->set_active(plan.strategy == LLAMA_PSHARD_EXPERT_POOL, sched.get());
     const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
     expert_pool->set_ab_mode(ab, sched.get());
 }
@@ -383,6 +406,9 @@ void llama_context::pshard_setup_sched() {
 }
 
 void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload, bool force_upload) {
+    // pool engage/mode must track EVERY applied plan (warmup reserves each tier
+    // before the initial plan lands; mixed registries flip per tier)
+    pshard_update_pool_mode(plan);
     // per-tier transport mode: governs split_graph keepalives and the runtime prefetch scan
     ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
     ggml_backend_t gpu = backends[pshard_layout.compute].get();

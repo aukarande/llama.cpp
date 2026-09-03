@@ -2121,7 +2121,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // through the input-copy override). Everything else - the probs get_rows,
     // the w_s scales, add_id biases, LoRA - keeps the original router ids.
     ggml_tensor * pool_mm_ids = nullptr;
-    if (expert_pool != nullptr && expert_pool->layer_pooled(il)) {
+    if (expert_pool != nullptr && expert_pool->active && expert_pool->layer_pooled(il)) {
         pool_mm_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32,
             selected_experts->ne[0], selected_experts->ne[1]);
         ggml_set_input(pool_mm_ids);

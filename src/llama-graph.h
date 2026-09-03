@@ -789,8 +789,11 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     // EXPERT_POOL runtime (nullptr unless the active pshard plan pools experts):
-    // pool-managed layers route their expert MUL_MAT_IDs through remapped ids
+    // pool-managed layers route their expert MUL_MAT_IDs through remapped ids.
+    // The epoch snapshots active/AB state: a flip changes pooled-layer topology
+    // or view bindings, so reused graphs must be rebuilt.
     struct llama_expert_pool * expert_pool;
+    uint64_t                   expert_pool_epoch;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -886,7 +889,8 @@ struct llm_graph_params {
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross &&
-            expert_pool == other.expert_pool;
+            expert_pool == other.expert_pool &&
+            expert_pool_epoch == other.expert_pool_epoch;
     }
 };
 
