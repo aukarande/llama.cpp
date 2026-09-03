@@ -275,63 +275,88 @@ void llama_context::pshard_setup_expert_pool() {
     const size_t buf_total = ggml_backend_buffer_get_size(buf);
     const size_t preloaded = model.get_dev_preloaded_size();
     const size_t cache     = total_pinned_cache_size(memory.get());
-    if (preloaded + cache + scratch_need >= buf_total) {
-        LLAMA_LOG_WARN("%s: no room for the expert pool (weights %.1f + cache %.1f + scratch %.1f >= %.1f MiB)\n",
+    if (preloaded + cache + scratch_need + 2 * pool->layer_full_bytes >= buf_total) {
+        LLAMA_LOG_WARN("%s: no room for the expert pool (weights %.1f + cache %.1f + scratch %.1f + A/B %.1f >= %.1f MiB)\n",
             __func__, preloaded / (1024.0 * 1024.0), cache / (1024.0 * 1024.0),
-            scratch_need / (1024.0 * 1024.0), buf_total / (1024.0 * 1024.0));
+            scratch_need / (1024.0 * 1024.0), 2 * pool->layer_full_bytes / (1024.0 * 1024.0),
+            buf_total / (1024.0 * 1024.0));
         return;
     }
-    const size_t avail = buf_total - preloaded - cache - scratch_need;
-    size_t want = pool->region_bytes_needed(slots);
+    GGML_UNUSED(slots);
+
+    // the region itself is sized per tier (pshard_pool_resize, from the tier's own
+    // measured scratch): pool + scratch is constant, so decode tiers turn the
+    // prefill scratch delta into slots
+    pool->backend_router = backends[pshard_layout.compute].get();
+    expert_pool = std::move(pool);
+}
+
+// size the region for ONE tier: everything between the weights + this tier's
+// scratch and the pinned KV cache. Slots = min(plan, what fits), floor-checked
+// for cache-mode tiers. Returns false (pool left unsized/disengaged) when the
+// tier cannot host a pool.
+bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
+    if (!expert_pool) {
+        return false;
+    }
+    ggml_backend_buffer_t buf = model.get_dev_preload_buf();
+    if (buf == nullptr) {
+        return false;
+    }
+    const size_t buf_total = ggml_backend_buffer_get_size(buf);
+    const size_t preloaded = model.get_dev_preloaded_size();
+    const size_t cache     = total_pinned_cache_size(memory.get());
+    const size_t scratch   = plan.scratch_measured + (64ull << 20);
+    if (preloaded + cache + scratch >= buf_total) {
+        return false;
+    }
+    const size_t avail = buf_total - preloaded - cache - scratch;
+
+    uint32_t slots = plan.pool_slots;
+    size_t   want  = expert_pool->region_bytes_needed(slots);
     while (slots > 0 && want > avail) {
         slots--;
-        want = pool->region_bytes_needed(slots);
+        want = expert_pool->region_bytes_needed(slots);
     }
-    if (slots == 0 || want == 0 || 2 * pool->layer_full_bytes > avail) {
-        LLAMA_LOG_WARN("%s: expert pool does not fit: avail %.1f MiB, A/B pair needs %.1f MiB\n",
-            __func__, avail / (1024.0 * 1024.0), 2 * pool->layer_full_bytes / (1024.0 * 1024.0));
-        return;
-    }
-
-    // the clamp must not undercut any cache-mode POOL tier's fetch floor (one
-    // MUL_MAT_ID needs the whole pass's distinct experts resident at once)
-    uint32_t floor_slots = 0;
-    for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
-        const llama_pshard_plan * p = registry->get_best(t);
-        if (p == nullptr || !p->is_viable || p->strategy != LLAMA_PSHARD_EXPERT_POOL) {
-            continue;
-        }
-        const uint64_t bs = registry->tier_sizes[t];
-        if (bs * model.hparams.n_expert_used * 2 >= model.hparams.n_expert) {
-            continue; // whole-stack tier: A/B mode, no slot floor
-        }
-        const uint32_t f = (uint32_t) std::min<uint64_t>(model.hparams.n_expert, bs * model.hparams.n_expert_used);
-        floor_slots = std::max(floor_slots, f);
-    }
-    if (slots < floor_slots) {
-        LLAMA_LOG_WARN("%s: expert pool clamped to %u slots/layer below the cache-tier floor %u - pool disabled\n",
-            __func__, slots, floor_slots);
-        return;
+    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
+    const uint32_t floor_slots = ab ? 0 : (uint32_t) std::min<uint64_t>(expert_pool->n_expert,
+        (uint64_t) plan.batch_size * expert_pool->n_expert_used);
+    if (slots == 0 || want == 0 || 2 * expert_pool->layer_full_bytes > avail || slots < floor_slots) {
+        LLAMA_LOG_WARN("%s: tier bs=%u: pool does not fit (avail %.1f MiB, s=%u, floor %u, A/B %.1f MiB)\n",
+            __func__, plan.batch_size, avail / (1024.0 * 1024.0), slots, floor_slots,
+            2 * expert_pool->layer_full_bytes / (1024.0 * 1024.0));
+        return false;
     }
 
     char * base = (char *) ggml_backend_buffer_get_base(buf) + buf_total - cache - want;
     base = (char *) ((uintptr_t) base & ~(uintptr_t) 255);
     want = (size_t) ((char *) ggml_backend_buffer_get_base(buf) + buf_total - cache - base);
 
-    if (!pool->set_region(buf, base, want, slots)) {
-        return;
+    if (expert_pool->region_base == base && expert_pool->region_bytes == want && expert_pool->n_slots == slots) {
+        return true; // same geometry (re-apply of the same tier): keep the cache warm
     }
-    pool->backend_router = backends[pshard_layout.compute].get();
+    if (!expert_pool->set_region(buf, base, want, slots)) {
+        return false;
+    }
+    expert_pool->epoch++;   // new view tensors: reused graphs must rebuild their bindings
     expert_pool_bytes = want;
-    expert_pool = std::move(pool);
+    return true;
 }
 
 void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
     if (!expert_pool) {
         return;
     }
-    // legacy tiers in a mixed registry stream normally: the pool disengages
-    expert_pool->set_active(plan.strategy == LLAMA_PSHARD_EXPERT_POOL, sched.get());
+    // legacy tiers in a mixed registry stream normally: the pool disengages and the
+    // tier gets the whole scratch window back
+    bool on = plan.strategy == LLAMA_PSHARD_EXPERT_POOL;
+    if (on) {
+        on = pshard_pool_resize(plan);
+    }
+    if (!on) {
+        expert_pool_bytes = 0;
+    }
+    expert_pool->set_active(on, sched.get());
     expert_pool->set_policy(plan.pool_miss, plan.pool_hybrid_frac, sched.get());
     const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
     expert_pool->set_ab_mode(ab, sched.get());

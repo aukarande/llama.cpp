@@ -282,6 +282,7 @@ private:
     void pshard_pack_cache_region();
     void pshard_setup_expert_pool();
     void pshard_update_pool_mode(const llama_pshard_plan & plan);
+    bool pshard_pool_resize(const llama_pshard_plan & plan);   // per-tier region: budget - weights - cache - this tier's scratch
     void pshard_assign_pool_tensors();
     void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true, bool force_upload = false);
     void pshard_reapply_active_plan();
