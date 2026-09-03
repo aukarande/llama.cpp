@@ -1254,6 +1254,41 @@ weighted reduce:
   disk-spill case slots in as HOME=disk with RAM as the capacity tier; the pool
   design is unchanged (Section 3), only fetch_cost and B* change.
 
+### 10b. Upstream PR triage (2026-09-03)
+
+52 upstream llama.cpp PRs/discussions were read against the pool work (14 direct,
+11 useful, 27 irrelevant). The design-relevant findings:
+
+- **#24528 (the RFC our pool implements).** Independent measurements say
+  replacement policy caps at under 10 percent gain. Miss-cost reduction is what
+  pays, which matches where our work sits. Their admission gate (admit after N
+  misses) gave a large win on a code workload. That is a small addition to our
+  fetch policy. Also flagged: a GPU-resident drafter reordered the device list and
+  broke their cache binding, relevant to our MTP path, and a Windows WDDM case that
+  silently migrated a pool region to host with no diagnostic.
+- **#25294 (disk expert streaming).** Their per-slot generation stamp, a
+  keep-bitmask protecting this ubatch's experts from eviction, and cold-miss versus
+  miss counters are all strictly better than our current LRU bookkeeping. Also the
+  reviewer-palatable footprint if we ever upstream: one source file plus a custom
+  op, no scheduler or galloc edits.
+- **#26003 and #26414 (lazy experts, pin hot experts).** We page-lock the whole
+  mapping, spending the driver's pin ceiling on bytes that never stream. Their
+  per-range advise and register primitives would let us pin only streamed expert
+  ranges. Warning from #26414: never VirtualLock per expert row on Windows,
+  adjacent rows share pages.
+- **#27402 (IQ panel GEMM, already merged upstream).** Not in our fork yet. The
+  next rebase pulls it in. It only fires at 8 or more rows per expert, so decode
+  miss cost is unchanged, but IQ prefill on the CPU chain roughly doubles and the
+  path is not bit-identical. Our IQ parity gates would need GGML_NO_IQ_PANEL set.
+- **#20596 and #22671 (CPU MoE fusion, MXFP6).** Both read expert ids with no -1
+  handling and would corrupt our split-op if merged as-is. Defensive item: any CPU
+  MUL_MAT_ID fusion must check the allow-skip flag.
+
+Cheap cherry-picks from the same triage, all on the CPU miss-chain kernel:
+#22181 (q4_K/q5_K AVX2 reduction, bit-identical), #22331 (SIMD q8_K activation
+quantizer; ours is the scalar reference), #25048 (atomic work-stealing for
+MUL_MAT_ID chunks), #27024 (AMX q8_K VNNI one-line fix).
+
 ## 11. Open design points
 
 Decided (section 12) vs not yet designed (this section). Items are numbered 1-24 across
