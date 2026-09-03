@@ -83,8 +83,14 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+
+// pageable host->device staging (defined with the CUDA backend below; used by the buffer ops above it)
+static void ggml_cuda_stage_drain(int device, cudaStream_t stream);
+static void ggml_cuda_stage_drain_device(int device);
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -743,6 +749,7 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_stage_drain_device(ctx->device);   // a queued staged copy may still target this buffer
     delete ctx;
 }
 
@@ -778,6 +785,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ggml_cuda_stage_drain_device(ctx->device);
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
@@ -786,6 +794,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ggml_cuda_stage_drain_device(ctx->device);
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -794,6 +803,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    ggml_cuda_stage_drain_device(ctx->device);
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -805,6 +815,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_stage_drain_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -815,6 +826,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_cuda_stage_drain_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -824,6 +836,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+        ggml_cuda_stage_drain_device(src_ctx->device);
+        ggml_cuda_stage_drain_device(dst_ctx->device);
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
@@ -847,6 +861,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_stage_drain_device(ctx->device);
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
@@ -2461,6 +2476,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_stage_drain_device(cuda_ctx->device);   // queued staged jobs may still target these streams
     delete cuda_ctx;
     delete backend;
 }
@@ -2556,8 +2572,9 @@ static void ggml_cuda_parallel_memcpy(void * dst, const void * src, size_t n, in
     }
 }
 
-// returns true when the copy was fully issued through the ring
-static bool ggml_cuda_staged_h2d(int device, void * dst, const void * src, size_t size, cudaStream_t stream) {
+// is this copy one the ring should take: >= 1 MiB from unregistered (pageable) host memory, not
+// inside a CUDA graph capture
+static bool ggml_cuda_stage_candidate(const void * src, size_t size, cudaStream_t stream) {
     if (size < (1ull << 20)) {
         return false;
     }
@@ -2574,6 +2591,11 @@ static bool ggml_cuda_staged_h2d(int device, void * dst, const void * src, size_
         return false;
     }
     (void) cudaGetLastError();
+    return true;
+}
+
+// the chunk pipeline itself (runs on the calling thread): returns false only if the ring is unavailable
+static bool ggml_cuda_staged_h2d_now(int device, void * dst, const void * src, size_t size, cudaStream_t stream) {
     ggml_cuda_stage_ring & ring = ggml_cuda_get_stage_ring(device);
     std::lock_guard<std::mutex> lock(ring.mu);
     if (!ring.init(device)) {
@@ -2591,12 +2613,270 @@ static bool ggml_cuda_staged_h2d(int device, void * dst, const void * src, size_
     }
     return true;
 }
+
+// ---- asynchronous staging: one worker thread per physical device ----------------------------
+// The synchronous pipeline blocks the calling (scheduler) thread for the whole memcpy (~70 ms per
+// 2 GB layer), so the GPU idles before that layer's compute is launched. The worker takes the
+// COPY jobs instead and the caller returns at once. Stream ORDER is preserved by routing through
+// the same FIFO everything that must land on a stream after its pending staged copies:
+//   - a cudaEventRecord on a stream with pending staged copies becomes a RECORD job (executes after
+//     the DMAs are enqueued); a wait/synchronize on such an event first joins the worker up to that
+//     job (the caller blocks only if the memcpy is still running - by then the GPU has the previous
+//     layer's compute queued, so the block overlaps work instead of idling the device);
+//   - every other direct operation on a stream with pending staged copies (kernel launch, other
+//     copies, synchronize) drains that stream's jobs first.
+// GGML_CUDA_STAGE_ASYNC=0 falls back to the synchronous pipeline.
+struct ggml_cuda_stage_worker {
+    // COPY: staged pageable upload; RECORD: deferred event record; H2D/D2H/MEMSET: ordinary stream
+    // operations the scheduler issued on a stream that still had staged copies queued - queued
+    // behind them instead of draining, so the caller never blocks (review finding: the padding
+    // memset and KV writeback uploads right after a staged weight re-serialized every layer)
+    enum job_type { JOB_COPY, JOB_RECORD, JOB_H2D, JOB_D2H, JOB_MEMSET };
+    struct job {
+        job_type     type;
+        void *       dst;
+        const void * src;
+        size_t       size;
+        cudaStream_t stream;
+        cudaEvent_t  event;
+        uint64_t     seq;
+        int          value;
+    };
+    int device = -1;
+    std::mutex mu;
+    std::condition_variable cv_job;
+    std::condition_variable cv_done;
+    std::deque<job> q;
+    uint64_t next_seq = 1;   // next sequence number to assign
+    uint64_t done_seq = 0;   // last executed sequence number (jobs execute in order)
+    std::unordered_map<cudaStream_t, uint64_t> stream_last;   // last queued job per stream
+
+    void start(int dev) {
+        device = dev;
+        std::thread([this] { run(); }).detach();
+    }
+    uint64_t push(job j) {
+        uint64_t seq;
+        {
+            std::lock_guard<std::mutex> l(mu);
+            seq = next_seq++;
+            j.seq = seq;
+            stream_last[j.stream] = seq;
+            q.push_back(j);
+        }
+        cv_job.notify_one();
+        return seq;
+    }
+    // is anything queued or running for this stream
+    bool pending(cudaStream_t s) {
+        std::lock_guard<std::mutex> l(mu);
+        auto it = stream_last.find(s);
+        return it != stream_last.end() && it->second > done_seq;
+    }
+    void join(uint64_t seq) {
+        std::unique_lock<std::mutex> l(mu);
+        cv_done.wait(l, [&] { return done_seq >= seq; });
+    }
+    void drain(cudaStream_t s) {
+        uint64_t seq;
+        {
+            std::lock_guard<std::mutex> l(mu);
+            auto it = stream_last.find(s);
+            if (it == stream_last.end() || it->second <= done_seq) {
+                return;
+            }
+            seq = it->second;
+        }
+        join(seq);
+    }
+    void drain_all() {
+        uint64_t seq;
+        {
+            std::lock_guard<std::mutex> l(mu);
+            seq = next_seq - 1;
+            if (seq <= done_seq) {
+                return;
+            }
+        }
+        join(seq);
+    }
+    void run() {
+        ggml_cuda_set_device(device);
+        for (;;) {
+            job j;
+            {
+                std::unique_lock<std::mutex> l(mu);
+                cv_job.wait(l, [&] { return !q.empty(); });
+                j = q.front();
+                q.pop_front();
+            }
+            switch (j.type) {
+                case JOB_COPY:
+                    if (!ggml_cuda_staged_h2d_now(device, j.dst, j.src, j.size, j.stream)) {
+                        // ring unavailable: the driver's pageable copy, still in stream order
+                        CUDA_CHECK(cudaMemcpyAsync(j.dst, j.src, j.size, cudaMemcpyHostToDevice, j.stream));
+                    }
+                    break;
+                case JOB_RECORD:
+                    CUDA_CHECK(cudaEventRecord(j.event, j.stream));
+                    break;
+                case JOB_H2D:
+                    CUDA_CHECK(cudaMemcpyAsync(j.dst, j.src, j.size, cudaMemcpyHostToDevice, j.stream));
+                    break;
+                case JOB_D2H:
+                    CUDA_CHECK(cudaMemcpyAsync(j.dst, j.src, j.size, cudaMemcpyDeviceToHost, j.stream));
+                    break;
+                case JOB_MEMSET:
+                    CUDA_CHECK(cudaMemsetAsync(j.dst, j.value, j.size, j.stream));
+                    break;
+            }
+            {
+                std::lock_guard<std::mutex> l(mu);
+                done_seq = j.seq;
+            }
+            cv_done.notify_all();
+        }
+    }
+};
+
+static std::mutex g_stage_workers_mu;
+static ggml_cuda_stage_worker * g_stage_workers[GGML_CUDA_MAX_DEVICES] = {};
+static std::atomic<bool> g_stage_any_worker{false};
+
+static bool ggml_cuda_stage_async_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_STAGE_ASYNC");
+        return e == nullptr || e[0] != '0';
+    }();
+    return enabled;
+}
+
+// worker of a device, created on first use; nullptr when async staging is off
+static ggml_cuda_stage_worker * ggml_cuda_stage_worker_for(int device, bool create) {
+    if (!create && !g_stage_any_worker.load(std::memory_order_acquire)) {
+        return nullptr;   // the common case when no pageable copy ever happened: no lock, no lookup
+    }
+    const int pd = ggml_cuda_get_physical_device(device);
+    std::lock_guard<std::mutex> l(g_stage_workers_mu);
+    if (g_stage_workers[pd] == nullptr && create) {
+        g_stage_workers[pd] = new ggml_cuda_stage_worker();   // lives for the process
+        g_stage_workers[pd]->start(device);
+        g_stage_any_worker.store(true, std::memory_order_release);
+    }
+    return g_stage_workers[pd];
+}
+
+// ordinary stream operations issued while the stream still has staged copies queued: enqueue them
+// behind those copies (same FIFO, same order the caller intended) instead of blocking the caller.
+// Return false when nothing is pending, so the caller runs the operation directly.
+static bool ggml_cuda_stage_queue_h2d(int device, cudaStream_t stream, void * dst, const void * src, size_t size) {
+    ggml_cuda_stage_worker * w = ggml_cuda_stage_worker_for(device, false);
+    if (w == nullptr || !w->pending(stream)) {
+        return false;
+    }
+    ggml_cuda_stage_worker::job j = { ggml_cuda_stage_worker::JOB_H2D, dst, src, size, stream, nullptr, 0, 0 };
+    w->push(j);
+    return true;
+}
+static bool ggml_cuda_stage_queue_d2h(int device, cudaStream_t stream, void * dst, const void * src, size_t size) {
+    ggml_cuda_stage_worker * w = ggml_cuda_stage_worker_for(device, false);
+    if (w == nullptr || !w->pending(stream)) {
+        return false;
+    }
+    ggml_cuda_stage_worker::job j = { ggml_cuda_stage_worker::JOB_D2H, dst, src, size, stream, nullptr, 0, 0 };
+    w->push(j);
+    return true;
+}
+static bool ggml_cuda_stage_queue_memset(int device, cudaStream_t stream, void * dst, int value, size_t size) {
+    ggml_cuda_stage_worker * w = ggml_cuda_stage_worker_for(device, false);
+    if (w == nullptr || !w->pending(stream)) {
+        return false;
+    }
+    ggml_cuda_stage_worker::job j = { ggml_cuda_stage_worker::JOB_MEMSET, dst, nullptr, size, stream, nullptr, 0, value };
+    w->push(j);
+    return true;
+}
+
+// before any direct operation on this stream: let pending staged copies land first
+static void ggml_cuda_stage_drain(int device, cudaStream_t stream) {
+    if (ggml_cuda_stage_worker * w = ggml_cuda_stage_worker_for(device, false)) {
+        w->drain(stream);
+    }
+}
+
+static void ggml_cuda_stage_drain_device(int device) {
+    if (ggml_cuda_stage_worker * w = ggml_cuda_stage_worker_for(device, false)) {
+        w->drain_all();
+    }
+}
+
+// deferred event records: event -> (worker, job seq) until the next wait/synchronize on it
+static std::mutex g_stage_events_mu;
+static std::unordered_map<cudaEvent_t, std::pair<ggml_cuda_stage_worker *, uint64_t>> g_stage_events;
+
+static void ggml_cuda_stage_event_record(int device, cudaEvent_t ev, cudaStream_t stream) {
+    if (ggml_cuda_stage_worker * w = ggml_cuda_stage_worker_for(device, false)) {
+        if (w->pending(stream)) {
+            ggml_cuda_stage_worker::job j = { ggml_cuda_stage_worker::JOB_RECORD, nullptr, nullptr, 0, stream, ev, 0, 0 };
+            const uint64_t seq = w->push(j);
+            std::lock_guard<std::mutex> l(g_stage_events_mu);
+            g_stage_events[ev] = { w, seq };
+            return;
+        }
+    }
+    CUDA_CHECK(cudaEventRecord(ev, stream));
+}
+
+// before waiting on / synchronizing an event whose record may still be queued
+static void ggml_cuda_stage_before_event_use(cudaEvent_t ev) {
+    std::pair<ggml_cuda_stage_worker *, uint64_t> p = { nullptr, 0 };
+    {
+        std::lock_guard<std::mutex> l(g_stage_events_mu);
+        auto it = g_stage_events.find(ev);
+        if (it == g_stage_events.end()) {
+            return;
+        }
+        p = it->second;
+        g_stage_events.erase(it);
+    }
+    p.first->join(p.second);
+}
+
+// front door for set_tensor_async: returns true when the copy is (being) handled by the ring
+static bool ggml_cuda_staged_h2d(int device, void * dst, const void * src, size_t size, cudaStream_t stream) {
+    if (!ggml_cuda_stage_candidate(src, size, stream)) {
+        return false;
+    }
+    if (ggml_cuda_stage_async_enabled()) {
+        ggml_cuda_stage_worker * w = ggml_cuda_stage_worker_for(device, true);
+        ggml_cuda_stage_worker::job j = { ggml_cuda_stage_worker::JOB_COPY, dst, src, size, stream, nullptr, 0, 0 };
+        w->push(j);
+        return true;
+    }
+    return ggml_cuda_staged_h2d_now(device, dst, src, size, stream);
+}
 #else
 // HIP/MUSA: the vendor shims lack the pointer-attribute / host-alloc / capture-status mappings the
 // ring needs; pageable copies take the driver path there
 static bool ggml_cuda_staged_h2d(int device, void * dst, const void * src, size_t size, cudaStream_t stream) {
     GGML_UNUSED(device); GGML_UNUSED(dst); GGML_UNUSED(src); GGML_UNUSED(size); GGML_UNUSED(stream);
     return false;
+}
+static void ggml_cuda_stage_drain(int device, cudaStream_t stream) { GGML_UNUSED(device); GGML_UNUSED(stream); }
+static void ggml_cuda_stage_drain_device(int device) { GGML_UNUSED(device); }
+static void ggml_cuda_stage_event_record(int device, cudaEvent_t ev, cudaStream_t stream) {
+    GGML_UNUSED(device);
+    CUDA_CHECK(cudaEventRecord(ev, stream));
+}
+static void ggml_cuda_stage_before_event_use(cudaEvent_t ev) { GGML_UNUSED(ev); }
+static bool ggml_cuda_stage_queue_h2d(int device, cudaStream_t stream, void * dst, const void * src, size_t size) {
+    GGML_UNUSED(device); GGML_UNUSED(stream); GGML_UNUSED(dst); GGML_UNUSED(src); GGML_UNUSED(size); return false;
+}
+static bool ggml_cuda_stage_queue_d2h(int device, cudaStream_t stream, void * dst, const void * src, size_t size) {
+    GGML_UNUSED(device); GGML_UNUSED(stream); GGML_UNUSED(dst); GGML_UNUSED(src); GGML_UNUSED(size); return false;
+}
+static bool ggml_cuda_stage_queue_memset(int device, cudaStream_t stream, void * dst, int value, size_t size) {
+    GGML_UNUSED(device); GGML_UNUSED(stream); GGML_UNUSED(dst); GGML_UNUSED(value); GGML_UNUSED(size); return false;
 }
 #endif // !GGML_USE_HIP && !GGML_USE_MUSA
 
@@ -2609,7 +2889,9 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     if (ggml_cuda_staged_h2d(cuda_ctx->device, (char *) tensor->data + offset, data, size, cuda_ctx->stream())) {
         return;
     }
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    if (!ggml_cuda_stage_queue_h2d(cuda_ctx->device, cuda_ctx->stream(), (char *) tensor->data + offset, data, size)) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    }
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2618,7 +2900,9 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    if (!ggml_cuda_stage_queue_d2h(cuda_ctx->device, cuda_ctx->stream(), data, (const char *) tensor->data + offset, size)) {
+        CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    }
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -2628,6 +2912,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_stage_drain(cuda_ctx->device, cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2639,6 +2924,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_stage_drain(cuda_ctx->device, cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -2650,6 +2936,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
     }
+    { ggml_backend_cuda_context * cuda_ctx_src_st = (ggml_backend_cuda_context *) backend_src->context; ggml_cuda_stage_drain(cuda_ctx_src_st->device, cuda_ctx_src_st->stream()); }
 
     if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
         return false;
@@ -2705,6 +2992,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_stage_drain(cuda_ctx->device, cuda_ctx->stream());
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
@@ -4442,6 +4730,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_stage_drain(cuda_ctx->device, cuda_ctx->stream());   // staged uploads on this stream land first
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4500,12 +4789,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+    // deferred behind pending staged uploads on this stream (see ggml_cuda_stage_worker)
+    ggml_cuda_stage_event_record(cuda_ctx->device, (cudaEvent_t)event->context, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_stage_before_event_use((cudaEvent_t)event->context);
     if (ggml_backend_is_cuda(backend)) {
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
     } else {
@@ -4769,7 +5060,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 static void ggml_backend_cuda_memset_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
-    CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + offset, value, size, cuda_ctx->stream()));
+    if (!ggml_cuda_stage_queue_memset(cuda_ctx->device, cuda_ctx->stream(), (char *)tensor->data + offset, value, size)) {
+        CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + offset, value, size, cuda_ctx->stream()));
+    }
 }
 
 static const ggml_backend_i ggml_backend_cuda_interface = {
@@ -5571,12 +5864,14 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
 
+    ggml_cuda_stage_before_event_use((cudaEvent_t)event->context);   // a queued RECORD must run before destroy
     CUDA_CHECK(cudaEventDestroy((cudaEvent_t)event->context));
     delete event;
 }
 
 static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
+    ggml_cuda_stage_before_event_use((cudaEvent_t)event->context);
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 

@@ -8,6 +8,11 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 #include "llama-pshard-plan.h"
+#ifdef _WIN32
+#   define WIN32_LEAN_AND_MEAN
+#   define NOMINMAX
+#   include <windows.h>
+#endif
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1164,6 +1169,8 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // mmap regions we VirtualLock'd (Windows) because they could not be page-locked; unlocked on model free
+    std::vector<std::pair<void *, size_t>> pshard_virtual_locked;
     // mmap regions we page-locked for pshard streaming; unregistered on model free
     // (long-lived servers load/free multiple models - leaking pins pageable-locks RAM)
     std::vector<void *> pshard_host_registered;
@@ -1231,6 +1238,12 @@ llama_model::~llama_model() {
         auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
         if (gpu_dev) {
             auto * reg = ggml_backend_dev_backend_reg(gpu_dev);
+#ifdef _WIN32
+            for (const auto & [addr, size] : pimpl->pshard_virtual_locked) {
+                VirtualUnlock(addr, (SIZE_T) size);
+            }
+            pimpl->pshard_virtual_locked.clear();
+#endif
             auto unregister_fn = (void (*)(void *))
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
             if (unregister_fn) {
@@ -1976,6 +1989,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                             // or GGML_CUDA_REGISTER_HOST=0: streamed copies from this region run pageable
                             LLAMA_LOG_WARN("%s: pshard: could not page-lock %.1f MiB mmap region - streamed copies from it will be pageable (slower)\n",
                                 __func__, mapping->size() / (1024.0 * 1024.0));
+#ifdef _WIN32
+                            // Windows trims file-mapped pages out of the working set between passes, so every
+                            // upload pass soft-faults the whole region again (~6 GB/s memcpy into the staging
+                            // ring, ~4 GB/s on the driver's pageable path, measured on a 45 GB DeepSeek-V4
+                            // shard). VirtualLock keeps the pages resident and mapped: the CUDA DMA still has to
+                            // go through the staging ring, but the ring's memcpy runs at memory speed.
+                            // PSHARD_VIRTUALLOCK=0 disables.
+                            if (const char * vl = getenv("PSHARD_VIRTUALLOCK"); vl == nullptr || vl[0] != '0') {
+                                const int64_t t1 = ggml_time_us();
+                                SIZE_T ws_min = 0, ws_max = 0;
+                                DWORD  ws_flags = 0;
+                                HANDLE proc = GetCurrentProcess();
+                                bool ok = false;
+                                if (GetProcessWorkingSetSizeEx(proc, &ws_min, &ws_max, &ws_flags)) {
+                                    const SIZE_T extra = (SIZE_T) mapping->size() + (64ULL << 20);
+                                    ok = SetProcessWorkingSetSizeEx(proc, ws_min + extra, ws_max + extra,
+                                            QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
+                                }
+                                if (ok) {
+                                    ok = VirtualLock(mapping->addr(), (SIZE_T) mapping->size()) != 0;
+                                }
+                                if (ok) {
+                                    pimpl->pshard_virtual_locked.push_back({ mapping->addr(), (size_t) mapping->size() });
+                                    LLAMA_LOG_INFO("%s: pshard: VirtualLock'd the %.1f MiB mmap region in %.1f ms (resident for the staging ring; not DMA-pinned)\n",
+                                        __func__, mapping->size() / (1024.0 * 1024.0), (ggml_time_us() - t1) / 1000.0);
+                                } else {
+                                    LLAMA_LOG_WARN("%s: pshard: VirtualLock of the %.1f MiB mmap region failed (error %lu) - staying pageable\n",
+                                        __func__, mapping->size() / (1024.0 * 1024.0), (unsigned long) GetLastError());
+                                }
+                            }
+#endif
                         }
                         if (locked) {
                             pimpl->pshard_host_registered.push_back(mapping->addr());
