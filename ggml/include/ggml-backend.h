@@ -404,6 +404,14 @@ extern "C" {
     GGML_API void ggml_backend_sched_clear_input_copy_overrides(ggml_backend_sched_t sched);
     GGML_API void ggml_backend_sched_set_pool_input_cb(ggml_backend_sched_t sched,
             ggml_backend_sched_pool_input_cb cb, void * user_data);
+    // optional: called from the weight-prefetch pass for an overridden input of the
+    // NEXT redirected split, on the copy backend, inside the same fence + event
+    // choreography as ordinary weight prefetch. Return true when an upload was
+    // enqueued (the consumer split then waits on the copy event before its kernels).
+    typedef bool (*ggml_backend_sched_pool_prefetch_cb)(const struct ggml_tensor * src,
+            struct ggml_tensor * view, ggml_backend_t copy_backend, void * user_data);
+    GGML_API void ggml_backend_sched_set_pool_prefetch_cb(ggml_backend_sched_t sched,
+            ggml_backend_sched_pool_prefetch_cb cb);
 
     // Per-split info snapshot for timing prediction.
     struct ggml_backend_sched_split_info {

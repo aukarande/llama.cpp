@@ -174,6 +174,7 @@ void llama_expert_pool::register_sched(ggml_backend_sched_t sched) {
         }
     }
     ggml_backend_sched_set_pool_input_cb(sched, sched_input_cb, this);
+    ggml_backend_sched_set_pool_prefetch_cb(sched, sched_prefetch_cb);
 }
 
 void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
@@ -255,6 +256,45 @@ ggml_tensor * llama_expert_pool::mm_view(int32_t il, const ggml_tensor * host) c
 bool llama_expert_pool::sched_input_cb(const ggml_tensor * src, ggml_tensor * view,
                                        ggml_backend_t split_backend, void * user_data) {
     return ((llama_expert_pool *) user_data)->serve(src, view, split_backend);
+}
+
+bool llama_expert_pool::sched_prefetch_cb(const ggml_tensor * src, ggml_tensor * view,
+                                          ggml_backend_t copy_backend, void * user_data) {
+    GGML_UNUSED(view);
+    return ((llama_expert_pool *) user_data)->prefetch(src, copy_backend);
+}
+
+bool llama_expert_pool::prefetch(const ggml_tensor * src, ggml_backend_t copy_backend) {
+    if (!active || !ab_mode) {
+        return false; // cache tiers: the router ids are not computed yet
+    }
+    layer_state * Lp = nullptr;
+    for (auto & L : layers) {
+        for (const auto & e : L.tensors) {
+            if (e.host == src) {
+                Lp = &L;
+                break;
+            }
+        }
+        if (Lp != nullptr) {
+            break;
+        }
+    }
+    if (Lp == nullptr) {
+        return false;
+    }
+    layer_state & L = *Lp;
+    if (L.ab_pass == generation && generation > 0) {
+        return true; // the layer's other tensors: already filled by the first call
+    }
+    // the sched already waited on the compute fence for this copy stream, so the
+    // half (last read by layer il-2) is free; the consumer waits on the copy event
+    for (const auto & e : L.tensors) {
+        ggml_backend_tensor_set_async(copy_backend, e.view_ab,
+            e.host->data, 0, (size_t) n_expert * e.row_bytes);
+    }
+    L.ab_pass = generation;
+    return true;
 }
 
 bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_backend_t split_backend) {

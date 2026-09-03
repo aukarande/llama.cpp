@@ -134,6 +134,13 @@ struct llama_expert_pool {
                                ggml_backend_t split_backend, void * user_data);
     bool serve(const ggml_tensor * src, ggml_tensor * view, ggml_backend_t split_backend);
 
+    // prefetch-time service (whole-stack tiers only): fill the layer's A/B half on
+    // the copy backend while the previous layer computes; serve() then finds the
+    // half already filled for this generation and only uploads the ids
+    static bool sched_prefetch_cb(const ggml_tensor * src, ggml_tensor * view,
+                                  ggml_backend_t copy_backend, void * user_data);
+    bool prefetch(const ggml_tensor * src, ggml_backend_t copy_backend);
+
     void reset_slots();
     void log_counters() const;
 

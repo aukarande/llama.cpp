@@ -847,6 +847,7 @@ struct ggml_backend_sched {
     int copy_overrides_cap;
     ggml_backend_sched_pool_input_cb pool_input_cb;
     void * pool_input_ud;
+    ggml_backend_sched_pool_prefetch_cb pool_prefetch_cb;
 
     ggml_backend_sched_split_cb split_pre_compute;
     ggml_backend_sched_split_cb split_post_compute;
@@ -1203,7 +1204,12 @@ static bool ggml_backend_sched_split_has_prefetchable_weights(
         }
         if (sched->n_copy_overrides > 0 &&
             ggml_backend_sched_input_copy_override_for(sched, input) != NULL) {
-            continue; // expert-pool managed: never prefetched
+            // expert-pool managed: the pool's prefetch callback may fill the
+            // persistent view ahead of time (no keepalive needed for it)
+            if (sched->pool_prefetch_cb != NULL) {
+                return true;
+            }
+            continue;
         }
         if (!ggml_backend_sched_prefer_sliced_expert_copy(g, input, input_cpy)) {
             return true;
@@ -2150,7 +2156,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     struct ggml_tensor * input_cpy = tensor_copy(next_input, next_gpu->backend_id, sched->cur_copy);
                     if (sched->n_copy_overrides > 0 &&
                         ggml_backend_sched_input_copy_override_for(sched, next_input) != NULL) {
-                        continue; // expert-pool managed: the pool callback serves it at consume time
+                        // expert-pool managed: whole-stack tiers fill the layer's A/B half here,
+                        // on the copy stream under the compute fence; cache tiers serve at
+                        // consume time (the router ids do not exist yet)
+                        if (sched->pool_prefetch_cb != NULL &&
+                            sched->pool_prefetch_cb(next_input, input_cpy, next_copy, sched->pool_input_ud)) {
+                            did_prefetch = true;
+                        }
+                        continue;
                     }
                     if (ggml_backend_sched_prefer_sliced_expert_copy(&next_gpu->graph, next_input, input_cpy)) {
                         // leave small-batch expert weights to the sliced consume-time copy
@@ -2932,6 +2945,11 @@ void ggml_backend_sched_set_pool_input_cb(ggml_backend_sched_t sched,
         ggml_backend_sched_pool_input_cb cb, void * user_data) {
     sched->pool_input_cb = cb;
     sched->pool_input_ud = user_data;
+}
+
+void ggml_backend_sched_set_pool_prefetch_cb(ggml_backend_sched_t sched,
+        ggml_backend_sched_pool_prefetch_cb cb) {
+    sched->pool_prefetch_cb = cb;
 }
 
 void ggml_backend_sched_add_writeback(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
