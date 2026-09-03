@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include "llama-expert-pool.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -494,6 +496,7 @@ llama_context::llama_context(
 
         if (cparams.pshard && !model.hparams.no_alloc) {
             pshard_pack_cache_region();
+            pshard_setup_expert_pool();
         }
 
         sched_reserve();
@@ -1473,6 +1476,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (cparams.pshard) {
             pshard_assign_tensors(sched.get(), model, memory.get(), backends, pshard_layout);
+            pshard_assign_pool_tensors();
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1498,6 +1502,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (cparams.pshard) {
         pshard_update_write_cells(mctx);
+        if (expert_pool) {
+            expert_pool->generation++;
+        }
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -2585,6 +2592,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     if (cparams.pshard) {
         pshard_assign_tensors(sched.get(), model, memory.get(), backends, pshard_layout);
+        pshard_assign_pool_tensors();
     }
 
     // initialize scheduler with the specified graph
@@ -2620,6 +2628,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.expert_pool =*/ expert_pool.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

@@ -1,0 +1,112 @@
+#pragma once
+
+// EXPERT_POOL runtime (docs/expert-pool-design.md): routed experts stop being
+// placed weights and become a managed VRAM cache. One instance per
+// llama_context. It owns
+//   - a device region carved from the model arena ([weights | scratch | POOL |
+//     pinned KV]), never galloc-managed,
+//   - per-layer expert->slot maps with LRU eviction and hit/miss counters,
+//   - the consume-time serving of pool-managed graph inputs: the layer's host
+//     expert tensors are registered with the scheduler as input-copy overrides
+//     (ggml_backend_sched_set_input_copy_override), so their transient copies
+//     become persistent pool views and the upload runs through serve().
+//
+// Two view sets exist per layer and the active one follows the tier:
+//   - cache mode (decode / small batch): ne[2] = n_slots, ids remapped through
+//     the expert->slot map, misses fetched into LRU victims;
+//   - A/B mode (whole-stack prefill tiers, bs*top_k*2 >= n_expert): ne[2] =
+//     n_expert over an alternating half of the region, identity ids, the whole
+//     layer uploaded on first use per pass.
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#include <cstdint>
+#include <vector>
+
+struct llama_model;
+
+struct llama_expert_pool {
+    // one routed-expert weight tensor of one layer (fused gate_up, or up/gate, and down)
+    struct tensor_entry {
+        const ggml_tensor * host      = nullptr;  // mmap-backed home (model tensor)
+        ggml_tensor *       view_slots = nullptr; // cache-mode view, ne[2] = n_slots
+        ggml_tensor *       view_ab    = nullptr; // A/B-mode view,  ne[2] = n_expert
+        size_t              row_bytes  = 0;       // one expert = host->nb[2]
+        size_t              region_off = 0;       // slot 0 offset inside the region (cache mode)
+        size_t              ab_off[2]  = {0, 0};  // layer-half offsets (A/B mode)
+    };
+
+    struct layer_state {
+        int32_t il = -1;
+        std::vector<tensor_entry> tensors;
+
+        // slot state is shared across the layer's tensors: slot i holds expert
+        // slot_expert[i] in every tensor of the layer
+        std::vector<int32_t>  expert_slot;  // [n_expert] -> slot or -1
+        std::vector<int32_t>  slot_expert;  // [n_slots]  -> expert or -1
+        std::vector<uint64_t> slot_stamp;   // LRU stamps
+        uint64_t stamp    = 0;
+        uint64_t hits     = 0;
+        uint64_t misses   = 0;
+        uint64_t ab_pass  = 0;              // last pass this layer's A/B half was filled
+        uint64_t serve_gen = 0;             // last generation serve() ran the full work
+
+        // per-graph-build registration (rebound every build by build_moe_ffn)
+        ggml_tensor * ids_router = nullptr; // selected_experts (device, original ids)
+        ggml_tensor * ids_gpu    = nullptr; // remapped ids the expert MUL_MAT_IDs consume
+    };
+
+    uint32_t n_expert      = 0;
+    uint32_t n_expert_used = 0;
+    uint32_t n_slots       = 0;        // cache-mode slots per layer (v1 uniform)
+    bool     ab_mode       = false;    // active tier is a whole-stack prefill tier
+    uint64_t generation    = 0;        // bumped once per decode call; dedupes serve()
+
+    void *   region_base   = nullptr;
+    size_t   region_bytes  = 0;
+    size_t   layer_slot_bytes = 0;     // per-layer cache-mode footprint (all tensors)
+    size_t   layer_full_bytes = 0;     // per-layer whole-expert-set footprint
+
+    std::vector<layer_state> layers;   // dense by il; tensors empty for non-moe layers
+    ggml_context * ctx_views = nullptr;
+    ggml_backend_t backend_router = nullptr; // compute backend that produced the ids
+
+    ~llama_expert_pool();
+
+    // scan the model's routed-expert tensors; false when the model has none
+    bool init(const llama_model & model, uint32_t n_expert, uint32_t n_expert_used);
+
+    // bind the carved region and (re)build both view sets; slots = cache-mode
+    // slots per layer from the active plan. arena = the model's managed device
+    // buffer (the views carry it so async copies pass the backend checks)
+    bool set_region(ggml_backend_buffer_t arena, void * base, size_t bytes, uint32_t slots_per_layer);
+
+    // bytes the region needs for a given slot count (planner/carve agreement)
+    size_t region_bytes_needed(uint32_t slots_per_layer) const;
+
+    // register every layer's host tensors as sched input-copy overrides pointing
+    // at the ACTIVE view set, and install the serving callback
+    void register_sched(ggml_backend_sched_t sched);
+
+    // tier switch: flip cache/AB mode and re-register; cache contents survive a
+    // mode round-trip only in the preserved span (v1: dropped - lazy refill)
+    void set_ab_mode(bool ab, ggml_backend_sched_t sched);
+
+    // graph-build registration (called from build_moe_ffn via the graph channel)
+    void bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu);
+    ggml_tensor * mm_view(int32_t il, const ggml_tensor * host) const;
+    bool layer_pooled(int32_t il) const {
+        return il >= 0 && il < (int32_t) layers.size() && !layers[il].tensors.empty();
+    }
+
+    // consume-time service (sched callback): reads the router ids, remaps,
+    // fetches misses into victim slots (cache mode) or fills the layer half
+    // (A/B mode), uploads ids_gpu
+    static bool sched_input_cb(const ggml_tensor * src, ggml_tensor * view,
+                               ggml_backend_t split_backend, void * user_data);
+    bool serve(const ggml_tensor * src, ggml_tensor * view, ggml_backend_t split_backend);
+
+    void reset_slots();
+    void log_counters() const;
+};

@@ -98,7 +98,7 @@ void llama_pshard_generate_overrides(
             if (patterns_layer_moe_exps[il].empty()) {
                 patterns_layer_moe_exps[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate|gate_up)_exps\\..*";
             }
-            emit(patterns_layer_moe_exps[il].c_str(), host_buft, layout.cpu);
+            emit(patterns_layer_moe_exps[il].c_str(), host_buft, overlap ? layout.shard(il) : layout.shard_a);
             emit(patterns_layer[il].c_str(), host_buft, layout.compute);
             continue;
         }
@@ -508,11 +508,14 @@ void llama_params_fit_pshard(
     for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
         const llama_pshard_plan * p = registry->get_best(t);
         if (p && p->is_viable && p->strategy == LLAMA_PSHARD_EXPERT_POOL) {
-            LLAMA_LOG_WARN("%s: EXPERT_POOL plan in the registry but the pool runtime "
-                "is not implemented yet - disabling pshard\n", __func__);
-            mparams->pshard = false;
-            cparams->pshard = false;
-            return;
+            if (getenv("PSHARD_POOL_RUNTIME") == nullptr) {
+                LLAMA_LOG_WARN("%s: EXPERT_POOL plan in the registry but the pool runtime "
+                    "is experimental - set PSHARD_POOL_RUNTIME=1 to enable; disabling pshard\n", __func__);
+                mparams->pshard = false;
+                cparams->pshard = false;
+                return;
+            }
+            break;
         }
     }
 

@@ -768,6 +768,8 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+struct llama_expert_pool;
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -785,6 +787,10 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    // EXPERT_POOL runtime (nullptr unless the active pshard plan pools experts):
+    // pool-managed layers route their expert MUL_MAT_IDs through remapped ids
+    struct llama_expert_pool * expert_pool;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -879,7 +885,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            expert_pool == other.expert_pool;
     }
 };
 
@@ -1026,6 +1033,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    struct llama_expert_pool * expert_pool; // EXPERT_POOL runtime or nullptr
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1055,11 +1064,14 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
+    // mm_ids: expert-pool remapped ids for the weight MUL_MAT_ID only (slot space);
+    // the w_s scale get_rows and the LoRA adapters keep the original expert ids
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * mm_ids = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

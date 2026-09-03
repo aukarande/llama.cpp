@@ -391,6 +391,20 @@ extern "C" {
     // Register a tensor for pre/post-compute split callbacks.
     GGML_API void ggml_backend_sched_add_writeback(ggml_backend_sched_t sched, struct ggml_tensor * tensor);
 
+    // expert-pool integration: bind a persistent externally-allocated device view as
+    // the input copy of a host weight tensor. The view replaces the transient
+    // per-split copy (galloc sees preset data and allocates nothing), the tensor is
+    // opted out of the weight-prefetch machinery, and its consume-time upload is
+    // served by the callback (slot lookup / fetch-on-miss / ids remap live in the
+    // caller). Single-copy schedulers only (no pipeline parallelism).
+    typedef bool (*ggml_backend_sched_pool_input_cb)(const struct ggml_tensor * src,
+            struct ggml_tensor * view, ggml_backend_t split_backend, void * user_data);
+    GGML_API void ggml_backend_sched_set_input_copy_override(ggml_backend_sched_t sched,
+            const struct ggml_tensor * src, struct ggml_tensor * view);
+    GGML_API void ggml_backend_sched_clear_input_copy_overrides(ggml_backend_sched_t sched);
+    GGML_API void ggml_backend_sched_set_pool_input_cb(ggml_backend_sched_t sched,
+            ggml_backend_sched_pool_input_cb cb, void * user_data);
+
     // Per-split info snapshot for timing prediction.
     struct ggml_backend_sched_split_info {
         struct ggml_cgraph * graph;

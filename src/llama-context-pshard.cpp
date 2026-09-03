@@ -229,6 +229,107 @@ void llama_context::pshard_pack_cache_region() {
         buf_total / (1024.0 * 1024.0));
 }
 
+#include "llama-expert-pool.h"
+
+// EXPERT_POOL: create the pool and carve its region from the arena, directly
+// below the pinned KV cache: [weights | scratch | POOL | pinned KV]. The slot
+// count comes from the plan; when the planner's file-size heuristic oversized
+// it, clamp to what actually fits after the largest measured tier scratch.
+void llama_context::pshard_setup_expert_pool() {
+    expert_pool.reset();
+    expert_pool_bytes = 0;
+    if (!cparams.pshard || getenv("PSHARD_POOL_RUNTIME") == nullptr) {
+        return;
+    }
+    auto * registry = const_cast<llama_pshard_plan_registry *>(model.get_plan_registry());
+    if (registry == nullptr) {
+        return;
+    }
+    uint32_t slots = 0;
+    size_t scratch_need = 64ull << 20;
+    bool any = false;
+    for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
+        const llama_pshard_plan * p = registry->get_best(t);
+        if (p == nullptr || !p->is_viable) {
+            continue;
+        }
+        scratch_need = std::max(scratch_need, p->scratch_measured + (64ull << 20));
+        if (p->strategy == LLAMA_PSHARD_EXPERT_POOL) {
+            any   = true;
+            slots = slots > 0 ? std::min(slots, p->pool_slots) : p->pool_slots;
+        }
+    }
+    if (!any || slots == 0) {
+        return;
+    }
+
+    auto pool = std::make_unique<llama_expert_pool>();
+    if (!pool->init(model, model.hparams.n_expert, model.hparams.n_expert_used)) {
+        return;
+    }
+
+    ggml_backend_buffer_t buf = model.get_dev_preload_buf();
+    if (buf == nullptr) {
+        return;
+    }
+    const size_t buf_total = ggml_backend_buffer_get_size(buf);
+    const size_t preloaded = model.get_dev_preloaded_size();
+    const size_t cache     = total_pinned_cache_size(memory.get());
+    if (preloaded + cache + scratch_need >= buf_total) {
+        LLAMA_LOG_WARN("%s: no room for the expert pool (weights %.1f + cache %.1f + scratch %.1f >= %.1f MiB)\n",
+            __func__, preloaded / (1024.0 * 1024.0), cache / (1024.0 * 1024.0),
+            scratch_need / (1024.0 * 1024.0), buf_total / (1024.0 * 1024.0));
+        return;
+    }
+    const size_t avail = buf_total - preloaded - cache - scratch_need;
+    size_t want = pool->region_bytes_needed(slots);
+    while (slots > 0 && want > avail) {
+        slots--;
+        want = pool->region_bytes_needed(slots);
+    }
+    if (slots == 0 || want == 0 || 2 * pool->layer_full_bytes > avail) {
+        LLAMA_LOG_WARN("%s: expert pool does not fit: avail %.1f MiB, A/B pair needs %.1f MiB\n",
+            __func__, avail / (1024.0 * 1024.0), 2 * pool->layer_full_bytes / (1024.0 * 1024.0));
+        return;
+    }
+
+    char * base = (char *) ggml_backend_buffer_get_base(buf) + buf_total - cache - want;
+    base = (char *) ((uintptr_t) base & ~(uintptr_t) 255);
+    want = (size_t) ((char *) ggml_backend_buffer_get_base(buf) + buf_total - cache - base);
+
+    if (!pool->set_region(buf, base, want, slots)) {
+        return;
+    }
+    pool->backend_router = backends[pshard_layout.compute].get();
+    expert_pool_bytes = want;
+    expert_pool = std::move(pool);
+}
+
+void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
+    if (!expert_pool) {
+        return;
+    }
+    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
+    expert_pool->set_ab_mode(ab, sched.get());
+}
+
+// the pool's remapped-ids leaves anchor on the same virtual backend as the
+// layer's expert tensors, so the mm split consumes them without a copy
+void llama_context::pshard_assign_pool_tensors() {
+    if (!expert_pool) {
+        return;
+    }
+    for (auto & L : expert_pool->layers) {
+        if (L.tensors.empty() || L.ids_gpu == nullptr) {
+            continue;
+        }
+        const int32_t bid = pshard_layout.shard(L.il);
+        if (bid >= 0 && bid < (int32_t) backends.size()) {
+            ggml_backend_sched_set_tensor_backend_hint(sched.get(), L.ids_gpu, backends[bid].get());
+        }
+    }
+}
+
 void llama_context::pshard_setup_sched() {
     ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap);
 
@@ -240,11 +341,15 @@ void llama_context::pshard_setup_sched() {
         ggml_backend_sched_set_prefetch_cb(sched.get(), pshard_prefetch);
     }
 
+    if (expert_pool) {
+        expert_pool->register_sched(sched.get());
+    }
+
     if (model.get_dev_preload_buf()) {
         size_t preloaded_size = model.get_dev_preloaded_size();
         size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
 
-        size_t pinned_cache_size = total_pinned_cache_size(memory.get());
+        size_t pinned_cache_size = total_pinned_cache_size(memory.get()) + expert_pool_bytes;
 
         if (preloaded_size + pinned_cache_size > buf_total) {
             LLAMA_LOG_ERROR("%s: weights = %.2f MiB, pinned cache = %.2f MiB, buffer = %.2f MiB, overshoot = %.2f MiB\n",
@@ -297,7 +402,7 @@ void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_
 
     if (model.get_dev_preload_buf()) {
         size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
-        size_t pinned_cache_size = total_pinned_cache_size(memory.get());
+        size_t pinned_cache_size = total_pinned_cache_size(memory.get()) + expert_pool_bytes;
 
         if (scratch_off + pinned_cache_size > buf_total) {
             LLAMA_LOG_ERROR("%s: scratch_off = %.2f MiB, pinned cache = %.2f MiB, buffer = %.2f MiB, overshoot = %.2f MiB\n",
@@ -357,7 +462,7 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
 
     if (external_buf) {
         const size_t buf_total         = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
-        const size_t pinned_cache_size = total_pinned_cache_size(memory.get());
+        const size_t pinned_cache_size = total_pinned_cache_size(memory.get()) + expert_pool_bytes;
         scratch_off   = plan.cached_scratch_off;
         scratch_avail = buf_total - scratch_off - pinned_cache_size;
         ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, SIZE_MAX/2);
@@ -452,7 +557,7 @@ void llama_context::pshard_warmup_plan_reserves() {
         // buffer must degrade, not assert (seen: 24 MiB overshoot at a 2000 MiB budget)
         if (model.get_dev_preload_buf()) {
             const size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
-            const size_t pc        = total_pinned_cache_size(memory.get());
+            const size_t pc        = total_pinned_cache_size(memory.get()) + expert_pool_bytes;
             if (plan.cached_scratch_off + pc > buf_total) {
                 LLAMA_LOG_WARN("%s: tier %zu (bs=%u, %s, n_pinned=%u) packing overshoots buffer by %.2f MiB; marking unviable\n",
                     __func__, t, registry->tier_sizes[t],
@@ -518,6 +623,7 @@ void llama_context::pshard_apply_initial_plan() {
         // extra landing at the same offset as the last warmup tier would otherwise be skipped
         pshard_apply_plan(*initial, /*with_upload=*/true, /*force_upload=*/true);
         pshard_active_plan = initial;
+        pshard_update_pool_mode(*initial);
     }
 }
 
@@ -583,6 +689,8 @@ void llama_context::pshard_switch_plan(
         return registry && tier < registry->tier_sizes.size() ? registry->tier_sizes[tier] : 0;
     };
 
+    pshard_update_pool_mode(new_plan);
+
     LLAMA_LOG_DEBUG("%s: tokens=%u tier %zu(bs=%u) -> %zu(bs=%u): %s (n_pinned=%u) -> %s (n_pinned=%u) | down=%d skip=%d up=%d skip=%d\n",
         __func__,
         n_tokens, old_tier, tier_bs(old_tier), new_tier, tier_bs(new_tier),
@@ -608,7 +716,7 @@ void llama_context::pshard_reapply_active_plan() {
 
     if (model.get_dev_preload_buf()) {
         const size_t buf_total         = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
-        const size_t pinned_cache_size = total_pinned_cache_size(memory.get());
+        const size_t pinned_cache_size = total_pinned_cache_size(memory.get()) + expert_pool_bytes;
         const size_t scratch_off       = plan.cached_scratch_off;
         const size_t scratch_size      = buf_total - scratch_off - pinned_cache_size;
 

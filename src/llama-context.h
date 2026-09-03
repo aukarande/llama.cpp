@@ -280,6 +280,9 @@ private:
 
     void pshard_setup_sched();
     void pshard_pack_cache_region();
+    void pshard_setup_expert_pool();
+    void pshard_update_pool_mode(const llama_pshard_plan & plan);
+    void pshard_assign_pool_tensors();
     void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true, bool force_upload = false);
     void pshard_reapply_active_plan();
     void pshard_reserve_and_save(const llama_pshard_plan & plan);
@@ -376,6 +379,10 @@ private:
     bool sched_need_reserve = true;
 
     const llama_pshard_plan * pshard_active_plan = nullptr;
+    // EXPERT_POOL runtime (docs/expert-pool-design.md); non-null only when the
+    // registry's viable plans pool experts and PSHARD_POOL_RUNTIME is set
+    std::unique_ptr<struct llama_expert_pool> expert_pool;
+    size_t expert_pool_bytes = 0;  // region carved below the pinned KV cache
     bool pshard_memory_dirty = false;
     // tiers reserved + initial plan landed; a later scheduler rebuild (sched_need_reserve
     // set after creation, e.g. by a draft context enabling layer-input extraction on this

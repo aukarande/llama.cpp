@@ -42,6 +42,7 @@ add_library(llama
             llama-pshard-cache.cpp
             llama-pshard-fit.cpp
             llama-pshard-plan.cpp
+            llama-expert-pool.cpp
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp

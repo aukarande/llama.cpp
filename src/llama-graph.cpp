@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "llama-expert-pool.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1486,6 +1488,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    expert_pool      (params.expert_pool),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1543,8 +1546,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+          ggml_tensor * w_s,
+          ggml_tensor * mm_ids) const {
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, mm_ids != nullptr ? mm_ids : ids);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2111,12 +2115,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // EXPERT_POOL: a pool-managed layer's expert MUL_MAT_IDs consume remapped
+    // slot ids, written per split by the pool's consume-time service; the weight
+    // args stay the host homes (the scheduler rebinds them to the pool views
+    // through the input-copy override). Everything else - the probs get_rows,
+    // the w_s scales, add_id biases, LoRA - keeps the original router ids.
+    ggml_tensor * pool_mm_ids = nullptr;
+    if (expert_pool != nullptr && expert_pool->layer_pooled(il)) {
+        pool_mm_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32,
+            selected_experts->ne[0], selected_experts->ne[1]);
+        ggml_set_input(pool_mm_ids);
+        ggml_set_output(pool_mm_ids); // written after alloc, keep galloc off it
+        cb(pool_mm_ids, "ffn_moe_pool_ids", il);
+        ggml_set_output(selected_experts); // the pool service host-reads it
+        expert_pool->bind_layer_ids(il, selected_experts, pool_mm_ids);
+    }
+
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, pool_mm_ids); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2135,7 +2155,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, pool_mm_ids); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2148,7 +2168,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, pool_mm_ids); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2252,7 +2272,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, pool_mm_ids); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

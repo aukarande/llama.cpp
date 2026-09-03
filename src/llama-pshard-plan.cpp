@@ -101,7 +101,10 @@ static void llama_pshard_generate_overrides(
             if (patterns_layer_moe_exps[il].empty()) {
                 patterns_layer_moe_exps[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate|gate_up)_exps\\..*";
             }
-            emit(patterns_layer_moe_exps[il].c_str(), host_buft, layout.cpu);
+            // shard bid: the expert MUL_MAT_IDs anchor on a redirected split (so the
+            // router's ids exist before the pool's consume-time service runs) and the
+            // host tensors stay out of the arena; the pool intercepts every upload path
+            emit(patterns_layer_moe_exps[il].c_str(), host_buft, overlap ? layout.shard(il) : layout.shard_a);
             emit(patterns_layer[il].c_str(), gpu_buft, layout.compute);
             continue;
         }

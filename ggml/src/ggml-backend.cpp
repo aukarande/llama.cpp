@@ -840,6 +840,14 @@ struct ggml_backend_sched {
     int  redirect_target[GGML_SCHED_MAX_BACKENDS];
     bool has_redirects;
 
+    // expert-pool input-copy overrides (host weight tensor -> persistent device view)
+    struct copy_override_entry { const struct ggml_tensor * src; struct ggml_tensor * view; };
+    struct copy_override_entry * copy_overrides;
+    int n_copy_overrides;
+    int copy_overrides_cap;
+    ggml_backend_sched_pool_input_cb pool_input_cb;
+    void * pool_input_ud;
+
     ggml_backend_sched_split_cb split_pre_compute;
     ggml_backend_sched_split_cb split_post_compute;
     ggml_backend_sched_split_cb split_prefetch_cb;
@@ -1168,6 +1176,16 @@ static bool ggml_backend_sched_prefer_sliced_expert_copy(
 
 // true if the split has at least one host-weight input the prefetch pass would actually copy
 // (i.e. not deferred to the sliced-by-used-ids consume-time path)
+static struct ggml_tensor * ggml_backend_sched_input_copy_override_for(
+        struct ggml_backend_sched * sched, const struct ggml_tensor * src) {
+    for (int i = 0; i < sched->n_copy_overrides; i++) {
+        if (sched->copy_overrides[i].src == src) {
+            return sched->copy_overrides[i].view;
+        }
+    }
+    return NULL;
+}
+
 static bool ggml_backend_sched_split_has_prefetchable_weights(
         struct ggml_backend_sched * sched, struct ggml_backend_sched_split * candidate,
         const struct ggml_cgraph * g) {
@@ -1182,6 +1200,10 @@ static bool ggml_backend_sched_split_has_prefetchable_weights(
         struct ggml_tensor * input_cpy = tensor_copy(input, candidate->backend_id, sched->cur_copy);
         if (input_cpy == NULL) {
             continue;
+        }
+        if (sched->n_copy_overrides > 0 &&
+            ggml_backend_sched_input_copy_override_for(sched, input) != NULL) {
+            continue; // expert-pool managed: never prefetched
         }
         if (!ggml_backend_sched_prefer_sliced_expert_copy(g, input, input_cpy)) {
             return true;
@@ -1603,12 +1625,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                        struct ggml_tensor * override_view = sched->n_copy_overrides > 0
+                            ? ggml_backend_sched_input_copy_override_for(sched, src) : NULL;
                         for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                            ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
-                                ggml_set_input(tensor_copy);
-                                ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                            struct ggml_tensor * tensor_copy;
+                            if (override_view != NULL) {
+                                // expert-pool: the persistent externally-allocated view IS the
+                                // copy (data preset, so galloc allocates nothing for it)
+                                tensor_copy = override_view;
+                            } else {
+                                tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                                ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                                if (sched->n_copies > 1) {
+                                    ggml_set_input(tensor_copy);
+                                    ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                                }
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
@@ -1759,7 +1790,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     ggml_backend_buffer_t next_buf = ggml_backend_sched_tensor_buffer(next_input);
                     if (next_buf != NULL &&
                         ggml_backend_buffer_get_usage(next_buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                        ggml_backend_buffer_is_host(next_buf)) {
+                        ggml_backend_buffer_is_host(next_buf) &&
+                        !(sched->n_copy_overrides > 0 &&
+                          ggml_backend_sched_input_copy_override_for(sched, next_input) != NULL)) {
                         const size_t id = hash_id(next_input);
                         struct ggml_tensor * next_cpy = tensor_id_copy(id, next_gpu->backend_id, sched->cur_copy);
                         assert(graph_copy->size > graph_copy->n_nodes);
@@ -2115,6 +2148,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_buffer_get_usage(next_buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(next_buf)) {
                     struct ggml_tensor * input_cpy = tensor_copy(next_input, next_gpu->backend_id, sched->cur_copy);
+                    if (sched->n_copy_overrides > 0 &&
+                        ggml_backend_sched_input_copy_override_for(sched, next_input) != NULL) {
+                        continue; // expert-pool managed: the pool callback serves it at consume time
+                    }
                     if (ggml_backend_sched_prefer_sliced_expert_copy(&next_gpu->graph, next_input, input_cpy)) {
                         // leave small-batch expert weights to the sliced consume-time copy
                         continue;
@@ -2167,6 +2204,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, copy_backend_id, sched->cur_copy);
             ggml_backend_buffer_t input_buf = ggml_backend_sched_tensor_buffer(input);
+
+            if (sched->n_copy_overrides > 0) {
+                struct ggml_tensor * pool_view = ggml_backend_sched_input_copy_override_for(sched, input);
+                if (pool_view != NULL) {
+                    // expert-pool managed: the callback owns the upload (slot lookup /
+                    // fetch-on-miss / ids remap); its async copies land on the split
+                    // backend's stream, ordered before this split's kernels
+                    GGML_ASSERT(pool_view == input_cpy);
+                    GGML_ASSERT(sched->pool_input_cb != NULL && "pool input has no serving callback");
+                    const bool served = sched->pool_input_cb(input, input_cpy, split_backend, sched->pool_input_ud);
+                    GGML_ASSERT(served && "expert-pool callback failed to serve an input");
+                    continue;
+                }
+            }
 
             if (weights_prefetched &&
                 input_buf != NULL &&
@@ -2664,6 +2715,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    free(sched->copy_overrides);
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2850,6 +2902,36 @@ void ggml_backend_sched_set_prefetch_cb(
         ggml_backend_sched_split_cb prefetch_cb) {
     GGML_ASSERT(sched);
     sched->split_prefetch_cb = prefetch_cb;
+}
+
+void ggml_backend_sched_set_input_copy_override(ggml_backend_sched_t sched,
+        const struct ggml_tensor * src, struct ggml_tensor * view) {
+    GGML_ASSERT(sched->n_copies == 1 && "input copy overrides are single-copy only");
+    for (int i = 0; i < sched->n_copy_overrides; i++) {
+        if (sched->copy_overrides[i].src == src) {
+            sched->copy_overrides[i].view = view;
+            return;
+        }
+    }
+    if (sched->n_copy_overrides == sched->copy_overrides_cap) {
+        sched->copy_overrides_cap = sched->copy_overrides_cap > 0 ? 2*sched->copy_overrides_cap : 64;
+        sched->copy_overrides = (ggml_backend_sched::copy_override_entry *) realloc(
+            sched->copy_overrides, sched->copy_overrides_cap * sizeof(sched->copy_overrides[0]));
+        GGML_ASSERT(sched->copy_overrides != NULL);
+    }
+    sched->copy_overrides[sched->n_copy_overrides].src  = src;
+    sched->copy_overrides[sched->n_copy_overrides].view = view;
+    sched->n_copy_overrides++;
+}
+
+void ggml_backend_sched_clear_input_copy_overrides(ggml_backend_sched_t sched) {
+    sched->n_copy_overrides = 0;
+}
+
+void ggml_backend_sched_set_pool_input_cb(ggml_backend_sched_t sched,
+        ggml_backend_sched_pool_input_cb cb, void * user_data) {
+    sched->pool_input_cb = cb;
+    sched->pool_input_ud = user_data;
 }
 
 void ggml_backend_sched_add_writeback(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
