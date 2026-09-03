@@ -367,6 +367,24 @@ and corrupt concurrent measurements).
    by the 0.2 ms/layer handoff, so <=10% on hybrid at tight budgets), (8) hybrid
    bench entry 11.B.10, QA grid -s5 cells (grid HELD), #24528 admission gate on
    the fetch policy, fetch_on_2nd_miss pricing, per-slot generation stamps (#25294).
+   ADMISSION GATE MEASURED 2026-09-03 (PSHARD_POOL_ADMIT_AFTER=N: a fetched expert is
+   restamped below every resident until its N-th miss, so one-off experts are the
+   next victims): NO WIN. Long generations (pool actually evicting): q35 @8000 s=86
+   256 tokens h 0.822 -> 0.815 -> 0.809 for N=1/2/4 (worse); q35 @2700 s=14 0.452 ->
+   0.455 -> 0.458; DSv4 @12000 s=17 128 tokens 0.521 -> 0.530 -> 0.533 (misses/token
+   124.3 -> 121.2, decode 13.3 -> 13.5). Matches the #24528 thread's replay result
+   (replacement policy caps <10%); the code-workload win reported there did not
+   reproduce on these prompts. Knob kept, default 1 = plain LRU, not priced. Bug
+   found on the way: the per-route touch in step 4 restamps every current slot to
+   MRU, so a demotion placed before it was a no-op (h invariant across 44k
+   evictions) - demote after the touch. HORIZON EFFECT (matters more): the 32-token
+   gate reports a COLD pool - q35 @8000 s=86: h 0.70 / 44.7 t/s at 32 tokens vs
+   0.822 / 49.8 t/s at 256 (legacy 50.0 at either: parity in steady state, not
+   -10%); DSv4 @12000: 10.65 t/s at 32 vs 13.3 at 128 (legacy 9.17: +45%). The
+   planner now prices the steady state (Zipf alpha 0.95, no LRU shortfall: h(14)
+   0.49 / h(86) 0.80 vs counted 0.452 / 0.822); perf cells should decode >= 128
+   tokens before judging the pool. Tokens are identical across admit settings and
+   across pool sizes (q35 256-token md5 9cf727cab686 at both budgets).
    Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
