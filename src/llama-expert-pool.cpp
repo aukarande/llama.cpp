@@ -202,13 +202,35 @@ void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
     }
 }
 
-void llama_expert_pool::bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu) {
+void llama_expert_pool::set_policy(int policy, float frac, ggml_backend_sched_t sched) {
+    const bool was_dual = cpu_routes();
+    miss_policy = policy;
+    if (frac > 0.0f && frac <= 1.0f) {
+        hybrid_frac = frac;
+    }
+    if (cpu_routes() != was_dual) {
+        epoch++;   // single <-> dual chain: graph topology changes
+        if (sched != nullptr && active) {
+            register_sched(sched);
+        }
+    }
+}
+
+void llama_expert_pool::bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu,
+                                       ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu) {
     if (!layer_pooled(il)) {
         return;
     }
-    layers[il].ids_router = ids_router;
-    layers[il].ids_gpu    = ids_gpu;
-    layers[il].serve_gen  = 0;
+    layer_state & L = layers[il];
+    L.ids_router   = ids_router;
+    L.ids_gpu      = ids_gpu;
+    L.ids_gpu_bias = ids_gpu_bias;
+    L.ids_cpu      = ids_cpu;
+    L.serve_gen    = 0;
+    if (L.expert_last_gen.size() != n_expert) {
+        L.expert_last_gen.assign(n_expert, 0);
+        L.miss_count.assign(n_expert, 0);
+    }
 }
 
 ggml_tensor * llama_expert_pool::mm_view(int32_t il, const ggml_tensor * host) const {
@@ -287,60 +309,155 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                     (idbuf.data() + i1*ids->nb[1] + i0*ids->nb[0]);
             }
         }
+        if (cpu_routes() && L.ids_cpu != nullptr) {
+            // dual chain on a whole-stack tier: everything is resident, nothing goes to CPU
+            L.bias_buf = mapped;
+            L.cpu_buf.assign(mapped.size(), -1);
+            if (L.ids_gpu_bias != nullptr) {
+                ggml_backend_tensor_set_async(split_backend, L.ids_gpu_bias,
+                    L.bias_buf.data(), 0, L.bias_buf.size() * sizeof(int32_t));
+            }
+            ggml_backend_tensor_set(L.ids_cpu, L.cpu_buf.data(), 0, L.cpu_buf.size() * sizeof(int32_t));
+        }
     } else {
-        // one MUL_MAT_ID consumes every token's routes at once: the pass's distinct
-        // experts must ALL be resident, or same-pass LRU eviction would silently
-        // compute with the wrong experts. The planner floors guarantee this per
-        // tier, but the runtime clamp can undercut them - fail loudly instead.
+        // 1. the pass's distinct experts: hits stay; misses are decided PER EXPERT
+        //    by the tier's miss policy (all of an expert's routes go the same way)
         seen_gen.assign(n_expert, 0);
-        uint32_t distinct = 0;
+        std::vector<int32_t> miss_list;
+        uint32_t n_hit = 0;
         for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
             for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
                 const int32_t e = *(const int32_t *)
                     (idbuf.data() + i1*ids->nb[1] + i0*ids->nb[0]);
                 GGML_ASSERT(e >= 0 && e < (int32_t) n_expert);
-                if (seen_gen[e] == 0) {
-                    seen_gen[e] = 1;
-                    distinct++;
+                if (seen_gen[e] != 0) {
+                    continue;
+                }
+                seen_gen[e] = 1;
+                if (L.expert_slot[e] >= 0) {
+                    // refresh NOW: the fetch loop below picks LRU victims, and a
+                    // same-pass hit must never be one
+                    L.slot_stamp[L.expert_slot[e]] = ++L.stamp;
+                    n_hit++;
+                } else {
+                    miss_list.push_back(e);
                 }
             }
         }
-        if (distinct > n_slots) {
-            LLAMA_LOG_ERROR("%s: pool layer %d: %u distinct experts this pass > %u slots - "
-                "the runtime clamp undercut the plan floor\n", __func__, L.il, distinct, n_slots);
-            return false;
+        const bool dual = cpu_routes() && L.ids_cpu != nullptr;
+
+        // 2. which misses get fetched (admitted) vs computed on CPU
+        //    fetch:             all (the floor guarantees the slots)
+        //    cpu_exec:          none
+        //    fetch_on_2nd_miss: only experts that missed before (admission filter)
+        //    hybrid:            the q* = round(m * B_P/B_H) most recently active misses
+        std::vector<uint8_t> admit(miss_list.size(), 1);
+        if (dual) {
+            const size_t m = miss_list.size();
+            if (miss_policy == 1) {                       // cpu_exec
+                std::fill(admit.begin(), admit.end(), 0);
+            } else if (miss_policy == 2) {                // fetch_on_2nd_miss
+                for (size_t i = 0; i < m; i++) {
+                    const int32_t e = miss_list[i];
+                    admit[i] = L.miss_count[e] > 0 ? 1 : 0;
+                    L.miss_count[e]++;
+                }
+            } else if (miss_policy == 3) {                // hybrid
+                size_t q = (size_t) (hybrid_frac * (double) m + 0.5);
+                if (m > 0 && q == 0) q = 1;
+                if (q > m) q = m;
+                // rank misses by recency (most recently active first), fetch the top q
+                std::vector<size_t> order(m);
+                for (size_t i = 0; i < m; i++) order[i] = i;
+                std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                    return L.expert_last_gen[miss_list[a]] > L.expert_last_gen[miss_list[b]];
+                });
+                std::fill(admit.begin(), admit.end(), 0);
+                for (size_t i = 0; i < q; i++) admit[order[i]] = 1;
+            }
+        }
+        // slot capacity: this pass's hits + admitted misses must all be resident at
+        // once (one MUL_MAT_ID per chain). Overflow spills to CPU when a CPU chain
+        // exists; a fetch-only tier fails loudly instead of evicting same-pass rows.
+        {
+            uint32_t need = n_hit;
+            for (size_t i = 0; i < miss_list.size(); i++) {
+                if (admit[i] && need < n_slots) {
+                    need++;
+                } else if (admit[i]) {
+                    if (!dual) {
+                        LLAMA_LOG_ERROR("%s: pool layer %d: distinct experts this pass exceed %u slots - "
+                            "the runtime clamp undercut the plan floor\n", __func__, L.il, n_slots);
+                        return false;
+                    }
+                    admit[i] = 0;
+                }
+            }
+        }
+
+        // 3. fetch the admitted misses into LRU victims (same-pass residents carry
+        //    the newest stamps, so they are never chosen)
+        for (size_t i = 0; i < miss_list.size(); i++) {
+            const int32_t e = miss_list[i];
+            L.expert_last_gen[e] = generation;
+            if (!admit[i]) {
+                L.misses++;
+                continue;
+            }
+            int32_t slot = 0;
+            for (uint32_t s = 1; s < n_slots; s++) {
+                if (L.slot_stamp[s] < L.slot_stamp[slot]) {
+                    slot = (int32_t) s;
+                }
+            }
+            if (L.slot_expert[slot] >= 0) {
+                L.expert_slot[L.slot_expert[slot]] = -1;
+            }
+            L.slot_expert[slot] = e;
+            L.expert_slot[e]    = slot;
+            L.slot_stamp[slot]  = ++L.stamp;
+            for (const auto & te : L.tensors) {
+                ggml_backend_tensor_set_async(split_backend, te.view_slots,
+                    (const char *) te.host->data + (size_t) e * te.row_bytes,
+                    (size_t) slot * te.row_bytes, te.row_bytes);
+            }
+            L.misses++;
+        }
+
+        // 4. per-route ids: GPU mm gets slot | -1, GPU bias gets expert | -1, the
+        //    CPU chain gets expert | -1 (complement)
+        if (dual) {
+            L.bias_buf.assign(mapped.size(), -1);
+            L.cpu_buf.assign(mapped.size(), -1);
         }
         for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
             for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
                 const int32_t e = *(const int32_t *)
                     (idbuf.data() + i1*ids->nb[1] + i0*ids->nb[0]);
-                int32_t slot = L.expert_slot[e];
-                if (slot < 0) {
-                    // LRU victim; the floor (n_slots >= min(E, top_k*bs)) keeps this
-                    // pass's residents un-evictable (their stamps are the newest)
-                    slot = 0;
-                    for (uint32_t s = 1; s < n_slots; s++) {
-                        if (L.slot_stamp[s] < L.slot_stamp[slot]) {
-                            slot = (int32_t) s;
-                        }
+                const int32_t slot = L.expert_slot[e];
+                const size_t  k    = (size_t) (i1*n_ids_0 + i0);
+                L.expert_last_gen[e] = generation;
+                if (slot >= 0) {
+                    L.slot_stamp[slot] = ++L.stamp;
+                    mapped[k] = slot;
+                    if (dual) {
+                        L.bias_buf[k] = e;
                     }
-                    if (L.slot_expert[slot] >= 0) {
-                        L.expert_slot[L.slot_expert[slot]] = -1;
-                    }
-                    L.slot_expert[slot] = e;
-                    L.expert_slot[e]    = slot;
-                    for (const auto & te : L.tensors) {
-                        ggml_backend_tensor_set_async(split_backend, te.view_slots,
-                            (const char *) te.host->data + (size_t) e * te.row_bytes,
-                            (size_t) slot * te.row_bytes, te.row_bytes);
-                    }
-                    L.misses++;
                 } else {
-                    L.hits++;
+                    GGML_ASSERT(dual && "unadmitted miss without a CPU chain");
+                    mapped[k] = -1;
+                    L.cpu_buf[k] = e;
                 }
-                L.slot_stamp[slot] = ++L.stamp;
-                mapped[i1*n_ids_0 + i0] = slot;
             }
+        }
+        L.hits += n_hit;
+        if (dual) {
+            if (L.ids_gpu_bias != nullptr) { // only exists when an expert bias consumes it
+                ggml_backend_tensor_set_async(split_backend, L.ids_gpu_bias,
+                    L.bias_buf.data(), 0, L.bias_buf.size() * sizeof(int32_t));
+            }
+            // the CPU chain's leaf lives in host memory: plain synchronous set
+            ggml_backend_tensor_set(L.ids_cpu, L.cpu_buf.data(), 0, L.cpu_buf.size() * sizeof(int32_t));
         }
     }
 

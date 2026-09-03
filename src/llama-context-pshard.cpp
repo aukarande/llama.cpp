@@ -332,6 +332,7 @@ void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
     }
     // legacy tiers in a mixed registry stream normally: the pool disengages
     expert_pool->set_active(plan.strategy == LLAMA_PSHARD_EXPERT_POOL, sched.get());
+    expert_pool->set_policy(plan.pool_miss, plan.pool_hybrid_frac, sched.get());
     const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
     expert_pool->set_ab_mode(ab, sched.get());
 }
@@ -349,6 +350,13 @@ void llama_context::pshard_assign_pool_tensors() {
         const int32_t bid = pshard_layout.shard(L.il);
         if (bid >= 0 && bid < (int32_t) backends.size()) {
             ggml_backend_sched_set_tensor_backend_hint(sched.get(), L.ids_gpu, backends[bid].get());
+            if (L.ids_gpu_bias != nullptr) {
+                ggml_backend_sched_set_tensor_backend_hint(sched.get(), L.ids_gpu_bias, backends[bid].get());
+            }
+        }
+        if (L.ids_cpu != nullptr && backend_cpu != nullptr) {
+            // the CPU chain reads it in place
+            ggml_backend_sched_set_tensor_backend(sched.get(), L.ids_cpu, backend_cpu);
         }
     }
 }

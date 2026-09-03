@@ -56,8 +56,14 @@ struct llama_expert_pool {
                                             // host pointer behind pending staged fetches)
 
         // per-graph-build registration (rebound every build by build_moe_ffn)
-        ggml_tensor * ids_router = nullptr; // selected_experts (device, original ids)
-        ggml_tensor * ids_gpu    = nullptr; // remapped ids the expert MUL_MAT_IDs consume
+        ggml_tensor * ids_router   = nullptr; // selected_experts (device, original ids)
+        ggml_tensor * ids_gpu      = nullptr; // GPU chain mm ids: slot id | -1
+        ggml_tensor * ids_gpu_bias = nullptr; // GPU chain add_id ids: expert id | -1 (dual only)
+        ggml_tensor * ids_cpu      = nullptr; // CPU chain ids: expert id | -1 (dual only)
+        std::vector<int32_t> bias_buf;        // persistent upload buffers (async-safe)
+        std::vector<int32_t> cpu_buf;
+        std::vector<uint64_t> expert_last_gen; // [n_expert] recency: last generation routed
+        std::vector<uint32_t> miss_count;      // [n_expert] fetch_on_2nd_miss admission counter
     };
 
     uint32_t n_expert      = 0;
@@ -66,6 +72,8 @@ struct llama_expert_pool {
     bool     ab_mode       = false;    // active tier is a whole-stack prefill tier
     bool     active        = false;    // the ACTIVE plan is EXPERT_POOL (legacy tiers
                                        // in a mixed registry must stream normally)
+    int      miss_policy   = 0;        // llama_pshard_miss_policy of the active tier
+    float    hybrid_frac   = 0.55f;    // fetched share of misses under hybrid (B_P / B_H)
     uint64_t epoch         = 0;        // bumped on active/ab flips; joins graph reuse
     uint64_t generation    = 0;        // bumped once per decode call; dedupes serve()
 
@@ -103,8 +111,17 @@ struct llama_expert_pool {
     // pooled layers build/stream like any legacy plan
     void set_active(bool on, ggml_backend_sched_t sched);
 
+    // true when the active policy admits CPU-executed routes (the split-op:
+    // two expert chains, -1 for the other side's routes)
+    bool cpu_routes() const { return miss_policy != 0; }
+
+    // policy of the active tier; a change of chain shape (single <-> dual)
+    // bumps the epoch
+    void set_policy(int policy, float frac, ggml_backend_sched_t sched);
+
     // graph-build registration (called from build_moe_ffn via the graph channel)
-    void bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu);
+    void bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu,
+                        ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu);
     ggml_tensor * mm_view(int32_t il, const ggml_tensor * host) const;
     bool layer_pooled(int32_t il) const {
         return il >= 0 && il < (int32_t) layers.size() && !layers[il].tensors.empty();

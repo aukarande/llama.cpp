@@ -1851,6 +1851,14 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         ? 2.0 * b_layer_exps
         : (double) floor_slots * b_expert * n_layers;
 
+    // hybrid q* share = gathered-fetch rate over host DRAM rate (design 4b);
+    // the paired bench entry (11.B.10) refines this
+    plan.pool_hybrid_frac = 0.55f;
+    if (ctx.predictor && ctx.predictor->stats.peak_system_bw > 0.0) {
+        const double bp = ctx.predictor->stats.slice_bw(b_expert);
+        plan.pool_hybrid_frac = (float) std::min(1.0, std::max(0.05, bp / ctx.predictor->stats.peak_system_bw));
+    }
+
     plan.total_vram_req = (size_t) vram_free;  // the pool absorbs the remainder by design
     plan.pool_slots = pool_bytes > 0 && b_expert > 0.0
         ? (uint32_t) ((double) pool_bytes / (b_expert * n_layers)) : 0;
