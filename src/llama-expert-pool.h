@@ -49,6 +49,7 @@ struct llama_expert_pool {
         uint64_t stamp    = 0;
         uint64_t hits     = 0;
         uint64_t misses   = 0;
+        uint64_t cache_passes = 0;          // cache-mode serve() passes (misses/token denominator)
         uint64_t ab_pass  = 0;              // last pass this layer's A/B half was filled
         uint64_t serve_gen = 0;             // last generation serve() ran the full work
         std::vector<int32_t> mapped_buf;    // remapped-ids upload buffer: MUST outlive the

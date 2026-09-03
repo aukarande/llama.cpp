@@ -392,6 +392,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             }
         }
         const bool dual = cpu_routes() && L.ids_cpu != nullptr;
+        L.cache_passes++;
 
         // 2. which misses get fetched (admitted) vs computed on CPU
         //    fetch:             all (the floor guarantees the slots)
@@ -529,12 +530,28 @@ void llama_expert_pool::reset_slots() {
 }
 
 void llama_expert_pool::log_counters() const {
-    uint64_t hits = 0, misses = 0;
+    uint64_t hits = 0, misses = 0, passes = 0;
+    std::string per_layer;
     for (const auto & L : layers) {
+        if (L.tensors.empty()) {
+            continue;
+        }
         hits   += L.hits;
         misses += L.misses;
+        passes  = std::max(passes, L.cache_passes);
+        const uint64_t n = L.hits + L.misses;
+        char buf[16];
+        snprintf(buf, sizeof(buf), " %.2f", n > 0 ? (double) L.hits / (double) n : 0.0);
+        per_layer += buf;
     }
-    const double h = hits + misses > 0 ? (double) hits / (double) (hits + misses) : 0.0;
-    LLAMA_LOG_INFO("%s: expert pool: %llu hits / %llu misses (h=%.3f)\n",
-        __func__, (unsigned long long) hits, (unsigned long long) misses, h);
+    if (hits + misses == 0) {
+        return; // never served in cache mode (or pool never engaged)
+    }
+    const double h   = (double) hits / (double) (hits + misses);
+    const double mpt = passes > 0 ? (double) misses / (double) passes : 0.0;
+    // cache-mode decode counters: distinct experts per layer per pass; misses/token
+    // is per pass (= per token at bs=1), summed over the pooled layers
+    LLAMA_LOG_INFO("%s: expert pool: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
+        __func__, (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) passes, h, mpt, n_slots);
+    LLAMA_LOG_INFO("%s: expert pool h per layer:%s\n", __func__, per_layer.c_str());
 }

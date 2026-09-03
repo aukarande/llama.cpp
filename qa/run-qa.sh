@@ -77,7 +77,7 @@ LEDGER="$OUT/ledger.csv"
 if [ "${QA_RESUME:-0}" = "1" ] && [ -f "$LEDGER" ]; then
     echo "resuming: $(grep -c ',pshard,' "$LEDGER") pshard rows already present"
 else
-    echo "config,side,model,ctx,mva,strategy_forced,strategy_active,strategy_prefill,overlap,n_pinned,n_attn_pinned,cache_ubatch,prefill_ub,prompt_tps,decode_tps,decode_tokens,vram_peak_delta,token_hash,status" > "$LEDGER"
+    echo "config,side,model,ctx,mva,strategy_forced,strategy_active,strategy_prefill,overlap,n_pinned,n_attn_pinned,cache_ubatch,prefill_ub,prompt_tps,decode_tps,decode_tokens,vram_peak_delta,mean_h,misses_per_token,token_hash,status" > "$LEDGER"
 fi
 
 IDLE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
@@ -168,7 +168,7 @@ for MDL in $MODELS_LIST; do
                     env PSHARD_STRATEGY=$STRAT ./llama-pshard-plan-params.exe -m "$MP" -c "$CTX" -mva "$MVA" > "$PLOG" 2>&1
                 fi
                 if [ $? -ne 0 ]; then
-                    echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,PLAN_FAILED,,,,,,,,,,,FAIL" >> "$LEDGER"
+                    echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,PLAN_FAILED,,,,,,,,,,,,,FAIL" >> "$LEDGER"
                     continue
                 fi
                 CUB=$(grep -aoE "cache_ubatch=[0-9]+" "$MP.tensor_overrides.pshard_registry" | head -1 | cut -d= -f2)
@@ -224,7 +224,7 @@ for MDL in $MODELS_LIST; do
                     fi
                     # stock row columns: cache_ubatch = the golden's matched shape,
                     # prefill_ub = the perf baseline's effective (default) n_ubatch
-                    echo "${MK}-c${CTX}-mva${MVA},stock,$MK,$CTX,$MVA,,,,,,,${CUB},${SUB},$P,$D,$NTOK,$DELTA,$STOCK_HASH,$ST" >> "$LEDGER"
+                    echo "${MK}-c${CTX}-mva${MVA},stock,$MK,$CTX,$MVA,,,,,,,${CUB},${SUB},$P,$D,$NTOK,$DELTA,,,$STOCK_HASH,$ST" >> "$LEDGER"
                     STOCK_DONE=1
                 fi
 
@@ -311,7 +311,10 @@ for MDL in $MODELS_LIST; do
                     fi
                 fi
                 if [ "$ST" = "FAIL" ]; then P=""; D=""; DELTA=""; H=""; NTOK=""; fi
-                echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,$ACT,$SP,$OVL,$NP,$NA,$CUB,$PUB,$P,$D,$NTOK,$DELTA,$H,$ST" >> "$LEDGER"
+                # expert-pool cache counters (EXPERT_POOL cells only; printed at context free in the -lv 4 correctness log)
+                MH=$(grep -aoE 'misses over [0-9]+ passes: h=[0-9.]+' "$CLOG" | tail -1 | grep -aoE 'h=[0-9.]+' | cut -d= -f2)
+                MPT=$(grep -aoE 'misses/token=[0-9.]+' "$CLOG" | tail -1 | cut -d= -f2)
+                echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,$ACT,$SP,$OVL,$NP,$NA,$CUB,$PUB,$P,$D,$NTOK,$DELTA,$MH,$MPT,$H,$ST" >> "$LEDGER"
                 echo "    active=$ACT prefill=$SP/ub$PUB ovl=$OVL np=$NP attn=$NA prompt=$P decode=$D (${NTOK}tok) vram=+$DELTA $ST"
             done
         done

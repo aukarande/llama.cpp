@@ -101,6 +101,7 @@ def main():
         if status_class(r["status"]) != status_class(rr["status"]):
             hard.append(f"{cfg}: token-gate class drift {rr['status']} -> {r['status']}")
         # plan attribution drift; only compare fields the (possibly older) reference has
+        # mean_h / misses_per_token (expert-pool cells) are informational: no drift gate
         for k in ("strategy_active", "strategy_prefill", "overlap", "n_pinned",
                   "n_attn_pinned", "prefill_ub"):
             if rr.get(k) not in (None, "") and r.get(k) not in (None, "") and r[k] != rr[k]:
