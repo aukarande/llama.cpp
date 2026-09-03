@@ -644,7 +644,8 @@ double llama_benchmark_predictor::predict_tps(
         uint32_t kv_size,
         int32_t batch_size,
         uint32_t n_outputs,
-        bool has_rs) const {
+        bool has_rs,
+        breakdown * bd) const {
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched);
     if (n_splits <= 0) return 0.0;
@@ -676,6 +677,7 @@ double llama_benchmark_predictor::predict_tps(
         const bool is_gpu = (si.backend_id != cpu_backend_id);
 
         double input_copy_ms = 0.0;
+        double input_copy_weight_ms = 0.0;
         double input_copy_bytes = 0.0;
         if (is_gpu && pcie_bw > 0.0) {
             // a prefetched split still pays its sliced-by-used-ids expert copies at
@@ -701,9 +703,9 @@ double llama_benchmark_predictor::predict_tps(
                     ? std::min(stats.slice_bw((double)si.input_weight_sliced_chunk_bytes), weight_bw)
                     : stats.slice_bw((double)si.input_weight_sliced_chunk_bytes))
                 : pcie_bw;
-            input_copy_ms = (rest_weight_bytes / 1e9 / weight_bw) * 1000.0
-                          + (rest_wb_bytes / 1e9 / pcie_bw) * 1000.0
-                          + (sliced_bw > 0.0 ? (sliced_bytes / 1e9 / sliced_bw) * 1000.0 : 0.0);
+            input_copy_weight_ms = (rest_weight_bytes / 1e9 / weight_bw) * 1000.0
+                                 + (sliced_bw > 0.0 ? (sliced_bytes / 1e9 / sliced_bw) * 1000.0 : 0.0);
+            input_copy_ms = input_copy_weight_ms + (rest_wb_bytes / 1e9 / pcie_bw) * 1000.0;
         }
 
         // peek at next split to determine if async prefetch will overlap with this split
@@ -812,6 +814,13 @@ double llama_benchmark_predictor::predict_tps(
             split_ms += f * std::max(comp_ms, pf_staged) + (1.0 - f) * std::max(comp_ms, pf_pinned);
         } else {
             split_ms += std::max(comp_ms, prefetch_ms);
+        }
+        if (bd != nullptr) {
+            // the max() term minus the compute it hid = exposed prefetch (weights)
+            const double overlap_ms = split_ms - input_copy_ms - activ_copy_ms;
+            bd->compute_ms       += t.time_ms;
+            bd->weight_upload_ms += input_copy_weight_ms + std::max(0.0, overlap_ms - comp_ms);
+            bd->other_ms         += (input_copy_ms - input_copy_weight_ms) + activ_copy_ms + kv_dl_ms;
         }
         total_ms += split_ms;
         copy_prefetched = next_copy_prefetched;

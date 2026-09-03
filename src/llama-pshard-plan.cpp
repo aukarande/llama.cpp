@@ -1,5 +1,7 @@
 #include "llama-pshard-plan.h"
 
+#include <cmath>
+
 #include "llama-benchmark.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
@@ -300,13 +302,14 @@ struct llama_pshard_tps_hook_data {
     uint32_t n_outputs;
     bool     has_rs;
     float  * out_tps;
+    llama_benchmark_predictor::breakdown * out_bd = nullptr; // optional attribution (expert pool)
 };
 
 static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
     auto * d = (llama_pshard_tps_hook_data *) user_data;
     if (!d || !d->predictor || !ctx) return;
 
-    double tps = d->predictor->predict_tps(ctx->get_sched(), d->cpu_backend_id, d->kv_size, d->batch_size, d->n_outputs, d->has_rs);
+    double tps = d->predictor->predict_tps(ctx->get_sched(), d->cpu_backend_id, d->kv_size, d->batch_size, d->n_outputs, d->has_rs, d->out_bd);
     if (d->out_tps) {
         *d->out_tps = (float)tps;
     }
@@ -1871,9 +1874,18 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     mp.n_gpu_layers = n_layers + 1;
     mp.tensor_buft_overrides = tensor_buft_overrides;
 
+    // the probe graph places the experts as shard-bid streamed weights, so the
+    // predictor prices it as FULL-LAYER STREAMING: right for whole-stack (A/B) tiers,
+    // and the breakdown lets cache tiers swap the weight-upload term for the miss term
+    llama_benchmark_predictor::breakdown bd;
+    llama_pshard_tps_hook_data tps_data = { ctx.predictor, layout.cpu, ctx.kv_size, (int32_t) cparams->n_batch,
+                                            cparams->n_seq_max, ctx.has_rs, &plan.tps, &bd };
+    auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
+    auto * hookdata = ctx.predictor ? (void *) &tps_data     : nullptr;
+
     int64_t gpu_used = -1;
     try {
-        const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, true);
+        const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, true);
         gpu_used = d[0].mb.total();
         plan.scratch_measured = d[0].mb.compute;
         plan.cache_measured   = d[0].mb.context;
@@ -1909,6 +1921,67 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     plan.pool_slots = pool_bytes > 0 && b_expert > 0.0
         ? (uint32_t) ((double) pool_bytes / (b_expert * n_layers_exp)) : 0;
     plan.is_viable = pool_bytes >= (int64_t) floor_bytes;
+
+    // cache-tier price (design 3b.2): compute + other + per-layer miss cost. The
+    // probe's weight-upload term (full expert stacks) is replaced by
+    //   distinct(bs) * (1 - h(s)) * t_miss   per pooled layer,
+    // distinct(bs) = min(E, bs*top_k) (token union), h(s) = Zipf(alpha) mass of
+    // the s most popular of E experts (assumption until the runtime counters feed
+    // the registry), t_miss by policy: fetch = S / gathered-slice rate; cpu_exec =
+    // S / (DRAM - gather) + a per-layer handoff; hybrid = the q*-balanced max().
+    // Whole-stack tiers keep the probe's streaming price (A/B upload with overlap).
+    if (ctx.predictor && plan.is_viable && plan.tps > 0.0f && !ab_tier && plan.pool_slots > 0) {
+        const auto & st = ctx.predictor->stats;
+        const double E  = (double) ctx.n_expert;
+        const double s  = std::min<double>(plan.pool_slots, E);
+        // Zipf(alpha) popularity mass of the s hottest of E experts. alpha=1 gives
+        // h(75)=0.80 for q35 where the runtime counted h=0.700 (fetch, 512+32 greedy,
+        // 31 passes); alpha=0.8 reproduces that point. PSHARD_POOL_ZIPF overrides;
+        // the QA ledger's mean_h column is the re-fit input.
+        double alpha = 0.8;
+        if (const char * za = getenv("PSHARD_POOL_ZIPF")) {
+            alpha = atof(za);
+        }
+        auto zipf_mass = [alpha](double n) {
+            double m = 0.0;
+            for (int i = 1; i <= (int) n; i++) {
+                m += std::pow((double) i, -alpha);
+            }
+            return m;
+        };
+        const double h  = s >= E ? 1.0 : zipf_mass(s) / zipf_mass(E);
+        const double distinct = std::min<double>(E, (double) bs * ctx.n_expert_used);
+        const double misses   = distinct * (1.0 - h);
+        const double bp_gbs   = st.slice_bw(b_expert) > 0.0 ? st.slice_bw(b_expert) : 25.0;
+        const double bh_gbs   = st.peak_system_bw > 0.0 ? st.peak_system_bw : 45.0;
+        const double t_fetch  = b_expert / 1e9 / bp_gbs * 1000.0;                       // ms per fetched expert
+        const double t_cpu    = b_expert / 1e9 / std::max(1.0, bh_gbs - bp_gbs) * 1000.0; // ms per CPU-computed expert
+        const double t_split  = 0.3;                                                      // ms per layer: GPU->CPU->GPU handoff (TBD: measure)
+        double miss_ms_layer = 0.0;
+        switch (plan.pool_miss) {
+            case LLAMA_PSHARD_MISS_CPU_EXEC:
+                miss_ms_layer = misses * t_cpu + t_split; break;
+            case LLAMA_PSHARD_MISS_HYBRID: {
+                const double q = std::round(plan.pool_hybrid_frac * misses);
+                miss_ms_layer = std::max(q * t_fetch, (misses - q) * t_cpu) + t_split; break;
+            }
+            case LLAMA_PSHARD_MISS_FETCH_ON_2ND:
+                miss_ms_layer = 0.5 * misses * t_cpu + 0.5 * misses * t_fetch + t_split; break; // half admitted (TBD: counters)
+            default:
+                miss_ms_layer = misses * t_fetch; break;
+        }
+        const double miss_ms   = miss_ms_layer * n_layers_exp;
+        const double pool_ms   = bd.compute_ms + bd.other_ms + miss_ms;
+        const float  probe_tps = plan.tps;
+        if (pool_ms > 0.0) {
+            plan.tps = (float) ((double) bs * 1000.0 / pool_ms);
+        }
+        LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u priced: probe %.1f t/s (compute %.1f + upload %.1f + other %.1f ms) -> "
+            "pool %.1f t/s (h(%u)=%.2f, %.1f misses/layer, %.2f ms/layer, %s)\n",
+            __func__, bs, probe_tps, bd.compute_ms, bd.weight_upload_ms, bd.other_ms, plan.tps,
+            plan.pool_slots, h, misses, miss_ms_layer,
+            llama_pshard_miss_policy_name((llama_pshard_miss_policy) plan.pool_miss));
+    }
 
     // keep the emitted placement on the plan (the registry round-trips it as ot=,
     // and the loader treats a viable plan without overrides as corruption)
@@ -1948,8 +2021,9 @@ static llama_pshard_plan llama_pshard_search_tier(
     for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
         if (force_strategy >= 0 && force_strategy != s) continue;
         if (prune.skip[s]) continue;
-        if (s == LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_EXPERT_POOL) {
-            continue; // auto entry lands with the pool pricing
+        if (s == LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_EXPERT_POOL &&
+                getenv("PSHARD_POOL_AUTO") == nullptr) {
+            continue; // PSHARD_POOL_AUTO=1 lets the priced pool compete in auto (runtime needs PSHARD_POOL_RUNTIME=1)
         }
 
         llama_pshard_strategy strategy = (llama_pshard_strategy)s;
@@ -2056,8 +2130,9 @@ static void llama_pshard_strategy_sweep(
         size_t first_tier) {
 
     if (force_strategy >= 0 && force_strategy != strategy) return;
-    if (strategy == LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_EXPERT_POOL) {
-        return; // auto entry lands with the pool pricing
+    if (strategy == LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_EXPERT_POOL &&
+            getenv("PSHARD_POOL_AUTO") == nullptr) {
+        return; // PSHARD_POOL_AUTO=1 lets the priced pool compete in auto
     }
 
     llama_model_tensor_buft_override local_overrides[4096];

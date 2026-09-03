@@ -198,13 +198,24 @@ struct llama_benchmark_predictor {
     // kv_size: total KV cells per layer (for partial upload ratio).
     // has_rs: true if model has recurrent state layers (RS uses full-tensor transfer, not cell-granular).
     // Returns 0 if no splits or no benchmark data.
+    // where a predicted pass spends its time (ms): compute, weight uploads the
+    // compute did not hide (consume-time copies + exposed prefetch), and the rest
+    // (activations, KV writeback/download). The expert pool re-prices a plan by
+    // swapping the weight-upload term for its own miss term.
+    struct breakdown {
+        double compute_ms       = 0.0;
+        double weight_upload_ms = 0.0;
+        double other_ms         = 0.0;
+    };
+
     double predict_tps(
             ggml_backend_sched_t sched,
             int cpu_backend_id,
             uint32_t kv_size,
             int32_t batch_size,
             uint32_t n_outputs = 0,
-            bool has_rs = false) const;
+            bool has_rs = false,
+            breakdown * bd = nullptr) const;
 
 private:
     void build_maps();
