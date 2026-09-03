@@ -287,7 +287,33 @@ and corrupt concurrent measurements).
    aliased rebuilt-graph tensors in mixed registries). Documented invariant: the GPU
    chain is the ADD's src[0] so its split runs first and the service writes the CPU
    ids in time. Refuted: LRU same-pass-hit (already fixed), hybrid trim order,
-   fetch_on_2nd_miss counter decay. Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
+   fetch_on_2nd_miss counter decay.
+   FOLLOW-UPS 1-5 LANDED 2026-09-03 (fd11c3593 real expert bytes, 75884f699 per-tier
+   region, 85a9599e6 A/B prefetch overlap, faa4d870f counters, 69fc96936 pricing +
+   PSHARD_POOL_AUTO): the planner sizes the pool from the gguf tensor table (q35:
+   498 MiB/layer, 1.95 MiB/expert -> s=75 decode / 66 on A/B tiers, was 17 under
+   the 0.85 heuristic + max-tier scratch); the region is re-carved per tier (pool +
+   scratch constant, so decode turns the prefill scratch delta into slots);
+   whole-stack tiers fill the A/B half from the sched prefetch pass on the copy
+   stream (prompt 574 -> 662 t/s); log_counters at context free (library INFO:
+   needs -lv 4, which the QA correctness log has) + ledger columns mean_h /
+   misses_per_token; predict_tps breakdown (compute / exposed weight upload /
+   other) + Zipf(alpha=0.8, PSHARD_POOL_ZIPF) miss term for cache tiers +
+   PSHARD_POOL_AUTO=1 ladder entry. Gates: fetch / cpu_exec / hybrid / legacy md5
+   ecb043a95a14 after every step. Calibration q35 @8000 fetch s=75: counted
+   h=0.700, 96 misses/token (2.4/layer, per-layer 0.45-0.80; Zipf(1) would say
+   0.80); priced 46.6 vs measured 45.8 t/s decode. HONEST LADDER OUTCOME: a fresh
+   legacy auto plan @8000 (12 layers pinned) is priced 52.3 / measured 50.0 t/s
+   decode and 764 prompt vs the pool's 45.8 / ~650, so with PSHARD_POOL_AUTO=1
+   the ladder keeps legacy on every tier at this budget - and the model is right
+   on both sides. The pool's case is tight budgets (legacy cannot pin whole
+   layers) and expert-dominated models (DSv4) - not yet measured. Registry trap:
+   PSHARD_MISS_POLICY is fingerprinted, PSHARD_POOL_AUTO is not (it rewrites the
+   auto section). OPEN (6-8): planner picks cpu_exec/hybrid below the fetch
+   floors; concurrent CPU chain (the max() handshake); hybrid bench entry,
+   GROVEMOE chexps, MMQ ne0%512 padding, QA grid -s5; upstream cherry-picks
+   #22181 #22331 #25048 #27024 and the #24528 admission gate (see the PR triage).
+   Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
    budget before the margin fix); ~~joint target+draft planning (cordis v2)
