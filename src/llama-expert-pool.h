@@ -53,6 +53,8 @@ struct llama_expert_pool {
         uint64_t hits_1   = 0;              // the same, restricted to single-token passes (decode)
         uint64_t misses_1 = 0;
         uint64_t passes_1 = 0;
+        uint64_t demoted  = 0;              // probationary fetches restamped below the residents
+        uint64_t evicted  = 0;              // residents displaced by a fetch
         uint64_t ab_pass  = 0;              // last pass this layer's A/B half was filled
         uint64_t serve_gen = 0;             // last generation serve() ran the full work
         std::vector<int32_t> mapped_buf;    // remapped-ids upload buffer: MUST outlive the
@@ -78,6 +80,11 @@ struct llama_expert_pool {
                                        // in a mixed registry must stream normally)
     int      miss_policy   = 0;        // llama_pshard_miss_policy of the active tier
     float    hybrid_frac   = 0.55f;    // fetched share of misses under hybrid (B_P / B_H)
+    // probationary admission (RFC #24528's ADMIT_AFTER): an expert earns an MRU stamp
+    // only from its admit_after-th miss on; earlier fetches still serve the pass but
+    // land below every live resident, so one-off experts cannot evict the hot set.
+    // 1 = plain LRU. PSHARD_POOL_ADMIT_AFTER overrides.
+    uint32_t admit_after   = 1;
     uint64_t epoch         = 0;        // bumped on active/ab flips; joins graph reuse
     uint64_t generation    = 0;        // bumped once per decode call; dedupes serve()
 

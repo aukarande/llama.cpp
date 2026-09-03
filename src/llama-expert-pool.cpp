@@ -13,6 +13,10 @@ llama_expert_pool::~llama_expert_pool() {
 }
 
 bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint32_t n_expert_used_) {
+    if (const char * aa = getenv("PSHARD_POOL_ADMIT_AFTER")) {
+        const long v = strtol(aa, nullptr, 10);
+        admit_after = (uint32_t) std::min<long>(64, std::max<long>(1, v));
+    }
     n_expert      = n_expert_;
     n_expert_used = n_expert_used_;
     if (n_expert == 0 || n_expert_used == 0) {
@@ -421,8 +425,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             } else if (miss_policy == 2) {                // fetch_on_2nd_miss
                 for (size_t i = 0; i < m; i++) {
                     const int32_t e = miss_list[i];
-                    admit[i] = L.miss_count[e] > 0 ? 1 : 0;
-                    L.miss_count[e]++;
+                    admit[i] = L.miss_count[e] > 0 ? 1 : 0;   // counted in the fetch loop below
                 }
             } else if (miss_policy == 3) {                // hybrid
                 size_t q = (size_t) (hybrid_frac * (double) m + 0.5);
@@ -459,9 +462,11 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
 
         // 3. fetch the admitted misses into LRU victims (same-pass residents carry
         //    the newest stamps, so they are never chosen)
+        std::vector<int32_t> probation;
         for (size_t i = 0; i < miss_list.size(); i++) {
             const int32_t e = miss_list[i];
             L.expert_last_gen[e] = generation;
+            const uint32_t seen_misses = ++L.miss_count[e];
             if (!admit[i]) {
                 L.misses++;
                 continue;
@@ -474,10 +479,14 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             }
             if (L.slot_expert[slot] >= 0) {
                 L.expert_slot[L.slot_expert[slot]] = -1;
+                L.evicted++;
             }
             L.slot_expert[slot] = e;
             L.expert_slot[e]    = slot;
-            L.slot_stamp[slot]  = ++L.stamp;
+            L.slot_stamp[slot]  = ++L.stamp;   // protected for THIS pass
+            if (seen_misses < admit_after) {
+                probation.push_back(slot);
+            }
             for (const auto & te : L.tensors) {
                 ggml_backend_tensor_set_async(split_backend, te.view_slots,
                     (const char *) te.host->data + (size_t) e * te.row_bytes,
@@ -511,6 +520,29 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                     L.cpu_buf[k] = e;
                 }
             }
+        }
+        // probationary admission: experts below admit_after misses served this pass
+        // but must not displace the established residents next time - restamp them
+        // below every live entry (in fetch order). Placed AFTER the per-route touch
+        // above, which refreshes every current slot to MRU (it undid the demotion when
+        // this sat before it: h was invariant to admit_after across 44k evictions)
+        if (!probation.empty()) {
+            uint64_t floor = UINT64_MAX;
+            for (uint32_t s = 0; s < n_slots; s++) {
+                bool on_probation = false;
+                for (int32_t ps : probation) {
+                    if (ps == (int32_t) s) { on_probation = true; break; }
+                }
+                if (!on_probation) {
+                    floor = std::min(floor, L.slot_stamp[s]);
+                }
+            }
+            const uint64_t n    = probation.size();
+            const uint64_t base = (floor != UINT64_MAX && floor > n) ? floor - n : 0;
+            for (uint64_t i = 0; i < n; i++) {
+                L.slot_stamp[probation[i]] = base + i;
+            }
+            L.demoted += n;
         }
         L.hits += n_hit;
         if (n_ids_1 == 1) {
@@ -550,7 +582,7 @@ void llama_expert_pool::reset_slots() {
 
 void llama_expert_pool::log_counters() const {
     uint64_t hits = 0, misses = 0, passes = 0;
-    uint64_t hits_1 = 0, misses_1 = 0, passes_1 = 0;
+    uint64_t hits_1 = 0, misses_1 = 0, passes_1 = 0, demoted = 0, evicted = 0;
     std::string per_layer;
     for (const auto & L : layers) {
         if (L.tensors.empty()) {
@@ -562,6 +594,8 @@ void llama_expert_pool::log_counters() const {
         hits_1   += L.hits_1;
         misses_1 += L.misses_1;
         passes_1  = std::max(passes_1, L.passes_1);
+        demoted  += L.demoted;
+        evicted  += L.evicted;
         const uint64_t n = L.hits + L.misses;
         char buf[16];
         snprintf(buf, sizeof(buf), " %.2f", n > 0 ? (double) L.hits / (double) n : 0.0);
@@ -577,6 +611,8 @@ void llama_expert_pool::log_counters() const {
     LLAMA_LOG_INFO("%s: expert pool: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
         __func__, (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) passes, h, mpt, n_slots);
     LLAMA_LOG_INFO("%s: expert pool h per layer:%s\n", __func__, per_layer.c_str());
+    LLAMA_LOG_INFO("%s: expert pool admission: admit_after=%u, %llu fetches demoted, %llu residents evicted\n",
+        __func__, admit_after, (unsigned long long) demoted, (unsigned long long) evicted);
     if (passes_1 > 0 && passes_1 != passes) {
         // decode-only view (single-token passes): what the planner's h(s) and
         // misses/token model; the all-passes line above includes any multi-token
