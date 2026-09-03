@@ -237,7 +237,26 @@ and corrupt concurrent measurements).
    per-layer slot maps/LRU/counters), graph emission over pool views + ids_gpu
    leaves, fetch via the pshard pre-compute split callback, warmup + token-hash gate
    vs always-fetch; then (2c) pool predictor terms + auto ladder entry; then split-op
-   policies (cpu_exec/hybrid/fetch_on_2nd_miss/cpu_tail) with PPL-parity gates. Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
+   policies (cpu_exec/hybrid/fetch_on_2nd_miss/cpu_tail) with PPL-parity gates.
+   STAGE 2B LANDED 2026-09-03 (e17d1d9bf) AND THE GATE PASSES: q35 @8000/2k forced-5
+   with PSHARD_POOL_RUNTIME=1, 512-token prompt + 32 greedy -> md5 ecb043a95a14,
+   byte-identical to the legacy pshard AND stock references, first end-to-end run.
+   Numbers (untuned): prompt 574 t/s, decode 40.1 t/s at 17 slots/layer - the carve
+   clamped the planner's 73 (file-size heuristic vs real nb[2] expert bytes, and
+   scratch_need = max tier scratch + 64 MiB eats the region; q35 pool got 1239 MiB).
+   Mechanism: sched input-copy overrides (persistent pool views replace transient
+   dups; four prefetch opt-out sites; consume-time callback), pool module with
+   cache-mode LRU slots + A/B halves on whole-stack tiers, ids split in the graph
+   (mm gets remapped ids_gpu; probs/w_s/add_id/LoRA keep router ids), experts on
+   shard bids (no pool instance = standard-streaming always-fetch fallback = the
+   gate reference arm). Legacy paths regression-clean (unforced q35 md5-identical,
+   MUL_MAT_ID suites green). OPEN for 2c+: pool region sizing should come from
+   real expert bytes not the 0.85 heuristic (planner underprices s); A/B-mode
+   prefill uploads are exposed (574 vs legacy ~640-680 prompt; prefetch-cb overlap
+   pending); decode 40 vs auto-legacy 51.5 @8000/2k needs h(s) counters + pricing;
+   counters exist but are not yet printed/ledgered; miss policies beyond fetch and
+   auto-ladder entry not implemented; graph reuse across pooled-layer changes
+   guarded only by the expert_pool pointer compare. Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
    budget before the margin fix); ~~joint target+draft planning (cordis v2)
