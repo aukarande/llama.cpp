@@ -507,6 +507,31 @@ and corrupt concurrent measurements).
    lose the A/B pair (avail 5159 < 2 x 2675 MiB) and fall back to plain host streaming
    at the same 82 t/s - the planner should trade output_on_gpu against the pair when the
    window is that tight (design 11.B.25).
+   128-TOKEN TABLE (2026-09-04, user rule: every decode perf number is a -n 128 run,
+   never less or more; perf-rule cells = workload + budget only, no --temp 0 / -lv):
+   q35 @8000 prompt/decode: stock 111/53.7, legacy 715/55.7, pool fetch 647/74-76
+   (three runs 74.3, 74.4, 76.0; an -lv 4 run gave 80.4 with h 0.812 at s=81), pool
+   fetch + PSHARD_POOL_PREDICT=1 651/83.1, auto ladder with PSHARD_POOL_AUTO=1 557/62.6
+   (61.9 with the predictor). q35 @2700: stock 80/29.6, legacy 557/43.1, pool fetch
+   606/47.9 (47.9 with the predictor), pool as planned (hybrid, s=8) 601/48.0 (43.5 with
+   the predictor - prefetch uploads fight the CPU chain's misses for the link), auto
+   ladder 540/44.4 (41.1 with the predictor). MTP @8000 (already 128 tok): stock 54.4,
+   legacy 60.7, pool 77.2, pool + predictor 90.8. DSv4 @12000: stock 24.9/10.4, legacy
+   82/10.7, pool 82/14.0, pool + predictor 83/14.95.
+   PLANNER PICK FINDING: the auto ladder's pool tier 0 is priced hybrid 63.0 vs fetch
+   62.2 at @8000 and picks hybrid; measured hybrid 62.6 (price exact) but fetch ~75 - the
+   pool loses 18% in the ladder to a mis-ranking inside its own policy table. Decomposed
+   from the priced line (probe compute 7.6 ms, h(81)=0.79 vs measured 0.81, 1.7 misses/
+   layer x t_fetch 0.065 = 0.11 ms/layer): fetch price 16.1 ms = 7.6 + 40 x (0.11 + t_serve
+   0.10); measured 13.4 ms = 7.6 + 40 x (0.11 + 0.025) -> t_serve is 0.10 ms/layer in
+   the model but ~0.03 measured (the GGML_SCHED_TIMING handoff measurement of 0.035
+   ms/layer said the same). Hybrid is then UNDER-priced by the same ~0.07 ms/layer its
+   CPU chain really costs at bs=1 (the add waits for the last CPU expert: uploads + one
+   t_cpu, not max(uploads, cpu)); the two errors cancel, which is why hybrid's price
+   looked exact. Proposed calibration (user's model, user's call): t_serve 0.10 -> 0.035
+   ms/layer and hybrid_ms = uploads_part + t_cpu(1 expert) + t_split instead of the
+   max(); with those fetch prices ~74.6 and hybrid ~62, matching both measurements, and
+   the ladder picks fetch at 8000 (at 2700 fetch and hybrid measure the same 48).
    Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.

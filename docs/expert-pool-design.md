@@ -1007,6 +1007,16 @@ budgets. Open: at DSv4 @12000 the head costs the prefill tiers their A/B pair (t
 back to host streaming at the same 82 t/s); the planner should price `output_on_gpu`
 against the pair when the window is that tight (11.B.25).
 
+**128-token table, 2026-09-04 (the user's measurement rule: decode perf = `-n 128`,
+workload + budget only):** q35 @8000 stock 53.7 / legacy 55.7 / pool fetch ~75 / pool +
+predictor 83.1 / auto ladder 62.6; q35 @2700 stock 29.6 / legacy 43.1 / pool 47.9 / auto
+ladder 44.4; MTP @8000 stock 54.4 / legacy 60.7 / pool 77.2 / pool + predictor 90.8; DSv4
+@12000 stock 10.4 / legacy 10.7 / pool 14.0 / pool + predictor 14.95. The auto ladder
+trails the forced pool because its policy table ranks hybrid (63.0) over fetch (62.2)
+while fetch measures ~75: `t_serve` is 0.10 ms/layer in the model and ~0.03 measured, and
+hybrid's CPU chain at bs=1 costs one `t_cpu` more than the max() form charges (11.A, open
+calibration: the two errors cancel for hybrid, so its price alone looked exact).
+
 Pricing inputs (predictor decode term per layer: `t_matmul + 8 x (1 - h(s_l)) x t_miss(policy)`):
 - fetch constant, one baseline: PCIe_Sliced curve at the 2 MB point (parsed
   src/llama-benchmark.cpp:196-201; measured examples/llama-profiler/profiler-cpu.cpp:124-179)
