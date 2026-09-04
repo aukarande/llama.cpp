@@ -354,7 +354,8 @@ and corrupt concurrent measurements).
    layer), s=17, fetch at bs=1, hybrid at bs=16 (fetch floor 32 GB), A/B pair fits
    at bs=512/1024 and not at 2048 (pool disengages there, tier streams normally):
    80.2 prompt / 10.65 decode vs legacy auto (2 layers pinned) 79.1 / 9.17 (+16%
-   decode) vs stock -fitb 24.9 / 10.37. Counted decode h(17)=0.414 (prior 0.48),
+   decode; legacy re-measured at 128 tokens: 10.7, so the fair steady-state
+   comparison is pool 13.4 vs legacy 10.7, +25%) vs stock -fitb 24.9 / 10.37. Counted decode h(17)=0.414 (prior 0.48),
    151 misses/token. Tokens: pool fetch = pool cpu_exec = pool with fusion off =
    LEGACY with fusion off (08b9d088f20a); legacy fused = stock (bda02a0d435a) ->
    the pool/legacy divergence is the classified placement-fusion effect on the
@@ -380,7 +381,8 @@ and corrupt concurrent measurements).
    evictions) - demote after the touch. HORIZON EFFECT (matters more): the 32-token
    gate reports a COLD pool - q35 @8000 s=86: h 0.70 / 44.7 t/s at 32 tokens vs
    0.822 / 49.8 t/s at 256 (legacy 50.0 at either: parity in steady state, not
-   -10%); DSv4 @12000: 10.65 t/s at 32 vs 13.3 at 128 (legacy 9.17: +45%). The
+   -10%); DSv4 @12000: 10.65 t/s at 32 vs 13.3 at 128 (legacy 9.17 at 32 tokens,
+   10.7 at 128: the 32-token legacy number was low run-to-run noise; +25%). The
    planner now prices the steady state (Zipf alpha 0.95, no LRU shortfall: h(14)
    0.49 / h(86) 0.80 vs counted 0.452 / 0.822); perf cells should decode >= 128
    tokens before judging the pool. Tokens are identical across admit settings and
