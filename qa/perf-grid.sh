@@ -17,8 +17,9 @@
 # RULES (user, 2026-09-01 / 2026-09-04):
 #   - decode length is 128 tokens on every perf arm; 32 tokens = correctness gate only;
 #   - a perf run carries workload + budget and nothing else (no temp, ub, lv, ngl, ot);
+#   - thread count is always the default (user rule 2026-09-04: never set -t);
 #   - every pshard cell plans fresh with the run's own environment (PSHARD_STRATEGY,
-#     PSHARD_MISS_POLICY, -t and the spec flags are fingerprinted) - consecutive cells
+#     PSHARD_MISS_POLICY and the spec flags are fingerprinted) - consecutive cells
 #     that differ only in non-fingerprinted knobs (PSHARD_POOL_PREDICT) share one plan;
 #   - benches get the whole machine; one instance at a time.
 
@@ -126,7 +127,6 @@ if [ "$GRID" = "ext" ]; then
     spec_set q35 8000 dspark stock auto pool:fetch pool:fetch+pred pool:plan poolauto
     for MB in "q35 8000" "dsv4 full"; do
         set -- $MB
-        for p in cpu_exec hybrid cpu_admit; do add perf $1 $2 512 none pool:$p 0 16 0; done
         for p in hybrid cpu_admit; do add perf $1 $2 512 none pool:$p 0 0 1; done
     done
     add ppl dsv4 full 512 none stock 0 0 0

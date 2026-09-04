@@ -35,7 +35,7 @@ models the pool work targets, plus the correctness gates those perf cells need.
 | arm | `stock`; `auto` (legacy ladder, planner's pick); `s0..s4` (forced legacy: GPUONLY_LAYERPIN_LAYERSTREAM, GPUONLY_ATTNPIN_FFNSTREAM, DYNAMIC_FFNCPU_ATTNSTREAM, STATIC_ATTNPRIO_ALLMODELS, DYNAMIC_FFN_ALTERNATE); `pool:<policy>` (forced EXPERT_POOL with `PSHARD_MISS_POLICY`); `pool:plan` (EXPERT_POOL, planner picks the policy); `poolauto` (auto ladder with the pool allowed) |
 | miss policy (pool arms) | `fetch` (copy the missed expert host -> LRU victim slot, compute on GPU); `cpu_exec` (compute every miss on the CPU from host weights, never admit); `fetch_on_2nd_miss` (first miss on CPU without admitting, a repeat miss fetches); `hybrid` (FreeToken q*: fetch a recency-chosen share of the misses, CPU computes the rest, both chains overlap); `cpu_admit` (compute the miss on CPU this pass while its rows upload on the copy stream; GPU hit next pass) |
 | predictor | off; `pred` = `PSHARD_POOL_PREDICT=1` (layer l's FFN input through layer l+1's router, prefetch cap 1) on the arms that admit: fetch, hybrid, cpu_admit, poolauto |
-| threads (ext) | default; `t16` = `-t 16` on the CPU-route policies (cpu_exec, hybrid, cpu_admit) |
+| threads | always the default (user rule 2026-09-04: never set `-t`) |
 | sched overlap (ext) | on; `noovl` = `GGML_SCHED_NO_CPU_OVERLAP=1` on hybrid and cpu_admit (plan and run) |
 
 DSv4's pool pins ~9.2 GB (attention, routers, norms, output head) before its first slot, so
@@ -75,8 +75,8 @@ dsv4 ~6 h (64 perf at ~3.5 min, dsv4 auto plans ~5 min), spec ~1 h, gates ~1 h, 
 ~0.5 h: **~10-12 h**, best run as `QA_GRID_MODELS=q35` (~5 h) then `QA_GRID_MODELS=dsv4`.
 
 Ext adds (~70 cells): q35 @2700 both prompts (36 perf + 11 gates); q35 @8000 with the
-dflash and dspark drafts (6 arms each); `t16` on cpu_exec/hybrid/cpu_admit and `noovl` on
-hybrid/cpu_admit at q35 @8000 and dsv4 full (10); dsv4 stock PPL.
+dflash and dspark drafts (6 arms each); `noovl` on hybrid/cpu_admit at q35 @8000 and
+dsv4 full (4); dsv4 stock PPL.
 
 ## Ledger
 
