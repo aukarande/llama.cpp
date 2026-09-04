@@ -2354,7 +2354,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // ORDER MATTERS: the GPU chain is built first and is the ADD's src[0], so
         // forward-expand visits it first and its split runs before the CPU chain's;
         // the pool service (fired by the GPU split's expert input) writes the CPU
-        // chain's ids before that split executes
+        // chain's ids before that split executes. The scheduler overlaps the two by
+        // copying the CPU split's inputs before the GPU chain launches and running
+        // the CPU compute while the GPU chain executes (ggml_backend_sched_compute_splits)
+        // - the serial order stays correct whenever that overlap is off.
         ggml_tensor * experts_gpu = build_expert_chain(cur, pool_mm_ids,  pool_bias_ids, /*on_cpu=*/false, /*allow_skip=*/true);
         ggml_tensor * experts_cpu = build_expert_chain(cur, pool_cpu_ids, pool_cpu_ids,  /*on_cpu=*/true,  /*allow_skip=*/true);
         // exact two-partial sum: every route is a zero row in exactly one chain

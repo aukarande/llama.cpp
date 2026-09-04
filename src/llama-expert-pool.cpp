@@ -492,9 +492,16 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             admit_backend = ggml_backend_dev_init(ggml_backend_get_device(split_backend), nullptr);
             if (admit_backend != nullptr) {
                 admit_event = ggml_backend_event_new(ggml_backend_get_device(split_backend));
+                if (admit_event == nullptr) {
+                    // no events on this device: an upload nobody can wait on must not
+                    // leave the split stream - fall back to in-line (fenced) uploads
+                    ggml_backend_free(admit_backend);
+                    admit_backend = nullptr;
+                    LLAMA_LOG_WARN("%s: no device events - cpu_admit uploads stay on the split stream\n", __func__);
+                }
             }
         }
-        ggml_backend_t up_backend  = (background && admit_backend != nullptr) ? admit_backend : split_backend;
+        ggml_backend_t up_backend  = (background && admit_backend != nullptr && admit_event != nullptr) ? admit_backend : split_backend;
         bool           uploaded_bg = false;
         std::vector<int32_t> probation;
         for (size_t i = 0; i < miss_list.size(); i++) {
@@ -612,6 +619,12 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
 }
 
 void llama_expert_pool::reset_slots() {
+    // background admission: uploads still in flight target the OLD slot layout;
+    // let them land before the maps (and possibly the region) change under them
+    if (admit_backend != nullptr) {
+        ggml_backend_synchronize(admit_backend);
+    }
+    admit_pending = false;
     for (auto & L : layers) {
         if (L.tensors.empty()) {
             continue;

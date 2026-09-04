@@ -2063,7 +2063,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
-    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+    // one split, in two stages: 1 = inputs only, 2 = compute only, 0 = both.
+    // The CPU/GPU overlap below runs a CPU split's inputs (stage 1), then the
+    // following device split whole (stage 0), then the CPU split's compute (stage 2),
+    // so the CPU chain of a pooled MoE layer computes while the GPU chain runs.
+    auto run_split = [&](int split_id, int stage) -> enum ggml_status {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         int copy_backend_id  = split_backend_id;
@@ -2071,7 +2075,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+        if (stage != 2 && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 SCHED_SYNC_TIMED(tt_s_prev, ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]));
             } else {
@@ -2081,15 +2085,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // pshard: a redirected backend executes this split on its target
         if (sched->redirect_target[split_backend_id] >= 0) {
-            nn_redirected++;
-            const int64_t t0 = sched_timing ? ggml_time_us() : 0;
-            ggml_backend_synchronize(sched->backends[split_backend_id]);
-            if (sched_timing) tt_redirect += ggml_time_us() - t0;
+            if (stage != 2) {
+                nn_redirected++;
+                const int64_t t0 = sched_timing ? ggml_time_us() : 0;
+                ggml_backend_synchronize(sched->backends[split_backend_id]);
+                if (sched_timing) tt_redirect += ggml_time_us() - t0;
+            }
             split_backend_id = sched->redirect_target[split_backend_id];
             split_backend = sched->backends[split_backend_id];
         }
 
-        const bool weights_prefetched =
+        bool weights_prefetched = false;
+        if (stage != 2) {
+        weights_prefetched =
             prefetched_split_id == split_id &&
             prefetched_backend_id == copy_backend_id;
         if (weights_prefetched) {
@@ -2108,6 +2116,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             prefetched_split_id = -1;
             prefetched_backend_id = -1;
         }
+        } // stage != 2
 
         auto prefetch_next_split = [&]() {
             if (!sched->prefetch_weights || prefetched_split_id >= 0) {
@@ -2204,6 +2213,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         };
 
+        if (stage != 2) {
         // copy the input tensors to the split backend
         const int64_t t_in0 = sched_timing ? ggml_time_us() : 0;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -2473,6 +2483,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (sched_timing) tt_inputs += ggml_time_us() - t_in0;
+        } // stage != 2
+
+        if (stage == 1) {
+            return GGML_STATUS_SUCCESS;
+        }
 
         // pre-compute: upload stateful cache (KV/RS) for WRITEBACK tensors in this split
         const int64_t t_pc0 = sched_timing ? ggml_time_us() : 0;
@@ -2600,7 +2615,70 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+        return GGML_STATUS_SUCCESS;
+    };
+
+    // CPU/GPU overlap (expert pool dual chains). Split order stays [.., GPU chain,
+    // CPU chain, merge ..]; the only thing that serialized the CPU chain behind the
+    // GPU chain was its input stage: the device->host copy of x ends in a full
+    // synchronize of the compute stream, which - issued after the GPU chain's launch -
+    // waits for those kernels. So when a device split is followed by a CPU split that
+    // consumes nothing the device split produces, the CPU split's inputs are copied
+    // BEFORE the device split launches (the sync then covers only what precedes it),
+    // the device split runs whole (inputs incl. the pool service that writes the CPU
+    // chain's ids, prefetch, launch, event records), and the CPU split's compute -
+    // blocking on this thread - proceeds at its own iteration while the GPU works.
+    // Split index order, galloc order and the prefetch bookkeeping are untouched; the
+    // serial order remains correct by construction. GGML_SCHED_NO_CPU_OVERLAP=1 disables.
+    static const bool cpu_overlap_env = getenv("GGML_SCHED_NO_CPU_OVERLAP") == NULL;
+    const bool cpu_overlap = cpu_overlap_env && sched->n_copy_overrides > 0 && sched->callback_eval == NULL;
+    auto cpu_overlap_ok = [&](int k) -> bool {
+        if (!cpu_overlap || k + 1 >= sched->n_splits) {
+            return false;
+        }
+        const struct ggml_backend_sched_split * g = &splits[k];       // device split
+        const struct ggml_backend_sched_split * b = &splits[k + 1];   // CPU split
+        if (g->backend_id == sched->n_backends - 1 || b->backend_id != sched->n_backends - 1) {
+            return false;
+        }
+        if (g->n_writeback > 0 || b->n_writeback > 0 || b->n_inputs == 0) {
+            return false;
+        }
+        for (int i = 0; i < b->n_inputs; i++) {
+            for (const struct ggml_tensor * t = b->inputs[i]; t != NULL; t = t->view_src) {
+                for (int n = 0; n < g->graph.n_nodes; n++) {
+                    if (g->graph.nodes[n] == t) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
+    int inputs_done = -1;   // the CPU split whose input stage already ran
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        if (inputs_done == split_id) {
+            enum ggml_status ec = run_split(split_id, 2);
+            if (ec != GGML_STATUS_SUCCESS) {
+                return ec;
+            }
+            inputs_done = -1;
+            continue;
+        }
+        if (cpu_overlap_ok(split_id)) {
+            enum ggml_status ec = run_split(split_id + 1, 1);   // CPU split inputs first: x lands before the GPU chain is queued
+            if (ec != GGML_STATUS_SUCCESS) {
+                return ec;
+            }
+            inputs_done = split_id + 1;
+        }
+        enum ggml_status ec = run_split(split_id, 0);
+        if (ec != GGML_STATUS_SUCCESS) {
+            return ec;
+        }
     }
+    GGML_ASSERT(inputs_done < 0);
 
     if (sched_timing) {
         GGML_LOG_INFO("sched_timing: n_splits=%d redirected=%d prefetched=%d total=%lld us | redirect_sync=%lld inputs=%lld precomp=%lld prefetch=%lld launch=%lld postcomp=%lld\n",
