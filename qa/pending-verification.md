@@ -464,8 +464,22 @@ and corrupt concurrent measurements).
    0.425 at 10.65 -> 10.39 (3.9 GB of seeds); 128 tok 0.529 -> 0.531. Verdict: the link
    is the constraint again - seeding spends the same PCIe time LRU spends warming, and
    the prompt's hot set is only a weak predictor of the reply's; per-layer allocation
-   is a wash because LRU already adapts per layer. Kept as knobs. Traps met: a
-   grep-filtered background build hid a
+   is a wash because LRU already adapts per layer. Kept as knobs.
+   STOCK vs LEGACY vs POOL, WITH AND WITHOUT SPECULATION (2026-09-04, 512-token prompt,
+   greedy; spec runs --ignore-eos n_max=2 since the prompt's natural continuation is
+   "100%"+EOS): base q35 @8000 prompt/decode: stock 117/48.9, legacy 764/50.0, pool
+   650/44.7 cold - 49.8 warm (50.6 with prefetch); DSv4 @12000: stock 24.9/10.4, legacy
+   82/10.7, pool 80/13.4 (14.3 with prefetch). Speculative decode t/s: q35 MTP: stock
+   54.4, legacy 60.7, pool 41.9 (h 0.73 at s=82; the 3-token verify batches triple the
+   distinct experts per layer per step, so misses per token ~3x and the pool loses its
+   edge: -16% vs its own plain decode, while legacy gains +21% and stock +11%); DSv4 +
+   DSpark: stock 4.5 (only fits with the target squeezed to -fitb 3000: the stock fit
+   ignores the 10.4 GB draft and OOMs at 12000), legacy 9.6, pool 11.0 (h 0.29 at
+   s=11) - speculation is a LOSS for both pshard arms on DSv4 vs plain decode (10.7 /
+   13.4). Acceptance ~55% everywhere. Open: pool tiers for small verify batches (bs=3)
+   should be priced/served as what they are (2-3x the distinct experts); a cpu_admit or
+   hybrid pick there, or skipping speculation for pool plans, is the likely answer.
+   Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.
    Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
