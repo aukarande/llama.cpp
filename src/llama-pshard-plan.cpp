@@ -2015,16 +2015,16 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         // weight-upload term (full expert stacks) is replaced by
         //   distinct(bs) * (1 - h(s)) * t_miss   per pooled layer,
         // distinct(bs) = min(E, bs*top_k) (token union), h(s) = Zipf(alpha) mass of
-        // the s most popular of E experts (the static optimum), optionally times an
-        // LRU shortfall (1 - lru_c * s/E). Calibrated to the STEADY STATE: q35 (fetch,
+        // the s most popular of E experts (the static optimum). Calibrated to the
+        // STEADY STATE: q35 (fetch,
         // 512-token prompt + 256 greedy) counted h(14)=0.452 and h(86)=0.822, which
         // alpha=0.95 reproduces as 0.49 / 0.80 with no shortfall. Short generations
         // pay the fill: over 32 tokens the same pool counted h(86)=0.70 (an 86-slot
         // layer needs ~10 tokens of misses to fill) - the planner prices the long-run
-        // rate, the 32-token QA gate reports the cold one. Admission gating
-        // (PSHARD_POOL_ADMIT_AFTER) moved h by <= 0.01 either way and is not priced.
-        // PSHARD_POOL_ZIPF / PSHARD_POOL_LRU_C override; the QA ledger's mean_h
-        // column is the re-fit input.
+        // rate, the 32-token QA gate reports the cold one. (An LRU-shortfall factor
+        // and admission gating were both measured unnecessary and removed.)
+        // PSHARD_POOL_ZIPF overrides alpha until the grid calibrates it; the QA
+        // ledger's mean_h column is the re-fit input.
         const double E = (double) ctx.n_expert;
         const double s = std::min<double>(plan.pool_slots, E);
         double alpha = 0.95;
@@ -2038,12 +2038,8 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             }
             return m;
         };
-        double lru_c = 0.0;
-        if (const char * lc = getenv("PSHARD_POOL_LRU_C")) {
-            lru_c = std::min(0.9, std::max(0.0, atof(lc)));
-        }
         const double h        = s >= E ? 1.0
-            : (s >= 1.0 ? zipf_mass(s) / zipf_mass(E) * (1.0 - lru_c * s / E) : 0.0);
+            : (s >= 1.0 ? zipf_mass(s) / zipf_mass(E) : 0.0);
         const double distinct = std::min<double>(E, (double) bs * ctx.n_expert_used);
         const double misses   = distinct * (1.0 - h);
         const double hits     = distinct - misses;

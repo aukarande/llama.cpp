@@ -2936,24 +2936,6 @@ size_t llama_model::pshard_apply_plan(const llama_pshard_plan & plan, ggml_backe
             }
         }
 
-        // PSHARD_DEBUG_LAYER=<il>: development lever - dump every tensor of one layer after the
-        // plan apply (placement the scheduler will see: buffer, data, preload-map entry)
-        if (const char * dbg_il = getenv("PSHARD_DEBUG_LAYER")) {
-            const std::string pfx = std::string("blk.") + dbg_il + ".";
-            for (const auto & [name, tensor] : tensors_by_name) {
-                if (name.rfind(pfx, 0) != 0) continue;
-                auto it = pimpl->weight_preload_map.find(tensor);
-                LLAMA_LOG_WARN("PSHARD-LAYER %-40s type=%-8s bytes=%9zu buffer=%-12s data=%p | map=%s cpu=%p host_buf=%s dev_only=%d bid=%d\n",
-                    name.c_str(), ggml_type_name(tensor->type), ggml_nbytes(tensor),
-                    tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "NULL", tensor->data,
-                    it == pimpl->weight_preload_map.end() ? "absent" : "present",
-                    it == pimpl->weight_preload_map.end() ? nullptr : it->second.cpu_addr,
-                    (it == pimpl->weight_preload_map.end() || !it->second.host_buffer) ? "NULL" : ggml_backend_buffer_name(it->second.host_buffer),
-                    it == pimpl->weight_preload_map.end() ? -1 : (int) it->second.device_only_common,
-                    pimpl->tensor_backend_ids.count(tensor) ? pimpl->tensor_backend_ids.at(tensor) : -99);
-            }
-        }
-
         size_t n_uploaded = 0;
         size_t bytes_uploaded = 0;
 

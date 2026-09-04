@@ -1856,38 +1856,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    // GGML_CUDA_DEBUG_MM=<dst name>: divergence-hunt probe - log the operands exactly as this
-    // op sees them (metadata, buffer usage, device-side FNV of the bytes) and the path taken
-    {
-        static const char * dbg = getenv("GGML_CUDA_DEBUG_MM");
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        if (dbg != nullptr && dbg[0] != 0 && strcmp(dst->name, dbg) == 0 &&
-            cudaStreamIsCapturing(ctx.stream(), &capture_status) == cudaSuccess &&
-            capture_status == cudaStreamCaptureStatusNone) {  // a device sync inside graph capture would abort
-            auto fnv_dev = [&](const ggml_tensor * t) -> unsigned long long {
-                const size_t n = ggml_nbytes(t);
-                std::vector<uint8_t> h(n);
-                CUDA_CHECK(cudaDeviceSynchronize());
-                CUDA_CHECK(cudaMemcpy(h.data(), t->data, n, cudaMemcpyDeviceToHost));
-                unsigned long long f = 0xcbf29ce484222325ULL;
-                for (size_t i = 0; i < n; i++) { f ^= h[i]; f *= 0x100000001b3ULL; }
-                return f;
-            };
-            const char * path = ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11) ? "mmvf"
-                : ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, false) ? "mmf"
-                : ggml_cuda_should_use_mmvq(src0->type, cc, ne11) ? "mmvq"
-                : ggml_cuda_should_use_mmq(src0->type, cc, ne11, 0) ? "mmq" : "cublas";
-            GGML_LOG_WARN("MM-DEBUG %s: path=%s | src0=%s type=%s ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu] data=%p buf=%s usage=%d alloc=%zu nbytes=%zu view=%p fnv=%016llx | src1=%s type=%s ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu] data=%p buf=%s fnv=%016llx | dst ne=[%lld,%lld] data=%p\n",
-                dst->name, path,
-                src0->name, ggml_type_name(src0->type), (long long) ne00, (long long) ne01, (long long) ne02, nb00, nb01, nb02, src0->data,
-                src0->buffer ? ggml_backend_buffer_name(src0->buffer) : "null", src0->buffer ? (int) ggml_backend_buffer_get_usage(src0->buffer) : -1,
-                src0->buffer ? ggml_backend_buffer_get_alloc_size(src0->buffer, src0) : (size_t) 0, ggml_nbytes(src0), (void *) src0->view_src, fnv_dev(src0),
-                src1->name, ggml_type_name(src1->type), (long long) ne10, (long long) ne11, (long long) ne12, nb10, nb11, nb12, src1->data,
-                src1->buffer ? ggml_backend_buffer_name(src1->buffer) : "null", fnv_dev(src1),
-                (long long) dst->ne[0], (long long) dst->ne[1], dst->data);
-        }
-    }
-
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)

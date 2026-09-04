@@ -1164,11 +1164,6 @@ static bool ggml_backend_sched_prefer_sliced_expert_copy(
     if (node == NULL || node->src[1] == NULL) {
         return false;
     }
-    // GGML_SCHED_NO_SLICED=1: bisect lever - force full-tensor uploads
-    static const bool no_sliced = getenv("GGML_SCHED_NO_SLICED") != NULL;
-    if (no_sliced) {
-        return false;
-    }
     const int64_t n_expert = input->ne[2];
     // expert-token pairs this evaluation will actually gather
     const int64_t n_pairs  = ggml_nelements(node->src[1]) / std::max<int64_t>(node->src[1]->ne[0], 1);
@@ -1612,21 +1607,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     need_copy = true;
                 }
 
-                // GGML_SCHED_TRACE_SRC=<name prefix>: split-graph decision trace for one source tensor
-                {
-                    static const char * trace = getenv("GGML_SCHED_TRACE_SRC");
-                    if (trace != NULL && trace[0] != 0 && strncmp(src->name, trace, strlen(trace)) == 0) {
-                        GGML_LOG_WARN("SCHED-TRACE src=%s node=%s(%s) cur_bid=%d src_bid=%d buf=%s usage=%d is_host=%d supported=%d has_redirects=%d n_backends=%d need_copy_pre=%d need_copy=%d existing_copy=%p\n",
-                            src->name, node->name, ggml_op_name(node->op), cur_backend_id, src_backend_id,
-                            src_buf ? ggml_backend_buffer_name(src_buf) : "NULL",
-                            src_buf ? (int) ggml_backend_buffer_get_usage(src_buf) : -1,
-                            src_buf ? (int) ggml_backend_buffer_is_host(src_buf) : -1,
-                            (int) ggml_backend_sched_buffer_supported(sched, src, cur_backend_id),
-                            (int) sched->has_redirects, sched->n_backends, (int) need_copy_pre, (int) need_copy,
-                            (void *) tensor_id_copy(src_id, cur_backend_id, 0));
-                    }
-                }
-
                 if (need_copy) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
@@ -1984,85 +1964,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     int nn_redirected = 0, nn_prefetched = 0, nn_handoff = 0;
     const int64_t tt_start = sched_timing ? ggml_time_us() : 0;
 
-    // GGML_SCHED_TRACK=<name-prefix>: after locating the first node matching the prefix,
-    // re-read its bytes around every subsequent split (full sync of compute + copy streams)
-    // to pinpoint WHICH split's activity (input copies / prefetch / compute) corrupts them.
-    // "pre" = after this split's input copies + prefetch launch, before its compute;
-    // "post" = after this split's compute. Garbage first seen at pre(N) => split N's copies
-    // or an in-flight prefetch clobbered it; first seen at post(N) => split N's compute.
-    static const char * track_prefix = getenv("GGML_SCHED_TRACK");
-    struct ggml_tensor * track_t = NULL;
-    int track_src_split = -1;
-    auto track_read = [&](int cur_split, const char * where) {
-        if (track_t == NULL) {
-            return;
-        }
-        for (int b = 0; b < sched->n_backends; b++) {
-            ggml_backend_synchronize(sched->backends[b]);
-            if (sched->copy_backends[b] != NULL) {
-                ggml_backend_synchronize(sched->copy_backends[b]);
-            }
-        }
-        const size_t nb = ggml_nbytes(track_t);
-        void * buf = malloc(nb);
-        if (buf == NULL) {
-            return;
-        }
-        ggml_backend_tensor_get(track_t, buf, 0, nb);
-        if (track_t->type == GGML_TYPE_I32) {
-            // strided read: non-contiguous views (e.g. top-k ids over argsort rows) carry
-            // legitimately-unwritten gap bytes - only the addressed elements are meaningful
-            const uint8_t * pb = (const uint8_t *) buf;
-            int32_t mn = INT32_MAX, mx = INT32_MIN;
-            for (int64_t i3 = 0; i3 < track_t->ne[3]; i3++)
-            for (int64_t i2 = 0; i2 < track_t->ne[2]; i2++)
-            for (int64_t i1 = 0; i1 < track_t->ne[1]; i1++)
-            for (int64_t i0 = 0; i0 < track_t->ne[0]; i0++) {
-                const int32_t v = *(const int32_t *)(pb + i3*track_t->nb[3] + i2*track_t->nb[2] + i1*track_t->nb[1] + i0*track_t->nb[0]);
-                if (v < mn) mn = v;
-                if (v > mx) mx = v;
-            }
-            GGML_LOG_INFO("sched_track: %-4s split=%d %s(src_split=%d data=%p) min=%d max=%d\n",
-                where, cur_split, track_t->name, track_src_split, track_t->data, mn, mx);
-        } else {
-            const float * pf = (const float *) buf;
-            double l2 = 0.0;
-            for (size_t fi = 0; fi < nb / 4; fi++) { l2 += (double) pf[fi] * pf[fi]; }
-            GGML_LOG_INFO("sched_track: %-4s split=%d %s(src_split=%d data=%p) l2=%.6e\n",
-                where, cur_split, track_t->name, track_src_split, track_t->data, l2);
-        }
-        free(buf);
-    };
-
-    // GGML_SCHED_DUMP_ALLOC=1: one-shot dump of every weight-slot (input copy) and node
-    // allocation range, for offline overlap analysis of slot bytes vs activation bytes
-    {
-        static bool dump_alloc = getenv("GGML_SCHED_DUMP_ALLOC") != nullptr;
-        if (dump_alloc) {
-            dump_alloc = false;  // once per process
-            for (int i = 0; i < sched->n_splits; i++) {
-                struct ggml_backend_sched_split * sp = &splits[i];
-                for (int j = 0; j < sp->n_inputs; j++) {
-                    struct ggml_tensor * inp = sp->inputs[j];
-                    struct ggml_tensor * cp  = tensor_copy(inp, sp->backend_id, sched->cur_copy);
-                    if (cp == NULL || cp->data == NULL) continue;
-                    const bool w = inp->buffer != NULL &&
-                        ggml_backend_buffer_get_usage(inp->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
-                    GGML_LOG_INFO("sched_alloc: %s split=%d bid=%d %p %zu %s\n",
-                        w ? "SLOT" : "ICPY", i, sp->backend_id, cp->data, ggml_nbytes(cp), inp->name);
-                }
-                for (int j = 0; j < sp->graph.n_nodes; j++) {
-                    struct ggml_tensor * t = sp->graph.nodes[j];
-                    if (t->data == NULL || t->view_src != NULL) continue;
-                    if (t->buffer != NULL &&
-                        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) continue;
-                    GGML_LOG_INFO("sched_alloc: NODE split=%d bid=%d %p %zu %s\n",
-                        i, sp->backend_id, t->data, ggml_nbytes(t), t->name);
-                }
-            }
-        }
-    }
-
     // one split, in two stages: 1 = inputs only, 2 = compute only, 0 = both.
     // The CPU/GPU overlap below runs a CPU split's inputs (stage 1), then the
     // following device split whole (stage 0), then the CPU split's compute (stage 2),
@@ -2410,12 +2311,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         }
                                     }
                                     if (sched->handoff_staging_size[in_bid] >= nbytes) {
-                                        static const bool handoff_dump = getenv("GGML_SCHED_HANDOFF_DUMP") != NULL;
-                                        if (handoff_dump) {
-                                            GGML_LOG_INFO("handoff: %s %s [%lld,%lld,%lld] %zu bytes\n",
-                                                input->name, ggml_op_name(input->op),
-                                                (long long)input->ne[0], (long long)input->ne[1], (long long)input->ne[2], nbytes);
-                                        }
                                         void * stage = ggml_backend_buffer_get_base(sched->handoff_staging[in_bid]);
                                         SCHED_SYNC_TIMED(tt_h_enq,  ggml_backend_tensor_get_async(input_backend, input, stage, 0, nbytes));
                                         SCHED_SYNC_TIMED(tt_h_sync, ggml_backend_synchronize(input_backend));
@@ -2432,52 +2327,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
                     }
-                }
-            }
-        }
-
-        // GGML_SCHED_HASH_IN=<prefix>: hash each input ORIGINAL vs COPY after the copy completes
-        {
-            static const char * hin = getenv("GGML_SCHED_HASH_IN");
-            if (hin != NULL && hin[0] != 0) {
-                for (int j = 0; j < split->n_inputs; j++) {
-                    struct ggml_tensor * inp = split->inputs[j];
-                    // "*" = every activation crossing (weights uploads are huge and boring - skip)
-                    if (strcmp(hin, "*") == 0) {
-                        if (inp->buffer != NULL &&
-                            ggml_backend_buffer_get_usage(inp->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) continue;
-                    } else if (strncmp(inp->name, hin, strlen(hin)) != 0) continue;
-                    struct ggml_tensor * cp = tensor_copy(inp, copy_backend_id, sched->cur_copy);
-                    if (cp == NULL) continue;
-                    ggml_backend_synchronize(split_backend);
-                    double l2o = -1.0, l2c = -1.0;
-                    for (int which = 0; which < 2; which++) {
-                        struct ggml_tensor * t = which ? cp : inp;
-                        const size_t nb = ggml_nbytes(t);
-                        void * buf = malloc(nb);
-                        if (!buf) continue;
-                        ggml_backend_tensor_get(t, buf, 0, nb);
-                        double l2 = 0.0;
-                        if (t->type == GGML_TYPE_F32) { const float * pf = (const float *) buf; for (size_t fi = 0; fi < nb/4; fi++) l2 += (double) pf[fi]*pf[fi]; }
-                        else if (t->type == GGML_TYPE_I32) {
-                            // strided: skip unwritten gap bytes of non-contiguous views
-                            const uint8_t * pb = (const uint8_t *) buf;
-                            int32_t mn = INT32_MAX, mx = INT32_MIN;
-                            for (int64_t i3 = 0; i3 < t->ne[3]; i3++)
-                            for (int64_t i2 = 0; i2 < t->ne[2]; i2++)
-                            for (int64_t i1 = 0; i1 < t->ne[1]; i1++)
-                            for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
-                                const int32_t v = *(const int32_t *)(pb + i3*t->nb[3] + i2*t->nb[2] + i1*t->nb[1] + i0*t->nb[0]);
-                                if (v < mn) mn = v;
-                                if (v > mx) mx = v;
-                            }
-                            l2 = (double) mn * 1000000.0 + mx;
-                        }
-                        free(buf);
-                        if (which) l2c = l2; else l2o = l2;
-                    }
-                    GGML_LOG_INFO("sched_hash_in: split=%d bid=%d %s orig=%.6e copy=%.6e%s\n",
-                        split_id, copy_backend_id, inp->name, l2o, l2c, (l2o == l2c ? "" : "  <<DIFF"));
                 }
             }
         }
@@ -2501,10 +2350,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const int64_t t_pf0 = sched_timing ? ggml_time_us() : 0;
         prefetch_next_split();
         if (sched_timing) tt_prefetch += ggml_time_us() - t_pf0;
-
-        if (track_prefix != NULL && track_prefix[0] != 0) {
-            track_read(split_id, "pre");
-        }
 
         const int64_t t_ln0 = sched_timing ? ggml_time_us() : 0;
         if (!sched->callback_eval) {
@@ -2545,50 +2390,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
-        }
-
-        // GGML_SCHED_HASH=<name-prefix>: per-split output hashing for divergence hunts.
-        // Synchronizes and hashes every node whose name starts with the prefix (e.g. "l_out").
-        {
-            static const char * hash_prefix = getenv("GGML_SCHED_HASH");
-            if (hash_prefix != NULL && hash_prefix[0] != 0) {
-                ggml_backend_synchronize(split_backend);
-                for (int hn = 0; hn < split->graph.n_nodes; hn++) {
-                    struct ggml_tensor * t = split->graph.nodes[hn];
-                    if (strncmp(t->name, hash_prefix, strlen(hash_prefix)) != 0) {
-                        continue;
-                    }
-                    const size_t nb = ggml_nbytes(t);
-                    void * buf = malloc(nb);
-                    if (buf == NULL) continue;
-                    ggml_backend_tensor_get(t, buf, 0, nb);
-                    uint64_t h = 1469598103934665603ull;
-                    const uint8_t * pb = (const uint8_t *) buf;
-                    for (size_t bi = 0; bi < nb; bi++) { h ^= pb[bi]; h *= 1099511628211ull; }
-                    double l2 = 0.0;
-                    if (t->type == GGML_TYPE_F32) {
-                        const float * pf = (const float *) buf;
-                        for (size_t fi = 0; fi < nb / 4; fi++) { l2 += (double) pf[fi] * pf[fi]; }
-                    }
-                    free(buf);
-                    GGML_LOG_INFO("sched_hash: split=%d bid=%d %s %016llx l2=%.6e\n",
-                        split_id, copy_backend_id, t->name, (unsigned long long) h, l2);
-                }
-            }
-        }
-
-        if (track_prefix != NULL && track_prefix[0] != 0) {
-            if (track_t == NULL) {
-                for (int tn = 0; tn < split->graph.n_nodes; tn++) {
-                    struct ggml_tensor * t = split->graph.nodes[tn];
-                    if (strncmp(t->name, track_prefix, strlen(track_prefix)) == 0) {
-                        track_t = t;
-                        track_src_split = split_id;
-                        break;
-                    }
-                }
-            }
-            track_read(split_id, "post");
         }
 
         // post-compute: download stateful cache (KV/RS) for WRITEBACK tensors in this split
