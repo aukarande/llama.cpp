@@ -222,6 +222,7 @@ struct llama_pshard_search_ctx {
     size_t                                     exps_layer_bytes = 0;   // largest layer (A/B pair floor)
     size_t                                     exps_row_bytes   = 0;   // largest per-expert row set
     size_t                                     exps_total_bytes = 0;   // all routed experts, all layers
+    size_t                                     exps_total_weights = 0; // element count of the same (CPU FLOPs)
     uint32_t                                   n_layers_moe     = 0;
 };
 
@@ -229,7 +230,7 @@ struct llama_pshard_search_ctx {
 // (blk.N.ffn_(up|down|gate|gate_up)_exps.weight); per_layer[il] gets the sum,
 // per_expert gets the max over layers of the summed per-expert row bytes
 static void pshard_scan_expert_bytes(const struct gguf_context * g, uint32_t n_expert,
-        std::vector<size_t> & per_layer, size_t & per_expert) {
+        std::vector<size_t> & per_layer, size_t & per_expert, size_t & total_weights) {
     const int64_t n = gguf_get_n_tensors(g);
     std::vector<size_t> row_this(per_layer.size(), 0);
     for (int64_t i = 0; i < n; i++) {
@@ -249,6 +250,12 @@ static void pshard_scan_expert_bytes(const struct gguf_context * g, uint32_t n_e
         }
         const size_t bytes = gguf_get_tensor_size(g, i);
         per_layer[il] += bytes;
+        {
+            // element count from the block type (exact for block quants)
+            const enum ggml_type t = gguf_get_tensor_type(g, i);
+            const size_t ts = ggml_type_size(t);
+            total_weights += ts > 0 ? bytes / ts * (size_t) ggml_blck_size(t) : 0;
+        }
         if (n_expert > 0) {
             row_this[il] += bytes / n_expert;
         }
@@ -1946,8 +1953,20 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     if (const char * cg = getenv("PSHARD_POOL_CPU_GBS")) {
         cpu_gbs = std::max(0.5, atof(cg));
     }
+    // the CPU chain is DRAM-bound on light quants (q35 Q4_K: 0.044 ms/expert = 46 GB/s)
+    // and compute-bound on heavy dequant (DSv4 UD-Q2_K_XL: ~0.68 ms per 10.4 MiB expert
+    // = 15 GB/s): price max(bytes at DRAM rate, 2 FLOP/weight at the CPU rate)
+    double cpu_gflops = (ctx.predictor && ctx.predictor->stats.cpu_matmul_floor_gflops > 0.0)
+        ? ctx.predictor->stats.cpu_matmul_floor_gflops : 150.0;
+    if (const char * cg = getenv("PSHARD_POOL_CPU_GFLOPS")) {
+        cpu_gflops = std::max(1.0, atof(cg));
+    }
+    const double w_expert = (ctx.exps_total_weights > 0 && ctx.n_expert > 0 && n_layers_exp > 0)
+        ? (double) ctx.exps_total_weights / ((double) ctx.n_expert * n_layers_exp)
+        : b_expert * 2.0;                                       // ~Q4: 2 weights per byte
     const double t_fetch = b_expert / 1e9 / bp_gbs  * 1000.0;   // ms per fetched expert
-    const double t_cpu   = b_expert / 1e9 / cpu_gbs * 1000.0;   // ms per CPU-computed expert
+    const double t_cpu   = std::max(b_expert / 1e9 / cpu_gbs * 1000.0,
+                                    2.0 * w_expert / 1e9 / cpu_gflops * 1000.0);   // ms per CPU-computed expert
     const double t_split = 0.20;                                // ms per layer: GPU->CPU->GPU handoff
     // hybrid q* share = B_P / B_H (design 4b): the FreeToken balance for concurrent
     // chains; serial chains (today) cap the fetched share by the free slots anyway
@@ -2003,40 +2022,41 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         const double distinct = std::min<double>(E, (double) bs * ctx.n_expert_used);
         const double misses   = distinct * (1.0 - h);
         const double hits     = distinct - misses;
+        // the CPU chain runs concurrently with the GPU chain once the scheduler
+        // lookahead lands (flip with it); until then the two chains are serial
+        const bool cpu_chain_overlaps = getenv("GGML_SCHED_NO_CPU_OVERLAP") == nullptr;
         auto miss_ms_layer = [&](int pol) -> double {
             switch (pol) {
                 case LLAMA_PSHARD_MISS_CPU_EXEC:
                     // never admits: the pool stays empty, every route is a CPU route
-                    // (h = 0, independent of s)
+                    // (h = 0, independent of s); nothing on the GPU side to overlap
                     return distinct * t_cpu + t_split;
                 case LLAMA_PSHARD_MISS_HYBRID: {
-                    // q* fetched, capped by the free slots (hits + q resident at once);
-                    // the two chains run serially today (sum) - the max() handshake
-                    // of design 6e overlaps them once it lands
+                    // q* fetched, capped by the free slots (hits + q resident at once).
+                    // With the scheduler overlap the CPU chain runs while the GPU split
+                    // uploads its q experts and computes: max(); serial otherwise
                     const double q = std::min(std::round(plan.pool_hybrid_frac * misses), std::max(0.0, s - hits));
-                    return q * t_fetch + (misses - q) * t_cpu + t_split;
+                    const double up_ms  = q * t_fetch;
+                    const double cpu_ms = (misses - q) * t_cpu;
+                    return (cpu_chain_overlaps ? std::max(up_ms, cpu_ms) : up_ms + cpu_ms) + t_split;
                 }
                 case LLAMA_PSHARD_MISS_FETCH_ON_2ND:
                     return 0.5 * misses * t_cpu + 0.5 * misses * t_fetch + t_split; // half admitted (TBD: counters)
                 case LLAMA_PSHARD_MISS_CPU_ADMIT: {
-                    // misses run on the CPU chain this pass, their rows upload on the copy
-                    // stream for the next pass: the upload leaves the critical path as long
-                    // as the copy engine keeps up with the layer. With the CPU chain overlapped
-                    // (sched lookahead) only its excess over the layer's GPU work shows.
-                    const double cpu_ms     = misses * t_cpu;
-                    const double gpu_ms     = bd.compute_ms / std::max<uint32_t>(1, n_layers_exp);
-                    const double visible    = cpu_chain_overlaps ? std::max(0.0, cpu_ms - gpu_ms) : cpu_ms;
-                    const double upload_ms  = misses * t_fetch;
-                    const double excess_up  = std::max(0.0, upload_ms - (gpu_ms + visible));
-                    return visible + excess_up + t_split;
+                    // misses run on the CPU chain this pass, their rows upload on the pool's
+                    // copy stream for the next pass. The GPU expert chain (hits, VRAM-bound)
+                    // is far shorter than the CPU chain at decode, so the CPU time is
+                    // visible whole; the background upload leaves the critical path as
+                    // long as the copy engine keeps up with the layer.
+                    const double cpu_ms    = misses * t_cpu;
+                    const double upload_ms = misses * t_fetch;
+                    const double excess_up = std::max(0.0, upload_ms - (cpu_ms + t_split));
+                    return cpu_ms + excess_up + t_split;
                 }
                 default:
                     return misses * t_fetch;
             }
         };
-        // the CPU chain runs concurrently with the GPU chain once the scheduler
-        // lookahead lands (flip with it); until then the two chains are serial
-        const bool  cpu_chain_overlaps = false;
         const bool  priced    = ctx.predictor && plan.tps > 0.0f;
         const float probe_tps = plan.tps;
         auto price = [&](int pol) -> float {
@@ -2074,10 +2094,11 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             if (priced) {
                 plan.tps = best_tps;
                 LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u priced: probe %.1f t/s (compute %.1f + upload %.1f + other %.1f ms) -> "
-                    "pool %.1f t/s (h(%u)=%.2f, %.1f misses/layer, %.2f ms/layer, %s)\n",
+                    "pool %.1f t/s (h(%u)=%.2f, %.1f misses/layer, %.2f ms/layer, %s; t_fetch %.3f t_cpu %.3f ms/expert%s)\n",
                     __func__, bs, probe_tps, bd.compute_ms, bd.weight_upload_ms, bd.other_ms, plan.tps,
                     plan.pool_slots, h, misses, miss_ms_layer(best),
-                    llama_pshard_miss_policy_name((llama_pshard_miss_policy) best));
+                    llama_pshard_miss_policy_name((llama_pshard_miss_policy) best), t_fetch, t_cpu,
+                    cpu_chain_overlaps ? ", overlap" : ", serial");
             }
         }
     }
@@ -2523,6 +2544,7 @@ void llama_params_fit_pshard_plan(
     int64_t total_file_size = model_file_size;
     std::vector<size_t> exps_per_layer(n_layers, 0);
     size_t exps_per_expert = 0;
+    size_t exps_weights    = 0;
     {
         std::vector<int64_t> map_sizes;
         map_sizes.push_back(model_file_size);
@@ -2533,7 +2555,7 @@ void llama_params_fit_pshard_plan(
             if (ks >= 0 && gguf_get_kv_type(g, ks) == GGUF_TYPE_UINT16) {
                 n_split = (int) gguf_get_val_u16(g, ks);
             }
-            pshard_scan_expert_bytes(g, hp_nex, exps_per_layer, exps_per_expert);
+            pshard_scan_expert_bytes(g, hp_nex, exps_per_layer, exps_per_expert, exps_weights);
             gguf_free(g);
             if (n_split > 1) {
                 char prefix[1024];
@@ -2551,7 +2573,7 @@ void llama_params_fit_pshard_plan(
 #endif
                             fclose(sf);
                             if (struct gguf_context * gs = gguf_init_from_file(split_path, gip_s)) {
-                                pshard_scan_expert_bytes(gs, hp_nex, exps_per_layer, exps_per_expert);
+                                pshard_scan_expert_bytes(gs, hp_nex, exps_per_layer, exps_per_expert, exps_weights);
                                 gguf_free(gs);
                             }
                         } else {
@@ -2611,7 +2633,8 @@ void llama_params_fit_pshard_plan(
             ctx.exps_total_bytes += b;
         }
     }
-    ctx.exps_row_bytes = exps_per_expert;
+    ctx.exps_row_bytes    = exps_per_expert;
+    ctx.exps_total_weights = exps_weights;
     if (ctx.n_layers_moe > 0) {
         LLAMA_LOG_INFO("%s: routed experts: %u layers, %.1f MiB per layer, %.2f MiB per expert (gguf tensor table)\n",
             __func__, ctx.n_layers_moe, ctx.exps_layer_bytes / (1024.0 * 1024.0), ctx.exps_row_bytes / (1024.0 * 1024.0));
