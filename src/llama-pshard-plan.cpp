@@ -96,10 +96,20 @@ static void llama_pshard_generate_overrides(
         if (patterns_layer_router[il].empty()) { patterns_layer_router[il] = "blk\\." + std::to_string(il) + "\\.(ffn_gate_inp|ffn_exp_probs_b).*"; }
 
         if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
+            // MTP head layers: the draft context (a stock sched, no pool) reads them
+            // on every draft step - a pooled head would stream its whole expert set
+            // per draft token (measured: 9.5 ms per draft on q35). Pin the head whole,
+            // experts included, like the legacy plans do; the pool region shrinks by
+            // one layer of experts (~6 of 82 slots on q35).
+            if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
+                emit(patterns_layer[il].c_str(), g_pshard_mtp_head_cpu ? host_buft : gpu_buft,
+                     g_pshard_mtp_head_cpu ? layout.cpu : layout.compute);
+                continue;
+            }
             // fetch corner: routed experts live in host RAM (the pool's home -
             // never arena-packed as bid-0 weights, never shard-slot-streamed);
             // everything else pins, which also covers the routers (ids_cross is
-            // structural for the pool) and the MTP head
+            // structural for the pool)
             if (patterns_layer_moe_exps[il].empty()) {
                 patterns_layer_moe_exps[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate|gate_up)_exps\\..*";
             }
@@ -1858,6 +1868,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     plan.ids_cross     = true;   // structural: remap + fetch-on-miss need ids at copy time
     plan.n_pinned      = 0;
     plan.n_attn_pinned = n_layers;
+    plan.output_on_gpu = true;
     plan.pool_k        = 0;
     plan.pool_prefill  = LLAMA_PSHARD_PREFILL_AB_STREAM;
     const int mp_env   = pshard_miss_policy_from_env();
@@ -1872,9 +1883,13 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         return plan; // dense models: the pool is not a candidate
     }
 
+    // output head ON the GPU: with it on the CPU every pass (target token AND draft
+    // step) pays the vocabulary projection at host rate - ~9 ms per pass on q35, the
+    // largest single term of a pool token; the head's bytes come out of the pool
+    // (~11 of 86 slots at 8000) and the probe prices the trade
     llama_pshard_generate_overrides(0, n_layers, gpu_buft, host_buft,
         tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, LLAMA_PSHARD_EXPERT_POOL,
-        layout, false, /*output_on_gpu=*/false, n_layers, /*overlap=*/true, /*ids_cross=*/true);
+        layout, false, /*output_on_gpu=*/true, n_layers, /*overlap=*/true, /*ids_cross=*/true);
 
     llama_model_params mp = *mparams;
     mp.pshard = true;

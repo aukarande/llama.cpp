@@ -305,7 +305,9 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
         return false;
     }
     const size_t buf_total = ggml_backend_buffer_get_size(buf);
-    const size_t preloaded = model.get_dev_preloaded_size();
+    // the window starts at this plan's packed weights end: the canonical common end
+    // plus the plan's own extras (tensors it pins that some other tier streams)
+    const size_t preloaded = std::max(model.get_dev_preloaded_size(), plan.addrs_cached ? plan.cached_scratch_off : (size_t) 0);
     const size_t cache     = total_pinned_cache_size(memory.get());
     // this tier's compute scratch: measured at its first reserve when available
     // (registry plans carry no scratch, and the planner's probe streamed the
@@ -467,9 +469,6 @@ void llama_context::pshard_setup_sched() {
 }
 
 void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload, bool force_upload) {
-    // pool engage/mode must track EVERY applied plan (warmup reserves each tier
-    // before the initial plan lands; mixed registries flip per tier)
-    pshard_update_pool_mode(plan);
     // per-tier transport mode: governs split_graph keepalives and the runtime prefetch scan
     ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
     ggml_backend_t gpu = backends[pshard_layout.compute].get();
@@ -486,6 +485,15 @@ void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_
     for (auto * ps : memory->get_pipe_shards()) {
         sync_pins(ps, bid_for, layout, gpu);
     }
+
+    // pool engage/mode must track EVERY applied plan (warmup reserves each tier
+    // before the initial plan lands; mixed registries flip per tier). AFTER the model
+    // apply and the KV pin sync: the region is carved between THIS plan's packed
+    // weights end (canonical common + the plan's own extras, fixed by the apply) and
+    // THIS plan's pinned KV cache (synced just above). A pool tier in a mixed registry
+    // pins what the legacy tiers stream - attention of their unpinned layers, the
+    // output head, every layer's KV - so neither bound is the canonical one.
+    pshard_update_pool_mode(plan);
 
     if (model.get_dev_preload_buf()) {
         size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());

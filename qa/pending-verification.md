@@ -479,6 +479,34 @@ and corrupt concurrent measurements).
    13.4). Acceptance ~55% everywhere. Open: pool tiers for small verify batches (bs=3)
    should be priced/served as what they are (2-3x the distinct experts); a cpu_admit or
    hybrid pick there, or skipping speculation for pool plans, is the likely answer.
+   OUTPUT HEAD ON THE GPU + MTP HEAD PINNED + REGION CARVE FIX (2026-09-04): the pool
+   corner had inherited output_on_gpu=false from the fetch corner, so every pass (target
+   token and each draft step) paid the vocabulary projection at host rate - ~8 ms of the
+   q35 token, reported by the probe as "compute". Head pinned: q35 @8000 fetch 32 tok
+   44.7 -> 66.1 t/s (md5 ecb043a95a14 identical, s=86 -> 81), 256 tok 49.8 -> 75.4
+   (legacy 50.0, stock 48.9), PPL c2048/8 1.2618 (CPU head 1.2619, stock 1.2640); q35
+   @2700 forced 44.8 (planner picks hybrid at s=8; legacy 40.1); DSv4 @12000 128 tok
+   13.4 -> 14.0 (s=17 -> 16) and its 32-token output is now stock's md5 bda02a0d435a
+   exactly (the old pool md5 08b9d088f20a differed from stock only by the CPU head:
+   first token "2.0" vs " In", continuation identical - rounding, not a defect).
+   Speculation: the MTP head layers are pinned whole in the pool corner (the draft
+   context is a stock sched with no pool; a pooled head streamed its whole expert set
+   per draft token, 9.5 ms) and prefetch also runs on small verify batches: q35 MTP
+   @8000 41.9 -> 77.2 t/s, 90.8 with PSHARD_POOL_PREDICT=1 (legacy 60.7, stock 54.4).
+   Auto ladder with PSHARD_POOL_AUTO=1 now picks the pool at both budgets (tier 0 priced
+   63.0 @8000 / 47.4 @2700 vs legacy 52.3 / 40) and runs end to end: @8000 256 tok 68.4
+   (mixed ladder: colder start, h 0.795 vs 0.810, and the tier-0 switch uploads ~1.4 GB
+   of pool-only pins), @2700 32 tok 42.6; outputs identical to the forced-pool runs.
+   That ladder exposed a carve bug: pshard_pool_resize sized the window from the
+   canonical common weights end and the previously applied plan's pinned-KV size; a
+   pool tier in a mixed registry pins what the legacy tiers stream (attention of their
+   unpinned layers, the head, every layer's KV), and those pack past the common end ->
+   "plan overshoots budget" assert (1387 MiB at 8000; 1.8 MiB after fixing only the
+   weights end). The pool mode update now runs after the model apply AND the KV pin
+   sync. Side effect to price: with the head on the GPU the DSv4 @12000 prefill tiers
+   lose the A/B pair (avail 5159 < 2 x 2675 MiB) and fall back to plain host streaming
+   at the same 82 t/s - the planner should trade output_on_gpu against the pair when the
+   window is that tight (design 11.B.25).
    Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.

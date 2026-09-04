@@ -74,6 +74,9 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
             if (t == nullptr || t->ne[2] != (int64_t) n_expert) {
                 continue;
             }
+            if (t->buffer != nullptr && !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;   // pinned on the device (e.g. the MTP head's experts): not a pool home
+            }
             tensor_entry e;
             e.host      = t;
             e.row_bytes = t->nb[2];
@@ -877,7 +880,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         //    hits once the split stream has waited on the admit event (top of serve()).
         //    The victim is safe: the target layer's previous pass has completed (the
         //    drain above) and nothing reads its slots before its own service.
-        if (predict_k > 0 && prefetch_on && n_ids_1 == 1) {
+        if (predict_k > 0 && prefetch_on && n_ids_1 <= 8) {   // decode and small verify batches
             const int32_t tgt = L.il + predict_k;
             if (layer_pooled(tgt) && layers[tgt].ids_pred != nullptr) {
                 layer_state & T = layers[tgt];
@@ -890,14 +893,16 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                     if (admit_backend != nullptr && admit_event != nullptr) {
                         bool issued = false;
                         int32_t n_issued = 0;
-                        // the prediction is in descending score order: with a cap, the
-                        // most confident experts go first (mispredicted uploads compete
-                        // with the critical-path misses for the same PCIe link)
+                        // the prediction is in descending score order per token: with a cap,
+                        // rank j0 of every token goes before rank j0+1 (mispredicted uploads
+                        // compete with the critical-path misses for the same PCIe link)
+                        const int64_t np1 = std::min<int64_t>(pt->ne[1], n_ids_1);
                         for (int64_t j0 = 0; j0 < pt->ne[0]; j0++) {
-                            if (prefetch_n > 0 && n_issued >= prefetch_n) {
+                        for (int64_t i1 = 0; i1 < np1; i1++) {
+                            if (prefetch_n > 0 && n_issued >= prefetch_n * np1) {
                                 break;
                             }
-                            const int32_t e = *(const int32_t *) (pred_read_buf.data() + j0*pt->nb[0]);
+                            const int32_t e = *(const int32_t *) (pred_read_buf.data() + i1*pt->nb[1] + j0*pt->nb[0]);
                             if (e < 0 || e >= (int32_t) n_expert || T.expert_slot[e] >= 0) {
                                 continue;
                             }
@@ -923,6 +928,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                             }
                             T.pf_issued++;
                             issued = true;
+                        }
                         }
                         if (issued) {
                             ggml_backend_event_record(admit_event, admit_backend);

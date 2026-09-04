@@ -303,7 +303,7 @@ Unit costs (q35, 40 layers, E=256, top_k=8, ctx 16k):
 | KV / layer @16k | 64 | -> attn+KV pin 119 MB/layer |
 | whole layer | 569 | 55 + 64 + 450 |
 | routers + norms, total | ~80 | token_embd host |
-| output head | GPU: `head_mb` (switch-model estimate 885 = 0.04 x file, qa/pending-verification.md:11-12; quantized head bytes TBD: measure) / CPU: 0 | `output_on_gpu` per tier, priced like every other remainder use. CPU head = full-matrix DRAM read per token (TBD: measure ms/token). Maps below draw the CPU case |
+| output head | GPU: `head_mb` (switch-model estimate 885 = 0.04 x file, qa/pending-verification.md:11-12; quantized head bytes TBD: measure) / CPU: 0 | `output_on_gpu` per tier, priced like every other remainder use. CPU head = full-matrix DRAM read per token (measured 2026-09-04: ~8 ms per pass on q35 - the POOL default is head on GPU, 6a). Maps below draw the CPU case |
 | scratch | 1400 / 600 / 100 | bs 8192 / 2048 / 1 (measured) |
 | attn+KV A/B staging | ~240 | 2 x (55 + 64), only if any attn streams |
 | RAM home | 18 GB | all 40 layers' experts, page-locked |
@@ -994,6 +994,19 @@ most; seeding costs the same link time LRU spends warming itself and made short
 replies slower (q35 44.9 -> 43.0 t/s at 32 tokens, DSv4 10.65 -> 10.39). The prompt's
 hot set is a weak predictor of the reply's, and LRU already adapts per layer.
 
+**Output head on the GPU, 2026-09-04:** the pool corner had inherited
+`output_on_gpu=false` from the fetch corner. At bs=1 the CPU head is the vocabulary
+projection at host rate on every pass (target token and each draft step): ~8 ms of the
+q35 token, which the probe reported as compute. The pool plan now pins the head like the
+legacy plans (the bytes come out of the region: q35 @8000 86 -> 81 slots) and the MTP
+head layers whole (the draft context has no pool). Measured: q35 @8000 fetch 49.8 -> 75.4
+t/s at 256 tokens (legacy 50.0, stock 48.9), @2700 44.8 (legacy 40.1), MTP 41.9 -> 77.2
+(90.8 with the prefetch predictor; legacy 60.7, stock 54.4); DSv4 @12000 13.4 -> 14.0 and
+its 32-token output is now stock's exactly. The auto ladder picks the pool at both
+budgets. Open: at DSv4 @12000 the head costs the prefill tiers their A/B pair (they fall
+back to host streaming at the same 82 t/s); the planner should price `output_on_gpu`
+against the pair when the window is that tight (11.B.25).
+
 Pricing inputs (predictor decode term per layer: `t_matmul + 8 x (1 - h(s_l)) x t_miss(policy)`):
 - fetch constant, one baseline: PCIe_Sliced curve at the 2 MB point (parsed
   src/llama-benchmark.cpp:196-201; measured examples/llama-profiler/profiler-cpu.cpp:124-179)
@@ -1559,6 +1572,14 @@ remain the unchanged external baselines the ladder prices POOL against.
     (intuition only; NOT an s3 change - s3 is unchanged, 12.29). Adjudicate from
     11.B.6 counters; interacts with 11.C.16 (eviction) and 11.B.11 (per-layer s_l).
     v1 = LRU.
+
+25. **P1 - output_on_gpu vs the A/B pair at tight windows (2026-09-04).** The pool corner
+    pins the head (6a). At DSv4 @12000 that costs the prefill tiers the 2-layer A/B pair
+    (avail 5159 MiB < 2 x 2675): they fall back to plain host streaming at the same
+    82 t/s today, but the pair's window is where the prompt histogram and the warm start
+    live. Planner: probe both head placements when the pair is lost and price the
+    prompt-side loss against the ~8 ms/pass decode gain; the runtime already degrades
+    cleanly (`pshard_pool_resize` logs "does not fit ... needs the A/B pair").
 
 ### 11.C Runtime
 
