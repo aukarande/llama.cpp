@@ -450,7 +450,22 @@ and corrupt concurrent measurements).
    the win is bounded by (layer time x link rate - miss bytes) and by accuracy.
    Not priced in the planner yet (env-gated). Traps: bind order (the layer's own
    binding ran after the predictor bound its target), an unconsumed node must be
-   forward-expanded. Traps met: a grep-filtered background build hid a
+   forward-expanded.
+   WARM START + PER-LAYER ALLOCATION MEASURED 2026-09-03 (both landed OFF by default):
+   the A/B service now counts the prompt's routes per expert per layer for free (the
+   ids are read anyway); at the A/B -> cache flip PSHARD_POOL_WARM=N seeds each layer's
+   N most-used prompt experts on the copy stream (per-layer event, waited at the
+   layer's first service) and PSHARD_POOL_ALLOC=1 redistributes the region's slots by
+   greedy water-filling on the histogram (fetch floor kept per layer; q35 gave 62..132
+   slots around the uniform 86, DSv4 7..23 around 17). Results (fetch, md5 identical):
+   q35 32 tok h 0.702 -> 0.731 but 44.9 -> 43.0 t/s (1.2 GB of seeds ~40 ms stall the
+   first tokens; the h gain repays it only after ~70 tokens, when LRU would have
+   warmed anyway); q35 256 tok h 0.822 -> 0.830, t/s within noise; DSv4 32 tok 0.41 ->
+   0.425 at 10.65 -> 10.39 (3.9 GB of seeds); 128 tok 0.529 -> 0.531. Verdict: the link
+   is the constraint again - seeding spends the same PCIe time LRU spends warming, and
+   the prompt's hot set is only a weak predictor of the reply's; per-layer allocation
+   is a wash because LRU already adapts per layer. Kept as knobs. Traps met: a
+   grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.
    Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a

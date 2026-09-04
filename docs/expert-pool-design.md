@@ -986,6 +986,14 @@ raise the hit rate further but lose speed: mispredicted uploads compete with the
 critical-path misses for the same PCIe link, so the usable prefetch volume is the
 link's idle time, not the predictor's recall.
 
+**Warm start and per-layer allocation, measured 2026-09-03, off by default:** the
+prompt's per-layer routing histogram (counted for free in A/B mode) can seed the
+cache at the flip to decode (`PSHARD_POOL_WARM=N`) and redistribute slots across
+layers by demand (`PSHARD_POOL_ALLOC=1`). Both moved the hit rate by 1-3 points at
+most; seeding costs the same link time LRU spends warming itself and made short
+replies slower (q35 44.9 -> 43.0 t/s at 32 tokens, DSv4 10.65 -> 10.39). The prompt's
+hot set is a weak predictor of the reply's, and LRU already adapts per layer.
+
 Pricing inputs (predictor decode term per layer: `t_matmul + 8 x (1 - h(s_l)) x t_miss(policy)`):
 - fetch constant, one baseline: PCIe_Sliced curve at the 2 MB point (parsed
   src/llama-benchmark.cpp:196-201; measured examples/llama-profiler/profiler-cpu.cpp:124-179)
