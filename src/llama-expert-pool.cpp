@@ -25,6 +25,9 @@ llama_expert_pool::~llama_expert_pool() {
 }
 
 bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint32_t n_expert_used_) {
+    if (const char * pk = getenv("PSHARD_POOL_PREDICT")) {
+        predict_k = (int32_t) std::min<long>(8, std::max<long>(0, strtol(pk, nullptr, 10)));
+    }
     if (const char * aa = getenv("PSHARD_POOL_ADMIT_AFTER")) {
         const long v = strtol(aa, nullptr, 10);
         admit_after = (uint32_t) std::min<long>(64, std::max<long>(1, v));
@@ -59,6 +62,9 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
             full += e.row_bytes * n_expert;
             L.tensors.push_back(e);
         }
+        L.gate_inp    = ml.ffn_gate_inp;
+        L.gate_inp_b  = ml.ffn_gate_inp_b;
+        L.exp_probs_b = ml.ffn_exp_probs_b;
         if (!L.tensors.empty()) {
             n_pooled++;
             layer_full_bytes = std::max(layer_full_bytes, full);
@@ -213,7 +219,7 @@ void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
         // the next graphs will not bind these; stale pointers would alias whatever
         // tensor the rebuilt graph places at the same address
         for (auto & L : layers) {
-            L.ids_router = L.ids_gpu = L.ids_gpu_bias = L.ids_cpu = nullptr;
+            L.ids_router = L.ids_gpu = L.ids_gpu_bias = L.ids_cpu = L.ids_pred = nullptr;
         }
     }
     if (sched != nullptr) {
@@ -254,6 +260,24 @@ void llama_expert_pool::set_policy(int policy, float frac, ggml_backend_sched_t 
     }
 }
 
+bool llama_expert_pool::router_of(int32_t il, const ggml_tensor *& gate_inp, const ggml_tensor *& gate_inp_b,
+                                  const ggml_tensor *& exp_probs_b) const {
+    if (!layer_pooled(il)) {
+        return false;
+    }
+    gate_inp    = layers[il].gate_inp;
+    gate_inp_b  = layers[il].gate_inp_b;
+    exp_probs_b = layers[il].exp_probs_b;
+    return true;
+}
+
+void llama_expert_pool::bind_pred_ids(int32_t il, ggml_tensor * ids_pred) {
+    if (!layer_pooled(il)) {
+        return;
+    }
+    layers[il].ids_pred = ids_pred;
+}
+
 void llama_expert_pool::bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu,
                                        ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu) {
     if (!layer_pooled(il)) {
@@ -265,6 +289,9 @@ void llama_expert_pool::bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggm
     L.ids_gpu_bias = ids_gpu_bias;
     L.ids_cpu      = ids_cpu;
     L.serve_gen    = 0;
+    // ids_pred is NOT touched here: within build_moe_ffn(il) the predictor for
+    // layer il+k binds BEFORE this call, and this layer's own prediction was bound
+    // k layers ago; every rebuild rebinds all reachable targets, deactivation clears
     if (L.expert_last_gen.size() != n_expert) {
         L.expert_last_gen.assign(n_expert, 0);
         L.miss_count.assign(n_expert, 0);
@@ -430,6 +457,35 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                 }
             }
         }
+        // prediction made predict_k layers earlier for THIS layer: how many of the
+        // routes did it name, and how many of the misses (residency as of now)
+        if (L.ids_pred != nullptr && predict_k > 0) {
+            const ggml_tensor * pt = L.ids_pred;
+            pred_read_buf.resize(ggml_nbytes(pt));
+            ggml_backend_tensor_get_async(backend_router, const_cast<ggml_tensor *>(pt), pred_read_buf.data(), 0, pred_read_buf.size());
+            ggml_backend_synchronize(backend_router);
+            const int64_t np1 = std::min<int64_t>(pt->ne[1], n_ids_1);
+            for (int64_t i1 = 0; i1 < np1; i1++) {
+                for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
+                    const int32_t e = *(const int32_t *) (idbuf.data() + i1*ids->nb[1] + i0*ids->nb[0]);
+                    bool in_pred = false;
+                    for (int64_t j0 = 0; j0 < pt->ne[0] && !in_pred; j0++) {
+                        in_pred = *(const int32_t *) (pred_read_buf.data() + i1*pt->nb[1] + j0*pt->nb[0]) == e;
+                    }
+                    L.pred_total++;
+                    if (in_pred) {
+                        L.pred_hit++;
+                    }
+                    if (e >= 0 && e < (int32_t) n_expert && L.expert_slot[e] < 0) {
+                        L.pred_misses++;
+                        if (in_pred) {
+                            L.pred_covered++;
+                        }
+                    }
+                }
+            }
+        }
+
         const bool dual = cpu_routes() && L.ids_cpu != nullptr;
         L.cache_passes++;
 
@@ -670,6 +726,23 @@ void llama_expert_pool::log_counters() const {
     LLAMA_LOG_INFO("%s: expert pool h per layer:%s\n", __func__, per_layer.c_str());
     LLAMA_LOG_INFO("%s: expert pool admission: admit_after=%u, %llu fetches demoted, %llu residents evicted\n",
         __func__, admit_after, (unsigned long long) demoted, (unsigned long long) evicted);
+    if (predict_k > 0) {
+        uint64_t pt = 0, ph = 0, pm = 0, pc = 0;
+        std::string per_layer_cov;
+        for (const auto & L : layers) {
+            if (L.pred_total == 0) {
+                continue;
+            }
+            pt += L.pred_total; ph += L.pred_hit; pm += L.pred_misses; pc += L.pred_covered;
+            char buf[16];
+            snprintf(buf, sizeof(buf), " %.2f", L.pred_misses > 0 ? (double) L.pred_covered / (double) L.pred_misses : 0.0);
+            per_layer_cov += buf;
+        }
+        LLAMA_LOG_INFO("%s: expert pool prediction (k=%d): recall %.3f (%llu/%llu routes), miss coverage %.3f (%llu/%llu misses)\n",
+            __func__, predict_k, pt > 0 ? (double) ph / (double) pt : 0.0, (unsigned long long) ph, (unsigned long long) pt,
+            pm > 0 ? (double) pc / (double) pm : 0.0, (unsigned long long) pc, (unsigned long long) pm);
+        LLAMA_LOG_INFO("%s: expert pool prediction miss coverage per layer:%s\n", __func__, per_layer_cov.c_str());
+    }
     if (passes_1 > 0 && passes_1 != passes) {
         // decode-only view (single-token passes): what the planner's h(s) and
         // misses/token model; the all-passes line above includes any multi-token

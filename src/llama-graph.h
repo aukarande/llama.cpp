@@ -1161,6 +1161,21 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
+    // router -> top-k expert ids (shared by the routing and the pool's prefetch predictor)
+    ggml_tensor * build_moe_select(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * gate_inp_b,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+            llama_expert_gating_func_type gating_op,
+                     int   il,
+             ggml_tensor * probs_in,
+             ggml_tensor * selected_experts_in,
+             ggml_tensor ** probs_out,
+              const char * tag) const;
+
     //
     // inputs
     //

@@ -66,6 +66,19 @@ struct llama_expert_pool {
         ggml_tensor * ids_gpu      = nullptr; // GPU chain mm ids: slot id | -1
         ggml_tensor * ids_gpu_bias = nullptr; // GPU chain add_id ids: expert id | -1 (dual only)
         ggml_tensor * ids_cpu      = nullptr; // CPU chain ids: expert id | -1 (dual only)
+        ggml_tensor * ids_pred     = nullptr; // routing predicted predict_k layers earlier (output leaf)
+
+        // this layer's router (for the predictor built in an earlier layer)
+        const ggml_tensor * gate_inp    = nullptr;
+        const ggml_tensor * gate_inp_b  = nullptr;
+        const ggml_tensor * exp_probs_b = nullptr;
+
+        // prediction quality: routes named by the prediction / all routes, and
+        // misses named by the prediction / all misses (what a prefetch could hide)
+        uint64_t pred_total   = 0;
+        uint64_t pred_hit     = 0;
+        uint64_t pred_misses  = 0;
+        uint64_t pred_covered = 0;
         std::vector<int32_t> bias_buf;        // persistent upload buffers (async-safe)
         std::vector<int32_t> cpu_buf;
         std::vector<uint64_t> expert_last_gen; // [n_expert] recency: last generation routed
@@ -87,6 +100,10 @@ struct llama_expert_pool {
     // land below every live resident, so one-off experts cannot evict the hot set.
     // 1 = plain LRU. PSHARD_POOL_ADMIT_AFTER overrides.
     uint32_t admit_after   = 1;
+    // prefetch predictor depth: layer il's FFN input through layer il+k's router
+    // predicts layer il+k's experts (PSHARD_POOL_PREDICT=k, 0 = off)
+    int32_t  predict_k     = 0;
+    std::vector<char> pred_read_buf;
     uint64_t epoch         = 0;        // bumped on active/ab flips; joins graph reuse
     uint64_t generation    = 0;        // bumped once per decode call; dedupes serve()
 
@@ -136,6 +153,10 @@ struct llama_expert_pool {
     void set_policy(int policy, float frac, ggml_backend_sched_t sched);
 
     // graph-build registration (called from build_moe_ffn via the graph channel)
+    // the target layer's router tensors for the predictor (false: layer not pooled)
+    bool router_of(int32_t il, const ggml_tensor *& gate_inp, const ggml_tensor *& gate_inp_b,
+                   const ggml_tensor *& exp_probs_b) const;
+    void bind_pred_ids(int32_t il, ggml_tensor * ids_pred);
     void bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu,
                         ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu);
     ggml_tensor * mm_view(int32_t il, const ggml_tensor * host) const;
