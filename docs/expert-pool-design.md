@@ -959,6 +959,22 @@ All four values are legal in any POOL tier; the planner prices them per tier. Pr
 defaults kept below as pricing intuition (bs=1 with ample budget -> `fetch`; tight budget
 or bs >= 16 -> `cpu_exec` / `hybrid`; `fetch_on_2nd_miss` where churn).
 
+**Fifth value, landed 2026-09-03 - `cpu_admit` (RFC #24528's execution model):** every
+miss is computed on the CPU chain THIS pass while its rows are uploaded into the LRU
+victim slot on the pool's own copy stream (a second backend instance on the split
+device), fenced by one event the split stream waits on at the next pass's first
+service; the expert is a GPU hit from the next pass on. Same admission dynamics as
+`fetch` (identical h), upload off the critical path, CPU cost on it. Priced as
+`m x t_cpu + max(0, m x t_fetch - (m x t_cpu + t_split)) + t_split` per layer, with
+`t_cpu = max(S / B_H, 2 FLOP/weight / CPU GFLOPS)` from the gguf weight count (DSv4's
+Q2_K experts are compute-bound, ~15 GB/s effective; q35's Q4_K are DRAM-bound). `hybrid`
+is priced `max(q x t_fetch, (m - q) x t_cpu) + t_split` now that the scheduler overlaps
+the chains (6e). Measured q35 @8000: fetch 45.5 > hybrid 39.8 > cpu_admit 38.0 >
+cpu_exec 30.0 t/s (PPL identical, 1.2619); DSv4 @12000 128 tok: hybrid 13.5 = fetch
+13.4 > cpu_admit 11.8. On this box CPU expert throughput does not beat the PCIe 5.0
+upload it replaces, so `fetch` wins or ties at bs=1; CPU routes pay where PCIe is the
+slower pipe. `PSHARD_MISS_POLICY=cpu_admit` forces it.
+
 Pricing inputs (predictor decode term per layer: `t_matmul + 8 x (1 - h(s_l)) x t_miss(policy)`):
 - fetch constant, one baseline: PCIe_Sliced curve at the 2 MB point (parsed
   src/llama-benchmark.cpp:196-201; measured examples/llama-profiler/profiler-cpu.cpp:124-179)
@@ -1132,6 +1148,18 @@ The old "three-way split" (cache head skips upload / PCIe middle / CPU tail) is 
 | shared               | the split-op (6e)                                                    | the split-op (6e)                                                       |
 
 ### 6e. The split-op primitive (v1)
+
+**Status 2026-09-03:** landed (e45601565 split-op, d8c388569 scheduler overlap). The
+max() handshake below is implemented in `ggml_backend_sched_compute_splits`: every split
+runs in two stages (inputs, compute); when a device split is followed by a CPU split
+that consumes nothing it produces, the CPU split's inputs are copied before the device
+split launches (the device->host copy of x used to end in a full compute-stream sync
+that waited for the GPU chain), the device split runs whole (pool service, prefetch,
+launch), and the CPU compute proceeds while the GPU works. Graph order keeps the GPU
+chain first, so the serial order stays correct with the overlap off
+(`GGML_SCHED_NO_CPU_OVERLAP=1`, an eval callback, no pool). Worth +9-35% on every
+CPU-route policy; the residual CPU-route cost is the CPU chain itself (see 6a) plus the
+0.2 ms/layer handoff (two copies + syncs), which the overlap cannot remove.
 
 Today: one expert sub-graph per layer with 2-3 MUL_MAT_ID nodes - fused gate_up
 (src/llama-graph.cpp:2119) or up (:2138) + gate (:2151), and down (:2255), all via

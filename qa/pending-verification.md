@@ -385,6 +385,38 @@ and corrupt concurrent measurements).
    0.49 / h(86) 0.80 vs counted 0.452 / 0.822); perf cells should decode >= 128
    tokens before judging the pool. Tokens are identical across admit settings and
    across pool sizes (q35 256-token md5 9cf727cab686 at both budgets).
+   RFC EXECUTION MODEL LANDED 2026-09-03 (user: "I expected cpu + gpu in parallel, and
+   the copy to the VRAM cache in parallel if we missed"): (1) miss policy cpu_admit
+   (70a4d503f + hardening in d8c388569): every miss computes on the CPU chain THIS
+   pass while its rows upload into the LRU victim on the pool's own copy backend (a
+   second backend instance on the split device; no ggml header change), fenced by one
+   event the split stream waits on at the next pass's first service; GPU hit from the
+   next pass on. (2) scheduler CPU/GPU overlap (d8c388569, ggml-backend.cpp
+   compute_splits): splits run in two stages; a device split followed by a CPU split
+   that consumes nothing it produces gets the CPU split's inputs copied BEFORE its
+   launch (the device->host copy of x used to end in a full compute-stream sync that
+   waited for the GPU chain), then launches, then the CPU compute runs at its own
+   iteration while the GPU works. Graph order stays GPU-chain-first, so the serial
+   order is correct by construction when the overlap is off
+   (GGML_SCHED_NO_CPU_OVERLAP=1 / eval callback / no pool). GATES: every policy
+   md5 ecb043a95a14 at 32 tokens with and without overlap; PPL c2048/8 fetch =
+   cpu_admit = hybrid = 1.2619 (the CPU-route parity gate); DSv4 32-token md5
+   08b9d088f20a. At 128-256 tokens CPU-route outputs diverge from fetch's
+   (cpu_exec too: CPU vs GPU MUL_MAT_ID accumulation order flips near-ties) -
+   expected, PPL-identical, not a race. MEASURED (t/s): q35 @8000 32 tok serial ->
+   overlap: cpu_admit 32.6 -> 38.0, hybrid 36.5 -> 39.8, cpu_exec 26.9 -> 30.0,
+   fetch 45.5; DSv4 @12000: cpu_admit 32 tok 6.8 -> 9.2, 128 tok 8.7 -> 11.8,
+   hybrid 128 tok 13.5 vs fetch 13.4. VERDICT: the mechanism works (+9-35% on every
+   CPU-route policy) but on this box the CPU chain's per-expert cost is no better
+   than the PCIe 5.0 upload it replaces (q35 Q4_K DRAM-bound 0.044 ms/expert ~ 46
+   GB/s; DSv4 UD-Q2_K_XL compute-bound ~0.68 ms per 10.4 MiB expert ~ 15 GB/s), and
+   the GPU expert chain at bs=1 is VRAM-bound and tiny, so the CPU chain can only
+   hide behind hybrid's uploads - fetch wins or ties at bs=1. The planner prices it:
+   t_cpu = max(bytes/DRAM, 2 FLOP/weight / eff_gflops) with the expert weight count
+   from the gguf scan, hybrid = max(uploads, CPU) + handoff under overlap, cpu_admit =
+   CPU + upload excess + handoff. Traps met: a grep-filtered background build hid a
+   compile error (gates ran a stale dll - always gate on the dll timestamp); the
+   planner's PSHARD_MISS_POLICY parser had to learn the new name.
    Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
    tier marked unviable at load should fall back to the nearest viable tier
    (decode stayed in the 512-token streaming plan: 6.3 t/s at a 2024 MiB
