@@ -28,6 +28,12 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
     if (const char * pk = getenv("PSHARD_POOL_PREDICT")) {
         predict_k = (int32_t) std::min<long>(8, std::max<long>(0, strtol(pk, nullptr, 10)));
     }
+    if (const char * pf = getenv("PSHARD_POOL_PREFETCH")) {
+        prefetch_on = strtol(pf, nullptr, 10) != 0;
+    }
+    if (const char * pn = getenv("PSHARD_POOL_PREFETCH_N")) {
+        prefetch_n = (int32_t) std::max<long>(0, strtol(pn, nullptr, 10));
+    }
     if (const char * aa = getenv("PSHARD_POOL_ADMIT_AFTER")) {
         const long v = strtol(aa, nullptr, 10);
         admit_after = (uint32_t) std::min<long>(64, std::max<long>(1, v));
@@ -143,6 +149,7 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
     for (auto & L : layers) {
         L.slot_expert.assign(n_slots, -1);
         L.slot_stamp.assign(n_slots, 0);
+        L.slot_pf_gen.assign(n_slots, 0);
         if (!L.expert_slot.empty()) {
             std::fill(L.expert_slot.begin(), L.expert_slot.end(), -1);
         }
@@ -256,6 +263,24 @@ void llama_expert_pool::set_policy(int policy, float frac, ggml_backend_sched_t 
         epoch++;   // single <-> dual chain: graph topology changes
         if (sched != nullptr && active) {
             register_sched(sched);
+        }
+    }
+}
+
+void llama_expert_pool::ensure_admit_backend(ggml_backend_t split_backend) {
+    if (admit_backend != nullptr || admit_tried) {
+        return;
+    }
+    admit_tried   = true;
+    admit_backend = ggml_backend_dev_init(ggml_backend_get_device(split_backend), nullptr);
+    if (admit_backend != nullptr) {
+        admit_event = ggml_backend_event_new(ggml_backend_get_device(split_backend));
+        if (admit_event == nullptr) {
+            // no events on this device: an upload nobody can wait on must not leave
+            // the split stream - background admission / prefetch stay off
+            ggml_backend_free(admit_backend);
+            admit_backend = nullptr;
+            LLAMA_LOG_WARN("%s: no device events - copy-stream uploads disabled\n", __func__);
         }
     }
 }
@@ -452,6 +477,9 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                     // same-pass hit must never be one
                     L.slot_stamp[L.expert_slot[e]] = ++L.stamp;
                     n_hit++;
+                    if (!L.slot_pf_gen.empty() && L.slot_pf_gen[L.expert_slot[e]] == generation) {
+                        L.pf_used++;   // a prefetch from this pass paid off
+                    }
                 } else {
                     miss_list.push_back(e);
                 }
@@ -544,18 +572,8 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         //    The victim is safe to overwrite concurrently: it is not routed this pass
         //    and the synchronous ids read above drained every earlier kernel.
         const bool background = miss_policy == LLAMA_PSHARD_MISS_CPU_ADMIT;
-        if (background && admit_backend == nullptr) {
-            admit_backend = ggml_backend_dev_init(ggml_backend_get_device(split_backend), nullptr);
-            if (admit_backend != nullptr) {
-                admit_event = ggml_backend_event_new(ggml_backend_get_device(split_backend));
-                if (admit_event == nullptr) {
-                    // no events on this device: an upload nobody can wait on must not
-                    // leave the split stream - fall back to in-line (fenced) uploads
-                    ggml_backend_free(admit_backend);
-                    admit_backend = nullptr;
-                    LLAMA_LOG_WARN("%s: no device events - cpu_admit uploads stay on the split stream\n", __func__);
-                }
-            }
+        if (background) {
+            ensure_admit_backend(split_backend);
         }
         ggml_backend_t up_backend  = (background && admit_backend != nullptr && admit_event != nullptr) ? admit_backend : split_backend;
         bool           uploaded_bg = false;
@@ -665,6 +683,69 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             // the CPU chain's leaf lives in host memory: plain synchronous set
             ggml_backend_tensor_set(L.ids_cpu, L.cpu_buf.data(), 0, L.cpu_buf.size() * sizeof(int32_t));
         }
+
+        // 5. prefetch for layer il+k. The prediction for that layer was computed in
+        //    THIS layer's compute split (ready: the ids read above drained the stream).
+        //    Upload its non-resident experts into that layer's LRU victims on the copy
+        //    stream now, about one layer ahead of their use; at il+k's service they are
+        //    hits once the split stream has waited on the admit event (top of serve()).
+        //    The victim is safe: the target layer's previous pass has completed (the
+        //    drain above) and nothing reads its slots before its own service.
+        if (predict_k > 0 && prefetch_on && n_ids_1 == 1) {
+            const int32_t tgt = L.il + predict_k;
+            if (layer_pooled(tgt) && layers[tgt].ids_pred != nullptr) {
+                layer_state & T = layers[tgt];
+                if (T.slot_expert.size() == n_slots && !T.expert_slot.empty()) {
+                    const ggml_tensor * pt = T.ids_pred;
+                    pred_read_buf.resize(ggml_nbytes(pt));
+                    ggml_backend_tensor_get_async(backend_router, const_cast<ggml_tensor *>(pt), pred_read_buf.data(), 0, pred_read_buf.size());
+                    ggml_backend_synchronize(backend_router);
+                    ensure_admit_backend(split_backend);
+                    if (admit_backend != nullptr && admit_event != nullptr) {
+                        bool issued = false;
+                        int32_t n_issued = 0;
+                        // the prediction is in descending score order: with a cap, the
+                        // most confident experts go first (mispredicted uploads compete
+                        // with the critical-path misses for the same PCIe link)
+                        for (int64_t j0 = 0; j0 < pt->ne[0]; j0++) {
+                            if (prefetch_n > 0 && n_issued >= prefetch_n) {
+                                break;
+                            }
+                            const int32_t e = *(const int32_t *) (pred_read_buf.data() + j0*pt->nb[0]);
+                            if (e < 0 || e >= (int32_t) n_expert || T.expert_slot[e] >= 0) {
+                                continue;
+                            }
+                            n_issued++;
+                            int32_t slot = 0;
+                            for (uint32_t s2 = 1; s2 < n_slots; s2++) {
+                                if (T.slot_stamp[s2] < T.slot_stamp[slot]) {
+                                    slot = (int32_t) s2;
+                                }
+                            }
+                            if (T.slot_expert[slot] >= 0) {
+                                T.expert_slot[T.slot_expert[slot]] = -1;
+                                T.evicted++;
+                            }
+                            T.slot_expert[slot] = e;
+                            T.expert_slot[e]    = slot;
+                            T.slot_stamp[slot]  = ++T.stamp;
+                            T.slot_pf_gen[slot] = generation;
+                            for (const auto & te : T.tensors) {
+                                ggml_backend_tensor_set_async(admit_backend, te.view_slots,
+                                    (const char *) te.host->data + (size_t) e * te.row_bytes,
+                                    (size_t) slot * te.row_bytes, te.row_bytes);
+                            }
+                            T.pf_issued++;
+                            issued = true;
+                        }
+                        if (issued) {
+                            ggml_backend_event_record(admit_event, admit_backend);
+                            admit_pending = true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     ggml_backend_tensor_set_async(split_backend, L.ids_gpu,
@@ -742,6 +823,14 @@ void llama_expert_pool::log_counters() const {
             __func__, predict_k, pt > 0 ? (double) ph / (double) pt : 0.0, (unsigned long long) ph, (unsigned long long) pt,
             pm > 0 ? (double) pc / (double) pm : 0.0, (unsigned long long) pc, (unsigned long long) pm);
         LLAMA_LOG_INFO("%s: expert pool prediction miss coverage per layer:%s\n", __func__, per_layer_cov.c_str());
+        uint64_t pfi = 0, pfu = 0;
+        for (const auto & L : layers) {
+            pfi += L.pf_issued;
+            pfu += L.pf_used;
+        }
+        LLAMA_LOG_INFO("%s: expert pool prefetch: %s, %llu uploads issued, %llu used by the target layer (%.3f)\n",
+            __func__, prefetch_on ? "on" : "off", (unsigned long long) pfi, (unsigned long long) pfu,
+            pfi > 0 ? (double) pfu / (double) pfi : 0.0);
     }
     if (passes_1 > 0 && passes_1 != passes) {
         // decode-only view (single-token passes): what the planner's h(s) and

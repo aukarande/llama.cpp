@@ -79,6 +79,11 @@ struct llama_expert_pool {
         uint64_t pred_hit     = 0;
         uint64_t pred_misses  = 0;
         uint64_t pred_covered = 0;
+        // prefetch: experts uploaded for this layer ahead of its service (from the
+        // prediction) and how many of them the layer then actually routed to
+        uint64_t pf_issued = 0;
+        uint64_t pf_used   = 0;
+        std::vector<uint64_t> slot_pf_gen;   // [n_slots] pass that prefetched the slot
         std::vector<int32_t> bias_buf;        // persistent upload buffers (async-safe)
         std::vector<int32_t> cpu_buf;
         std::vector<uint64_t> expert_last_gen; // [n_expert] recency: last generation routed
@@ -103,6 +108,11 @@ struct llama_expert_pool {
     // prefetch predictor depth: layer il's FFN input through layer il+k's router
     // predicts layer il+k's experts (PSHARD_POOL_PREDICT=k, 0 = off)
     int32_t  predict_k     = 0;
+    bool     prefetch_on   = true;   // PSHARD_POOL_PREFETCH=0: predict and score only
+    int32_t  prefetch_n    = 1;      // PSHARD_POOL_PREFETCH_N: at most this many of the predicted
+                                     // experts per layer, highest predicted score first (0 = all).
+                                     // Mispredicted uploads share the PCIe link with the critical-
+                                     // path misses: DSv4 @12000 N=1 +6.5%, N=2 +3.7%, N=3 -2%
     std::vector<char> pred_read_buf;
     uint64_t epoch         = 0;        // bumped on active/ab flips; joins graph reuse
     uint64_t generation    = 0;        // bumped once per decode call; dedupes serve()
@@ -157,6 +167,8 @@ struct llama_expert_pool {
     bool router_of(int32_t il, const ggml_tensor *& gate_inp, const ggml_tensor *& gate_inp_b,
                    const ggml_tensor *& exp_probs_b) const;
     void bind_pred_ids(int32_t il, ggml_tensor * ids_pred);
+    // the pool's copy backend + event (background admission, prefetch); no-op once created
+    void ensure_admit_backend(ggml_backend_t split_backend);
     void bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu,
                         ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu);
     ggml_tensor * mm_view(int32_t il, const ggml_tensor * host) const;
@@ -192,6 +204,7 @@ struct llama_expert_pool {
     // each layer's uploads (FIFO stream: the latest record covers them all), waited
     // on by the split stream at the first service of the next pass.
     ggml_backend_t       admit_backend = nullptr;
+    bool                 admit_tried   = false;
     ggml_backend_event_t admit_event   = nullptr;
     bool                 admit_pending = false;
 
