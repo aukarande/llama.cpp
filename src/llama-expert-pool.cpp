@@ -11,6 +11,12 @@ llama_expert_pool::~llama_expert_pool() {
     if (admit_backend != nullptr) {
         ggml_backend_synchronize(admit_backend);
     }
+    for (auto & L : layers) {
+        if (L.warm_event != nullptr) {
+            ggml_backend_event_free(L.warm_event);
+            L.warm_event = nullptr;
+        }
+    }
     if (admit_event != nullptr) {
         ggml_backend_event_free(admit_event);
         admit_event = nullptr;
@@ -33,6 +39,12 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
     }
     if (const char * pn = getenv("PSHARD_POOL_PREFETCH_N")) {
         prefetch_n = (int32_t) std::max<long>(0, strtol(pn, nullptr, 10));
+    }
+    if (const char * w = getenv("PSHARD_POOL_WARM")) {
+        warm_n = (int32_t) std::max<long>(0, strtol(w, nullptr, 10));
+    }
+    if (const char * a = getenv("PSHARD_POOL_ALLOC")) {
+        alloc_on = strtol(a, nullptr, 10) != 0;
     }
     if (const char * aa = getenv("PSHARD_POOL_ADMIT_AFTER")) {
         const long v = strtol(aa, nullptr, 10);
@@ -113,6 +125,7 @@ size_t llama_expert_pool::region_bytes_needed(uint32_t slots_per_layer, bool wit
 bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, size_t bytes, uint32_t slots_per_layer) {
     region_base  = base;
     region_bytes = bytes;
+    region_arena = arena;
     n_slots      = slots_per_layer;
 
     if (ctx_views != nullptr) {
@@ -128,7 +141,16 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
         return false;
     }
 
-    const size_t need = region_bytes_needed(slots_per_layer, /*with_ab=*/false);
+    // per-layer counts: the last warm start's plan when it was made for this uniform
+    // count (same region), else uniform
+    const bool use_plan = alloc_on && layer_slots_plan.size() == layers.size() && layer_slots_plan_base == slots_per_layer;
+    size_t need = 0;
+    for (auto & L : layers) {
+        L.n_slots_l = use_plan ? layer_slots_plan[L.il] : slots_per_layer;
+        for (const auto & e : L.tensors) {
+            need += ((size_t) L.n_slots_l * e.row_bytes + 255) & ~(size_t) 255;
+        }
+    }
     if (need > bytes) {
         LLAMA_LOG_WARN("%s: expert pool region too small: need %.1f MiB (s=%u), have %.1f MiB\n",
             __func__, need / (1024.0 * 1024.0), slots_per_layer, bytes / (1024.0 * 1024.0));
@@ -147,18 +169,19 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
     // cache contents are volatile by design)
     size_t off = 0;
     for (auto & L : layers) {
-        L.slot_expert.assign(n_slots, -1);
-        L.slot_stamp.assign(n_slots, 0);
-        L.slot_pf_gen.assign(n_slots, 0);
+        L.slot_expert.assign(L.n_slots_l, -1);
+        L.slot_stamp.assign(L.n_slots_l, 0);
+        L.slot_pf_gen.assign(L.n_slots_l, 0);
+        L.warm_pending = false;
         if (!L.expert_slot.empty()) {
             std::fill(L.expert_slot.begin(), L.expert_slot.end(), -1);
         }
         for (auto & e : L.tensors) {
             e.region_off = off;
-            off += ((size_t) n_slots * e.row_bytes + 255) & ~(size_t) 255;
+            off += ((size_t) L.n_slots_l * e.row_bytes + 255) & ~(size_t) 255;
 
             e.view_slots = ggml_new_tensor_3d(ctx_views, e.host->type,
-                e.host->ne[0], e.host->ne[1], n_slots);
+                e.host->ne[0], e.host->ne[1], L.n_slots_l);
             e.view_slots->data   = (char *) base + e.region_off;
             e.view_slots->buffer = arena;
             ggml_format_name(e.view_slots, "pool_s#%s", e.host->name);
@@ -190,8 +213,20 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
         }
     }
 
-    LLAMA_LOG_INFO("%s: expert pool region %.1f MiB: s=%u slots/layer (cache)%s\n",
+    uint32_t smin = UINT32_MAX, smax = 0;
+    for (const auto & L : layers) {
+        if (L.tensors.empty()) {
+            continue;
+        }
+        smin = std::min(smin, L.n_slots_l);
+        smax = std::max(smax, L.n_slots_l);
+    }
+    if (smin == UINT32_MAX) {
+        smin = smax = n_slots;
+    }
+    LLAMA_LOG_INFO("%s: expert pool region %.1f MiB: s=%u slots/layer (cache%s)%s\n",
         __func__, bytes / (1024.0 * 1024.0), n_slots,
+        use_plan ? (std::string(", per layer ") + std::to_string(smin) + ".." + std::to_string(smax)).c_str() : "",
         ab_capable ? " + 2-layer A/B pair" : " (no A/B pair: cache tiers only)");
     return true;
 }
@@ -248,6 +283,18 @@ void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
     // v1 relabel: cache contents do not survive the A/B overlay (the halves alias
     // the slot arrays); drop the maps and refill lazily
     reset_slots();
+    if (ab) {
+        // a new prefill: start its histogram
+        prompt_seen = false;
+        for (auto & L : layers) {
+            if (!L.tensors.empty()) {
+                L.prompt_count.assign(n_expert, 0);
+            }
+        }
+    } else {
+        // back to decode: the prompt just processed sizes and seeds the cache
+        warm_start();
+    }
     if (sched != nullptr) {
         register_sched(sched);
     }
@@ -283,6 +330,133 @@ void llama_expert_pool::ensure_admit_backend(ggml_backend_t split_backend) {
             LLAMA_LOG_WARN("%s: no device events - copy-stream uploads disabled\n", __func__);
         }
     }
+}
+
+void llama_expert_pool::warm_start() {
+    if (!prompt_seen || region_base == nullptr || n_slots == 0 || backend_router == nullptr) {
+        return;
+    }
+    // experts of each layer ranked by prompt count (descending), counts > 0 only
+    std::vector<std::vector<int32_t>> order(layers.size());
+    for (const auto & L : layers) {
+        if (L.tensors.empty() || L.prompt_count.empty()) {
+            continue;
+        }
+        auto & o = order[L.il];
+        for (uint32_t e = 0; e < n_expert; e++) {
+            if (L.prompt_count[e] > 0) {
+                o.push_back((int32_t) e);
+            }
+        }
+        std::sort(o.begin(), o.end(), [&](int32_t a, int32_t b) { return L.prompt_count[a] > L.prompt_count[b]; });
+    }
+
+    // (1) per-layer allocation: same region bytes, slots redistributed by demand.
+    //     Every layer keeps the decode fetch floor (top_k distinct experts per
+    //     pass); the remaining slots go, one at a time, to the layer whose next
+    //     most-used prompt expert has the highest count (greedy water-filling on
+    //     the histogram: the marginal slot buys the most expected hits there).
+    if (alloc_on) {
+        const uint32_t floor_l = std::min<uint32_t>(n_expert, n_expert_used);
+        std::vector<uint32_t> alloc(layers.size(), 0);
+        std::vector<size_t>   slot_bytes(layers.size(), 0);   // bytes of ONE slot in this layer
+        size_t used = 0;
+        bool ok = true;
+        for (const auto & L : layers) {
+            if (L.tensors.empty()) {
+                continue;
+            }
+            for (const auto & e : L.tensors) {
+                slot_bytes[L.il] += e.row_bytes;
+            }
+            slot_bytes[L.il] += 256 * L.tensors.size();   // per-tensor rounding slack
+            alloc[L.il] = floor_l;
+            used += (size_t) floor_l * slot_bytes[L.il];
+        }
+        if (used > region_bytes) {
+            ok = false;   // the floors alone do not fit: keep the uniform layout
+        }
+        while (ok) {
+            int32_t  best = -1;
+            uint32_t best_gain = 0;
+            for (const auto & L : layers) {
+                if (L.tensors.empty() || alloc[L.il] >= n_expert) {
+                    continue;
+                }
+                const auto & o = order[L.il];
+                const uint32_t gain = alloc[L.il] < o.size() ? L.prompt_count[o[alloc[L.il]]] : 0;
+                if (best < 0 || gain > best_gain) {
+                    best = L.il;
+                    best_gain = gain;
+                }
+            }
+            if (best < 0 || used + slot_bytes[best] > region_bytes) {
+                break;
+            }
+            alloc[best]++;
+            used += slot_bytes[best];
+        }
+        if (ok) {
+            layer_slots_plan      = alloc;
+            layer_slots_plan_base = n_slots;
+            if (!set_region(region_arena, region_base, region_bytes, n_slots)) {
+                layer_slots_plan.clear();
+                set_region(region_arena, region_base, region_bytes, n_slots);
+            }
+        }
+    }
+
+    // (2) seeding: each layer's most-used prompt experts go into its slots now, on
+    //     the copy stream; the layer's first service waits for its own seeds. Popular
+    //     first, stamped most-recent so the LRU keeps them longest.
+    const int32_t wn = warm_n;
+    if (wn <= 0) {
+        return;
+    }
+    ensure_admit_backend(backend_router);
+    if (admit_backend == nullptr) {
+        return;
+    }
+    uint64_t seeded = 0;
+    size_t   seeded_bytes = 0;
+    for (auto & L : layers) {
+        if (L.tensors.empty() || L.slot_expert.empty()) {
+            continue;
+        }
+        const auto & o = order[L.il];
+        const uint32_t m = std::min<uint32_t>({ (uint32_t) wn, L.n_slots_l, (uint32_t) o.size() });
+        if (m == 0) {
+            continue;
+        }
+        for (uint32_t i = 0; i < m; i++) {
+            const int32_t e = o[i];
+            L.slot_expert[i] = e;
+            L.expert_slot[e] = (int32_t) i;
+            L.slot_stamp[i]  = (uint64_t) (m - i);
+            for (const auto & te : L.tensors) {
+                ggml_backend_tensor_set_async(admit_backend, te.view_slots,
+                    (const char *) te.host->data + (size_t) e * te.row_bytes,
+                    (size_t) i * te.row_bytes, te.row_bytes);
+                seeded_bytes += te.row_bytes;
+            }
+        }
+        L.stamp = m;
+        if (L.warm_event == nullptr) {
+            L.warm_event = ggml_backend_event_new(ggml_backend_get_device(backend_router));
+        }
+        if (L.warm_event != nullptr) {
+            ggml_backend_event_record(L.warm_event, admit_backend);
+            L.warm_pending = true;
+        } else {
+            ggml_backend_synchronize(admit_backend);   // no events: land them now
+        }
+        seeded += m;
+    }
+    warm_seeded += seeded;
+    warm_starts++;
+    LLAMA_LOG_INFO("%s: expert pool warm start: seeded %llu experts (%.1f MiB) from the prompt histogram%s\n",
+        __func__, (unsigned long long) seeded, seeded_bytes / (1024.0 * 1024.0),
+        alloc_on && !layer_slots_plan.empty() ? ", slots redistributed per layer" : "");
 }
 
 bool llama_expert_pool::router_of(int32_t il, const ggml_tensor *& gate_inp, const ggml_tensor *& gate_inp_b,
@@ -443,8 +617,13 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         }
         for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
             for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
-                mapped[i1*n_ids_0 + i0] = *(const int32_t *)
-                    (idbuf.data() + i1*ids->nb[1] + i0*ids->nb[0]);
+                const int32_t e = *(const int32_t *) (idbuf.data() + i1*ids->nb[1] + i0*ids->nb[0]);
+                mapped[i1*n_ids_0 + i0] = e;
+                // prompt histogram for the warm start (the ids are read anyway)
+                if (!L.prompt_count.empty() && e >= 0 && e < (int32_t) n_expert) {
+                    L.prompt_count[e]++;
+                    prompt_seen = true;
+                }
             }
         }
         if (cpu_routes() && L.ids_cpu != nullptr) {
@@ -458,6 +637,13 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             ggml_backend_tensor_set(L.ids_cpu, L.cpu_buf.data(), 0, L.cpu_buf.size() * sizeof(int32_t));
         }
     } else {
+        // warm start: this layer's seeded slots were uploaded on the copy stream at the
+        // A/B -> cache flip; the split stream waits for them before the first read
+        if (L.warm_pending && L.warm_event != nullptr) {
+            ggml_backend_event_wait(split_backend, L.warm_event);
+            L.warm_pending = false;
+        }
+
         // 1. the pass's distinct experts: hits stay; misses are decided PER EXPERT
         //    by the tier's miss policy (all of an expert's routes go the same way)
         seen_gen.assign(n_expert, 0);
@@ -552,12 +738,12 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         {
             uint32_t need = n_hit;
             for (size_t i = 0; i < miss_list.size(); i++) {
-                if (admit[i] && need < n_slots) {
+                if (admit[i] && need < L.n_slots_l) {
                     need++;
                 } else if (admit[i]) {
                     if (!dual) {
                         LLAMA_LOG_ERROR("%s: pool layer %d: distinct experts this pass exceed %u slots - "
-                            "the runtime clamp undercut the plan floor\n", __func__, L.il, n_slots);
+                            "the runtime clamp undercut the plan floor\n", __func__, L.il, L.n_slots_l);
                         return false;
                     }
                     admit[i] = 0;
@@ -587,7 +773,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                 continue;
             }
             int32_t slot = 0;
-            for (uint32_t s = 1; s < n_slots; s++) {
+            for (uint32_t s = 1; s < L.n_slots_l; s++) {
                 if (L.slot_stamp[s] < L.slot_stamp[slot]) {
                     slot = (int32_t) s;
                 }
@@ -653,7 +839,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         // this sat before it: h was invariant to admit_after across 44k evictions)
         if (!probation.empty()) {
             uint64_t floor = UINT64_MAX;
-            for (uint32_t s = 0; s < n_slots; s++) {
+            for (uint32_t s = 0; s < L.n_slots_l; s++) {
                 bool on_probation = false;
                 for (int32_t ps : probation) {
                     if (ps == (int32_t) s) { on_probation = true; break; }
@@ -695,7 +881,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             const int32_t tgt = L.il + predict_k;
             if (layer_pooled(tgt) && layers[tgt].ids_pred != nullptr) {
                 layer_state & T = layers[tgt];
-                if (T.slot_expert.size() == n_slots && !T.expert_slot.empty()) {
+                if (T.slot_expert.size() == T.n_slots_l && T.n_slots_l > 0 && !T.expert_slot.empty()) {
                     const ggml_tensor * pt = T.ids_pred;
                     pred_read_buf.resize(ggml_nbytes(pt));
                     ggml_backend_tensor_get_async(backend_router, const_cast<ggml_tensor *>(pt), pred_read_buf.data(), 0, pred_read_buf.size());
@@ -717,7 +903,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                             }
                             n_issued++;
                             int32_t slot = 0;
-                            for (uint32_t s2 = 1; s2 < n_slots; s2++) {
+                            for (uint32_t s2 = 1; s2 < T.n_slots_l; s2++) {
                                 if (T.slot_stamp[s2] < T.slot_stamp[slot]) {
                                     slot = (int32_t) s2;
                                 }
@@ -828,6 +1014,8 @@ void llama_expert_pool::log_counters() const {
             pfi += L.pf_issued;
             pfu += L.pf_used;
         }
+        LLAMA_LOG_INFO("%s: expert pool warm start: %u flips, %llu experts seeded\n",
+            __func__, warm_starts, (unsigned long long) warm_seeded);
         LLAMA_LOG_INFO("%s: expert pool prefetch: %s, %llu uploads issued, %llu used by the target layer (%.3f)\n",
             __func__, prefetch_on ? "on" : "off", (unsigned long long) pfi, (unsigned long long) pfu,
             pfi > 0 ? (double) pfu / (double) pfi : 0.0);

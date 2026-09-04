@@ -84,6 +84,15 @@ struct llama_expert_pool {
         uint64_t pf_issued = 0;
         uint64_t pf_used   = 0;
         std::vector<uint64_t> slot_pf_gen;   // [n_slots] pass that prefetched the slot
+
+        // per-layer allocation: this layer's slot count (= the pool's uniform n_slots
+        // unless the last warm start redistributed the region by prompt demand)
+        uint32_t n_slots_l = 0;
+        // routes per expert over the last prefill (A/B mode counts them for free):
+        // the warm start seeds the cache from it and sizes the layers by it
+        std::vector<uint32_t> prompt_count;
+        ggml_backend_event_t  warm_event   = nullptr;   // this layer's seeds landed (copy stream)
+        bool                  warm_pending = false;
         std::vector<int32_t> bias_buf;        // persistent upload buffers (async-safe)
         std::vector<int32_t> cpu_buf;
         std::vector<uint64_t> expert_last_gen; // [n_expert] recency: last generation routed
@@ -94,7 +103,7 @@ struct llama_expert_pool {
 
     uint32_t n_expert      = 0;
     uint32_t n_expert_used = 0;
-    uint32_t n_slots       = 0;        // cache-mode slots per layer (v1 uniform)
+    uint32_t n_slots       = 0;        // cache-mode slots per layer (the uniform baseline)
     bool     ab_mode       = false;    // active tier is a whole-stack prefill tier
     bool     active        = false;    // the ACTIVE plan is EXPERT_POOL (legacy tiers
                                        // in a mixed registry must stream normally)
@@ -119,6 +128,20 @@ struct llama_expert_pool {
 
     void *   region_base   = nullptr;
     size_t   region_bytes  = 0;
+    ggml_backend_buffer_t region_arena = nullptr;
+    // warm start (A/B -> cache flip after a prefill): per-layer slot plan from the
+    // prompt histogram (valid for the uniform count it was derived from) and seeding
+    std::vector<uint32_t> layer_slots_plan;
+    uint32_t              layer_slots_plan_base = 0;
+    bool                  prompt_seen = false;
+    // both measured 2026-09-03 and left OFF by default: seeding costs link time the
+    // cache would have spent warming itself (q35 32 tok: h 0.70 -> 0.73 but 44.9 ->
+    // 43.0 t/s; DSv4 10.65 -> 10.39) and the per-layer redistribution moved h by
+    // <= 0.4 points; PSHARD_POOL_WARM=N / PSHARD_POOL_ALLOC=1 enable them
+    int32_t  warm_n        = 0;        // PSHARD_POOL_WARM: seeds per layer (0 = off)
+    bool     alloc_on      = false;    // PSHARD_POOL_ALLOC=1: slots per layer by prompt demand
+    uint64_t warm_seeded   = 0;
+    uint32_t warm_starts   = 0;
     size_t   layer_slot_bytes = 0;     // per-layer cache-mode footprint (all tensors)
     size_t   layer_full_bytes = 0;     // per-layer whole-expert-set footprint
     bool     ab_capable       = false; // the region holds the A/B pair (set_region)
@@ -169,6 +192,9 @@ struct llama_expert_pool {
     void bind_pred_ids(int32_t il, ggml_tensor * ids_pred);
     // the pool's copy backend + event (background admission, prefetch); no-op once created
     void ensure_admit_backend(ggml_backend_t split_backend);
+    // at the A/B -> cache flip: size the layers by prompt demand and seed the cache
+    // with each layer's most-used prompt experts (uploads on the copy stream)
+    void warm_start();
     void bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu,
                         ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu);
     ggml_tensor * mm_view(int32_t il, const ggml_tensor * host) const;
