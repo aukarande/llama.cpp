@@ -986,13 +986,19 @@ raise the hit rate further but lose speed: mispredicted uploads compete with the
 critical-path misses for the same PCIe link, so the usable prefetch volume is the
 link's idle time, not the predictor's recall.
 
-**Warm start and per-layer allocation, measured 2026-09-03, off by default:** the
-prompt's per-layer routing histogram (counted for free in A/B mode) can seed the
-cache at the flip to decode (`PSHARD_POOL_WARM=N`) and redistribute slots across
-layers by demand (`PSHARD_POOL_ALLOC=1`). Both moved the hit rate by 1-3 points at
-most; seeding costs the same link time LRU spends warming itself and made short
-replies slower (q35 44.9 -> 43.0 t/s at 32 tokens, DSv4 10.65 -> 10.39). The prompt's
-hot set is a weak predictor of the reply's, and LRU already adapts per layer.
+**Warm start and per-layer allocation, reworked 2026-09-04, off by default:** the
+A/B prefill records each expert's route count AND most recent route position;
+seeding (`PSHARD_POOL_WARM=N`) ranks by prompt-end LRU order (the user's
+hypothesis: the reply continues the prompt's tail - the 2026-09-03 flat histogram
+seeded the whole prompt's average and measured a loss), the water-fill allocation
+(`PSHARD_POOL_ALLOC=1`) still ranks by count (expected hits are a popularity
+question; ranking it by recency collapsed h 0.79 -> 0.65). q35 @8000 fetch,
+128 tok: baseline 79-80 t/s h 0.787; warm=8 recency 77.0 / 0.794 (the seed burst
+still costs more link time than it buys - LRU warms itself); alloc only 79.4 /
+0.791; warm+alloc 80-81 / 0.798, the one variant at or above baseline
+(redistribution puts seeds in layers where they survive). Both default off.
+DSv4 below the full budget cannot warm at all: no A/B pair since the head pin,
+so no histogram (11.B.25). The admission gate (ADMIT_AFTER) is REMOVED.
 
 **Output head on the GPU, 2026-09-04:** the pool corner had inherited
 `output_on_gpu=false` from the fetch corner. At bs=1 the CPU head is the vocabulary

@@ -46,10 +46,6 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
     if (const char * a = getenv("PSHARD_POOL_ALLOC")) {
         alloc_on = strtol(a, nullptr, 10) != 0;
     }
-    if (const char * aa = getenv("PSHARD_POOL_ADMIT_AFTER")) {
-        const long v = strtol(aa, nullptr, 10);
-        admit_after = (uint32_t) std::min<long>(64, std::max<long>(1, v));
-    }
     n_expert      = n_expert_;
     n_expert_used = n_expert_used_;
     if (n_expert == 0 || n_expert_used == 0) {
@@ -292,6 +288,8 @@ void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
         for (auto & L : layers) {
             if (!L.tensors.empty()) {
                 L.prompt_count.assign(n_expert, 0);
+                L.prompt_last.assign(n_expert, 0);
+                L.prompt_pos = 0;
             }
         }
     } else {
@@ -351,7 +349,14 @@ void llama_expert_pool::warm_start() {
                 o.push_back((int32_t) e);
             }
         }
-        std::sort(o.begin(), o.end(), [&](int32_t a, int32_t b) { return L.prompt_count[a] > L.prompt_count[b]; });
+        // prompt-end LRU order: most recently routed first, popularity as tiebreak
+        // (user hypothesis 2026-09-04: the reply continues the prompt's tail)
+        std::sort(o.begin(), o.end(), [&](int32_t a, int32_t b) {
+            if (L.prompt_last[a] != L.prompt_last[b]) {
+                return L.prompt_last[a] > L.prompt_last[b];
+            }
+            return L.prompt_count[a] > L.prompt_count[b];
+        });
     }
 
     // (1) per-layer allocation: same region bytes, slots redistributed by demand.
@@ -360,6 +365,15 @@ void llama_expert_pool::warm_start() {
     //     most-used prompt expert has the highest count (greedy water-filling on
     //     the histogram: the marginal slot buys the most expected hits there).
     if (alloc_on) {
+        // popularity order just for the water-fill's marginal-gain metric
+        std::vector<std::vector<int32_t>> order_cnt = order;
+        for (auto & L : layers) {
+            if (L.tensors.empty() || L.prompt_count.empty()) {
+                continue;
+            }
+            auto & o = order_cnt[L.il];
+            std::sort(o.begin(), o.end(), [&](int32_t a, int32_t b) { return L.prompt_count[a] > L.prompt_count[b]; });
+        }
         const uint32_t floor_l = std::min<uint32_t>(n_expert, n_expert_used);
         std::vector<uint32_t> alloc(layers.size(), 0);
         std::vector<size_t>   slot_bytes(layers.size(), 0);   // bytes of ONE slot in this layer
@@ -386,7 +400,7 @@ void llama_expert_pool::warm_start() {
                 if (L.tensors.empty() || alloc[L.il] >= n_expert) {
                     continue;
                 }
-                const auto & o = order[L.il];
+                const auto & o = order_cnt[L.il];
                 const uint32_t gain = alloc[L.il] < o.size() ? L.prompt_count[o[alloc[L.il]]] : 0;
                 if (best < 0 || gain > best_gain) {
                     best = L.il;
@@ -457,7 +471,7 @@ void llama_expert_pool::warm_start() {
     }
     warm_seeded += seeded;
     warm_starts++;
-    LLAMA_LOG_INFO("%s: expert pool warm start: seeded %llu experts (%.1f MiB) from the prompt histogram%s\n",
+    LLAMA_LOG_INFO("%s: expert pool warm start: seeded %llu experts (%.1f MiB) in prompt-end LRU order%s\n",
         __func__, (unsigned long long) seeded, seeded_bytes / (1024.0 * 1024.0),
         alloc_on && !layer_slots_plan.empty() ? ", slots redistributed per layer" : "");
 }
@@ -622,13 +636,16 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
                 const int32_t e = *(const int32_t *) (idbuf.data() + i1*ids->nb[1] + i0*ids->nb[0]);
                 mapped[i1*n_ids_0 + i0] = e;
-                // prompt histogram for the warm start (the ids are read anyway)
+                // prompt routing stats for the warm start (the ids are read anyway):
+                // count + position of the most recent route (i1 is the token index)
                 if (!L.prompt_count.empty() && e >= 0 && e < (int32_t) n_expert) {
                     L.prompt_count[e]++;
+                    L.prompt_last[e] = L.prompt_pos + (uint32_t) i1 + 1;
                     prompt_seen = true;
                 }
             }
         }
+        L.prompt_pos += (uint32_t) n_ids_1;
         if (cpu_routes() && L.ids_cpu != nullptr) {
             // dual chain on a whole-stack tier: everything is resident, nothing goes to CPU
             L.bias_buf = mapped;
@@ -766,11 +783,10 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         }
         ggml_backend_t up_backend  = (background && admit_backend != nullptr && admit_event != nullptr) ? admit_backend : split_backend;
         bool           uploaded_bg = false;
-        std::vector<int32_t> probation;
         for (size_t i = 0; i < miss_list.size(); i++) {
             const int32_t e = miss_list[i];
             L.expert_last_gen[e] = generation;
-            const uint32_t seen_misses = ++L.miss_count[e];
+            ++L.miss_count[e];   // fetch_on_2nd_miss admission reads this
             if (!admit[i]) {
                 L.misses++;
                 continue;
@@ -788,9 +804,6 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             L.slot_expert[slot] = e;
             L.expert_slot[e]    = slot;
             L.slot_stamp[slot]  = ++L.stamp;   // protected for THIS pass
-            if (seen_misses < admit_after) {
-                probation.push_back(slot);
-            }
             for (const auto & te : L.tensors) {
                 ggml_backend_tensor_set_async(up_backend, te.view_slots,
                     (const char *) te.host->data + (size_t) e * te.row_bytes,
@@ -834,29 +847,6 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                     L.cpu_buf[k] = e;
                 }
             }
-        }
-        // probationary admission: experts below admit_after misses served this pass
-        // but must not displace the established residents next time - restamp them
-        // below every live entry (in fetch order). Placed AFTER the per-route touch
-        // above, which refreshes every current slot to MRU (it undid the demotion when
-        // this sat before it: h was invariant to admit_after across 44k evictions)
-        if (!probation.empty()) {
-            uint64_t floor = UINT64_MAX;
-            for (uint32_t s = 0; s < L.n_slots_l; s++) {
-                bool on_probation = false;
-                for (int32_t ps : probation) {
-                    if (ps == (int32_t) s) { on_probation = true; break; }
-                }
-                if (!on_probation) {
-                    floor = std::min(floor, L.slot_stamp[s]);
-                }
-            }
-            const uint64_t n    = probation.size();
-            const uint64_t base = (floor != UINT64_MAX && floor > n) ? floor - n : 0;
-            for (uint64_t i = 0; i < n; i++) {
-                L.slot_stamp[probation[i]] = base + i;
-            }
-            L.demoted += n;
         }
         L.hits += n_hit;
         if (n_ids_1 == 1) {
@@ -968,7 +958,7 @@ void llama_expert_pool::reset_slots() {
 
 void llama_expert_pool::log_counters() const {
     uint64_t hits = 0, misses = 0, passes = 0;
-    uint64_t hits_1 = 0, misses_1 = 0, passes_1 = 0, demoted = 0, evicted = 0;
+    uint64_t hits_1 = 0, misses_1 = 0, passes_1 = 0, evicted = 0;
     std::string per_layer;
     for (const auto & L : layers) {
         if (L.tensors.empty()) {
@@ -980,7 +970,6 @@ void llama_expert_pool::log_counters() const {
         hits_1   += L.hits_1;
         misses_1 += L.misses_1;
         passes_1  = std::max(passes_1, L.passes_1);
-        demoted  += L.demoted;
         evicted  += L.evicted;
         const uint64_t n = L.hits + L.misses;
         char buf[16];
@@ -997,8 +986,8 @@ void llama_expert_pool::log_counters() const {
     LLAMA_LOG_INFO("%s: expert pool: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
         __func__, (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) passes, h, mpt, n_slots);
     LLAMA_LOG_INFO("%s: expert pool h per layer:%s\n", __func__, per_layer.c_str());
-    LLAMA_LOG_INFO("%s: expert pool admission: admit_after=%u, %llu fetches demoted, %llu residents evicted\n",
-        __func__, admit_after, (unsigned long long) demoted, (unsigned long long) evicted);
+    LLAMA_LOG_INFO("%s: expert pool admission: %llu residents evicted\n",
+        __func__, (unsigned long long) evicted);
     if (predict_k > 0) {
         uint64_t pt = 0, ph = 0, pm = 0, pc = 0;
         std::string per_layer_cov;

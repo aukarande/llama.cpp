@@ -532,6 +532,21 @@ and corrupt concurrent measurements).
    ms/layer and hybrid_ms = uploads_part + t_cpu(1 expert) + t_split instead of the
    max(); with those fetch prices ~74.6 and hybrid ~62, matching both measurements, and
    the ladder picks fetch at 8000 (at 2700 fetch and hybrid measure the same 48).
+   WARM START REWORKED TO PROMPT-END LRU + ADMISSION GATE REMOVED (2026-09-04, user
+   direction): seeding now ranks experts by most-recent prompt route (recency, count
+   tiebreak); allocation keeps popularity ranking - mixing them collapsed h 0.79 ->
+   0.65 (allocation's marginal gain is an expected-hits count). q35 @8000 fetch 128
+   tok (temp0+lv4 form, md5 invariant 0855dd950aa4, gate 32-tok ecb043a95a14 OK):
+   baseline 79.2-80.3 / h 0.787, warm=8 77.0 / 0.794, alloc 79.4 / 0.791, warm+alloc
+   80.2-81.3 / 0.798 (only variant >= baseline; h deterministic across runs). The
+   recency ordering beats the flat histogram per seed but a seed burst still buys
+   less than its link time - both knobs stay off. DSv4 @12000 cannot warm since the
+   head pin (prefill tiers lose the A/B pair -> no histogram; 11.B.25) - warm runs
+   there show identical counters. PSHARD_POOL_ADMIT_AFTER + probation/demotion code
+   deleted (h invariant across 44k evictions); miss_count stays (fetch_on_2nd_miss).
+   Also removed today (user): PSHARD_FORCE_PREFILL_UB (unused QA knob),
+   PSHARD_VERIFY_PRELOAD machinery, PSHARD_VIRTUALLOCK / PSHARD_PAGELOCK_SKIP
+   (VirtualLock + page-locking now unconditional).
    Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.
