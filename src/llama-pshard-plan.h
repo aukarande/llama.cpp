@@ -473,14 +473,6 @@ struct llama_pshard_plan_registry {
     // use max_ubatch when TPS data is missing
     uint32_t find_optimal_ubatch(uint32_t n_prompt, uint32_t max_ubatch,
                                  const llama_pshard_plan * from_plan = nullptr) const {
-        // QA/debug override: evaluation shape changes numerics on shape-sensitive models
-        // (gpt-oss raw-text PPL), so A/B runs need a way to pin the prefill ubatch
-        if (const char * force = getenv("PSHARD_FORCE_PREFILL_UB")) {
-            const long v = atol(force);
-            if (v > 0) {
-                return std::min<uint32_t>((uint32_t) v, max_ubatch);
-            }
-        }
         uint32_t best_ub  = max_ubatch;
         double   best_time = 1e30;
 

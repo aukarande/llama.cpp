@@ -1874,7 +1874,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             static uint32_t logged_ub = 0;
             if (n_ubatch_eff != cparams.n_ubatch && logged_ub != n_ubatch_eff) {
                 logged_ub = n_ubatch_eff;
-                LLAMA_LOG_INFO("%s: pshard_prefill_ubatch_eff=%u (n_ubatch=%u, predicted-ttft optimum; PSHARD_FORCE_PREFILL_UB overrides)\n",
+                LLAMA_LOG_INFO("%s: pshard_prefill_ubatch_eff=%u (n_ubatch=%u, predicted-ttft optimum)\n",
                     __func__, n_ubatch_eff, cparams.n_ubatch);
             }
         }
