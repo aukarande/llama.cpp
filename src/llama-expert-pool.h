@@ -70,6 +70,8 @@ struct llama_expert_pool {
         std::vector<int32_t> cpu_buf;
         std::vector<uint64_t> expert_last_gen; // [n_expert] recency: last generation routed
         std::vector<uint32_t> miss_count;      // [n_expert] fetch_on_2nd_miss admission counter
+        std::vector<uint32_t> expert_pending;  // [n_expert] generation whose pass admitted the expert
+                                               // in the background (cpu_admit: CPU route that pass)
     };
 
     uint32_t n_expert      = 0;
@@ -161,6 +163,16 @@ struct llama_expert_pool {
     static bool sched_input_cb(const ggml_tensor * src, ggml_tensor * view,
                                ggml_backend_t split_backend, void * user_data);
     bool serve(const ggml_tensor * src, ggml_tensor * view, ggml_backend_t split_backend);
+
+    // background admission (cpu_admit): admitted experts upload on the pool's own
+    // copy backend (a second backend instance on the split device = its own stream,
+    // like the sched's prefetch copy backends) while the CPU chain computes them this
+    // pass; the GPU reads the slot from the next pass on. One event, recorded after
+    // each layer's uploads (FIFO stream: the latest record covers them all), waited
+    // on by the split stream at the first service of the next pass.
+    ggml_backend_t       admit_backend = nullptr;
+    ggml_backend_event_t admit_event   = nullptr;
+    bool                 admit_pending = false;
 
     // prefetch-time service (whole-stack tiers only): fill the layer's A/B half on
     // the copy backend while the previous layer computes; serve() then finds the

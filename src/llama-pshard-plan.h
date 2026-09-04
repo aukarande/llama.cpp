@@ -69,6 +69,9 @@ enum llama_pshard_miss_policy {
     LLAMA_PSHARD_MISS_CPU_EXEC     = 1,  // compute the miss on CPU from host weights (split-op)
     LLAMA_PSHARD_MISS_FETCH_ON_2ND = 2,  // first miss cpu_exec (no admit), repeat miss fetches
     LLAMA_PSHARD_MISS_HYBRID       = 3,  // q* split: fetch m*B_P/B_H by recency, CPU runs the rest
+    LLAMA_PSHARD_MISS_CPU_ADMIT    = 4,  // every miss computes on CPU THIS pass while its rows upload
+                                         // on the copy stream into a slot (background admission):
+                                         // a GPU hit from the next pass on (RFC #24528 execution)
     LLAMA_PSHARD_MISS_COUNT
 };
 
@@ -85,6 +88,7 @@ inline const char * llama_pshard_miss_policy_name(llama_pshard_miss_policy p) {
         case LLAMA_PSHARD_MISS_CPU_EXEC:     return "cpu_exec";
         case LLAMA_PSHARD_MISS_FETCH_ON_2ND: return "fetch_on_2nd_miss";
         case LLAMA_PSHARD_MISS_HYBRID:       return "hybrid";
+        case LLAMA_PSHARD_MISS_CPU_ADMIT:    return "cpu_admit";
         default:                             return "unknown";
     }
 }

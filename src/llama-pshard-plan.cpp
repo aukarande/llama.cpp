@@ -2018,10 +2018,25 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
                 }
                 case LLAMA_PSHARD_MISS_FETCH_ON_2ND:
                     return 0.5 * misses * t_cpu + 0.5 * misses * t_fetch + t_split; // half admitted (TBD: counters)
+                case LLAMA_PSHARD_MISS_CPU_ADMIT: {
+                    // misses run on the CPU chain this pass, their rows upload on the copy
+                    // stream for the next pass: the upload leaves the critical path as long
+                    // as the copy engine keeps up with the layer. With the CPU chain overlapped
+                    // (sched lookahead) only its excess over the layer's GPU work shows.
+                    const double cpu_ms     = misses * t_cpu;
+                    const double gpu_ms     = bd.compute_ms / std::max<uint32_t>(1, n_layers_exp);
+                    const double visible    = cpu_chain_overlaps ? std::max(0.0, cpu_ms - gpu_ms) : cpu_ms;
+                    const double upload_ms  = misses * t_fetch;
+                    const double excess_up  = std::max(0.0, upload_ms - (gpu_ms + visible));
+                    return visible + excess_up + t_split;
+                }
                 default:
                     return misses * t_fetch;
             }
         };
+        // the CPU chain runs concurrently with the GPU chain once the scheduler
+        // lookahead lands (flip with it); until then the two chains are serial
+        const bool  cpu_chain_overlaps = false;
         const bool  priced    = ctx.predictor && plan.tps > 0.0f;
         const float probe_tps = plan.tps;
         auto price = [&](int pol) -> float {
@@ -2036,7 +2051,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         if (mp_env >= 0) {
             cands.push_back(mp_env);
         } else {
-            cands = { LLAMA_PSHARD_MISS_FETCH, LLAMA_PSHARD_MISS_HYBRID, LLAMA_PSHARD_MISS_CPU_EXEC };
+            cands = { LLAMA_PSHARD_MISS_FETCH, LLAMA_PSHARD_MISS_CPU_ADMIT, LLAMA_PSHARD_MISS_HYBRID, LLAMA_PSHARD_MISS_CPU_EXEC };
         }
         int   best     = -1;
         float best_tps = -1.0f;

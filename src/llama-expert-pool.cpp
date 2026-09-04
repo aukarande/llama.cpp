@@ -1,4 +1,5 @@
 #include "llama-expert-pool.h"
+#include "llama-pshard-plan.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -7,6 +8,17 @@
 #include <cstring>
 
 llama_expert_pool::~llama_expert_pool() {
+    if (admit_backend != nullptr) {
+        ggml_backend_synchronize(admit_backend);
+    }
+    if (admit_event != nullptr) {
+        ggml_backend_event_free(admit_event);
+        admit_event = nullptr;
+    }
+    if (admit_backend != nullptr) {
+        ggml_backend_free(admit_backend);
+        admit_backend = nullptr;
+    }
     if (ctx_views != nullptr) {
         ggml_free(ctx_views);
     }
@@ -256,6 +268,7 @@ void llama_expert_pool::bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggm
     if (L.expert_last_gen.size() != n_expert) {
         L.expert_last_gen.assign(n_expert, 0);
         L.miss_count.assign(n_expert, 0);
+        L.expert_pending.assign(n_expert, 0);
     }
 }
 
@@ -353,6 +366,14 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
     std::vector<char> & idbuf = ids_read_buf;
     ggml_backend_tensor_get_async(backend_router, const_cast<ggml_tensor *>(ids), idbuf.data(), 0, idbuf.size());
     ggml_backend_synchronize(backend_router);
+
+    // background admission: slots filled on the copy stream last pass must have
+    // landed before any kernel of this pass reads them (one wait per pass, first
+    // pooled layer; every later kernel queues behind it on the split stream)
+    if (admit_pending && admit_event != nullptr) {
+        ggml_backend_event_wait(split_backend, admit_event);
+        admit_pending = false;
+    }
 
     // per-layer persistent upload buffer: the async staging worker may queue this
     // host pointer behind pending staged fetches and read it after serve() returns
@@ -461,7 +482,20 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         }
 
         // 3. fetch the admitted misses into LRU victims (same-pass residents carry
-        //    the newest stamps, so they are never chosen)
+        //    the newest stamps, so they are never chosen). cpu_admit uploads on the
+        //    pool's copy backend (off the critical path) and routes the expert to the
+        //    CPU chain THIS pass; the slot is read from the next pass on (event below).
+        //    The victim is safe to overwrite concurrently: it is not routed this pass
+        //    and the synchronous ids read above drained every earlier kernel.
+        const bool background = miss_policy == LLAMA_PSHARD_MISS_CPU_ADMIT;
+        if (background && admit_backend == nullptr) {
+            admit_backend = ggml_backend_dev_init(ggml_backend_get_device(split_backend), nullptr);
+            if (admit_backend != nullptr) {
+                admit_event = ggml_backend_event_new(ggml_backend_get_device(split_backend));
+            }
+        }
+        ggml_backend_t up_backend  = (background && admit_backend != nullptr) ? admit_backend : split_backend;
+        bool           uploaded_bg = false;
         std::vector<int32_t> probation;
         for (size_t i = 0; i < miss_list.size(); i++) {
             const int32_t e = miss_list[i];
@@ -488,11 +522,19 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                 probation.push_back(slot);
             }
             for (const auto & te : L.tensors) {
-                ggml_backend_tensor_set_async(split_backend, te.view_slots,
+                ggml_backend_tensor_set_async(up_backend, te.view_slots,
                     (const char *) te.host->data + (size_t) e * te.row_bytes,
                     (size_t) slot * te.row_bytes, te.row_bytes);
             }
+            if (background) {
+                L.expert_pending[e] = generation;   // CPU route this pass, GPU hit from the next
+                uploaded_bg = uploaded_bg || up_backend == admit_backend;
+            }
             L.misses++;
+        }
+        if (uploaded_bg && admit_event != nullptr) {
+            ggml_backend_event_record(admit_event, admit_backend);
+            admit_pending = true;
         }
 
         // 4. per-route ids: GPU mm gets slot | -1, GPU bias gets expert | -1, the
@@ -508,7 +550,9 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                 const int32_t slot = L.expert_slot[e];
                 const size_t  k    = (size_t) (i1*n_ids_0 + i0);
                 L.expert_last_gen[e] = generation;
-                if (slot >= 0) {
+                const bool pending = miss_policy == LLAMA_PSHARD_MISS_CPU_ADMIT &&
+                                     !L.expert_pending.empty() && L.expert_pending[e] == generation;
+                if (slot >= 0 && !pending) {
                     L.slot_stamp[slot] = ++L.stamp;
                     mapped[k] = slot;
                     if (dual) {
