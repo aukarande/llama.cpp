@@ -957,6 +957,8 @@ void llama_expert_pool::reset_slots() {
 }
 
 void llama_expert_pool::log_counters() const {
+    // the three headline lines print at WARN: perf runs carry no -lv (user rule) and the
+    // grid calibrates the pricing model from them; per-layer detail stays at INFO
     uint64_t hits = 0, misses = 0, passes = 0;
     uint64_t hits_1 = 0, misses_1 = 0, passes_1 = 0, evicted = 0;
     std::string per_layer;
@@ -983,7 +985,7 @@ void llama_expert_pool::log_counters() const {
     const double mpt = passes > 0 ? (double) misses / (double) passes : 0.0;
     // cache-mode decode counters: distinct experts per layer per pass; misses/token
     // is per pass (= per token at bs=1), summed over the pooled layers
-    LLAMA_LOG_INFO("%s: expert pool: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
+    LLAMA_LOG_WARN("%s: expert pool: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
         __func__, (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) passes, h, mpt, n_slots);
     LLAMA_LOG_INFO("%s: expert pool h per layer:%s\n", __func__, per_layer.c_str());
     LLAMA_LOG_INFO("%s: expert pool admission: %llu residents evicted\n",
@@ -1011,7 +1013,7 @@ void llama_expert_pool::log_counters() const {
         }
         LLAMA_LOG_INFO("%s: expert pool warm start: %u flips, %llu experts seeded\n",
             __func__, warm_starts, (unsigned long long) warm_seeded);
-        LLAMA_LOG_INFO("%s: expert pool prefetch: %s, %llu uploads issued, %llu used by the target layer (%.3f)\n",
+        LLAMA_LOG_WARN("%s: expert pool prefetch: %s, %llu uploads issued, %llu used by the target layer (%.3f)\n",
             __func__, prefetch_on ? "on" : "off", (unsigned long long) pfi, (unsigned long long) pfu,
             pfi > 0 ? (double) pfu / (double) pfi : 0.0);
     }
@@ -1022,7 +1024,7 @@ void llama_expert_pool::log_counters() const {
         // fell back onto the decode plan). The QA ledger takes the LAST line.
         const double h1   = hits_1 + misses_1 > 0 ? (double) hits_1 / (double) (hits_1 + misses_1) : 0.0;
         const double mpt1 = (double) misses_1 / (double) passes_1;
-        LLAMA_LOG_INFO("%s: expert pool decode: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
+        LLAMA_LOG_WARN("%s: expert pool decode: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
             __func__, (unsigned long long) hits_1, (unsigned long long) misses_1, (unsigned long long) passes_1, h1, mpt1, n_slots);
     }
 }

@@ -1,8 +1,8 @@
-# pshard perf grid: stock vs legacy strategies vs expert pool, q35 and DSv4
+# pshard perf grid: stock vs legacy vs expert pool, q35 and DSv4
 
-Runner: `sh qa/perf-grid.sh <out-dir> [core|ext] [--list]` (2026-09-04). This grid is
-separate from the held 144-cell QA grid (`qa/run-qa.sh`): it is a PERF grid for the two
-models the pool work targets, plus the correctness gates those perf cells need.
+Runner: `sh qa/perf-grid.sh <out-dir> [--list]` (2026-09-04). This grid is separate from
+the held 144-cell QA grid (`qa/run-qa.sh`): it is a PERF grid for the two models the pool
+work targets, plus the correctness gates and perplexity mirrors those perf cells need.
 
 ## Rules every cell obeys
 
@@ -11,11 +11,16 @@ models the pool work targets, plus the correctness gates those perf cells need.
 - A perf run carries the workload and the budget and nothing else:
   `-m -f <prompt> -n 128 -c <ctx> --ignore-eos -no-cnv` plus `-fitb N` (stock) or
   `-pshard -mva N` (pshard). No `--temp 0`, no `-lv`, no `-ub/-b`, no `-ngl`, no `-ot`.
+  The pool's three headline counter lines (all-pass h, decode h, prefetch) print at WARN,
+  so every pool perf row still carries `h` and `misses_per_token` - the pricing model's
+  calibration data.
+- Thread count is always the default (user rule: never set `-t`).
 - Every pshard cell plans fresh with exactly the environment the run will use
-  (`PSHARD_STRATEGY`, `PSHARD_MISS_POLICY`, `-t`, the spec flags and the budget are all
-  fingerprinted; a mismatch silently falls back to stock - the runner greps the run log for
-  that fallback and marks the row FALLBACK). Consecutive cells that differ only in a
-  runtime-only knob (`PSHARD_POOL_PREDICT`) share one plan.
+  (`PSHARD_STRATEGY`, `PSHARD_MISS_POLICY`, `GGML_SCHED_NO_CPU_OVERLAP`, the spec flags and
+  the budget are all fingerprinted; a mismatch silently falls back to stock - the runner
+  greps the run log for that fallback and marks the row FALLBACK). Consecutive cells that
+  differ only in runtime-only knobs (`PSHARD_POOL_PREDICT`, `PSHARD_POOL_WARM/ALLOC`) share
+  one plan.
 - Pool arms run with `PSHARD_POOL_RUNTIME=1`; the auto ladder with the pool allowed adds
   `PSHARD_POOL_AUTO=1` to both plan and run.
 - "full" budget = `QA_FULL_MVA`, default 14500 MiB: the 16 GB card's idle free VRAM
@@ -24,84 +29,96 @@ models the pool work targets, plus the correctness gates those perf cells need.
 - The machine is otherwise idle; one instance at a time (registries are per-model global
   state). The runner backs up each model's registry at start and restores it at exit.
 
-## Dimensions
+## The user's table (2026-09-04)
 
-| dimension | values |
-|---|---|
-| model | `q35` Qwen3.6-35B-A3B-UD-Q4_K_M; `q35mtp` the -wmtp variant (MTP head); `dsv4` DeepSeek-V4-Flash-UD-Q2_K_XL (3 shards) |
-| budget (`-mva` / `-fitb`, MiB) | 4000, 8000, full (14500) - user's choice 2026-09-04; ext adds q35 @2700 (the tight-budget showcase) |
-| prompt | `512` (prompt-512.txt, ctx 2048); `4k` (prompt-4k.txt, ctx 8192) |
-| speculation | none; `mtp` (`--spec-type draft-mtp --spec-draft-n-max 2`, q35mtp); `dspark` (`-md` DSpark draft; dsv4 core, q35 ext); `dflash` (`-md` DFlash draft, q35 ext). Spec cells use the 512 prompt: speculation is a decode question |
-| arm | `stock`; `auto` (legacy ladder, planner's pick); `s0..s4` (forced legacy: GPUONLY_LAYERPIN_LAYERSTREAM, GPUONLY_ATTNPIN_FFNSTREAM, DYNAMIC_FFNCPU_ATTNSTREAM, STATIC_ATTNPRIO_ALLMODELS, DYNAMIC_FFN_ALTERNATE); `pool:<policy>` (forced EXPERT_POOL with `PSHARD_MISS_POLICY`); `pool:plan` (EXPERT_POOL, planner picks the policy); `poolauto` (auto ladder with the pool allowed) |
-| miss policy (pool arms) | `fetch` (copy the missed expert host -> LRU victim slot, compute on GPU); `cpu_exec` (compute every miss on the CPU from host weights, never admit); `fetch_on_2nd_miss` (first miss on CPU without admitting, a repeat miss fetches); `hybrid` (FreeToken q*: fetch a recency-chosen share of the misses, CPU computes the rest, both chains overlap); `cpu_admit` (compute the miss on CPU this pass while its rows upload on the copy stream; GPU hit next pass) |
-| predictor | off; `pred` = `PSHARD_POOL_PREDICT=1` (layer l's FFN input through layer l+1's router, prefetch cap 1) on the arms that admit: fetch, hybrid, cpu_admit, poolauto |
-| threads | always the default (user rule 2026-09-04: never set `-t`) |
-| sched overlap (ext) | on; `noovl` = `GGML_SCHED_NO_CPU_OVERLAP=1` on hybrid and cpu_admit (plan and run) |
-
-DSv4's pool pins ~9.2 GB (attention, routers, norms, output head) before its first slot, so
-at 4000 and 8000 only stock and the legacy arms exist for dsv4; every arm runs at full.
-
-## Cells (core)
-
-Plain decode, per (model, budget, prompt):
-
-| arm | perf (128) | gate 512 (32, md5 + counters) | gate 4k |
+| block | arms | budgets | prompts |
 |---|---|---|---|
-| stock | x | x (reference md5) | x |
-| auto | x | x | x |
-| s0, s1, s2, s3, s4 | x each | | |
-| pool:fetch, pool:hybrid, pool:cpu_admit, each with and without pred | x each (6) | fetch, hybrid, cpu_admit, fetch+pred | fetch |
-| pool:cpu_exec, pool:fetch_on_2nd_miss | x each | x each | |
-| pool:plan | x | | |
-| poolauto, poolauto+pred | x each | | |
+| q35 plain | stock, legacy, pool | 4000, 8000, full | 512, 4k |
+| dsv4 plain | legacy at 8000 and full; pool at full only | 8000, full | 512, 4k |
+| q35mtp (`--spec-type draft-mtp --spec-draft-n-max 2`) | stock, legacy, pool | 4000, 8000, full | 512, 4k |
+| dsv4 + DSpark (`-md` draft, `--spec-type draft-dspark`) | stock, legacy, pool | 8000, full | 512, 4k |
 
-q35: 3 budgets x 2 prompts = 6 sets of 18 perf (108) + gates 3x8 + 3x3 (33).
-dsv4: 4000 and 8000 x 2 prompts = 4 sets of 7 perf (28) + 2 gates each (8); full x 2
-prompts = 36 perf + 8 + 3 gates (11).
+"legacy" = the planner's auto pick (no forced s0..s4). DSv4's pool pins ~9.2 GB
+(attention, routers, norms, output head) before its first slot, so it has no pool arm at
+8000. DSv4 + DSpark stock only fits at `-fitb 3000` (the stock fit ignores the 10.4 GB
+draft) and is recorded at that budget. Prompts: `512` = prompt-512.txt at ctx 2048, `4k` =
+prompt-4k.txt at ctx 8192.
 
-Speculative decoding (128 tokens, prompt 512, `llama-speculative-simple`):
+## The pool arm = 13 variants (plain decode), 5 (speculative)
 
-| model / draft | budgets | arms |
-|---|---|---|
-| q35mtp / mtp | 4000, 8000, full | stock, auto, pool:fetch, pool:fetch+pred, pool:plan, poolauto (18 cells) |
-| dsv4 / dspark | full | stock (fits only at `-fitb 3000`, recorded as such), auto, pool:fetch, pool:fetch+pred, pool:hybrid, pool:plan, poolauto (7 cells) |
+| # | variant | env | decides |
+|---|---|---|---|
+| 1 | fetch | `PSHARD_MISS_POLICY=fetch` | the baseline policy |
+| 2 | fetch + pred | + `PSHARD_POOL_PREDICT=1` | predictor default |
+| 3 | fetch + pred + warm | + `PSHARD_POOL_WARM=8 PSHARD_POOL_ALLOC=1` | prompt-end LRU seeding + per-layer slots |
+| 4 | hybrid | `PSHARD_MISS_POLICY=hybrid` | the FreeToken q* split |
+| 5 | hybrid + pred | + `PSHARD_POOL_PREDICT=1` | whether prefetch hurts CPU-route policies everywhere |
+| 6 | hybrid noovl | + `GGML_SCHED_NO_CPU_OVERLAP=1` | certify the CPU/GPU overlap, then delete the switch |
+| 7 | cpu_admit | `PSHARD_MISS_POLICY=cpu_admit` | background admission |
+| 8 | cpu_admit + pred | + `PSHARD_POOL_PREDICT=1` | |
+| 9 | cpu_admit noovl | + `GGML_SCHED_NO_CPU_OVERLAP=1` | |
+| 10 | cpu_exec | `PSHARD_MISS_POLICY=cpu_exec` | the never-admit floor |
+| 11 | fetch_on_2nd_miss | `PSHARD_MISS_POLICY=fetch_on_2nd_miss` | certify it is dominated, then delete the policy |
+| 12 | plan | `PSHARD_STRATEGY=5`, planner picks the policy | does the pricing pick the measured winner |
+| 13 | poolauto | `PSHARD_POOL_AUTO=1` | does the ladder reach the forced pool |
 
-Perplexity mirror (c2048, 8 chunks, prompt-256k): q35 stock, auto, pool:fetch at each
-budget (9); dsv4 full auto, pool:fetch (2; stock is ext - 11 min).
+Speculative pool block: fetch, fetch + pred, hybrid, plan, poolauto (the CPU-route
+policies already lost on verify batches).
 
-**Core total: 260 cells** (197 perf, 52 gate, 11 ppl); ext 330. Estimate: q35 ~4 h (108 perf at
-~1.2 min, the legacy-auto and poolauto plans 3-4 min each - shared by the pred variant),
-dsv4 ~6 h (64 perf at ~3.5 min, dsv4 auto plans ~5 min), spec ~1 h, gates ~1 h, ppl
-~0.5 h: **~10-12 h**, best run as `QA_GRID_MODELS=q35` (~5 h) then `QA_GRID_MODELS=dsv4`.
+Not varied by design: threads (default), the prefetch cap (1; 2 lost on DSv4), the
+staging-ring knobs (every DSv4 cell exercises the ring at its defaults, which is their
+confirmation), the pricing constants (calibrated FROM the pool rows' `h`).
 
-Ext adds (~70 cells): q35 @2700 both prompts (36 perf + 11 gates); q35 @8000 with the
-dflash and dspark drafts (6 arms each); `noovl` on hybrid/cpu_admit at q35 @8000 and
-dsv4 full (4); dsv4 stock PPL.
+## Cells
+
+Perf (128 tokens):
+
+| block | per (budget, prompt) | sets | cells |
+|---|---|---|---|
+| q35 plain | stock + legacy + 13 pool = 15 | 3 x 2 | 90 |
+| dsv4 plain | 8000: legacy = 1; full: legacy + 13 pool = 14 | 2 x 2 | 30 |
+| q35mtp | stock + legacy + 5 pool = 7 | 3 x 2 | 42 |
+| dsv4 + DSpark | 8000: stock + legacy = 2; full: + 5 pool = 7 | 2 x 2 | 18 |
+| **perf total** | | | **180** |
+
+Gates (32 tokens, `--temp 0 -lv 4`, md5 vs stock + pool counters): stock (the reference,
+also where its perf cell is not in the table) and legacy at every (model, budget, prompt);
+at the 512 prompt every pool policy (fetch, fetch + pred, fetch + pred + warm, hybrid,
+cpu_admit, cpu_exec, fetch_on_2nd_miss), at 4k pool fetch only. **52 gates.**
+
+Perplexity mirror (`llama-perplexity -c 2048 --chunks 8` on prompt-256k, prompt-independent,
+once per model and budget): stock, legacy, pool fetch. **14 ppl** (dsv4 stock ~11 min each).
+
+**Total 246 cells.** Estimate: perf ~5 h (q35 cells ~1.2 min, legacy-auto and poolauto plans
+3-4 min each, dsv4 cells ~3.5 min), gates ~50 min, ppl ~45 min: **~6.5 h**, splittable as
+`QA_GRID_MODELS=q35` then `QA_GRID_MODELS=dsv4`.
 
 ## Ledger
 
 One CSV row per cell in `<out-dir>/ledger.csv`:
-`cell,kind,model,mva,prompt,ctx,spec,arm,predict,threads,noovl,rc,prompt_tps,decode_tps,decode_tokens,accept_pct,vram_peak_delta_mib,strategy_active,n_pinned,miss_policy,pool_slots,md5,h,misses_per_token,ppl,status`.
+`cell,kind,model,mva,prompt,ctx,spec,arm,predict,warm,noovl,rc,prompt_tps,decode_tps,decode_tokens,accept_pct,vram_peak_delta_mib,strategy_active,n_pinned,miss_policy,pool_slots,md5,h,misses_per_token,ppl,status`.
 `strategy_active/n_pinned/miss_policy/pool_slots` come from the registry's tier-0 line after
-the plan; `md5/h/misses_per_token` from gate cells; `accept_pct` from spec cells. Status is
-OK, FAIL (rc != 0), PLAN_FAILED, FALLBACK (pshard disabled itself - a fingerprint mismatch
-or an unviable plan), or SHORT (decode window < 64 tokens).
+the plan; `md5` from gate cells; `h/misses_per_token` from every pool row (perf and gate);
+`accept_pct` from spec cells. Status is OK, FAIL (rc != 0), PLAN_FAILED, FALLBACK (pshard
+disabled itself - a fingerprint mismatch or an unviable plan), or SHORT (decode window
+< 64 tokens).
 
 `QA_RESUME=1` skips cells already in the ledger; `QA_ONLY=<regex>` filters cell names
 (e.g. `QA_ONLY='q35-8000-512'`); `QA_GRID_MODELS="q35"` or `"dsv4"` filters models.
 
 ## What the grid answers
 
-1. Legacy: does the planner's auto pick match the best forced strategy at each budget and
-   prompt length?
-2. Pool: which miss policy wins at each budget, and does the planner's pick (`pool:plan`)
-   match it (the 2026-09-04 finding: hybrid priced over fetch at q35 @8000 while fetch
-   measures 20% faster)?
-3. Predictor: where prefetch helps (fetch) and where it hurts (CPU-route policies).
-4. Ladder: does `poolauto` reach the forced pool's number, and what does the mixed ladder
+1. Stock vs legacy vs pool at every budget and prompt length, both models, plain and
+   speculative.
+2. Pool: which miss policy wins where, and does the planner's pick (`plan`) match it
+   (the 2026-09-04 finding: hybrid priced over fetch at q35 @8000 while fetch measures
+   20% faster - `t_serve` 0.10 ms/layer in the model vs ~0.03 measured).
+3. Predictor: default on? (helps fetch, hurts CPU-route policies so far.)
+4. Warm start + allocation with prompt-end LRU seeding: any budget where it wins?
+5. The CPU/GPU overlap switch and fetch_on_2nd_miss: certify, then delete.
+6. Ladder: does `poolauto` reach the forced pool's number, and what does the mixed ladder
    cost (colder start after a legacy prefill tier, the tier-0 switch)?
-5. Prompt length: how the prefill tiers (A/B streaming vs legacy layer streaming) compare
-   at 4k, and whether the decode after a 4k prompt keeps the 512-prompt ranking.
-6. Speculation: pool vs legacy vs stock with each draft type, at 128 tokens.
-7. Correctness: every pool policy's 32-token md5 against stock; PPL parity for the
-   headline arms.
+7. Pricing calibration: `h` from every pool row across s = 8..100 refits alpha and the CPU
+   rates, after which PSHARD_POOL_ZIPF / CPU_GBS / CPU_GFLOPS become constants.
+8. Correctness: every pool policy's 32-token md5 against stock; PPL parity for the headline
+   arms.
