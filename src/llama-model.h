@@ -730,8 +730,6 @@ struct llama_model {
     ggml_backend_buffer_t get_dev_preload_buf() const;
     size_t get_dev_preloaded_size() const;
     void   sync_dev_preload();
-    // PSHARD_VERIFY_PRELOAD lever: re-hash every preloaded tensor's live device bytes against
-    // the file hash recorded at upload, and check tensor->data still equals the preload address
 
     void pshard_set_backend_maps(const llama_pshard_plan & plan);
     std::unordered_map<struct ggml_tensor *, int32_t> pshard_build_canonical_weight_order(
