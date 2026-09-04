@@ -547,6 +547,21 @@ and corrupt concurrent measurements).
    Also removed today (user): PSHARD_FORCE_PREFILL_UB (unused QA knob),
    PSHARD_VERIFY_PRELOAD machinery, PSHARD_VIRTUALLOCK / PSHARD_PAGELOCK_SKIP
    (VirtualLock + page-locking now unconditional).
+   UPLOAD PATH EXPERIMENT (2026-09-04, DSv4 @12000 fetch, 128 tok, temp 0 so all three runs
+   route the identical 124.8 misses/token, md5 68240bc58dad each): shard 2 (49 GB) is
+   cudaHostRegister'd, shard 3 (47 GB) hits the pinned-memory ceiling and is VirtualLock'd
+   only. Default (half DMA, half ring) 68.6 ms/token = 14.6 t/s, prompt 83; all misses
+   through the staging ring (GGML_CUDA_REGISTER_HOST=0) 94.4 ms = 10.6, prompt 56; all
+   misses through the driver's pageable path (+ GGML_CUDA_STAGE_RING_MB=0) 99.8 ms = 10.0,
+   prompt 53. Per miss: DMA ~0.42 ms (10.4 MB at PCIe rate), ring ~0.83, driver ~0.92.
+   Findings: (1) the token is transfer-bound - a zero-compute model fits both measured
+   points; (2) a pageable miss costs 2x a DMA one whichever way it is staged; the ring beats
+   the driver path by only ~6% (the 4 GB/s it was built against was the page-fault regime
+   that VirtualLock alone now prevents) - ring knobs stay, but the ring is not the lever;
+   (3) DMA-pinning shard 3 too would remove ~26 ms/token: 18-23 t/s (linear 23; compute
+   stops hiding under uploads somewhere below 50 ms) - blocked by the pinned-memory ceiling
+   (49 + 47 GB > what cudaHostRegister grants); the route is a pinned host tier of hot
+   experts (tens of GB) so shard-3 misses DMA from pinned cache instead of the ring.
    Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.
