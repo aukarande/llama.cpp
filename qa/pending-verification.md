@@ -414,7 +414,16 @@ and corrupt concurrent measurements).
    hide behind hybrid's uploads - fetch wins or ties at bs=1. The planner prices it:
    t_cpu = max(bytes/DRAM, 2 FLOP/weight / eff_gflops) with the expert weight count
    from the gguf scan, hybrid = max(uploads, CPU) + handoff under overlap, cpu_admit =
-   CPU + upload excess + handoff. Traps met: a grep-filtered background build hid a
+   CPU + upload excess + handoff. CORRECTION (same day, from GGML_SCHED_TIMING): the
+   handoff is 0.035 ms/layer (~1.4 ms/token: x device->host 1.1 + partial host->device
+   0.3), not 0.20 - the earlier figure folded the CPU rate error into it; the CPU compute
+   of the misses is the larger part (q35 ~0.035 ms/expert measured at 8/layer). The
+   planner now uses t_split 0.04 and a t_serve 0.10 ms/layer paid by EVERY pool policy
+   (the service's synchronous ids readback; fetch was priced 16% high without it):
+   q35 @8000 fetch 43.7 (measured 45.5), hybrid 43.7 (39.8 at 32 tok - hybrid's h is
+   lower than fetch's until warm), cpu_admit 40.7 (38.0), cpu_exec 24.0 (30.0: the CPU
+   matmul floor rate is too low for Q4_K; per-type rate is the fix); DSv4 hybrid 12.0 /
+   fetch 10.9 (measured 13.5 / 13.4). Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.
    Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a

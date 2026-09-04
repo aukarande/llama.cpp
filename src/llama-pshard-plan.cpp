@@ -1967,7 +1967,17 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     const double t_fetch = b_expert / 1e9 / bp_gbs  * 1000.0;   // ms per fetched expert
     const double t_cpu   = std::max(b_expert / 1e9 / cpu_gbs * 1000.0,
                                     2.0 * w_expert / 1e9 / cpu_gflops * 1000.0);   // ms per CPU-computed expert
-    const double t_split = 0.20;                                // ms per layer: GPU->CPU->GPU handoff
+    // per-layer fixed costs, from GGML_SCHED_TIMING on q35 @8000 (40 layers):
+    //   t_serve: the pool service's synchronous ids readback + the split boundaries
+    //            it adds, paid by EVERY cache-tier policy (fetch included): the
+    //            single-chain graph spends ~4 ms/token more than the probe predicts
+    //   t_split: the dual chain's handoff - device->host copy of x (fallback_cpy
+    //            ~1.1 ms/token) + host->device partial (set_async ~0.3 ms/token)
+    //            = ~1.4 ms/token, 0.035 ms/layer; the CPU compute itself is the
+    //            larger part of a CPU route's cost (the earlier 0.20 folded the
+    //            compute rate error into the handoff)
+    const double t_serve = 0.10;                                // ms per layer, all policies
+    const double t_split = 0.04;                                // ms per layer: GPU->CPU->GPU handoff
     // hybrid q* share = B_P / B_H (design 4b): the FreeToken balance for concurrent
     // chains; serial chains (today) cap the fetched share by the free slots anyway
     plan.pool_hybrid_frac = (float) std::min(1.0, std::max(0.05, bp_gbs / cpu_gbs));
@@ -2063,7 +2073,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             if (!priced) {
                 return 0.0f;
             }
-            const double pool_ms = bd.compute_ms + bd.other_ms + miss_ms_layer(pol) * n_layers_exp;
+            const double pool_ms = bd.compute_ms + bd.other_ms + (miss_ms_layer(pol) + t_serve) * n_layers_exp;
             return pool_ms > 0.0 ? (float) ((double) bs * 1000.0 / pool_ms) : 0.0f;
         };
 

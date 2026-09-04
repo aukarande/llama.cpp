@@ -1158,8 +1158,12 @@ that waited for the GPU chain), the device split runs whole (pool service, prefe
 launch), and the CPU compute proceeds while the GPU works. Graph order keeps the GPU
 chain first, so the serial order stays correct with the overlap off
 (`GGML_SCHED_NO_CPU_OVERLAP=1`, an eval callback, no pool). Worth +9-35% on every
-CPU-route policy; the residual CPU-route cost is the CPU chain itself (see 6a) plus the
-0.2 ms/layer handoff (two copies + syncs), which the overlap cannot remove.
+CPU-route policy. Measured with GGML_SCHED_TIMING on q35 @8000: the handoff (device->host
+copy of x + host->device partial + their syncs) is ~1.4 ms/token = 0.035 ms/layer, about
+6% of the token; the CPU compute of the misses (~0.035 ms/expert, 96 experts) is the
+larger part. Cutting the handoff to zero would not put a CPU-route policy ahead of fetch
+on this box. Every pool policy, fetch included, also pays ~0.10 ms/layer for the
+service's synchronous ids readback (priced as t_serve).
 
 Today: one expert sub-graph per layer with 2-3 MUL_MAT_ID nodes - fused gate_up
 (src/llama-graph.cpp:2119) or up (:2138) + gate (:2151), and down (:2255), all via
