@@ -1744,11 +1744,6 @@ void llama_model_loader::print_info() const {
     }
 }
 
-std::unordered_map<std::string, uint64_t> & llama_pshard_verify_hashes() {
-    static std::unordered_map<std::string, uint64_t> m;
-    return m;
-}
-
 struct llama_async_tensor_uploader {
     static constexpr size_t n_buffers = 4;
 
@@ -2005,37 +2000,6 @@ bool llama_model_loader::preload_common_weights_to_device(
 
     LLAMA_LOG_INFO("%s: preloaded %zu common tensors (%.2f MiB) into %.2f MiB device buffer\n",
         __func__, n_packed, talloc.offset / (1024.0 * 1024.0), buf_size / (1024.0 * 1024.0));
-
-    // PSHARD_VERIFY_PRELOAD=1: development lever - read every packed tensor back from the
-    // device and compare it byte-for-byte with the file bytes it was uploaded from
-    if (getenv("PSHARD_VERIFY_PRELOAD") && getenv("PSHARD_VERIFY_PRELOAD")[0] == '1') {
-        std::vector<uint8_t> dev_buf, file_buf;
-        size_t n_bad = 0, n_checked = 0;
-        for (size_t i = 0; i < n_common; i++) {
-            ggml_tensor * tensor = preload_order[i];
-            if (tensor == nullptr || tensor->data == nullptr) continue;
-            const auto * weight = get_weight(ggml_get_name(tensor));
-            if (weight == nullptr) continue;
-            const size_t n_size = ggml_nbytes(tensor);
-            dev_buf.resize(n_size); file_buf.resize(n_size);
-            ggml_backend_tensor_get(tensor, dev_buf.data(), 0, n_size);
-            auto & file = files.at(weight->idx);
-            file->seek(weight->offs, SEEK_SET);
-            file->read_raw(file_buf.data(), n_size);
-            n_checked++;
-            llama_pshard_verify_hashes()[ggml_get_name(tensor)] = llama_pshard_fnv1a(file_buf.data(), n_size);
-            if (memcmp(dev_buf.data(), file_buf.data(), n_size) != 0) {
-                size_t first = 0; while (first < n_size && dev_buf[first] == file_buf[first]) first++;
-                size_t n_diff = 0; for (size_t k = 0; k < n_size; k++) n_diff += dev_buf[k] != file_buf[k];
-                LLAMA_LOG_WARN("%s: VERIFY MISMATCH %s type=%s bytes=%zu file=%u offs=%zu gpu_off=%zu first_diff=%zu n_diff=%zu (%.1f%%)\n",
-                    __func__, ggml_get_name(tensor), ggml_type_name(tensor->type), n_size, (unsigned) weight->idx, (size_t) weight->offs,
-                    (size_t) ((const uint8_t *) tensor->data - (const uint8_t *) ggml_backend_buffer_get_base(*out_buf)),
-                    first, n_diff, 100.0 * n_diff / n_size);
-                n_bad++;
-            }
-        }
-        LLAMA_LOG_WARN("%s: VERIFY done: %zu/%zu preloaded tensors differ from the file\n", __func__, n_bad, n_checked);
-    }
 
     return true;
 }

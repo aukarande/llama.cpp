@@ -506,9 +506,6 @@ llama_context::llama_context(
             const_cast<llama_model &>(model).sync_dev_preload();
             pshard_apply_initial_plan();
             pshard_runtime_ready = true;
-            if (getenv("PSHARD_VERIFY_PRELOAD")) {
-                model.pshard_verify_resident("after init");
-            }
         }
 
         if (!cparams.flash_attn) {
@@ -1762,12 +1759,6 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    if (cparams.pshard && getenv("PSHARD_VERIFY_PRELOAD")) {
-        static thread_local int n_calls = 0;
-        n_calls++;
-        if (n_calls == 1) model.pshard_verify_resident("before first decode");
-        if (n_calls == 2) model.pshard_verify_resident("after first decode");
-    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);

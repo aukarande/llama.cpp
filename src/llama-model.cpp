@@ -1970,18 +1970,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 auto register_fn = (bool (*)(void *, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
                 if (register_fn) {
-                    // PSHARD_PAGELOCK_SKIP=<i>: leave mapping i pageable (measurement lever: attribute
-                    // the pageable-upload cost of one shard while the others stay page-locked)
-                    const char * skip_env = getenv("PSHARD_PAGELOCK_SKIP");
-                    const int skip_idx = skip_env ? atoi(skip_env) : -1;
-                    int mapping_idx = -1;
                     for (const auto & mapping : pimpl->mappings) {
-                        mapping_idx++;
-                        if (mapping_idx == skip_idx) {
-                            LLAMA_LOG_WARN("%s: pshard: PSHARD_PAGELOCK_SKIP=%d - leaving the %.1f MiB mmap region pageable\n",
-                                __func__, skip_idx, mapping->size() / (1024.0 * 1024.0));
-                            continue;
-                        }
                         const int64_t t0 = ggml_time_us();
                         const bool locked = register_fn(mapping->addr(), mapping->size());
                         if (!locked) {
@@ -1995,8 +1984,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                             // ring, ~4 GB/s on the driver's pageable path, measured on a 45 GB DeepSeek-V4
                             // shard). VirtualLock keeps the pages resident and mapped: the CUDA DMA still has to
                             // go through the staging ring, but the ring's memcpy runs at memory speed.
-                            // PSHARD_VIRTUALLOCK=0 disables.
-                            if (const char * vl = getenv("PSHARD_VIRTUALLOCK"); vl == nullptr || vl[0] != '0') {
+                            {
                                 const int64_t t1 = ggml_time_us();
                                 SIZE_T ws_min = 0, ws_max = 0;
                                 DWORD  ws_flags = 0;
@@ -2495,34 +2483,6 @@ ggml_backend_buffer_t llama_model::get_dev_preload_buf() const {
 
 size_t llama_model::get_dev_preloaded_size() const {
     return pimpl->dev_preloaded_size;
-}
-
-void llama_model::pshard_verify_resident(const char * stage) const {
-    const auto & hashes = llama_pshard_verify_hashes();
-    if (hashes.empty()) return;
-    size_t n_checked = 0, n_bad = 0, n_moved = 0, n_shown = 0;
-    std::vector<uint8_t> buf;
-    for (const auto & [tensor, entry] : pimpl->weight_preload_map) {
-        if (!entry.device_only_common || !tensor || !tensor->data) continue;
-        auto it = hashes.find(ggml_get_name(tensor));
-        if (it == hashes.end()) continue;
-        const size_t n = ggml_nbytes(tensor);
-        buf.resize(n);
-        ggml_backend_tensor_get(tensor, buf.data(), 0, n);
-        const uint64_t h = llama_pshard_fnv1a(buf.data(), n);
-        n_checked++;
-        const bool moved = tensor->data != entry.gpu_addr;
-        if (moved) n_moved++;
-        if (h != it->second) {
-            n_bad++;
-            if (n_shown++ < 20) {
-                LLAMA_LOG_WARN("%s[%s]: MISMATCH %s type=%s bytes=%zu data=%p preload=%p%s\n", __func__, stage,
-                    ggml_get_name(tensor), ggml_type_name(tensor->type), n, tensor->data, entry.gpu_addr, moved ? " (MOVED)" : "");
-            }
-        }
-    }
-    LLAMA_LOG_WARN("%s[%s]: %zu/%zu resident tensors differ from their file hash, %zu have data != preload address\n",
-        __func__, stage, n_bad, n_checked, n_moved);
 }
 
 void llama_model::sync_dev_preload() {
