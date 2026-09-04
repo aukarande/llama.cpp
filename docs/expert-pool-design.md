@@ -975,6 +975,17 @@ cpu_exec 30.0 t/s (PPL identical, 1.2619); DSv4 @12000 128 tok: hybrid 13.5 = fe
 upload it replaces, so `fetch` wins or ties at bs=1; CPU routes pay where PCIe is the
 slower pipe. `PSHARD_MISS_POLICY=cpu_admit` forces it.
 
+**Prefetch predictor, landed 2026-09-03 (`PSHARD_POOL_PREDICT=k`):** layer l's FFN
+input through layer l+k's router (same gating, bias and group masking via
+`build_moe_select`) predicts layer l+k's experts k layers early; the service uploads
+the most confident non-resident ones (`PSHARD_POOL_PREFETCH_N`, default 1) into that
+layer's LRU victims on the pool's copy stream, and the layer finds them as hits after
+the admit-event wait. Recall 0.81 (q35) / 0.66 (DSv4) at k=1; decode +3% on q35 and
++6.5% on DSv4 @12000 (13.4 -> 14.3 t/s) with one prefetch per layer. More prefetches
+raise the hit rate further but lose speed: mispredicted uploads compete with the
+critical-path misses for the same PCIe link, so the usable prefetch volume is the
+link's idle time, not the predictor's recall.
+
 Pricing inputs (predictor decode term per layer: `t_matmul + 8 x (1 - h(s_l)) x t_miss(policy)`):
 - fetch constant, one baseline: PCIe_Sliced curve at the 2 MB point (parsed
   src/llama-benchmark.cpp:196-201; measured examples/llama-profiler/profiler-cpu.cpp:124-179)

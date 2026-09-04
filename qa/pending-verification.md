@@ -431,7 +431,26 @@ and corrupt concurrent measurements).
    Only the all-CPU policy gains; anything with a GPU path loses 4-5% to thread
    contention with the scheduler/service thread. The CPU chain is not compute-bound
    enough for SMT to help - no CPU-side lever on this box; stock itself: 10.4 -> 12.1-12.7
-   at 16 threads. Traps met: a grep-filtered background build hid a
+   at 16 threads.
+   PREFETCH PREDICTOR LANDED 2026-09-03 (user's idea: layer l's FFN input through
+   layer l+k's router predicts l+k's experts; PSHARD_POOL_PREDICT=k, prefetch on by
+   default with PSHARD_POOL_PREFETCH_N=1, =0 for all predicted, PSHARD_POOL_PREFETCH=0
+   to score only): build_moe_select() factors the router->top-k path; the prediction
+   is expanded into the graph in layer l's split (nothing consumes it) and bound to
+   layer l+k; at layer l's service the pool reads it (the ids read drained the
+   stream) and uploads its non-resident experts into layer l+k's LRU victims on the
+   pool's copy stream, most confident first; l+k's service waits on the admit event
+   and finds them as hits. Predictor quality: recall / miss coverage q35 k=1
+   0.81 / 0.72, DSv4 k=1 0.66 / 0.54 (k=2,3 lower); its compute is free. Uncapped
+   prefetch raises h (q35 0.82 -> 0.93, DSv4 0.53 -> 0.74) but on DSv4 costs speed
+   (13.4 -> 11.9): the 48% mispredicted uploads share the PCIe link with the
+   critical-path misses and the event wait then stalls. Capped: DSv4 N=1 14.3 t/s
+   (+6.5%, h 0.63, 72% of prefetches used), N=2 13.9, N=3 13.2; q35 N=3 50.4, N=5
+   50.6 (+3%, h 0.93). All md5 identical. Prefetch can only use idle link time -
+   the win is bounded by (layer time x link rate - miss bytes) and by accuracy.
+   Not priced in the planner yet (env-gated). Traps: bind order (the layer's own
+   binding ran after the predictor bound its target), an unconsumed node must be
+   forward-expanded. Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.
    Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
