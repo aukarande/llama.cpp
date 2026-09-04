@@ -556,8 +556,12 @@ and corrupt concurrent measurements).
    prompt 53. Per miss: DMA ~0.42 ms (10.4 MB at PCIe rate), ring ~0.83, driver ~0.92.
    Findings: (1) the token is transfer-bound - a zero-compute model fits both measured
    points; (2) a pageable miss costs 2x a DMA one whichever way it is staged; the ring beats
-   the driver path by only ~6% (the 4 GB/s it was built against was the page-fault regime
-   that VirtualLock alone now prevents) - ring knobs stay, but the ring is not the lever;
+   the driver path by only ~6% when EVERYTHING is pageable, and by nothing in the real
+   configuration: shard 2 pinned + ring OFF (GGML_CUDA_STAGE_RING_MB=0) = 14.69 t/s,
+   prompt 85.5, vs 14.58 / 83.1 with the ring, same 124.8 misses - the driver's pageable
+   copy from VirtualLock'd memory is as fast as our memcpy+DMA pipeline (the 4 GB/s the
+   ring was built against was the page-fault regime that VirtualLock alone now prevents).
+   The ring and its three knobs are removable; user's call;
    (3) DMA-pinning shard 3 too would remove ~26 ms/token: 18-23 t/s (linear 23; compute
    stops hiding under uploads somewhere below 50 ms) - blocked by the pinned-memory ceiling
    (49 + 47 GB > what cudaHostRegister grants); the route is a pinned host tier of hot
