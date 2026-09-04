@@ -425,7 +425,13 @@ and corrupt concurrent measurements).
    q35 @8000 fetch 43.7 (measured 45.5), hybrid 43.7 (39.8 at 32 tok - hybrid's h is
    lower than fetch's until warm), cpu_admit 40.7 (38.0), cpu_exec 24.0 (30.0: the CPU
    matmul floor rate is too low for Q4_K; per-type rate is the fix); DSv4 hybrid 12.0 /
-   fetch 10.9 (measured 13.5 / 13.4). Traps met: a grep-filtered background build hid a
+   fetch 10.9 (measured 13.5 / 13.4). 16 THREADS ON DSv4 (128 tok, planner + runtime
+   both -t 16; n_threads is fingerprinted, a mismatched -t silently runs STOCK): cpu_exec
+   9.5 -> 10.7 (+13%), cpu_admit 11.8 -> 11.3, hybrid 13.5 -> 13.0, fetch 13.4 -> 12.8.
+   Only the all-CPU policy gains; anything with a GPU path loses 4-5% to thread
+   contention with the scheduler/service thread. The CPU chain is not compute-bound
+   enough for SMT to help - no CPU-side lever on this box; stock itself: 10.4 -> 12.1-12.7
+   at 16 threads. Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.
    Runtime map (agent-verified): uploads are per-tensor cudaMemcpyAsync on a dedicated copy stream, prefetch depth 1 with one full layer of real overlap, full 256-expert stack per layer for any ubatch >= 22 tokens, ~2 splits per layer; minor host syncs (one per streamed split on an idle placeholder stream; events[][] dead under pshard because n_copies == 1). Levers: GGML_CUDA_REGISTER_HOST=0 (all pageable), PSHARD_PAGELOCK_SKIP=<i> (one mapping pageable). Earlier two-point additive estimates in this note were wrong and are superseded by the trace. The loader now WARNs when a page-lock fails; a
