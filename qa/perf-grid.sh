@@ -183,12 +183,13 @@ CLK=$(nvidia-smi --query-gpu=clocks.sm,clocks.mem --format=csv,noheader,nounits 
 SM=${CLK%%,*}; MEM=${CLK##*,}
 if [ "${QA_FORCE:-0}" != "1" ]; then
     case $SM in 249[0-9]|250[0-9]) ;; *) echo "ABORT: GPU clocks not locked (sm=$SM MHz, mem=$MEM MHz); run C:/Aditya/gb203_lock_clocks.bat from C:/Aditya, or QA_FORCE=1"; exit 2 ;; esac
-    # GPU idle: utilization over 3 s and foreign compute contexts (anything holding a CUDA
-    # context besides the desktop compositor perturbs every cell - 2026-09-04: a background
-    # Codex/ChatGPT app cost 15-30% on both prefill and decode)
+    # GPU idle: utilization over 3 s and foreign GPU contexts. The Windows shell and the Claude
+    # desktop app (claude.exe + its msedgewebview2 renderer - this session's host) are
+    # whitelisted: idle graphics contexts. Browsers, the Codex/ChatGPT app and anything else
+    # are not - 2026-09-04 a background ChatGPT.exe (compute + graphics context) plus a
+    # browser cost 15-30% on both prefill and decode.
     UTIL=$(for i in 1 2 3; do nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null; sleep 1; done | sort -n | tail -1 | tr -d ' ')
-    FOREIGN=$(nvidia-smi --query-compute-apps=process_name --format=csv,noheader 2>/dev/null | grep -viE 'dwm.exe|explorer.exe|LogonUI|ShellExperienceHost|StartMenuExperienceHost|TextInputHost|TabTip|WUDFHost|SearchHost|nvidia' | sed 's#.*\##' | sort -u | tr '
-' ' ')
+    FOREIGN=$(nvidia-smi --query-compute-apps=process_name --format=csv,noheader 2>/dev/null | grep -viE 'dwm.exe|explorer.exe|LogonUI|ShellExperienceHost|StartMenuExperienceHost|TextInputHost|TabTip|WUDFHost|SearchHost|ShellHost|CrossDeviceResume|claude.exe|msedgewebview2|nvidia' | tr '\134' '/' | sed 's#.*/##' | sort -u | tr '\n' ' ')
     if [ "${UTIL:-0}" -gt 3 ] 2>/dev/null || [ -n "$FOREIGN" ]; then
         echo "ABORT: GPU is not idle (utilization ${UTIL}%, foreign GPU contexts: ${FOREIGN:-none}); close them or QA_FORCE=1"; exit 2
     fi
