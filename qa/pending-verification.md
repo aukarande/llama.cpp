@@ -601,6 +601,21 @@ and corrupt concurrent measurements).
    completion count (deleted). q35 gate ecb043a95a14 / DSv4 gate bda02a0d435a unchanged.
    Remaining gap to DMA cost: 16 threads reach ~18 GB/s aggregate memcpy; the pinned
    hot-expert tier is the route past it (file pinning capped near 50 GB here).
+   POOL STALLS = OS PREEMPTION; CLOCKS NOW LOCKED (2026-09-04 evening): with 16 copiers on 16
+   logical cores, identical DSv4 runs spread 16.3 -> 10.8 / 5.2 t/s (same misses, same md5):
+   a copier descheduled mid-part holds the upload for a ~15 ms quantum. Fix: pool threads at
+   THREAD_PRIORITY_ABOVE_NORMAL, default threads = cores capped at 8. From here on every perf
+   run is under LOCKED clocks (C:\Aditya\gb203_lock_clocks.bat: perfdebug GPC 2505 MHz, DRAM
+   14 GHz; run its lines from C:\Aditya; re-lock after a TDR/reboot) - every number earlier
+   today was on boost clocks and is NOT comparable. Locked, DSv4 @12000 fetch+pred 128 tok
+   temp0, 4 runs each: threads=1 (old ring) 15.0-15.6; 8: 16.06-16.22; 12: 15.9-16.2; 16:
+   16.1-16.2 - no stall in 12 pooled runs; pool = +5-6% at locked clocks. Locked references:
+   q35 @8000 fetch+pred 73.0/74.2 (boost ~83); DSv4 @12000 fetch 15.2/15.9. The GPU driver
+   reset (TDR 18:21, UVM error 18:17) during the first pool measurements traces to the pinning
+   experiments that poisoned the device (nvlddmkm errors 16:59-17:04), not to the pool: 23
+   pooled runs since, event log watched, no nvlddmkm event. Gate-hash trap: a gate run with
+   stderr on NUL colours stdout (Windows isatty) - hash with ANSI codes stripped (the grid
+   runner does).
    Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.

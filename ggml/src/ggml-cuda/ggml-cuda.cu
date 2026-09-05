@@ -73,6 +73,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
@@ -2496,10 +2500,12 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 struct ggml_cuda_stage_ring {
     size_t chunk     = 64ull << 20;
     int    n_chunks  = 0;
-    // memcpy threads per copy: the logical core count, capped at 16. Prefill (64 MiB chunks)
-    // saturated at 8 (q35 all-pageable: 2 -> 115, 4 -> 157, 8 -> 211, 12 -> 206 t/s prompt);
-    // decode misses (10 MB, persistent pool) kept scaling: DSv4 8 -> 15.2, 16 -> 16.5 t/s
-    int    n_threads = (int) std::min<unsigned>(16, std::max<unsigned>(2, std::thread::hardware_concurrency()));
+    // memcpy threads per copy: the logical core count, capped at 8 - the measured saturation
+    // point for both prefill (64 MiB chunks, q35 all-pageable: 2 -> 115, 4 -> 157, 8 -> 211,
+    // 12 -> 206 t/s prompt) and decode misses (10 MB, persistent pool, locked clocks, DSv4:
+    // 1 -> 15.3, 8 -> 16.2, 12 -> 16.1, 16 -> 16.2 t/s). Fewer copiers leave cores to the
+    // CPU-route miss policies.
+    int    n_threads = (int) std::min<unsigned>(8, std::max<unsigned>(2, std::thread::hardware_concurrency()));
     bool   disabled  = false;
     bool   init_done = false;
     char * base      = nullptr;
@@ -2581,7 +2587,14 @@ struct ggml_cuda_memcpy_pool {
 
     void start(int n_workers) {
         for (int i = 0; i < n_workers; i++) {
-            th.emplace_back([this] { worker(); });
+            th.emplace_back([this] {
+#ifdef _WIN32
+                // a copier descheduled mid-part stalls the whole upload for a scheduler quantum
+                // (~15 ms): measured as 5-11 t/s outliers among 16 t/s runs on DSv4 (2026-09-04)
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
+                worker();
+            });
         }
     }
     // copy parts until the job's indices are exhausted (fields are stable for the whole call:
