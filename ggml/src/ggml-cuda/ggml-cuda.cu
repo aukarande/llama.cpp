@@ -2496,8 +2496,10 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 struct ggml_cuda_stage_ring {
     size_t chunk     = 64ull << 20;
     int    n_chunks  = 0;
-    int    n_threads = 8;   // measured: 2 -> 115, 4 -> 157, 8 -> 211, 12 -> 206 t/s prompt on an all-pageable
-                            // q35 (16 logical cores); DeepSeek-V4 4 -> 60, 8 -> 75, 12 -> 78 t/s
+    // memcpy threads per copy: the logical core count, capped at 16. Prefill (64 MiB chunks)
+    // saturated at 8 (q35 all-pageable: 2 -> 115, 4 -> 157, 8 -> 211, 12 -> 206 t/s prompt);
+    // decode misses (10 MB, persistent pool) kept scaling: DSv4 8 -> 15.2, 16 -> 16.5 t/s
+    int    n_threads = (int) std::min<unsigned>(16, std::max<unsigned>(2, std::thread::hardware_concurrency()));
     bool   disabled  = false;
     bool   init_done = false;
     char * base      = nullptr;
@@ -2549,25 +2551,113 @@ static ggml_cuda_stage_ring & ggml_cuda_get_stage_ring(int device) {
     return rings[ggml_cuda_get_physical_device(device)];
 }
 
+// Persistent memcpy pool for the staging ring. The ring's copy leg is the pipeline's slow
+// stage (one thread ~12 GB/s vs ~25 GB/s DMA: a 10 MB expert miss cost 0.83 ms staged vs
+// 0.42 ms pinned, 2026-09-04), and spawning threads per copy only paid off above 16 MiB, so
+// every decode-sized miss ran single-threaded. The pool's threads live for the process.
+//
+// Protocol (one job at a time, run_mu): run() publishes the job under mu (fields, counters
+// reset, gen++) and notifies; a worker takes the job by, under mu, seeing gen advance and
+// incrementing in_work; it leaves by decrementing in_work under mu. run() returns only when
+// every part is done AND in_work is 0, so no worker is ever inside work() while the next
+// run() rewrites the job (the review of 2026-09-04 found that a straggler still in work()
+// could compare a stale part index against the next job's n_parts and over-count done_parts,
+// letting the caller return before a part had landed).
+struct ggml_cuda_memcpy_pool {
+    std::vector<std::thread> th;
+    std::mutex              mu;       // guards gen / stop / in_work / the job fields
+    std::mutex              run_mu;   // one job at a time
+    std::condition_variable cv_job;
+    std::condition_variable cv_done;
+    uint64_t                gen     = 0;
+    int                     in_work = 0;
+    bool                    stop    = false;   // never set: the pool lives for the process
+    char *                  dst = nullptr;
+    const char *            src = nullptr;
+    size_t                  n = 0;
+    int                     n_parts = 0;
+    std::atomic<int>        next_part{0};
+    std::atomic<int>        done_parts{0};
+
+    void start(int n_workers) {
+        for (int i = 0; i < n_workers; i++) {
+            th.emplace_back([this] { worker(); });
+        }
+    }
+    // copy parts until the job's indices are exhausted (fields are stable for the whole call:
+    // the caller holds in_work > 0, or IS the run() caller)
+    void work() {
+        for (;;) {
+            const int p = next_part.fetch_add(1, std::memory_order_acq_rel);
+            if (p >= n_parts) {
+                return;
+            }
+            const size_t part = (n + n_parts - 1) / n_parts;
+            const size_t off  = (size_t) p * part;   // < n for every p < n_parts (part = ceil(n / n_parts))
+            const size_t len  = std::min(part, n - off);
+            memcpy(dst + off, src + off, len);
+            done_parts.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+    void worker() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv_job.wait(lk, [&] { return stop || gen != seen; });
+                if (stop) {
+                    return;
+                }
+                seen = gen;
+                in_work++;
+            }
+            work();
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                in_work--;
+            }
+            cv_done.notify_all();
+        }
+    }
+    void run(void * d, const void * s_, size_t nbytes, int parts) {
+        std::lock_guard<std::mutex> one(run_mu);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            dst = (char *) d;
+            src = (const char *) s_;
+            n = nbytes;
+            n_parts = parts;
+            done_parts.store(0, std::memory_order_release);
+            next_part.store(0, std::memory_order_release);
+            gen++;
+        }
+        cv_job.notify_all();
+        work();   // the caller is a worker too
+        std::unique_lock<std::mutex> lk(mu);
+        cv_done.wait(lk, [&] { return done_parts.load(std::memory_order_acquire) >= n_parts && in_work == 0; });
+    }
+};
+
+// process-lifetime, never destroyed (like the stage workers): a static destructor in this DLL
+// would run at DLL_PROCESS_DETACH after Windows has already killed the worker threads, and a
+// join / a mutex a dead thread held would hang the exit (review finding 2026-09-04)
+static ggml_cuda_memcpy_pool & ggml_cuda_get_memcpy_pool(int n_threads) {
+    static ggml_cuda_memcpy_pool * pool = [n_threads] {
+        auto * p = new ggml_cuda_memcpy_pool();
+        p->start(std::max(0, n_threads - 1));
+        return p;
+    }();
+    return *pool;
+}
+
 static void ggml_cuda_parallel_memcpy(void * dst, const void * src, size_t n, int n_threads) {
-    if (n_threads <= 1 || n < (16ull << 20)) {
-        memcpy(dst, src, n);   // below ~16 MiB the thread creations cost more than they save
+    // parts of >= 512 KiB: below that the wake-up costs more than the split saves
+    const int parts = (int) std::min<size_t>((size_t) n_threads, std::max<size_t>(1, n / (512ull << 10)));
+    if (n_threads <= 1 || parts <= 1) {
+        memcpy(dst, src, n);
         return;
     }
-    const size_t part = (n + n_threads - 1) / n_threads;
-    std::vector<std::thread> th;
-    th.reserve(n_threads);
-    for (int i = 0; i < n_threads; i++) {
-        const size_t off = (size_t) i * part;
-        if (off >= n) {
-            break;
-        }
-        const size_t len = std::min(part, n - off);
-        th.emplace_back([dst, src, off, len] { memcpy((char *) dst + off, (const char *) src + off, len); });
-    }
-    for (auto & t : th) {
-        t.join();
-    }
+    ggml_cuda_get_memcpy_pool(n_threads).run(dst, src, n, parts);
 }
 
 // is this copy one the ring should take: >= 1 MiB from unregistered (pageable) host memory, not

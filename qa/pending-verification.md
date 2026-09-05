@@ -580,6 +580,27 @@ and corrupt concurrent measurements).
    stops hiding under uploads somewhere below 50 ms) - blocked by the pinned-memory ceiling
    (49 + 47 GB > what cudaHostRegister grants); the route is a pinned host tier of hot
    experts (tens of GB) so shard-3 misses DMA from pinned cache instead of the ring.
+   STAGING RING MEMCPY POOL (2026-09-04, user: "build the persistent thread pool and
+   measure"): the ring's slow stage was a single-threaded memcpy (copies < 16 MiB never
+   split because threads were spawned per copy; a 10 MB miss = one thread at ~12 GB/s vs
+   25 GB/s DMA). Persistent pool, parts >= 512 KiB, up to n_threads runners incl. the
+   caller, default threads = logical cores capped at 16 (was 8). DSv4 @12000 fetch 128 tok,
+   temp 0, identical 124.8 misses/token, md5 68240bc58dad throughout: half-DMA/half-ring
+   14.6 -> 15.4-16.0 t/s (16.5 in the first, racy version); all-ring 10.6 -> 12.2; ring
+   miss 0.83 -> ~0.6 ms (DMA 0.42); prompt unchanged ~83 (GEMM-bound). 8 vs 16 threads:
+   15.2 vs 16.5. Spin-then-block wait: no gain at 16 threads, dropped. Perf-rule cells
+   (default sampling): fetch 13.2 t/s at 149 misses/token = 0.51 ms/miss (before 0.55
+   ms/miss at 121-127 misses) - the sampled token path decides the miss count, so compare
+   per miss. ADVERSARIAL REVIEW (31 agents, 3 lenses x 2 skeptics) confirmed 3 defects,
+   all fixed before commit: (1) a straggler worker still in work() compared a stale part
+   index against the NEXT job's n_parts and over-counted completion -> run() could return
+   with a part half-written -> torn bytes on the GPU (fix: run() waits until in_work == 0,
+   workers enter/leave under the mutex - no straggler can exist); (2) the pool's static
+   destructor would join threads Windows already killed at DLL_PROCESS_DETACH (fix: leak
+   the pool like the stage workers); (3) an unreachable early return that skipped the
+   completion count (deleted). q35 gate ecb043a95a14 / DSv4 gate bda02a0d435a unchanged.
+   Remaining gap to DMA cost: 16 threads reach ~18 GB/s aggregate memcpy; the pinned
+   hot-expert tier is the route past it (file pinning capped near 50 GB here).
    Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.
