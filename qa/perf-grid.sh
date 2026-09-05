@@ -55,7 +55,10 @@ dpath() { # model spec -> draft gguf ("" for none / mtp)
         *) echo "" ;;
     esac
 }
-prompt_file() { case $1 in 512) echo "$PROMPTS/prompt-512.txt" ;; 4k) echo "$PROMPTS/prompt-4k.txt" ;; esac; }
+# 4k = prompt-4k-v2.txt (2026-09-05): repository documentation, no internal repetition. The old
+# prompt-4k.txt repeats one 50-sentence article 12x: models copied it, the 4k gates produced
+# identical text across MODELS, and a warm start that seeded the copied passage looked like +50%.
+prompt_file() { case $1 in 512) echo "$PROMPTS/prompt-512.txt" ;; 4k) echo "$PROMPTS/prompt-4k-v2.txt" ;; esac; }
 prompt_ctx()  { case $1 in 512) echo 2048 ;; 4k) echo 8192 ;; esac; }
 mva_of()      { case $1 in full) echo "$FULL" ;; *) echo "$1" ;; esac; }
 
@@ -64,7 +67,7 @@ mva_of()      { case $1 in full) echo "$FULL" ;; *) echo "$1" ;; esac; }
 #   kind   perf | gate | ppl
 #   mva    MiB or "full"
 #   prompt 512 | 4k
-#   arm    stock | auto | pool:<policy> | pool:plan | poolauto
+#   arm    stock | auto | s0..s4 (forced legacy) | pool:<policy> | pool:plan | poolauto
 #   warm   1 = PSHARD_POOL_WARM=8 PSHARD_POOL_ALLOC=1 (prompt-end LRU seeding + per-layer slots)
 #   noovl  1 = GGML_SCHED_NO_CPU_OVERLAP=1 (plan and run)
 CELLS=""
@@ -90,11 +93,13 @@ plain_set() { # model mva prompt stock_ok pool_ok
     M=$1; B=$2; PR=$3; ST=$4; POOL=$5
     [ "$ST" = "1" ] && add perf $M $B $PR none stock 0 0 0
     add perf $M $B $PR none auto 0 0 0
+    for st in 0 1 2 3 4; do add perf $M $B $PR none s$st 0 0 0; done   # forced legacy strategies (user, 2026-09-04)
     [ "$POOL" = "1" ] && pool_block $M $B $PR
     # gates: 32-token md5 vs stock (stock always runs as the reference, even where its
     # perf cell is not in the table) + pool counters; every policy at 512, fetch at 4k
     add gate $M $B $PR none stock 0 0 0
     add gate $M $B $PR none auto  0 0 0
+    if [ "$PR" = "512" ]; then for st in 0 1 2 3 4; do add gate $M $B $PR none s$st 0 0 0; done; fi
     if [ "$POOL" = "1" ]; then
         if [ "$PR" = "512" ]; then
             add gate $M $B $PR none pool:fetch 0 0 0
@@ -116,6 +121,7 @@ spec_set() { # model mva spec prompt pool_ok  -> stock + auto (+ 5 pool variants
     M=$1; B=$2; SPC=$3; PR=$4; POOL=$5
     add perf $M $B $PR $SPC stock 0 0 0
     add perf $M $B $PR $SPC auto  0 0 0
+    for st in 0 1 2 3 4; do add perf $M $B $PR $SPC s$st 0 0 0; done
     if [ "$POOL" = "1" ]; then
         add perf $M $B $PR $SPC pool:fetch  0 0 0
         add perf $M $B $PR $SPC pool:fetch  1 0 0
@@ -264,7 +270,10 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
         dspark) TOOL=./llama-speculative-simple.exe; SPECF="-md $DP --spec-type draft-dspark" ;;
     esac
     case $K in
-        perf) WORK="-f $PROMPT -n $N_GEN -c $CTX --ignore-eos"; [ "$S" = "none" ] && WORK="$WORK -no-cnv" ;;
+        perf) WORK="-f $PROMPT -n $N_GEN -c $CTX --ignore-eos"; [ "$S" = "none" ] && WORK="$WORK -no-cnv"
+              # llama-speculative-simple refuses a prompt longer than its logical batch (2048): stock
+              # cells with the 4k prompt get -b = ctx (pshard sizes its own batch from the plan)
+              [ "$S" != "none" ] && [ "$A" = "stock" ] && [ "$PR" = "4k" ] && WORK="$WORK -b $CTX" ;;
         gate) WORK="-f $PROMPT -n $N_GATE -c $CTX --temp 0 --ignore-eos -no-cnv --no-display-prompt -lv 4"; TOOL=./llama-completion.exe; SPECF="" ;;
         ppl)  WORK="-f $PPL_TEXT -c $CTX --chunks 8"; TOOL=./llama-perplexity.exe; SPECF="" ;;
     esac
@@ -274,6 +283,7 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
     case $A in
         stock)    ;;
         auto)     ;;
+        s[0-4])   ENVF="PSHARD_STRATEGY=${A#s}" ;;   # forced legacy strategy (fingerprinted)
         pool:plan) ENVF="PSHARD_STRATEGY=5 PSHARD_POOL_RUNTIME=1" ;;
         pool:*)   ENVF="PSHARD_STRATEGY=5 PSHARD_MISS_POLICY=${A#pool:} PSHARD_POOL_RUNTIME=1" ;;
         poolauto) ENVF="PSHARD_POOL_AUTO=1 PSHARD_POOL_RUNTIME=1" ;;

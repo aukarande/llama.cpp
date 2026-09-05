@@ -38,7 +38,7 @@ work targets, plus the correctness gates and perplexity mirrors those perf cells
 | q35mtp (`--spec-type draft-mtp --spec-draft-n-max 2`) | stock, legacy, pool | 4000, 8000, full | 512, 4k |
 | dsv4 + DSpark (`-md` draft, `--spec-type draft-dspark`) | stock, legacy, pool | 8000, full | 512, 4k |
 
-"legacy" = the planner's auto pick (no forced s0..s4). DSv4's pool pins ~9.2 GB
+"legacy" = the planner's auto pick, PLUS the five forced strategies s0..s4 as their own arms (added 2026-09-04 mid-run: +100 perf, +25 gates at 512). DSv4's pool pins ~9.2 GB
 (attention, routers, norms, output head) before its first slot, so it has no pool arm at
 8000. DSv4 + DSpark stock only fits at `-fitb 3000` (the stock fit ignores the 10.4 GB
 draft) and is recorded at that budget. Prompts: `512` = prompt-512.txt at ctx 2048, `4k` =
@@ -89,7 +89,7 @@ cpu_admit, cpu_exec, fetch_on_2nd_miss), at 4k pool fetch only. **52 gates.**
 Perplexity mirror (`llama-perplexity -c 2048 --chunks 8` on prompt-256k, prompt-independent,
 once per model and budget): stock, legacy, pool fetch. **14 ppl** (dsv4 stock ~11 min each).
 
-**Total 246 cells.** Estimate: perf ~5 h (q35 cells ~1.2 min, legacy-auto and poolauto plans
+**Total 371 cells** (246 + the forced strategies). Estimate: perf ~5 h (q35 cells ~1.2 min, legacy-auto and poolauto plans
 3-4 min each, dsv4 cells ~3.5 min), gates ~50 min, ppl ~45 min: **~6.5 h**, splittable as
 `QA_GRID_MODELS=q35` then `QA_GRID_MODELS=dsv4`.
 
