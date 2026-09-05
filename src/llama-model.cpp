@@ -1533,8 +1533,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         split_sum += splits[i];
         splits[i] = split_sum;
     }
-    for (size_t i = 0; i < n_devices(); ++i) {
-        splits[i] /= split_sum;
+    if (split_sum > 0.0f) {
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] /= split_sum;
+        }
+    } else {
+        // every device reported 0 free bytes (a pshard target that took the whole card
+        // before its draft model loads, 2026-09-05: DSv4 + DSpark at ctx 8192): the
+        // division above would make the split points NaN, upper_bound would return the
+        // end iterator and devices.at() would throw "invalid vector subscript". Split
+        // evenly instead - the budget decides what fits, not the split.
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] = float(i + 1) / float(n_devices());
+        }
     }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
