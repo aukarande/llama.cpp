@@ -35,6 +35,7 @@ MODELS=${QA_MODELS_DIR:-/c/Aditya/Models}
 PROMPTS=${QA_PROMPTS_DIR:-/c/Aditya/Prompts}
 PPL_TEXT="$PROMPTS/prompt-256k.txt"
 FULL=${QA_FULL_MVA:-14500}
+GPC=${QA_GPC_MHZ:-2100}   # locked GPC clock, MHz (2026-09-05: lowered from 2505, suspected of tripping the PSU; 2505-clock ledgers are NOT comparable)
 N_GEN=128          # perf decode window (user rule: always 128)
 N_GATE=32          # correctness gate window (md5 + counters)
 MIN_DECODE=64      # a perf row whose decode window ends shorter than this is marked SHORT
@@ -181,14 +182,14 @@ fi
 # GPC 2505 MHz, DRAM 14 GHz, fixed-frequency regime. Re-run here (idempotent; locks do not
 # survive a driver reset). QA_FORCE=1 skips both checks.
 if [ -x /c/Aditya/perfdebug.exe ]; then
-    ( cd /c/Aditya && for a in "--lock_strict set dramclkkHz 14000000" "--lock_strict set gpcclkkHz 2505000"         "--lock_loose set sysclkkHz 2230000" "--lock_loose set xbarclkkHz 2230000" "--force_regime ffr"; do
+    ( cd /c/Aditya && for a in "--lock_strict set dramclkkHz 14000000" "--lock_strict set gpcclkkHz ${GPC}000"         "--lock_loose set sysclkkHz 2230000" "--lock_loose set xbarclkkHz 2230000" "--force_regime ffr"; do
         MSYS_NO_PATHCONV=1 ./perfdebug.exe $a > /dev/null 2>&1; done )
     sleep 2
 fi
 CLK=$(nvidia-smi --query-gpu=clocks.sm,clocks.mem --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
 SM=${CLK%%,*}; MEM=${CLK##*,}
 if [ "${QA_FORCE:-0}" != "1" ]; then
-    case $SM in 249[0-9]|250[0-9]) ;; *) echo "ABORT: GPU clocks not locked (sm=$SM MHz, mem=$MEM MHz); run C:/Aditya/gb203_lock_clocks.bat from C:/Aditya, or QA_FORCE=1"; exit 2 ;; esac
+    if [ -z "$SM" ] || [ "$SM" -lt $((GPC - 30)) ] || [ "$SM" -gt $((GPC + 10)) ] 2>/dev/null; then echo "ABORT: GPU clocks not locked at $GPC MHz (sm=$SM MHz, mem=$MEM MHz); lock with perfdebug from C:/Aditya, or QA_FORCE=1"; exit 2; fi
     # GPU idle: utilization over 3 s and foreign GPU contexts. The Windows shell and the Claude
     # desktop app (claude.exe + its msedgewebview2 renderer - this session's host) are
     # whitelisted: idle graphics contexts. Browsers, the Codex/ChatGPT app and anything else
