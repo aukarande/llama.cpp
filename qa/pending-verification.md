@@ -561,7 +561,21 @@ and corrupt concurrent measurements).
    prompt 85.5, vs 14.58 / 83.1 with the ring, same 124.8 misses - the driver's pageable
    copy from VirtualLock'd memory is as fast as our memcpy+DMA pipeline (the 4 GB/s the
    ring was built against was the page-fault regime that VirtualLock alone now prevents).
-   The ring and its three knobs are removable; user's call;
+   The ring and its three knobs are removable; user's call.
+   PINNING PAST SHARD 2 (2026-09-04, tried and reverted): whole-shard cudaHostRegister of
+   shard 3 fails "out of memory" (WDDM); raising the working-set quota first does not help.
+   Chunked registration (1 GiB pieces ending on tensor boundaries) is GRANTED up to 64.0 GB
+   total (= half of the 128 GB RAM) - but every run that pinned anything beyond shard 2's
+   49.4 GB (+16.5, +12.6, +8.4, even +4.2 GB) then failed: cudaMemGetInfo reports 0/0, a
+   1.3 MiB cudaMalloc for the compressor state fails "out of memory", and VirtualLock of
+   the remainder fails with error 1450, although 49.4 pinned + 45.2 VirtualLock'd works
+   every day. The registrations succeed at the API and poison the device: WDDM's
+   GPU-mappable system memory is exhausted by ~50 GB of file-backed pins on this box, not
+   64. CONCLUSION: total DMA-pinned host memory is capped near 50 GB here; the only way to
+   raise the DMA share of DSv4's misses above 50% is to spend that budget on a pinned
+   hot-expert TIER (Zipf top-half per layer -> ~75-80% of misses DMA) instead of shard 2's
+   file order. Loader change reverted; the CUDA registration failure reason now logs at
+   WARN.
    (3) DMA-pinning shard 3 too would remove ~26 ms/token: 18-23 t/s (linear 23; compute
    stops hiding under uploads somewhere below 50 ms) - blocked by the pinned-memory ceiling
    (49 + 47 GB > what cudaHostRegister grants); the route is a pinned host tier of hot
