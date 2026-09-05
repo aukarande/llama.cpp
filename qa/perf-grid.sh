@@ -170,8 +170,31 @@ if [ "${QA_RESUME:-0}" = "1" ] && [ -f "$LEDGER" ]; then
 else
     echo "$HDR" > "$LEDGER"
 fi
+# ---- preconditions (user rules): locked clocks, and the whole machine ------------------------
+# clocks: C:/Aditya/gb203_lock_clocks.bat = five perfdebug.exe lines (must run from C:/Aditya):
+# GPC 2505 MHz, DRAM 14 GHz, fixed-frequency regime. Re-run here (idempotent; locks do not
+# survive a driver reset). QA_FORCE=1 skips both checks.
+if [ -x /c/Aditya/perfdebug.exe ]; then
+    ( cd /c/Aditya && for a in "--lock_strict set dramclkkHz 14000000" "--lock_strict set gpcclkkHz 2505000"         "--lock_loose set sysclkkHz 2230000" "--lock_loose set xbarclkkHz 2230000" "--force_regime ffr"; do
+        MSYS_NO_PATHCONV=1 ./perfdebug.exe $a > /dev/null 2>&1; done )
+    sleep 2
+fi
+CLK=$(nvidia-smi --query-gpu=clocks.sm,clocks.mem --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+SM=${CLK%%,*}; MEM=${CLK##*,}
+if [ "${QA_FORCE:-0}" != "1" ]; then
+    case $SM in 249[0-9]|250[0-9]) ;; *) echo "ABORT: GPU clocks not locked (sm=$SM MHz, mem=$MEM MHz); run C:/Aditya/gb203_lock_clocks.bat from C:/Aditya, or QA_FORCE=1"; exit 2 ;; esac
+    # GPU idle: utilization over 3 s and foreign compute contexts (anything holding a CUDA
+    # context besides the desktop compositor perturbs every cell - 2026-09-04: a background
+    # Codex/ChatGPT app cost 15-30% on both prefill and decode)
+    UTIL=$(for i in 1 2 3; do nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null; sleep 1; done | sort -n | tail -1 | tr -d ' ')
+    FOREIGN=$(nvidia-smi --query-compute-apps=process_name --format=csv,noheader 2>/dev/null | grep -viE 'dwm.exe|explorer.exe|LogonUI|ShellExperienceHost|StartMenuExperienceHost|TextInputHost|TabTip|WUDFHost|SearchHost|nvidia' | sed 's#.*\##' | sort -u | tr '
+' ' ')
+    if [ "${UTIL:-0}" -gt 3 ] 2>/dev/null || [ -n "$FOREIGN" ]; then
+        echo "ABORT: GPU is not idle (utilization ${UTIL}%, foreign GPU contexts: ${FOREIGN:-none}); close them or QA_FORCE=1"; exit 2
+    fi
+fi
 IDLE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1); [ -z "$IDLE" ] && IDLE=0
-echo "# idle_used=$IDLE full_mva=$FULL git=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null) date=$(date +%Y-%m-%dT%H:%M)" >> "$LEDGER"
+echo "# idle_used=$IDLE full_mva=$FULL clocks_sm=$SM clocks_mem=$MEM git=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null) date=$(date +%Y-%m-%dT%H:%M)" >> "$LEDGER"
 
 # registries: back up at start, restore at exit (the grid rewrites them per cell)
 BK="$OUT/registry-backup"; mkdir -p "$BK"
