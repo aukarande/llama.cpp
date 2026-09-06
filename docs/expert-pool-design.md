@@ -1709,6 +1709,29 @@ remain the unchanged external baselines the ladder prices POOL against.
     (window - probe scratch >= A/B pair) would save the two warmup reserves and make the tier
     summary honest at plan time; and the prefill cost of the fall-back (two A/B passes over
     the stack instead of one) is the price of staying inside the budget at this ctx.
+    AUDIT FOLLOW-UP (2026-09-05 evening, 57-agent review of the fix + the grid artifacts):
+    (i) a tier whose reserve fails AT RUNTIME (a scheduler rebuild for spec/backend-sampler
+    contexts re-reserves under a different graph shape) is now unviable too, and the switch
+    lands the nearest viable tier below (`pshard_land_tier`), returning its batch size so
+    `decode` clamps the prefill ubatch - the freed-overflow path had left the allocator with
+    dead state the caller would have computed over; no viable tier at all throws (an honest
+    failure, not a spill). (ii) `find_optimal_ubatch` without TPS data defaults to the largest
+    VIABLE tier, not the top tier; `pshard_maybe_switch` uses `viable_tier_for`. (iii) The MTP
+    head lever (union enforcer moves the MTP head to the CPU) now charges the arena n_vocab x
+    128 x 6 B for the MTP context's larger device compute (measured 5.9 B/entry: +177.5 and
+    +179.5 MiB in the three 09-04 cells that took the lever, which ran 4.4% over a 4000
+    budget); persisted as `mtp_head_extra_mb=` in the variant, applied through
+    `arena_bytes()`, added to the draft reserve the one-budget check compares against.
+    (iv) The planner's attn-pin substitution for a forced strategy or an unfitting pool tier
+    logs at WARN; the grid runner reads the EXECUTING tier (tier 1 for speculative cells) and
+    marks STRATEGY_FALLBACK / NOPOOL / OVER_BUDGET / OVER_RESERVE / CLOCK instead of OK.
+    (v) `~llama_context`'s buffer-size check now expects the post-warmup sizes, so it warns
+    only when a buffer grew during the run. Refuted by the review: the DSv4 pool-vs-stock hash
+    at full/512 is a token-1 near-tie (head IS on the GPU; every ulp-level prefill difference,
+    fusion or placement, lands on the same flip - the 09-04 "CPU head" attribution was wrong,
+    the 12000 exact match a coin flip), fetch_on_2nd_miss's third hash is a token-2 flip of the
+    same class, and stock at -fitb 8000 differs from all-GPU stock on the 4k prompt because its
+    fit leaves 12 attention layers (and 5 indexer top-k selections) on the CPU.
 
 ### 11.D QA
 

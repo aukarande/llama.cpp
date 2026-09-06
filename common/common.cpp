@@ -1371,6 +1371,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             // the fit may have shrunk the arena budget below mva_eff (DeepSeek-V4 compressor state
             // lives outside the arena): the leftover is what the ARENA's budget has beyond the arena
             common_pshard_draft_leftover(params, mparams.pshard_registry, mparams.max_vram_alloc);
+            // the planner moved the MTP head to the CPU and left the MTP context's larger logits
+            // scratch outside the arena: account it as reserve so the one-budget check compares
+            // the context against what the target really left it
+            if (const uint32_t extra = llama_pshard_registry_mtp_head_extra_mb(mparams.pshard_registry); extra > 0) {
+                params.speculative.draft.pshard_reserve_mb += (int32_t) extra;
+                LOG_INF("%s: MTP head on CPU: %u MiB left outside the arena for the MTP context (reserve now %d MiB)\n",
+                    __func__, extra, params.speculative.draft.pshard_reserve_mb);
+            }
         }
         if (!mparams.pshard) {
             // this process continues on the STOCK path: undo the pshard-only env gates so the

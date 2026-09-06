@@ -1876,10 +1876,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // n_ubatch_eff ubatches, so keying the tier off n_tokens_all would apply the
         // top tier's plan (e.g. an unviable-streaming fallback) to smaller ubatches
         // that were chosen precisely because their tier predicts far better tps
-        pshard_maybe_switch(std::min(n_tokens_all, n_ubatch_eff));
+        const uint32_t landed = pshard_maybe_switch(std::min(n_tokens_all, n_ubatch_eff));
+        if (landed >= 16 && landed < n_ubatch_eff && n_tokens_all > landed) {
+            // the tier for this ubatch is not viable (or its runtime reserve failed): run the
+            // prompt in ubatches the landed tier's reserve covers (a batch that already fits
+            // the landed tier - every decode step lands bs=1 - needs no clamp; a landed tier
+            // below 16 is a decode/verify tier, never a prefill ubatch - the MTP splitter
+            // asserts n_ubatch > n_keep_tail - so such a prompt runs unclamped)
+            LLAMA_LOG_WARN("%s: prefill ubatch %u -> %u: the landed tier is bs=%u\n", __func__, n_ubatch_eff, landed, landed);
+            n_ubatch_eff = landed;
+        }
     }
 
     sched_reserve();
+
+    if (cparams.pshard && pshard_active_plan && pshard_active_plan->batch_size >= 16 &&
+            n_tokens_all > pshard_active_plan->batch_size && n_ubatch_eff > pshard_active_plan->batch_size) {
+        // a scheduler rebuild inside sched_reserve re-reserves the active plan; when that
+        // fails it lands the tier below (pshard_reapply_active_plan) - follow it
+        LLAMA_LOG_WARN("%s: prefill ubatch %u -> %u after the scheduler rebuild landed tier bs=%u\n",
+            __func__, n_ubatch_eff, pshard_active_plan->batch_size, pshard_active_plan->batch_size);
+        n_ubatch_eff = pshard_active_plan->batch_size;
+    }
 
     bool did_optimize = false;
 

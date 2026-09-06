@@ -234,6 +234,7 @@ struct llama_pshard_search_ctx {
     size_t                                     exps_total_bytes = 0;   // all routed experts, all layers
     size_t                                     exps_total_weights = 0; // element count of the same (CPU FLOPs)
     uint32_t                                   n_layers_moe     = 0;
+    uint32_t                                   n_vocab          = 0;   // tokenizer size (the MTP head-on-CPU charge)
 };
 
 // accumulate routed-expert tensor bytes per layer from a gguf tensor table
@@ -960,6 +961,10 @@ size_t llama_pshard_registry_arena_bytes(const struct llama_pshard_plan_registry
     return registry ? registry->arena_bytes(budget_bytes) : budget_bytes;
 }
 
+uint32_t llama_pshard_registry_mtp_head_extra_mb(const struct llama_pshard_plan_registry * registry) {
+    return registry ? registry->mtp_head_extra_mb : 0;
+}
+
 bool pshard_registry_save(
         const llama_pshard_plan_registry * registry, uint64_t fingerprint,
         const char * cache_path, ggml_backend_buffer_type_t host_buft,
@@ -1091,11 +1096,11 @@ bool pshard_registry_save(
 
     // trailing fields after cache_ubatch are ignored by older parsers (sscanf assigns
     // the two %u before the literal ']' mismatch and still returns 2)
-    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d union_mb=%zu]\n",
+    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu]\n",
         budget_mib, cache_ubatch,
         registry->switch_layer_mb, registry->switch_attn_frac,
         registry->switch_head_mb, registry->switch_pcie_gb_s,
-        registry->mtp_head_cpu ? 1 : 0,
+        registry->mtp_head_cpu ? 1 : 0, registry->mtp_head_extra_mb,
         (size_t) ((registry->union_bytes + 1024 * 1024 - 1) / (1024 * 1024)));  // whole MiB, rounded up
     if (registry->pshard_disabled) {
         fprintf(f, "pshard_disabled=1 baseline_vram=%.1f\n", registry->baseline_vram_req / (1024.0 * 1024.0));
@@ -1179,6 +1184,7 @@ bool pshard_registry_load(
         float switch_head_mb = 0.0f;
         float switch_pcie_gb_s = 0.0f;
         bool  mtp_head_cpu     = false;
+        uint32_t mtp_head_extra_mb = 0;
         size_t union_bytes     = 0;
         std::vector<tier_data> tiers;
     };
@@ -1210,6 +1216,7 @@ bool pshard_registry_load(
             if ((p = strstr(s.c_str(), "head_mb="))   != NULL) cur_variant->switch_head_mb   = (float)atof(p + 8);
             if ((p = strstr(s.c_str(), "pcie="))      != NULL) cur_variant->switch_pcie_gb_s = (float)atof(p + 5);
             if ((p = strstr(s.c_str(), "mtp_head_cpu=")) != NULL) cur_variant->mtp_head_cpu = atoi(p + 13) != 0;
+            if ((p = strstr(s.c_str(), "mtp_head_extra_mb=")) != NULL) cur_variant->mtp_head_extra_mb = (uint32_t) atoi(p + 18);
             if ((p = strstr(s.c_str(), "union_mb="))    != NULL) cur_variant->union_bytes = (size_t)(atof(p + 9) * 1024.0 * 1024.0);
             continue;
         }
@@ -1464,6 +1471,7 @@ bool pshard_registry_load(
         registry->switch_head_mb   = best_whole->switch_head_mb;
         registry->switch_pcie_gb_s = best_whole->switch_pcie_gb_s;
         registry->mtp_head_cpu     = best_whole->mtp_head_cpu;
+        registry->mtp_head_extra_mb = best_whole->mtp_head_extra_mb;
         registry->union_bytes      = best_whole->union_bytes;
     }
 
@@ -1556,7 +1564,7 @@ static void pshard_enforce_union_budget(
     }
 
     const size_t alignment    = ggml_backend_buft_get_alignment(ctx.gpu_buft);
-    const size_t budget_bytes = (size_t) mparams->max_vram_alloc * 1024ULL * 1024ULL;
+    size_t budget_bytes = (size_t) mparams->max_vram_alloc * 1024ULL * 1024ULL;   // shrinks by the MTP head charge below
     auto align_up = [alignment](size_t off) { return ((off + alignment - 1) / alignment) * alignment; };
 
     // resident set of a plan: first override (emission order) with backend_id >= 0
@@ -1703,12 +1711,22 @@ static void pshard_enforce_union_budget(
 
         // trunk shaving did not converge: MTP head lever (once), then shave again
         if (g_pshard_n_layers_mtp > 0 && !g_pshard_mtp_head_cpu) {
-            LLAMA_LOG_WARN("%s: union still overshoots after %d rounds with the MTP head pinned; re-planning all tiers with the head on CPU\n",
-                __func__, max_rounds);
+            // the MTP context's reserve (common_pshard_draft_reserve_mb) was measured with the
+            // head pinned; on the CPU its device compute grows by the logits scratch (n_vocab x
+            // 128, its ubatch, x 6 B: measured 5.9 B per entry on q35, +177.5 / +179.5 MiB in the
+            // three 2026-09-04 grid cells that took this lever). Charge it to the arena, so the
+            // tiers are re-planned under a budget that leaves the MTP context its room.
+            const size_t extra    = (size_t) ctx.n_vocab * 128ull * 6ull;
+            const size_t extra_mb = (extra + (1ull << 20) - 1) >> 20;
+            LLAMA_LOG_WARN("%s: union still overshoots after %d rounds with the MTP head pinned; re-planning all tiers with the head on CPU, arena charged %zu MiB for the MTP context's logits scratch (n_vocab %u x 128 x 6 B)\n",
+                __func__, max_rounds, extra_mb, ctx.n_vocab);
             g_pshard_mtp_head_cpu  = true;
             registry->mtp_head_cpu = true;
+            registry->mtp_head_extra_mb = (uint32_t) extra_mb;
+            budget_bytes = budget_bytes > extra ? budget_bytes - extra : 0;
+            const size_t replan_budget = ctx.vram_free > extra ? ctx.vram_free - extra : 0;
             for (size_t t = 0; t < registry->best_plans.size(); t++) {
-                if (orig_viable[t]) { replan_tier(t, ctx.vram_free); }
+                if (orig_viable[t]) { replan_tier(t, replan_budget); }
             }
             continue;
         }
@@ -1833,7 +1851,9 @@ static llama_pshard_plan llama_pshard_attn_pin_fallback(
         uint32_t hi_pinned = UINT32_MAX) {
     llama_pshard_plan fallback = llama_pshard_search_attn_pin(ctx, LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS, hi_attn, hi_pinned);
     fallback.batch_size = ctx.cparams->n_batch;
-    LLAMA_LOG_INFO("llama_params_fit_pshard: [bs=%-4u %-10s] forced %s non-viable, STATIC_ATTNPRIO_ALLMODELS fallback: n_pinned=%2u/%2u, %s\n",
+    // WARN: the grid runner labels rows by the forced arm; a silent substitution recorded three
+    // s1 cells and seven speculative pool cells as something they were not (audit 2026-09-05)
+    LLAMA_LOG_WARN("llama_params_fit_pshard: [bs=%-4u %-10s] forced %s non-viable, STATIC_ATTNPRIO_ALLMODELS fallback: n_pinned=%2u/%2u, %s\n",
         ctx.cparams->n_batch, llama_pshard_strategy_name(LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS),
         llama_pshard_strategy_name((llama_pshard_strategy)force_strategy),
         fallback.n_pinned, fallback.n_attn_pinned,
@@ -2659,6 +2679,16 @@ void llama_params_fit_pshard_plan(
     if (ctx.n_layers_moe > 0) {
         LLAMA_LOG_INFO("%s: routed experts: %u layers, %.1f MiB per layer, %.2f MiB per expert (gguf tensor table)\n",
             __func__, ctx.n_layers_moe, ctx.exps_layer_bytes / (1024.0 * 1024.0), ctx.exps_row_bytes / (1024.0 * 1024.0));
+    }
+    {
+        // vocabulary size: the union enforcer's MTP head lever charges the MTP context's
+        // logits scratch (n_vocab x 128 x 6 B) to the arena, see pshard_enforce_union_budget
+        struct gguf_init_params gip_v = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };
+        if (struct gguf_context * g = gguf_init_from_file(path_model, gip_v)) {
+            const int64_t kt = gguf_find_key(g, "tokenizer.ggml.tokens");
+            if (kt >= 0) { ctx.n_vocab = (uint32_t) gguf_get_arr_n(g, kt); }
+            gguf_free(g);
+        }
     }
     if (hp_nex > 0) {
         struct gguf_init_params gip = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };

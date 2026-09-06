@@ -302,6 +302,7 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
     }
     ggml_backend_buffer_t buf = model.get_dev_preload_buf();
     if (buf == nullptr) {
+        LLAMA_LOG_WARN("%s: tier bs=%u: no device preload buffer; pool disengaged\n", __func__, plan.batch_size);
         return false;
     }
     const size_t buf_total = ggml_backend_buffer_get_size(buf);
@@ -320,6 +321,9 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
         }
     }
     if (preloaded + cache + scratch >= buf_total) {
+        LLAMA_LOG_WARN("%s: tier bs=%u: weights %.1f + cache %.1f + scratch %.1f MiB fill the %.1f MiB arena; pool disengaged\n",
+            __func__, plan.batch_size, preloaded / (1024.0 * 1024.0), cache / (1024.0 * 1024.0),
+            scratch / (1024.0 * 1024.0), buf_total / (1024.0 * 1024.0));
         return false;
     }
     const size_t avail = buf_total - preloaded - cache - scratch;
@@ -570,6 +574,7 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
     if (external_buf && expert_pool && !expert_pool->active && plan.strategy == LLAMA_PSHARD_EXPERT_POOL) {
         LLAMA_LOG_WARN("%s: tier bs=%u (expert pool): the pool region does not fit beside this tier's pinned set; tier unviable\n",
             __func__, plan.batch_size);
+        ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, scratch_avail);  // never leave the window open
         plan.alloc_state.valid = false;
         return;
     }
@@ -604,6 +609,7 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
                 // prompt falls to the largest viable tier.
                 LLAMA_LOG_WARN("%s: tier bs=%u (expert pool): graph scratch %.1f MiB leaves no room for the pool region; tier unviable\n",
                     __func__, plan.batch_size, chunk0_used / (1024.0 * 1024.0));
+                ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, scratch_avail);
                 plan.alloc_state.valid = false;
                 return;
             }
@@ -656,6 +662,10 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
     if (!gf) {
         LLAMA_LOG_ERROR("%s: graph_reserve failed for plan %s n_pinned=%u; alloc state not saved\n",
             __func__, llama_pshard_strategy_name(plan.strategy), plan.n_pinned);
+        if (external_buf) {
+            // a constrained reserve that died allocating overflow chunk c leaves 1..c-1 resident
+            ggml_backend_sched_free_overflow_chunks(sched.get(), gpu);
+        }
         plan.alloc_state.valid = false;
         return;
     }
@@ -793,6 +803,15 @@ void llama_context::pshard_apply_initial_plan() {
         pshard_active_plan = initial;
         pshard_update_pool_mode(*initial);
     }
+    // ~llama_context compares each backend's sched buffer against these: pshard skips the
+    // stock reserves that set them, so they stayed 0 and every run printed the mismatch WARN.
+    // Set them to the sizes after the warmup: a mismatch at exit then means the scheduler grew
+    // a buffer during the run (an arena overflow, the 2026-09-05 bug class) and nothing else.
+    if (backend_buf_exp_size.size() == backend_ptrs.size()) {
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        }
+    }
 }
 
 void llama_context::pshard_switch_plan(
@@ -868,16 +887,19 @@ void llama_context::pshard_switch_plan(
 }
 
 // restore saved alloc state for the active plan
-void llama_context::pshard_reapply_active_plan() {
+// the active plan's allocation state: reserve it when a scheduler rebuild invalidated it
+// (the plan is landed, so the reserve under its current placement is the right one), then
+// the scratch range and the saved galloc state. false = the reserve failed (the tier does
+// not fit its window under the current graph shape); the allocator then holds no usable
+// state for this plan and the caller must land another tier before any compute.
+bool llama_context::pshard_restore_active_alloc() {
     if (!pshard_active_plan) {
-        return;
+        return false;
     }
     if (!pshard_active_plan->alloc_state.valid) {
-        // invalidated by a scheduler rebuild (sched_reserve): the plan is landed, so the
-        // reserve under its current placement is the correct one - take it now
         pshard_reserve_and_save(*pshard_active_plan);
         if (!pshard_active_plan->alloc_state.valid) {
-            return;
+            return false;
         }
     }
     const llama_pshard_plan & plan = *pshard_active_plan;
@@ -899,6 +921,72 @@ void llama_context::pshard_reapply_active_plan() {
     ggml_backend_sched_restore_backend_ids(sched.get(),
         plan.alloc_state.node_backend_ids.data(), (int)plan.alloc_state.node_backend_ids.size(),
         plan.alloc_state.leaf_backend_ids.data(), (int)plan.alloc_state.leaf_backend_ids.size());
+    return true;
+}
+
+void llama_context::pshard_reapply_active_plan() {
+    if (!pshard_active_plan) {
+        return;
+    }
+    if (pshard_restore_active_alloc()) {
+        return;
+    }
+    // the active tier's runtime reserve failed (a rebuilt scheduler shapes its graph
+    // differently from the warmup's): it is unviable from here on. Land the nearest viable
+    // tier below it - computing over the allocator's dead state would abort or spill.
+    auto * registry = model.get_plan_registry();
+    size_t tier = registry->tier_sizes.size();
+    for (size_t i = 0; i < registry->best_plans.size(); i++) {
+        if (&registry->best_plans[i] == pshard_active_plan) { tier = i; break; }
+    }
+    LLAMA_LOG_WARN("%s: tier bs=%u (%s, n_pinned=%u): runtime reserve failed; tier unviable, landing the tier below\n",
+        __func__, pshard_active_plan->batch_size, llama_pshard_strategy_name(pshard_active_plan->strategy), pshard_active_plan->n_pinned);
+    if (tier >= registry->tier_sizes.size()) {
+        throw std::runtime_error("pshard: the active plan is not a registry tier; cannot recover from its failed reserve");
+    }
+    registry->best_plans[tier].is_viable = false;   // pshard_active_plan is a const view of this entry
+    if (tier == 0) {
+        throw std::runtime_error("pshard: the decode tier's runtime reserve failed; no viable tier left");
+    }
+    pshard_land_tier(tier - 1, pshard_active_plan->batch_size);
+}
+
+// land the plan of `tier`, stepping down to the nearest viable tier when a runtime reserve
+// fails (the failed tier becomes unviable). Returns the landed plan's batch size: the
+// ubatch the caller must not exceed. Throws when no tier can be landed - an honest failure
+// beats computing over an allocator state that points at released memory.
+uint32_t llama_context::pshard_land_tier(size_t tier, uint32_t n_tokens) {
+    auto * registry = model.get_plan_registry();
+    for (;;) {
+        llama_pshard_plan * best = tier < registry->tier_sizes.size() ? registry->get_best(tier) : nullptr;
+        if (best) {
+            if (best != pshard_active_plan) {
+                if (pshard_active_plan) {
+                    size_t old_tier = registry->tier_sizes.size();
+                    for (size_t i = 0; i < registry->best_plans.size(); i++) {
+                        if (&registry->best_plans[i] == pshard_active_plan) { old_tier = i; break; }
+                    }
+                    pshard_switch_plan(*pshard_active_plan, *best, old_tier, tier, n_tokens);
+                } else {
+                    pshard_apply_plan(*best);
+                }
+                // the device holds this plan's placement now, whatever its reserve did
+                pshard_active_plan = best;
+                if (best->alloc_state.valid) {
+                    return best->batch_size;
+                }
+            } else if (pshard_restore_active_alloc()) {
+                return best->batch_size;
+            }
+            LLAMA_LOG_WARN("%s: tier bs=%u (%s, n_pinned=%u): runtime reserve failed; tier unviable, stepping down\n",
+                __func__, best->batch_size, llama_pshard_strategy_name(best->strategy), best->n_pinned);
+            best->is_viable = false;
+        }
+        if (tier == 0) {
+            throw std::runtime_error("pshard: no viable tier can be landed after a failed runtime reserve");
+        }
+        tier--;
+    }
 }
 
 bool llama_context::pshard_prepare_host_access() {
@@ -931,35 +1019,27 @@ void llama_context::pshard_restore_after_host_access() {
     pshard_memory_dirty = false;
 }
 
-void llama_context::pshard_maybe_switch(uint32_t n_tokens) {
+uint32_t llama_context::pshard_maybe_switch(uint32_t n_tokens) {
     if (pshard_memory_dirty) {
         pshard_restore_after_host_access();
     }
 
     auto * registry = model.get_plan_registry();
-    if (!registry) return;
+    if (!registry) return n_tokens;
 
-    size_t tier = registry->tier_index(n_tokens);
-    llama_pshard_plan * best = registry->get_best(tier);
-    if (!best) return;
-
-    if (best != pshard_active_plan) {
-        if (pshard_active_plan) {
-            size_t old_tier = registry->tier_sizes.size();
-            for (size_t i = 0; i < registry->best_plans.size(); i++) {
-                if (&registry->best_plans[i] == pshard_active_plan) {
-                    old_tier = i;
-                    break;
-                }
-            }
-            pshard_switch_plan(*pshard_active_plan, *best, old_tier, tier, n_tokens);
-        } else {
-            pshard_apply_plan(*best);
+    // the tier that executes this ubatch: the smallest viable tier at or above it, else the
+    // largest viable tier below (the caller clamps the ubatch to what we return). tier_index
+    // alone would hand an unviable top tier's batch to the decode plan (audit 2026-09-05).
+    const size_t tier = registry->viable_tier_for(n_tokens);
+    if (tier >= registry->tier_sizes.size()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: no viable tier for a %u-token batch; keeping the active plan\n", __func__, n_tokens);
         }
-        pshard_active_plan = best;
-    } else {
-        pshard_reapply_active_plan();
+        return n_tokens;
     }
+    return pshard_land_tier(tier, n_tokens);
 }
 
 void llama_context::pshard_update_write_cells(llama_memory_context_i * mctx) {

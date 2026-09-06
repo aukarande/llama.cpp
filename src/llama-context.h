@@ -286,6 +286,8 @@ private:
     void pshard_assign_pool_tensors();
     void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true, bool force_upload = false);
     void pshard_reapply_active_plan();
+    bool pshard_restore_active_alloc();               // reserve if invalid, then range + state; false = reserve failed
+    uint32_t pshard_land_tier(size_t tier, uint32_t n_tokens); // land `tier` or the nearest viable tier below; returns its batch size
     void pshard_reserve_and_save(const llama_pshard_plan & plan);
     void pshard_save_alloc_state(const llama_pshard_plan & plan);
     void pshard_warmup_plan_reserves();
@@ -296,7 +298,7 @@ private:
             size_t                    old_tier,
             size_t                    new_tier,
             uint32_t                  n_tokens);
-    void pshard_maybe_switch(uint32_t n_tokens);
+    uint32_t pshard_maybe_switch(uint32_t n_tokens); // returns the landed plan's batch size (the ubatch cap), n_tokens when no tier is viable
     void pshard_update_write_cells(llama_memory_context_i * mctx);
     bool pshard_prepare_host_access();
     void pshard_restore_after_host_access();

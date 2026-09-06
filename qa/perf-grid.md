@@ -106,9 +106,27 @@ One CSV row per cell in `<out-dir>/ledger.csv`:
 `cell,kind,model,mva,prompt,ctx,spec,arm,predict,warm,noovl,rc,prompt_tps,decode_tps,decode_tokens,accept_pct,vram_peak_delta_mib,strategy_active,n_pinned,miss_policy,pool_slots,md5,h,misses_per_token,ppl,status`.
 `strategy_active/n_pinned/miss_policy/pool_slots` come from the registry's tier-0 line after
 the plan; `md5` from gate cells; `h/misses_per_token` from every pool row (perf and gate);
-`accept_pct` from spec cells. Status is OK, FAIL (rc != 0), PLAN_FAILED, FALLBACK (pshard
-disabled itself - a fingerprint mismatch or an unviable plan), or SHORT (decode window
-< 64 tokens).
+`accept_pct` from spec cells. `strategy_active/n_pinned/miss_policy/pool_slots` describe the
+tier that EXECUTES the cell: tier 0 (bs=1) for plain decode, tier 1 (the n_draft+1 verify
+batch) for speculative cells - the planner can substitute the attn-pin legacy plan for one
+tier and keep another (2026-09-05 audit: seven speculative "pool" rows had run legacy).
+Speculative `prompt_tps` is the tool's own prefill line ("encoded N tokens ... speed"), not
+llama's "prompt eval" figure, which books every verification batch as prompt work.
+
+Status (2026-09-05): OK; FAIL (rc != 0); PLAN_FAILED; FALLBACK (pshard disabled itself - a
+fingerprint mismatch or no viable plan); SHORT (decode window < 64 tokens);
+STRATEGY_FALLBACK (the executing tier's strategy is not the arm's: the planner substituted
+STATIC_ATTNPRIO_ALLMODELS for a forced s0..s4 or for a pool policy whose floor did not fit -
+the fetch floor is bs x top_k slots, 24 at the MTP verify batch, more than a 4000 budget
+holds); NOPOOL (a pool row whose pool never served: no counters); OVER_BUDGET
+(vram_peak_delta > mva + 1024 MiB: an arena overflow, the bug class fixed 2026-09-05; below that
+line sit the CUDA context + workspaces, ~250 MiB on every arm by the user's decision, and on pool
+arms at the 4k prompt another ~250 MiB of CUDA temporaries on the redirect backends during the
+A/B prefill - dsv4-full-4k pool_fetch peaks at +492 with the sched buffer exactly at the arena;
+this pool-side overhead is measured, not priced by the planner);
+OVER_RESERVE (a speculative context outgrew what the target left it by > 64 MiB);
+CLOCK (the SM clock left the lock window while the card was busy). Rows other than OK are
+not comparable numbers.
 
 2026-09-05: the tier-0 parser matched `n_pinned=` inside `n_attn_pinned=` and looked for a
 `pool_slots=` key the registry never writes (it is `s=`), so pshard rows had the attention-pin

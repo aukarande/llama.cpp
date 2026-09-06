@@ -325,6 +325,12 @@ struct llama_pshard_plan_registry {
     float switch_head_mb   = 0.0f;  // est. MB of the output head
     float switch_pcie_gb_s = 0.0f;  // upload rate for pinned weights
     bool  mtp_head_cpu     = false; // MTP head demoted to CPU by union-budget enforcement
+    // arena charge that goes with mtp_head_cpu: the MTP context was priced with the head pinned
+    // (common_pshard_draft_reserve_mb, before the fit); with the head on the CPU its device
+    // compute grows by the logits scratch, n_vocab x 128 (its ubatch) x 6 B (measured 5.9 B per
+    // entry on q35: +177.5 / +179.5 MiB, 2026-09-05). arena_bytes() keeps it outside the arena;
+    // persisted as mtp_head_extra_mb= (older parsers ignore the field).
+    uint32_t mtp_head_extra_mb = 0;
     uint32_t n_layers      = 0;     // trunk layer count (set in-memory by planner and runtime;
                                     // 0 = unknown -> structural attention pins are not priced)
     // canonical union of every viable tier (packed weights + pinned cache + compute scratch +
@@ -352,13 +358,16 @@ struct llama_pshard_plan_registry {
     size_t arena_bytes(size_t budget_bytes) const {
         const size_t mib      = 1024ULL * 1024;
         const size_t headroom = 64 * mib;
+        // the MTP head-on-CPU charge lives outside the arena (see mtp_head_extra_mb)
+        const size_t charge   = (size_t) mtp_head_extra_mb * mib;
+        const size_t budget   = budget_bytes > charge ? budget_bytes - charge : budget_bytes;
         if (union_bytes == 0 || has_pool()) {
-            return (budget_bytes / mib) * mib; // whole MiB, see below
+            return (budget / mib) * mib; // whole MiB, see below
         }
         // whole MiB: the buffer size positions the pinned cache region (buf_total - cache),
         // so a fractional size would misalign every cache tensor (CUDA misaligned address)
         const size_t want = ((union_bytes + headroom + mib - 1) / mib) * mib;
-        return want >= budget_bytes ? budget_bytes : want;
+        return want >= budget ? budget : want;
     }
 
     // layers whose ATTENTION is device-resident under a plan. n_attn_pinned is the
@@ -469,11 +478,30 @@ struct llama_pshard_plan_registry {
         return best_plans[tier].is_viable ? &best_plans[tier] : nullptr;
     }
 
-    // pick the prefill ubatch with the lowest predicted ttft
-    // use max_ubatch when TPS data is missing
+    // the tier that executes a batch of batch_size tokens: the smallest VIABLE tier at or
+    // above it (a larger tier's reserve covers a smaller ubatch); when none is viable above,
+    // the largest viable tier below (the caller clamps its ubatch to that tier's size).
+    // tier_sizes.size() = no viable tier at all.
+    size_t viable_tier_for(uint32_t batch_size) const {
+        for (size_t i = 0; i < tier_sizes.size(); i++) {
+            if (tier_sizes[i] >= batch_size && best_plans[i].is_viable) return i;
+        }
+        for (size_t i = tier_sizes.size(); i-- > 0;) {
+            if (best_plans[i].is_viable) return i;
+        }
+        return tier_sizes.size();
+    }
+
+    // pick the prefill ubatch with the lowest predicted ttft. Without TPS data the default
+    // is the LARGEST VIABLE tier <= max_ubatch, never max_ubatch itself: the top tier can be
+    // unviable by design (a pool tier whose scratch leaves no room for its region, 2026-09-05)
+    // and a ubatch routed to it would run on the decode plan and spill past its window.
     uint32_t find_optimal_ubatch(uint32_t n_prompt, uint32_t max_ubatch,
                                  const llama_pshard_plan * from_plan = nullptr) const {
         uint32_t best_ub  = max_ubatch;
+        for (size_t t = tier_sizes.size(); t-- > 0;) {
+            if (tier_sizes[t] <= max_ubatch && best_plans[t].is_viable) { best_ub = tier_sizes[t]; break; }
+        }
         double   best_time = 1e30;
 
         // switches are pairwise: prefill leaves whatever plan is CURRENTLY active
