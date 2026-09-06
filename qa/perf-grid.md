@@ -15,6 +15,13 @@ work targets, plus the correctness gates and perplexity mirrors those perf cells
   so every pool perf row still carries `h` and `misses_per_token` - the pricing model's
   calibration data.
 - Thread count is always the default (user rule: never set `-t`).
+- Perf cells sample with a fixed seed (`-s 1234`, `QA_SEED`; added 2026-09-05). The pool
+  decode speed follows the generated text: in the 2026-09-04 grid the DSv4 pool_fetch cell at
+  full/512 produced digits of pi and hit h=0.753 (22.3 t/s); the same cell producing prose
+  hits h=0.463 (14.0 t/s at 2100 MHz). Stock and legacy stream the same bytes whatever the
+  text, so only pool rows moved. A seed defines the workload, it is not an engine knob; the
+  arms still diverge where their numerics differ (DSv4 pool vs stock after ~22 tokens), so
+  pool rows carry `h` as the comparability check.
 - Every pshard cell plans fresh with exactly the environment the run will use
   (`PSHARD_STRATEGY`, `PSHARD_MISS_POLICY`, `GGML_SCHED_NO_CPU_OVERLAP`, the spec flags and
   the budget are all fingerprinted; a mismatch silently falls back to stock - the runner
@@ -42,7 +49,7 @@ work targets, plus the correctness gates and perplexity mirrors those perf cells
 (attention, routers, norms, output head) before its first slot, so it has no pool arm at
 8000. DSv4 + DSpark stock only fits at `-fitb 3000` (the stock fit ignores the 10.4 GB
 draft) and is recorded at that budget. Prompts: `512` = prompt-512.txt at ctx 2048, `4k` =
-prompt-4k.txt at ctx 8192.
+prompt-4k-v2.txt (repository docs, no repetition; 2026-09-05) at ctx 8192.
 
 ## The pool arm = 13 variants (plain decode), 5 (speculative)
 
@@ -102,6 +109,12 @@ the plan; `md5` from gate cells; `h/misses_per_token` from every pool row (perf 
 `accept_pct` from spec cells. Status is OK, FAIL (rc != 0), PLAN_FAILED, FALLBACK (pshard
 disabled itself - a fingerprint mismatch or an unviable plan), or SHORT (decode window
 < 64 tokens).
+
+2026-09-05: the tier-0 parser matched `n_pinned=` inside `n_attn_pinned=` and looked for a
+`pool_slots=` key the registry never writes (it is `s=`), so pshard rows had the attention-pin
+count in `miss_policy` and the policy in `pool_slots`. Fixed in the runner; the 20260904-locked
+ledger was repaired in place (backup `ledger.csv.bak-colfix`), with `pool_slots` recovered from the
+run logs where the carve line was present (32 rows) and left empty elsewhere.
 
 `QA_RESUME=1` skips cells already in the ledger; `QA_ONLY=<regex>` filters cell names
 (e.g. `QA_ONLY='q35-8000-512'`); `QA_GRID_MODELS="q35"` or `"dsv4"` filters models.

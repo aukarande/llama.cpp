@@ -38,6 +38,10 @@ FULL=${QA_FULL_MVA:-14500}
 GPC=${QA_GPC_MHZ:-2100}   # locked GPC clock, MHz (2026-09-05: lowered from 2505, suspected of tripping the PSU; 2505-clock ledgers are NOT comparable)
 N_GEN=128          # perf decode window (user rule: always 128)
 N_GATE=32          # correctness gate window (md5 + counters)
+SEED=${QA_SEED:-1234}  # perf cells sample with a FIXED seed (2026-09-05): the pool
+                   # decode speed follows the generated text (degenerate digit runs route to a
+                   # few experts: h 0.75 vs 0.46 for prose on the same cell), so arms must
+                   # generate the same text to be comparable. Gates are greedy (--temp 0).
 MIN_DECODE=64      # a perf row whose decode window ends shorter than this is marked SHORT
 GRID_MODELS=${QA_GRID_MODELS:-"q35 dsv4"}
 ONLY=${QA_ONLY:-}
@@ -232,7 +236,7 @@ spec_accept() { strip < "$1" | grep -a "accept  *=" | tail -1 | grep -aoE '[0-9.
 fallback()    { strip < "$1" | grep -aqE 'pshard not active|disabling pshard|pshard DISABLED|invalid PSHARD_'; }
 tier0() { # registry -> "strategy n_pinned miss_policy pool_slots" of the first tier-0 line
     L=$(grep -a -A1 '^\[tier 0 ' "$1" 2>/dev/null | grep -a '^strategy=' | head -1)
-    echo "$(echo "$L" | grep -aoE 'strategy=[A-Z_]+' | cut -d= -f2) $(echo "$L" | grep -aoE 'n_pinned=[0-9]+' | cut -d= -f2) $(echo "$L" | grep -aoE 'miss_policy=[a-z_0-9]+' | cut -d= -f2) $(echo "$L" | grep -aoE 'pool_slots=[0-9]+' | cut -d= -f2)"
+    echo "$(echo "$L" | grep -aoE 'strategy=[A-Z_]+' | cut -d= -f2) $(echo "$L" | grep -aoE '(^| )n_pinned=[0-9]+' | tr -d ' ' | cut -d= -f2) $(echo "$L" | grep -aoE 'miss_policy=[a-z_0-9]+' | cut -d= -f2) $(echo "$L" | grep -aoE '(^| )s=[0-9]+' | tr -d ' ' | cut -d= -f2)"
 }
 pool_counters() { # log -> "h misses_per_token" from the pool's headline line (WARN level: present in perf logs too)
     L=$(strip < "$1" | grep -a 'log_counters: expert pool: ' | head -1)
@@ -271,7 +275,7 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
         dspark) TOOL=./llama-speculative-simple.exe; SPECF="-md $DP --spec-type draft-dspark" ;;
     esac
     case $K in
-        perf) WORK="-f $PROMPT -n $N_GEN -c $CTX --ignore-eos"; [ "$S" = "none" ] && WORK="$WORK -no-cnv"
+        perf) WORK="-f $PROMPT -n $N_GEN -c $CTX --ignore-eos -s $SEED"; [ "$S" = "none" ] && WORK="$WORK -no-cnv"
               # llama-speculative-simple refuses a prompt longer than its logical batch (2048): stock
               # cells with the 4k prompt get -b = ctx (pshard sizes its own batch from the plan)
               [ "$S" != "none" ] && [ "$A" = "stock" ] && [ "$PR" = "4k" ] && WORK="$WORK -b $CTX" ;;
