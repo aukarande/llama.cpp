@@ -616,6 +616,19 @@ and corrupt concurrent measurements).
    pooled runs since, event log watched, no nvlddmkm event. Gate-hash trap: a gate run with
    stderr on NUL colours stdout (Windows isatty) - hash with ANSI codes stripped (the grid
    runner does).
+   REBOOTS + CLOCK CHANGE + DRAFT-LOAD FIX (2026-09-05): six unexpected shutdowns in 24 h
+   (Kernel-Power 41, BugcheckCode 0, no dumps, no WHEA) incl. one 72 s after boot with no
+   workload -> hardware/power-level resets, not OS crashes, not our code (they predate the
+   pool work). GPC lock lowered 2505 -> 2100 MHz as a PSU-transient mitigation: the 371-cell
+   ledger grid-results/20260904-locked (512-prompt rows complete, 41 4k rows missing) is at
+   2505 and is NOT comparable with anything measured from now on. Bug fixed (e3eefc566):
+   DSv4 + DSpark + ctx 8192 + pool died in the DRAFT model's load with "invalid vector
+   subscript" - the target had taken the whole card, the device reported 0 free bytes, the
+   loader's tensor-split normalisation divided by zero, NaN split points made upper_bound
+   return end() and devices.at() threw; even split when the sum is 0. Prompt trap: every
+   prompt-*.txt (incl. the 256k PPL text) is one 50-sentence yoga article repeated; the 4k
+   cells now use prompt-4k-v2.txt (repo docs, 3978/3910 tokens, no repetition) and are
+   re-run at 2100 MHz into a new ledger.
    Traps met: a grep-filtered background build hid a
    compile error (gates ran a stale dll - always gate on the dll timestamp); the
    planner's PSHARD_MISS_POLICY parser had to learn the new name.
