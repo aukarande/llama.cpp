@@ -1674,6 +1674,42 @@ remain the unchanged external baselines the ladder prices POOL against.
     bs=8192 -> exposed unless the ladder reaches 32-64k tokens; scratch viability there
     unpriced).
 
+19. **P0 - arena overflow = unviable tier (landed 2026-09-05).** Finding (the "DSv4 pool
+    slow after a 4k prompt" bug of the 2026-09-04 grid): the pshard arena (packed weights +
+    KV pins + scratch + pool region) IS the VRAM budget, but the graph allocator can grow an
+    external buffer past its range into overflow chunks - real cudaMalloc buffers
+    (`ggml-alloc.c`, the external-buffer realloc path) - when a constrained reserve does not
+    fit. A pool tier whose measured scratch left no window for its region
+    (`pshard_pool_resize` false) fell through to the constrained retry against the PREVIOUS
+    tier's region: DSv4 @14500, ctx 8192 -> bs=4096 spilled 2.2 GiB, bs=8192 4.7 GiB (sched
+    buffer 19178 MiB at exit against the 14489 MiB arena; the legacy plan's 14015 fits). The
+    chunks outlive the reserve (the saved alloc states point into them), so VRAM was
+    oversubscribed for the whole run; Windows WDDM backs the excess with system memory and,
+    once a long prompt touches the overflow (the 4k prompt runs on the bs=4096 tier), demotes
+    resident pages - decode after the 4k prompt 5.2 t/s (pool) vs 12.1 (legacy) with the
+    SAME h (0.58) and misses/token (109): the GPU itself ran slow, and the sched "inputs"
+    stage (132 ms/token) absorbed it because the pool serve's router sync waits on every
+    queued kernel. A 512 prompt runs on the bs=1024 tier, never touches the overflow: 22 t/s.
+    Fix (`pshard_reserve_and_save`): (a) a pool tier whose region does not fit beside its
+    measured scratch is unviable, no retry; (b) a pool tier whose pool disengaged at apply is
+    unviable; (c) any constrained retry that leaves the arena
+    (`ggml_backend_sched_get_n_chunks > 1`) is unviable and its overflow chunks are released
+    (`ggml_gallocr_free_overflow_chunks` / `ggml_backend_sched_free_overflow_chunks`, new).
+    `find_optimal_ubatch` then runs the prompt on the largest viable tier (bs=2048: two
+    ubatches for 3.9k tokens, `pshard_prefill_ubatch_eff=2048`). Verified 2026-09-05 at GPC
+    2100: tiers 4096/8192 "no viable plan", sched buffer 14489 MiB, decode 16.5 t/s after the
+    4k prompt (h=0.576, 109 misses/token; 5.2 before at 2505), prompt 449 t/s (194 spilled;
+    legacy 739 in one ubatch). 32-token gate on the 4k prompt: pool 083900c5fce2 vs stock
+    434885d69097 - the texts agree for 22 tokens then diverge at a formatting choice, the
+    same near-tie class as the known DSv4 pool-vs-stock hash difference at 512 (PPL parity;
+    qa/pending-verification.md). Diagnostic worth keeping: the `~llama_context` "compute buffer
+    size ... does not match expectation" WARN prints the sched total; in pshard mode anything
+    above the arena size is overflow. Open: the planner still emits the two tiers (its probe
+    streams experts, so it cannot price the pool graph's scratch) - a planner-side bound
+    (window - probe scratch >= A/B pair) would save the two warmup reserves and make the tier
+    summary honest at plan time; and the prefill cost of the fall-back (two A/B passes over
+    the stack instead of one) is the price of staying inside the budget at this ctx.
+
 ### 11.D QA
 
 19. **P0 - PPL-parity gate for CPU-route plans.** Decided (12.4; scoped by 12.30): gates
@@ -1741,6 +1777,7 @@ the consequence in the doc.
 | 28 | s2 identity is hard: ALL routed FFN on CPU, attention streamed; NO pool in any s2 plan (2026-09-02) | s2 keeps zero expert VRAM; all budget -> attention/KV/scratch; the '5b cache-mode translation of s2' retracted |
 | 29 | s3 = STATIC attn-prio split: SOME FFN statically on GPU (whole layers today), rest on CPU, zero inference-time transfers (2026-09-02) | static-population POOL variant recorded as open point 11.B.24, not an s3 change |
 | 30 | Taxonomy: the expert pool is ONE new strategy (POOL, proposed LLAMA_PSHARD_EXPERT_POOL); legacy s0-s4 unchanged, compete as baselines/fallbacks, retire on ledger evidence (2026-09-02) | per-strategy pool translations retracted (5b table, 3b.3 constraint-set framing); gates follow the plan; POOL owns miss_policy/prefill_mode/K/s/pool_mb; ladder = legacy candidates + POOL |
+| 31 | the arena is the budget: a reserve that leaves it (overflow chunks) or a pool tier without room for its region is an UNVIABLE tier, never a spill (2026-09-05) | DSv4 pool after a 4k prompt 5.2 -> 16.5 t/s; the 4k prompt prefills on bs=2048 (two A/B passes) at this ctx/budget; planner-side tier bound left open (11.C.19) |
 
 Corrected (assistant claims retracted in the same discussion; do not re-propose):
 - corrected: "split-op hybrid is v2/v3 with a separate gate" -> v1; PPL-parity gate.

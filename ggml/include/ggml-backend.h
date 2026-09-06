@@ -366,6 +366,8 @@ extern "C" {
     // per-chunk introspection (see ggml_gallocr_get_n_chunks / get_chunk_max_size)
     GGML_API int                  ggml_backend_sched_get_n_chunks(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t               ggml_backend_sched_get_chunk_max_size(ggml_backend_sched_t sched, ggml_backend_t backend, int chunk_id);
+    // release the overflow chunks a graph grew beyond the backend's external buffer range (see ggml_gallocr_free_overflow_chunks)
+    GGML_API size_t               ggml_backend_sched_free_overflow_chunks(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     // save/restore gallocr + backend_id state (for plan switch without re-reserve)
     GGML_API ggml_gallocr_t       ggml_backend_sched_get_galloc(ggml_backend_sched_t sched);

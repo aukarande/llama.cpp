@@ -563,6 +563,17 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
         ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, SIZE_MAX/2);
     }
 
+    // a pool tier whose region did not fit beside its pinned set (pshard_update_pool_mode
+    // disengaged the pool) cannot run: its experts are host-resident and the redirect
+    // splits read the pool views. Streaming them instead needs whole expert tensors in the
+    // scratch - not this tier's budget. Unviable, like the scratch overflow below.
+    if (external_buf && expert_pool && !expert_pool->active && plan.strategy == LLAMA_PSHARD_EXPERT_POOL) {
+        LLAMA_LOG_WARN("%s: tier bs=%u (expert pool): the pool region does not fit beside this tier's pinned set; tier unviable\n",
+            __func__, plan.batch_size);
+        plan.alloc_state.valid = false;
+        return;
+    }
+
     auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
 
     if (gf && external_buf) {
@@ -582,19 +593,31 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
         if (expert_pool && expert_pool->active && plan.strategy == LLAMA_PSHARD_EXPERT_POOL &&
                 pshard_pool_scratch.find(plan.batch_size) == pshard_pool_scratch.end()) {
             pshard_pool_scratch[plan.batch_size] = chunk0_used + (32ull << 20);
-            if (pshard_pool_resize(plan)) {
-                const size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
-                scratch_avail = buf_total - scratch_off - total_pinned_cache_size(memory.get()) - expert_pool_bytes;
-                ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, SIZE_MAX/2);
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
-                if (!gf) {
-                    LLAMA_LOG_ERROR("%s: graph_reserve failed after the pool re-carve (bs=%u); alloc state not saved\n",
-                        __func__, plan.batch_size);
-                    plan.alloc_state.valid = false;
-                    return;
-                }
-                chunk0_used = measure();
+            if (!pshard_pool_resize(plan)) {
+                // the measured scratch leaves no window for the region (or for the A/B pair a
+                // whole-stack tier streams through). Before 2026-09-05 this fell through to the
+                // constrained retry below against the PREVIOUS tier's region: the graph could
+                // not fit and the allocator packed it into overflow chunks OUTSIDE the arena
+                // (DSv4 @14500, ctx 8192: 2.2 GiB at bs=4096, 4.7 GiB at bs=8192). VRAM was
+                // oversubscribed, WDDM demoted the pool slots after a long prompt, and decode
+                // ran at 5 t/s instead of 22. A pool tier without its pool is unviable; the
+                // prompt falls to the largest viable tier.
+                LLAMA_LOG_WARN("%s: tier bs=%u (expert pool): graph scratch %.1f MiB leaves no room for the pool region; tier unviable\n",
+                    __func__, plan.batch_size, chunk0_used / (1024.0 * 1024.0));
+                plan.alloc_state.valid = false;
+                return;
             }
+            const size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
+            scratch_avail = buf_total - scratch_off - total_pinned_cache_size(memory.get()) - expert_pool_bytes;
+            ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, SIZE_MAX/2);
+            gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: graph_reserve failed after the pool re-carve (bs=%u); alloc state not saved\n",
+                    __func__, plan.batch_size);
+                plan.alloc_state.valid = false;
+                return;
+            }
+            chunk0_used = measure();
         }
 
         if (chunk0_used <= scratch_avail) {
@@ -608,6 +631,26 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
 
         ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, scratch_avail);
         gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+
+        // constrained packing that still does not fit the window spills into overflow
+        // chunks: real allocations outside the budgeted arena that outlive the reserve (the
+        // saved alloc state points into them). That is not a fit - the arena IS the budget.
+        // Release them and drop the tier.
+        if (gf) {
+            const int n_chunks = ggml_backend_sched_get_n_chunks(sched.get(), gpu);
+            if (n_chunks > 1) {
+                size_t overflow = 0;
+                for (int c = 1; c < n_chunks; c++) {
+                    overflow += ggml_backend_sched_get_chunk_max_size(sched.get(), gpu, c);
+                }
+                const size_t freed = ggml_backend_sched_free_overflow_chunks(sched.get(), gpu);
+                LLAMA_LOG_WARN("%s: tier bs=%u (%s, n_pinned=%u): constrained packing needs %.1f MiB beyond the %.1f MiB scratch window (%.1f MiB of overflow chunks released); tier unviable\n",
+                    __func__, plan.batch_size, llama_pshard_strategy_name(plan.strategy), plan.n_pinned,
+                    overflow / (1024.0 * 1024.0), scratch_avail / (1024.0 * 1024.0), freed / (1024.0 * 1024.0));
+                plan.alloc_state.valid = false;
+                return;
+            }
+        }
     }
 
     if (!gf) {

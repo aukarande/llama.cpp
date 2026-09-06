@@ -1240,6 +1240,37 @@ size_t ggml_gallocr_get_chunk_max_size(ggml_gallocr_t galloc, int buffer_id, int
     return galloc->buf_tallocs[buffer_id]->chunks[chunk_id]->max_size;
 }
 
+size_t ggml_gallocr_free_overflow_chunks(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    GGML_ASSERT(galloc->buf_external[buffer_id] && "free_overflow_chunks requires an external buffer");
+
+    size_t freed = 0;
+    struct vbuffer * vbuf = galloc->buffers[buffer_id];
+    if (vbuf != NULL) {
+        // the vbuffer is shared by every buffer id on the same tallocr: one pass frees it for all
+        for (int c = 1; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+            if (vbuf->chunks[c] == NULL) {
+                continue;
+            }
+            freed += ggml_backend_buffer_get_size(vbuf->chunks[c]);
+            ggml_backend_buffer_free(vbuf->chunks[c]);
+            vbuf->chunks[c] = NULL;
+        }
+    }
+    // drop the tallocr's overflow bookkeeping too, so get_n_chunks reports the arena alone;
+    // tensor allocs in the hash table that pointed into those chunks are dead until the next
+    // reserve or restore_state overwrites them
+    struct ggml_dyn_tallocr * talloc = galloc->buf_tallocs[buffer_id];
+    for (int c = 1; c < talloc->n_chunks; c++) {
+        free(talloc->chunks[c]);
+        talloc->chunks[c] = NULL;
+    }
+    if (talloc->n_chunks > 1) {
+        talloc->n_chunks = 1;
+    }
+    return freed;
+}
+
 void ggml_gallocr_set_buffer(ggml_gallocr_t galloc, int buffer_id,
         ggml_backend_buffer_t buffer, size_t alloc_offset, size_t alloc_size) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);

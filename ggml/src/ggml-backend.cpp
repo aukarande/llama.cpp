@@ -2869,6 +2869,13 @@ size_t ggml_backend_sched_get_chunk_max_size(ggml_backend_sched_t sched, ggml_ba
     return ggml_gallocr_get_chunk_max_size(sched->galloc, backend_index, chunk_id);
 }
 
+size_t ggml_backend_sched_free_overflow_chunks(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    return ggml_gallocr_free_overflow_chunks(sched->galloc, backend_index);
+}
+
 ggml_gallocr_t ggml_backend_sched_get_galloc(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->galloc;

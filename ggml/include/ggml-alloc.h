@@ -76,6 +76,10 @@ GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_i
 // per-chunk introspection (after reserve_n / reserve_n_size)
 GGML_API int    ggml_gallocr_get_n_chunks(ggml_gallocr_t galloc, int buffer_id);
 GGML_API size_t ggml_gallocr_get_chunk_max_size(ggml_gallocr_t galloc, int buffer_id, int chunk_id);
+// release the overflow chunks (index >= 1) an external buffer grew because a graph did not fit its
+// allocation range. Returns the bytes freed. Allocation state saved from that reserve is void; the
+// next reserve re-seeds the range.
+GGML_API size_t ggml_gallocr_free_overflow_chunks(ggml_gallocr_t galloc, int buffer_id);
 
 // set an externally-owned buffer for a buffer slot (must be called before reserve)
 GGML_API void ggml_gallocr_set_buffer(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t buffer, size_t alloc_offset, size_t alloc_size);
