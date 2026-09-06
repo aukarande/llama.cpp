@@ -41,7 +41,7 @@ work targets, plus the correctness gates and perplexity mirrors those perf cells
 | block | arms | budgets | prompts |
 |---|---|---|---|
 | q35 plain | stock, legacy, pool | 4000, 8000, full | 512, 4k |
-| dsv4 plain | legacy at 8000 and full; pool at full only | 8000, full | 512, 4k |
+| dsv4 plain | stock (perf cells added 2026-09-06), legacy at 8000 and full; pool at full only | 8000, full | 512, 4k |
 | q35mtp (`--spec-type draft-mtp --spec-draft-n-max 2`) | stock, legacy, pool | 4000, 8000, full | 512, 4k |
 | dsv4 + DSpark (`-md` draft, `--spec-type draft-dspark`) | stock, legacy, pool | 8000, full | 512, 4k |
 
@@ -125,8 +125,14 @@ arms at the 4k prompt another ~250 MiB of CUDA temporaries on the redirect backe
 A/B prefill - dsv4-full-4k pool_fetch peaks at +492 with the sched buffer exactly at the arena;
 this pool-side overhead is measured, not priced by the planner);
 OVER_RESERVE (a speculative context outgrew what the target left it by > 64 MiB);
-CLOCK (the SM clock left the lock window while the card was busy). Rows other than OK are
-not comparable numbers.
+CLOCK (the SM clock left the lock window while the card was busy); DEGENERATE (2026-09-06: the
+generation collapsed - one token repeated, a digit run, a 3-gram loop - so the pool's h measures
+the loop, not the workload); SCHED_GREW (2026-09-06: the target's scheduler buffer at exit is
+larger than after the warmup - the scheduler's own re-reserve spilled outside the arena; the
+run log carries the ggml_backend_sched_alloc_splits WARN with the bytes). Rows other than OK are
+not comparable numbers. `qa/perf-grid-tables.py <out-dir> --md results.md` renders the ledger
+(plain and speculative tables, gate hash groups, PPL, pool counters; speculative rows carry the
+per-target-step rate decode/(1 + accept x n_draft) because acceptance follows the sampled text).
 
 2026-09-05: the tier-0 parser matched `n_pinned=` inside `n_attn_pinned=` and looked for a
 `pool_slots=` key the registry never writes (it is `s=`), so pshard rows had the attention-pin

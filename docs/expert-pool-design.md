@@ -1732,6 +1732,34 @@ remain the unchanged external baselines the ladder prices POOL against.
     the 12000 exact match a coin flip), fetch_on_2nd_miss's third hash is a token-2 flip of the
     same class, and stock at -fitb 8000 differs from all-GPU stock on the 4k prompt because its
     fit leaves 12 attention layers (and 5 indexer top-k selections) on the CPU.
+    GRID 20260905-gpc2100 (371 cells, all at 2100 MHz with seed 1234, 2026-09-05 20:43 - 09-06
+    04:55; results in grid-results/20260905-gpc2100/results.md from qa/perf-grid-tables.py) found
+    two more defects, both fixed or instrumented on 2026-09-06: (vi) WARM START seeded into memory
+    the pool did not own: the A/B -> cache flip calls warm_start(), and in a MIXED registry that
+    flip also happens when a LEGACY tier takes over (pshard_update_pool_mode disengages the pool,
+    then clears A/B); at q35 @4000 with the 4k prompt the forced-pool registry's prefill tiers
+    from bs=1024 up are attn-pin substitutes, the prompt ran on the legacy bs=4096 tier, and
+    45 ms into it warm_start wrote 320 experts (583 MiB) over that tier's scratch - garbage from
+    token 1 (a run of "/", h=0.993, "92 t/s"), prompt "faster" (4241 vs 2925 t/s). Isolated:
+    PSHARD_POOL_WARM alone reproduces it, PSHARD_POOL_ALLOC alone is byte-identical to the base.
+    Fix: seed only while the pool is active (trigger + routine); verified WARM = base hash. Note
+    the warm variant never beat fetch+pred anywhere in the grid (q35 mean -3%, DSv4 +0/+1.5%) -
+    removal of both knobs is the recommendation (user's call). (vii) The scheduler's OWN
+    re-reserve spills: when a graph no longer fits its saved allocation,
+    ggml_backend_sched_alloc_splits re-reserves within the active range and an external arena
+    that does not fit grows overflow chunks silently. dsv4-8000-512-dspark auto and s3 both
+    grew the target's sched buffer 6201 -> 7289 MiB (+1088, exactly, twice); the first decode's
+    graph (10757 nodes, 1618 leafs, backend ids changed vs the saved state) needs 1088 MiB more
+    than the bs=512 legacy tier's window although that tier's own warmup reserve fit - the
+    runtime graph differs in SHAPE from the reserved one (a speculative-target prompt graph;
+    root cause open: candidates are the spec context's output/embedding requirements and DSv4's
+    n_kv-dependent indexer graph). Instrumented: the sched path now WARNs with the spilled
+    bytes and graph size, ~llama_context's exit check expects the post-warmup sizes so it fires
+    only on growth, and the runner marks such rows SCHED_GREW (plus DEGENERATE for a collapsed
+    generation). Also from the grid: the MTP draft reserve is short by ~178 MiB under
+    GPUONLY_ATTNPIN_FFNSTREAM too (q35mtp-4000-4k s1, OVER_RESERVE): the MTP layer's FFN is
+    streamed and the MTP context's compute grows, the same class as the head lever - the general
+    fix is to measure the MTP reserve after the plan under its placement (open).
 
 ### 11.D QA
 

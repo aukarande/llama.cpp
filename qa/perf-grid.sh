@@ -142,8 +142,8 @@ for PR in 512 4k; do
     plain_set q35  4000 $PR 1 1
     plain_set q35  8000 $PR 1 1
     plain_set q35  full $PR 1 1
-    plain_set dsv4 8000 $PR 0 0
-    plain_set dsv4 full $PR 0 1
+    plain_set dsv4 8000 $PR 1 0   # stock perf cells added 2026-09-06 (user: the DSv4 table needs a stock column)
+    plain_set dsv4 full $PR 1 1
     spec_set q35mtp 4000 mtp    $PR 1
     spec_set q35mtp 8000 mtp    $PR 1
     spec_set q35mtp full mtp    $PR 1
@@ -249,6 +249,30 @@ spec_accept() { strip < "$1" | grep -a "accept  *=" | tail -1 | grep -aoE '[0-9.
 spec_prefill() { strip < "$1" | grep -a "encoded .* tokens in" | tail -1 | grep -aoE 'speed: +[0-9.]+' | grep -aoE '[0-9.]+$'; }
 # the spec context's real device footprint vs what the target left it ("(+X MiB)" = over)
 reserve_over() { strip < "$1" | grep -a 'pshard one-budget check' | tail -1 | grep -aoE '\(\+[0-9.]+ MiB\)' | grep -aoE '[0-9]+' | head -1; }
+# a perf cell whose generation collapsed (one token repeated, digit runs, a 3-gram loop) routes to
+# the same few experts every step: h inflates and the pool row measures nothing (the 2026-09-04
+# DSv4 "+77%" and the 2026-09-05 q35 warm-start row were such text). Tail = the .gen minus the
+# echoed prompt; flagged when its whitespace tokens are too few or too repetitive.
+degenerate() { # gen prompt_file -> 0 (degenerate) / 1
+    PLEN=$(wc -c < "$2" | tr -d ' ')
+    strip < "$1" | tr -d '\r' | tail -c +"$((PLEN + 1))" | awk '
+        { for (i = 1; i <= NF; i++) { n++; t[n] = $i; c[$i]++ } }
+        END {
+            if (n == 0) { print 0; exit }                       # no whitespace tokens at all
+            if (n < 12) { print (length(t[1]) > 40 ? 0 : 1); exit }
+            for (i = 1; i <= n - 2; i++) g[t[i] " " t[i+1] " " t[i+2]]++
+            u = 0; for (k in g) u++
+            top = 0; for (k in c) if (c[k] > top) top = c[k]
+            print (u / (n - 2) < 0.35 || top / n > 0.30) ? 0 : 1
+        }'
+}
+# ~llama_context prints each backend's sched buffer against its post-warmup size; a larger CUDA0
+# size at exit means the scheduler grew the target's buffer during the run = an arena overflow
+sched_grew() { # log -> 0 (grew) / 1
+    strip < "$1" | grep -a 'CUDA0 compute buffer size of' | grep -a 'does not match' | tail -1 |
+        awk '{ for (i = 1; i <= NF; i++) { if ($i == "of" && $(i+2) == "MiB,") sz = $(i+1); if ($i == "expectation") ex = $(i+2) } }
+             END { print (sz + 0 > ex + 1) ? 0 : 1 }'
+}
 expected_strategy() { # arm -> the tier-0 strategy name the arm must produce ("" = any)
     case $1 in s0) echo GPUONLY_LAYERPIN_LAYERSTREAM ;; s1) echo GPUONLY_ATTNPIN_FFNSTREAM ;; s2) echo DYNAMIC_FFNCPU_ATTNSTREAM ;;
                s3) echo STATIC_ATTNPRIO_ALLMODELS ;; s4) echo DYNAMIC_FFN_ALTERNATE ;; pool:*) echo EXPERT_POOL ;; *) echo "" ;; esac
@@ -408,6 +432,8 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
         elif [ "$CLKOK" = 0 ]; then STATUS=CLOCK
         fi
     fi
+    if [ "$STATUS" = OK ] && [ "$K" = perf ] && [ "$(degenerate "$GENF" "$PROMPT")" = 0 ]; then STATUS=DEGENERATE; fi
+    if [ "$STATUS" = OK ] && [ "$A" != "stock" ] && [ "$(sched_grew "$LOG")" = 0 ]; then STATUS=SCHED_GREW; fi
     echo "$NM,$K,$M,$BUDGET,$PR,$CTX,$S,$A,$P,$W,$N,$RC,$PT,$DT,$NTOK,$ACC,$DELTA,$STRAT,$NPIN,$MPOL,$SLOTS,$MD5,$H,$MPT,$PPL,$STATUS" >> "$LEDGER"
     echo "    $STATUS rc=$RC prompt=$PT decode=$DT n=$NTOK acc=$ACC md5=$MD5 h=$H ppl=$PPL tier0=$STRAT/$NPIN/$MPOL/$SLOTS in $(( $(date +%s) - T0 )) s"
 done

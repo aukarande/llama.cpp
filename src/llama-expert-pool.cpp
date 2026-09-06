@@ -292,8 +292,12 @@ void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
                 L.prompt_pos = 0;
             }
         }
-    } else {
-        // back to decode: the prompt just processed sizes and seeds the cache
+    } else if (active) {
+        // back to decode: the prompt just processed sizes and seeds the cache. Only while the
+        // pool owns its region: in a mixed registry the flip also happens when a LEGACY tier
+        // takes over (pshard_update_pool_mode disengages the pool, then clears A/B), and the
+        // legacy tier owns that memory as scratch - seeding there wrote 583 MiB over the
+        // q35 @4000 4k-prompt prefill (garbage from token 1, 2026-09-06).
         warm_start();
     }
     if (sched != nullptr) {
@@ -334,7 +338,7 @@ void llama_expert_pool::ensure_admit_backend(ggml_backend_t split_backend) {
 }
 
 void llama_expert_pool::warm_start() {
-    if (!prompt_seen || region_base == nullptr || n_slots == 0 || backend_router == nullptr) {
+    if (!active || !prompt_seen || region_base == nullptr || n_slots == 0 || backend_router == nullptr) {
         return;
     }
     // experts of each layer ranked by prompt count (descending), counts > 0 only

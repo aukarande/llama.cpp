@@ -1912,6 +1912,21 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }
+        // an external (pshard arena) buffer that no longer fits its range grew overflow chunks: real
+        // allocations outside the budget that outlive this graph. Say so - the 2026-09-05 grid found
+        // 1088 MiB of them under a speculative verify graph with no line in any log.
+        for (int i = 0; i < sched->n_backends; i++) {
+            const int n_chunks = ggml_gallocr_get_n_chunks(sched->galloc, i);
+            if (n_chunks > 1) {
+                size_t over = 0;
+                for (int c = 1; c < n_chunks; c++) {
+                    over += ggml_gallocr_get_chunk_max_size(sched->galloc, i, c);
+                }
+                GGML_LOG_WARN("%s: graph re-reserve on %s spilled %.1f MiB into %d overflow chunk(s) outside the buffer range (graph nodes=%d leafs=%d, backend_ids_changed=%d)\n",
+                    __func__, ggml_backend_name(sched->backends[i]), over / (1024.0 * 1024.0), n_chunks - 1,
+                    sched->graph.n_nodes, sched->graph.n_leafs, (int) backend_ids_changed);
+            }
+        }
     }
 
     return true;
