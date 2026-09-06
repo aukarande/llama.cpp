@@ -2400,7 +2400,7 @@ int llama_bench(int argc, char ** argv) {
             const uint32_t n_ctx_plan = cparams.n_ctx;
             const uint32_t tier_max_auto = std::min(std::max(cparams.n_batch, (uint32_t) 16384), n_ctx_plan);
 
-            pending_pshard_registry = llama_pshard_registry_create(tier_max_auto, cparams.n_seq_max);
+            pending_pshard_registry = llama_pshard_registry_create(tier_max_auto, cparams.n_seq_max, /*n_draft=*/0);
             mparams.pshard_registry = pending_pshard_registry;
 
             llama_params_fit_pshard(inst.model.c_str(), &mparams, &cparams,
