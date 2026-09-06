@@ -48,7 +48,7 @@ work targets, plus the correctness gates and perplexity mirrors those perf cells
 "legacy" = the planner's auto pick, PLUS the five forced strategies s0..s4 as their own arms (added 2026-09-04 mid-run: +100 perf, +25 gates at 512). DSv4's pool pins ~9.2 GB
 (attention, routers, norms, output head) before its first slot, so it has no pool arm at
 8000. DSv4 + DSpark stock only fits at `-fitb 3000` (the stock fit ignores the 10.4 GB
-draft) and is recorded at that budget. Prompts: `512` = prompt-512.txt at ctx 2048, `4k` =
+draft) and is recorded at that budget. Prompts (all non-repetitive since 2026-09-05; every older prompt-*.txt, the 512 one included, was one yoga article repeated - the 512 prompt twice, the 4k one twelve times - and models copied it, which also flatters the pool because a copied continuation routes to the prompt experts): `512` = prompt-512-v2.txt (CONTRIBUTING.md opening, 1709 bytes, 366 q35 / 348 DSv4 tokens; the old one was 346 / 343) at ctx 2048, `4k` =
 prompt-4k-v2.txt (repository docs, no repetition; 2026-09-05) at ctx 8192.
 
 ## The pool arm = 13 variants (plain decode), 5 (speculative)
@@ -93,7 +93,7 @@ also where its perf cell is not in the table) and legacy at every (model, budget
 at the 512 prompt every pool policy (fetch, fetch + pred, fetch + pred + warm, hybrid,
 cpu_admit, cpu_exec, fetch_on_2nd_miss), at 4k pool fetch only. **52 gates.**
 
-Perplexity mirror (`llama-perplexity -c 2048 --chunks 8` on prompt-256k, prompt-independent,
+Perplexity mirror (`llama-perplexity -c 2048 --chunks 8` on ppl-docs-v2.txt = the repo docs concatenated (571 KB, 173k q35 tokens; prompt-256k.txt was the repeated article), prompt-independent,
 once per model and budget): stock, legacy, pool fetch. **14 ppl** (dsv4 stock ~11 min each).
 
 **Total 371 cells** (246 + the forced strategies). Estimate: perf ~5 h (q35 cells ~1.2 min, legacy-auto and poolauto plans

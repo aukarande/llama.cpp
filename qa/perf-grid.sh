@@ -33,7 +33,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN=${QA_BIN:-$ROOT/build/bin/Release}
 MODELS=${QA_MODELS_DIR:-/c/Aditya/Models}
 PROMPTS=${QA_PROMPTS_DIR:-/c/Aditya/Prompts}
-PPL_TEXT="$PROMPTS/prompt-256k.txt"
+PPL_TEXT="$PROMPTS/ppl-docs-v2.txt"   # 2026-09-05: repo docs corpus (571 KB, 173k q35 tokens, 5% repeated shingles); prompt-256k.txt was one article repeated
 FULL=${QA_FULL_MVA:-14500}
 GPC=${QA_GPC_MHZ:-2100}   # locked GPC clock, MHz (2026-09-05: lowered from 2505, suspected of tripping the PSU; 2505-clock ledgers are NOT comparable)
 N_GEN=128          # perf decode window (user rule: always 128)
@@ -63,7 +63,7 @@ dpath() { # model spec -> draft gguf ("" for none / mtp)
 # 4k = prompt-4k-v2.txt (2026-09-05): repository documentation, no internal repetition. The old
 # prompt-4k.txt repeats one 50-sentence article 12x: models copied it, the 4k gates produced
 # identical text across MODELS, and a warm start that seeded the copied passage looked like +50%.
-prompt_file() { case $1 in 512) echo "$PROMPTS/prompt-512.txt" ;; 4k) echo "$PROMPTS/prompt-4k-v2.txt" ;; esac; }
+prompt_file() { case $1 in 512) echo "$PROMPTS/prompt-512-v2.txt" ;; 4k) echo "$PROMPTS/prompt-4k-v2.txt" ;; esac; }
 prompt_ctx()  { case $1 in 512) echo 2048 ;; 4k) echo 8192 ;; esac; }
 mva_of()      { case $1 in full) echo "$FULL" ;; *) echo "$1" ;; esac; }
 
@@ -167,7 +167,7 @@ if [ "$LIST" = "1" ]; then
         case $M in q35mtp) BM=q35 ;; *) BM=$M ;; esac
         case " $GRID_MODELS " in *" $BM "*) ;; *) continue ;; esac
         cell_name "$K" "$M" "$B" "$PR" "$S" "$A" "$P" "$W" "$N"
-    done | { if [ -n "$ONLY" ]; then grep -E "$ONLY"; else cat; fi; } | awk '{n++; print} END {print "# " n " cells"}'
+    done | { if [ -n "$ONLY" ]; then grep -E -e "$ONLY"; else cat; fi; } | awk '{n++; print} END {print "# " n " cells"}'
     exit 0
 fi
 
@@ -262,7 +262,7 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
     case $M in q35mtp) BM=q35 ;; *) BM=$M ;; esac
     case " $GRID_MODELS " in *" $BM "*) ;; *) continue ;; esac
     NM=$(cell_name "$K" "$M" "$B" "$PR" "$S" "$A" "$P" "$W" "$N")
-    if [ -n "$ONLY" ] && ! echo "$NM" | grep -qE "$ONLY"; then continue; fi
+    if [ -n "$ONLY" ] && ! echo "$NM" | grep -qE -e "$ONLY"; then continue; fi
     if grep -q "^$NM," "$LEDGER"; then echo "=== $NM (in ledger, skipping)"; continue; fi
     T0=$(date +%s)
     MP=$(mpath $M); DP=$(dpath $M $S); REG="$MP.tensor_overrides.pshard_registry"
