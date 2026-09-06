@@ -119,7 +119,12 @@ plain_set() { # model mva prompt stock_ok pool_ok
     if [ "$PR" = "512" ]; then
         add ppl $M $B $PR none stock 0 0 0
         add ppl $M $B $PR none auto  0 0 0
-        [ "$POOL" = "1" ] && add ppl $M $B $PR none pool:fetch 0 0 0
+        if [ "$POOL" = "1" ]; then
+            add ppl $M $B $PR none pool:fetch 0 0 0
+            # CPU-route policies are certified by PPL parity, not the token hash (design 6a): their
+            # DSv4 gates were the only hashes stock never produced (2026-09-06 grid analysis)
+            for p in hybrid cpu_admit cpu_exec fetch_on_2nd_miss; do add ppl $M $B $PR none pool:$p 0 0 0; done
+        fi
     fi
 }
 spec_set() { # model mva spec prompt pool_ok  -> stock + auto (+ 5 pool variants)
