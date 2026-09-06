@@ -215,6 +215,100 @@ for r in R:
         w("| %s | %s | %s | %s | %s | %s%s |" % (r["cell"], r["miss_policy"], r["pool_slots"], r["h"], r["misses_per_token"], r["decode_tps"], "" if ok(r) else " (excluded)"))
 w()
 
+# ---- end-to-end seconds: prompt tokens / prompt_tps + decode tokens / decode_tps (load excluded).
+#      The decode tables overstate an arm whose prefill is slower; this is the workload's wall time.
+PROMPT_TOK = {("q35", "512"): 366, ("q35", "4k"): 3978, ("q35mtp", "512"): 366, ("q35mtp", "4k"): 3978,
+              ("dsv4", "512"): 348, ("dsv4", "4k"): 3910}
+def e2e(r):
+    try:
+        pt = float(r["prompt_tps"]); dt = float(r["decode_tps"]); nt = float(r["decode_tokens"] or 128)
+        return PROMPT_TOK[(r["model"], r["prompt"])] / pt + nt / dt
+    except Exception:
+        return None
+w("## End-to-end seconds per cell (prompt + decode tokens, from the two throughput columns; load excluded)")
+w()
+for model, spec in [("q35", "none"), ("dsv4", "none"), ("q35mtp", "mtp"), ("dsv4", "dspark")]:
+    buds = budgets_of(model)
+    cols = [(b, p) for p in ["512", "4k"] for b in buds]
+    w("### %s%s" % (model, "" if spec == "none" else " + " + spec))
+    w()
+    w("| arm | " + " | ".join("%s/%s" % (b if b != "14500" else "full", p) for b, p in cols) + " |")
+    w("|---|" + "---|" * len(cols))
+    idx = {(r["arm_full"], r["mva"], r["prompt"]): r for r in R if r["kind"] == "perf" and r["model"] == model and r["spec"] == spec}
+    for r in R:
+        if r["kind"] == "perf" and r["model"] == model and r["spec"] == spec and r["arm"] == "stock" and r["mva"] == "3000":
+            for b in buds:
+                idx.setdefault(("stock", b, r["prompt"]), r)
+    for a in ["stock", "auto", "s3", "pool:fetch", "pool:fetch+pred", "pool:hybrid", "pool:plan", "poolauto"]:
+        cells = []
+        for b, p in cols:
+            r = idx.get((a, b, p))
+            if r is None or not ok(r):
+                cells.append("-"); continue
+            t = e2e(r)
+            cells.append("%.2f s%s" % (t, " (@3000, peak %s MiB)" % r["vram_peak_delta_mib"] if r["mva"] == "3000" else "") if t else "-")
+        if any(c != "-" for c in cells):
+            w("| %s | " % a + " | ".join(cells) + " |")
+    w()
+
+# ---- planner predicted vs measured: the gate logs (-lv 4) print the warmup tier summary with the
+#      planner's own tps per tier; tier 0 (bs=1) is the decode plan of plain cells. Predicted is
+#      matched to the perf row of the same (model, budget, prompt, arm).
+def predicted_tps(cell_gate_log, tier=0):
+    p = os.path.join(out_dir, cell_gate_log)
+    if not os.path.exists(p):
+        return None
+    for line in io.open(p, encoding="utf-8", errors="replace"):
+        line = re.sub(chr(27) + r"\[[0-9;]*m", "", line)
+        m = re.search(r"tier %d bs=\S+\s+(\S+) n_pinned=\d+.*?tps=([0-9.]+)" % tier, line)
+        if m:
+            return m.group(1), float(m.group(2))
+    return None
+w("## Planner predicted vs measured decode t/s (tier 0 of the gate log's warmup summary vs the perf row)")
+w()
+w("| cell | strategy | predicted | measured | measured/predicted |")
+w("|---|---|---|---|---|")
+for r in R:
+    if r["kind"] != "perf" or r["spec"] != "none" or r["arm"] == "stock" or not ok(r):
+        continue
+    gate = r["cell"] + "-gate.log"
+    pr = predicted_tps(gate, 0)
+    if not pr:
+        continue
+    strat, pt = pr
+    try:
+        meas = float(r["decode_tps"])
+    except Exception:
+        continue
+    w("| %s | %s | %.1f | %.2f | %.2fx |" % (r["cell"], strat, pt, meas, meas / pt if pt else 0))
+w()
+w("Prefill tier predicted vs measured prompt t/s (the tier at bs >= the prompt's ubatch; predicted from the same gate log):")
+w()
+w("| cell | tier | strategy | predicted | measured | measured/predicted |")
+w("|---|---|---|---|---|---|")
+for r in R:
+    if r["kind"] != "perf" or r["spec"] != "none" or r["arm"] == "stock" or not ok(r):
+        continue
+    gate = r["cell"] + "-gate.log"
+    p = os.path.join(out_dir, gate)
+    if not os.path.exists(p):
+        continue
+    want = 512 if r["prompt"] == "512" else 4096
+    best = None
+    for line in io.open(p, encoding="utf-8", errors="replace"):
+        line = re.sub(chr(27) + r"\[[0-9;]*m", "", line)
+        m = re.search(r"tier \d+ bs=(\d+)\s+(\S+) n_pinned=\d+.*?tps=([0-9.]+)", line)
+        if m and int(m.group(1)) == want:
+            best = (m.group(1), m.group(2), float(m.group(3)))
+    if not best:
+        continue
+    try:
+        meas = float(r["prompt_tps"])
+    except Exception:
+        continue
+    w("| %s | bs=%s | %s | %.1f | %.1f | %.2fx |" % (r["cell"], best[0], best[1], best[2], meas, meas / best[2] if best[2] else 0))
+w()
+
 text = "\n".join(L) + "\n"
 if md_path:
     io.open(md_path, "w", encoding="utf-8", newline="\n").write(text)

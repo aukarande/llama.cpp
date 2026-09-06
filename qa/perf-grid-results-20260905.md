@@ -12,9 +12,13 @@ executing tier: DSv4 s1 at 8000, and pool fetch on every speculative verify tier
 floor bs x top_k exceeds the slots), 2 OVER_BUDGET rows (DSv4 + DSpark at 8000: the scheduler's
 own re-reserve spilled 1088 MiB outside the arena), 1 OVER_RESERVE row (q35 MTP s1 at 4000/4k),
 and 1 degenerate row (q35 4000/4k pool fetch+pred+warm: warm start wrote over a legacy tier's
-scratch; fixed 2026-09-06). Every other row is a single run; the same-configuration repeat
-spread (planner's-pick row vs the forced row it picked, identical text and counters) is
-0.5-2.7% on plain cells and up to 6% on speculative cells - deltas inside that are noise.
+scratch; reproduced and fixed 2026-09-06, grid-results/repro-20260906/warm.log and fix.log).
+Every other row is a single run. Noise band: the one same-plan same-text repeat pair (q35 full/512
+legacy auto 82.29 vs forced s3 85.70, identical .gen) differs by 4.1%, and same-plan speculative
+pairs by 7-11% per target step, so plain deltas under ~4% and speculative deltas under ~10% are
+not findings. Most cross-arm comparisons are cross-text: the arms' numerics differ, the sampled
+continuation differs, and pool speed follows the routed text (q35 8000/512: nine arms, nine
+texts). Only fetch = fetch+pred, hybrid = plan, base = noovl pairs share a text.
 
 ## 1. Stock vs legacy vs pool
 
@@ -44,30 +48,48 @@ differ, so the sampled text and its acceptance differ even with the seed):
 | q35 MTP 4000 / 4k | 22.9 | 20.2 | 27.3 hybrid | 1.35x |
 | q35 MTP 8000 / 4k | 26.8 | 26.7 | 44.5 fetch+pred | 1.67x |
 | q35 MTP full / 4k | 36.4 | 38.4 | 49.4 fetch+pred | 1.29x |
-| DSv4 DSpark full / 512 | 1.8 (@3000) | 3.6 | 6.1 hybrid | 1.69x |
-| DSv4 DSpark full / 4k | 1.9 (@3000) | 3.3 | 5.8 hybrid | 1.74x |
+| DSv4 DSpark full / 512 | 1.8 (fit label 3000, actual peak 12.7 GB) | 3.6 | 6.1 hybrid | 1.69x |
+| DSv4 DSpark full / 4k | 1.9 (fit label 3000, actual peak 12.7 GB) | 3.3 | 5.8 hybrid | 1.74x |
 
-- The pool wins where the budget is tight (q35 4000/8000, +16-39%), ties at full budget where
-  legacy pins nearly everything, and wins every speculative set (+29-74% per target step,
+- The pool wins decode where the budget is tight (q35 4000/8000, +16-39%), ties at full budget
+  where legacy pins nearly everything, and wins every speculative set (+29-74% per target step,
   fetch where admissible, hybrid where the verify batch's fetch floor does not fit).
 - DSv4 at full budget: pool +49% over legacy auto and +61% over stock at 512; the "+77%" of the
-  2026-09-04 ledger was degenerate text.
+  2026-09-04 ledger was degenerate text. Legacy auto LOSES decode to stock at DSv4 full/4k
+  (11.9 vs 12.7) while winning prefill 7.6x.
 - Prefill: pool tiers stream the whole expert stack through the A/B pair, so on the 512 prompt
   the pool's prompt speed is flat with budget (q35 702-720 t/s) while legacy scales with what it
-  pins (684-1097). On the 4k prompt the pool matches legacy where its bs=4096 tier is viable
-  (q35 8000/full ~4150 vs ~4270) and runs two 2048 passes where it is not (q35 4000: 2924 vs
-  4173; DSv4 full: 449 vs 695).
-- Legacy strategies: s3 (STATIC_ATTNPRIO) ties auto on decode and beats it on 512-prompt prefill
-  by 9-13% (q35) and 17% (DSv4 full); s0/s1/s2/s4 never beat auto on decode.
+  pins (684-1097). On the 4k prompt the pool matches legacy where its own bs=4096 tier is viable
+  (q35 8000/full ~4150 vs ~4270); at q35 4000 the forced-pool registry's prefill tiers from
+  bs=1024 up are legacy attn-pin substitutes and the prompt ran on one (2924 = s3's 2942); at
+  DSv4 full the bs>=4096 pool tiers are unviable and the prompt runs in two 2048 passes (449 vs
+  legacy 695).
+- Legacy strategies: s3 (STATIC_ATTNPRIO) is the same tier-0 plan as auto in every plain set
+  (decode within the noise band) and beats it on 512-prompt prefill by 9-13% (q35) and 17%
+  (DSv4 full); s0/s1/s2/s4 never beat auto on plain decode (one speculative tie: DSv4 DSpark
+  8000/4k, where auto itself landed s2).
+- End-to-end (prompt + 128 tokens; table in the appendix): the pool's decode gain survives where
+  its prefill keeps up - q35 4000/512 2.63 s vs auto 3.23 s, q35 8000/512 2.18 vs 2.71, q35
+  8000/4k 2.63 vs 3.26, DSv4 full/512 11.0 vs 14.5 (stock 17.2), DSv4 DSpark full/512 14.4 vs
+  22.6 - and is cancelled by slower prefill at q35 full/512 (2.03 vs 1.88; s3 1.79), q35 full/4k
+  (tie), DSv4 full/4k (poolauto ties auto at 16.3), and reversed on DSv4 DSpark full/4k (42.3 vs
+  27.0 s: the pool's 122 t/s 4k prefill).
 
 ## 2. Miss policy and the planner's pick
 
 Measured winner at bs=1: fetch in every q35 set (55-84 vs hybrid 52-69), fetch and hybrid tie on
-DSv4 (17.7 vs 17.8; 15.5 vs 16.3). cpu_admit third everywhere, cpu_exec last and flat (40-42 q35,
-11 DSv4), fetch_on_2nd_miss never best. The planner picks hybrid over fetch at q35 4000/8000 and at
-every MTP verify tier where fetch is admissible: -7/-14/-3/-17% plain, -12 to -19% per step.
+DSv4 (17.7 vs 17.8; 15.5 vs 16.3, inside the band). cpu_admit third of the planner's four
+candidates everywhere, cpu_exec last and flat (40-42 q35, 11 DSv4), fetch_on_2nd_miss never best.
+The planner picks hybrid over fetch at q35 4000/8000 and at every MTP verify tier where fetch is
+admissible: -7/-14/-3/-17% plain, -12 to -19% per step.
 
-Cause (re-derived from src/llama-pshard-plan.cpp and the profile, reproducing all 16 picks): the
+The planner's own prices are in every gate log's warmup tier summary (appendix table "predicted
+vs measured"): at q35 8000/512 it predicts fetch 62.2 and hybrid 63.0 t/s against measured 76.6
+and 65.9 - fetch under-priced 11-31% on q35 and 44-45% on DSv4 (12.2 predicted vs 17.7), hybrid
+within 2-5% on q35. That is the pick defect measured directly; the pool-vs-legacy margin on DSv4 is
+priced +10% (12.2 vs 11.1) and measures +45%.
+
+Term-level cause (source-derived, reproducing all 16 picks; inferred): the
 hybrid term prices the CPU chain as overlapped with the uploads, max(q t_fetch, (m-q) t_cpu) +
 t_split; the measured bs=1 rows fit the serial sum q t_fetch + (m-q) t_cpu + t_split (q35 s=26:
 0.212 ms/layer measured, 0.203 sum, 0.155 max). Pricing the sum with the code's own constants
@@ -76,9 +98,12 @@ slots; its per-layer figures were recomputed by the verifiers with the same conc
 with t_cpu: the FLOP floor (cpu_matmul_floor_gflops 93.8, an f16 B=64 profile entry) prices the
 bs=1 expert matvec 1.7x (q35) / 2.2x (DSv4) too slow against the DRAM-rate term that matches the
 measurements (q35 0.042 vs 0.0395 ms/expert measured); with the FLOP floor the sum form would flip
-DSv4 to fetch against its measured tie. t_serve (0.10 ms/layer, ~0.03 measured) is common to all
-policies and cannot move a policy pick; it belongs to the pool-vs-legacy ladder pricing. These are
-the model's constants and are proposed, not applied.
+DSv4 to fetch against its measured tie. Cross-budget regression of the fetch rows gives t_fetch
+0.055 ms/miss (priced 0.0655, ~18% high) with a 9.6-9.9 ms/token common part. The sum is an
+empirical fit to overlap-ON rows: execution overlap stays on (section 3); only the PRICE of the
+overlapped chain is the serial sum. t_serve (0.10 ms/layer, ~0.03 measured) is common to all
+policies and cannot move a policy pick; no cell isolates it, so the "t_serve" framing of the
+2026-09-04 note is retired. These are the model's constants and are proposed, not applied.
 
 ## 3. Predictor, warm start, overlap, fetch_on_2nd_miss
 
@@ -108,9 +133,14 @@ for DSpark until the planner bounds pool tiers by scratch at plan time (design 1
 verify-tier pricing at s=17-18 is recalibrated.
 
 Legacy auto's prefill tier: on 512 prompts auto loses 8-13% (q35) / 17% (DSv4 full) to forced
-s3 because its s0/s1 streaming prefill tier does not earn its ~80 ms switch on a 366-token
-prompt; on 4k prompts the same choice wins +38-42% (q35) / +53% (DSv4 full). The prefill-tier
-choice should depend on the prompt length.
+s3, on 4k prompts the same choice wins +38-42% (q35) / +53% (DSv4 full). The gate logs show why
+(appendix "prefill tier predicted vs measured"): at bs=512 the planner prices the streaming tier
+ABOVE attn-pin (q35 4000: 1173 vs 899; DSv4 full: 101 vs 64) while measurement ranks them the
+other way (684 vs 779; 87 vs 105), and the pool's bs=512 tier is over-predicted at every budget
+(1079 vs 697-715); at 4k the executed bs=4096 tiers are under-predicted 2.4x on q35 (1765 vs 4173)
+and 8-12x on DSv4 (57 vs 695) with the ranking right. The prefill model has the wrong slope in
+batch size on q35 and the wrong level on DSv4; the tier-switch time itself is not in the
+artifacts.
 
 ## 5. Correctness
 
@@ -129,15 +159,18 @@ flips with no perplexity signal.
 
 ## 6. Pricing constants (PSHARD_POOL_ZIPF / CPU_GBS / CPU_GFLOPS)
 
-h(s) = zipf_mass(s)/zipf_mass(E), alpha 0.95: reproduces the measured fetch h within 0.03 for
-s <= 81 on the 512 prompt and on DSv4 (s=26 0.601 vs 0.594; s=81 0.814 vs 0.789; DSv4 s=23 0.609
-vs 0.573), under-predicts the thrash regime of the 4k prompt at s=25 (0.518 measured vs 0.587),
-and over-predicts at s~170 (0.867 vs 0.923, the 128-token window still filling; a ceiling near
-0.875 fits). Least-squares alpha: 0.97 (512), 0.935 (4k), 0.98 (DSv4). Freeze alpha = 0.95 and delete the env. No cell set CPU_GBS/CPU_GFLOPS: delete
-the overrides, but the constants beneath them are what mis-prices hybrid (section 2): cpu_exec is
-predicted 28.8 vs 41-42 measured on q35 (0.69x), 5.2 vs 11.1 on DSv4 (0.47x). The per-miss cost
-cannot be read off this grid: every highest-h row is a predictor row whose prefetch uploads are
-not counted as misses.
+h(s) = zipf_mass(s)/zipf_mass(E), alpha 0.95: reproduces the measured fetch h within 0.04 for
+s <= 81 (s=26 0.601 vs 0.594; s=81 0.814 vs 0.789; DSv4 s=23 0.609 vs 0.573) except the 4k
+prompt at s=25 (0.518 measured vs 0.587, the thrash regime), and over-predicts at s~170 (0.867
+vs 0.923). Whether that plateau is a hit-rate ceiling (~0.875) or the 128-token window still
+filling (the 32-token gate reads 0.724 at the same s) the grid cannot say - no longer decode
+exists. Least-squares alpha: 0.97 (512), 0.935 (4k), 0.98 (DSv4): freeze 0.95, delete the env.
+Per-miss cost by cross-budget regression of the fetch rows: 0.055 ms/miss (q35, both prompts,
+intercept 9.6-9.9 ms/token); t_cpu from cpu_exec minus that intercept: 0.040 ms/expert on q35
+(DRAM-bound), 0.21-0.26 on DSv4 (one budget). No cell set CPU_GBS/CPU_GFLOPS; keep the overrides
+until the t_cpu term is fixed in code (section 2), then delete them - the constants beneath them
+are what mis-prices hybrid: cpu_exec is predicted 28.8 vs 41-42 measured on q35 (0.69x), 5.2 vs
+11.1 on DSv4 (0.47x).
 
 ## 7. Defects the grid found and their state
 
@@ -159,14 +192,14 @@ not counted as misses.
 | knob | grid verdict | action |
 |---|---|---|
 | GGML_SCHED_NO_CPU_OVERLAP | overlap wins all 16 pairs | delete; overlap always on |
-| fetch_on_2nd_miss | dominated in 8/8 sets | delete the policy |
+| fetch_on_2nd_miss | dominated in 8/8 sets at s=22-170; its s<15 churn niche untested | delete the policy (a scope decision) |
 | PSHARD_POOL_WARM / ALLOC | never wins; one corruption (fixed) | delete both |
 | PSHARD_POOL_PREDICT | -2% q35, +1..+2.6% DSv4 (noise) | keep off; keep as opt-in |
-| PSHARD_POOL_ZIPF | 0.95 fits s <= 81 on both models | freeze 0.95, delete env |
-| PSHARD_POOL_CPU_GBS / CPU_GFLOPS | unused; constants beneath mis-price hybrid | delete env; fix the t_cpu term (section 2) |
+| PSHARD_POOL_ZIPF | 0.95 fits s <= 81 (except the 4k thrash row); s~170 plateau open | freeze 0.95, delete env |
+| PSHARD_POOL_CPU_GBS / CPU_GFLOPS | unused; constants beneath mis-price hybrid | fix the t_cpu term in code first (section 2), then delete the envs |
 | GGML_CUDA_STAGE_ASYNC / RING_MB / THREADS | ran stably on all 109 DSv4 cells; on/off was not an arm | hard-code the defaults; keep the ring until the pinned hot-expert tier |
 
-## Appendix: full tables (qa/perf-grid-tables.py over the ledger, 2026-09-06 05:40)
+## Appendix: full tables (qa/perf-grid-tables.py over the ledger, 2026-09-06)
 
 ### rendered from 20260905-gpc2100
 
@@ -472,4 +505,197 @@ Prompt t/s for the same cells:
 | q35mtp-full-4k-mtp-poolauto | hybrid | 156 | 0.759 | 167.4 | 86.523 |
 | dsv4-full-4k-dspark-pool_hybrid | hybrid | 17 | 0.440 | 374.3 | 12.303 |
 | dsv4-full-4k-dspark-pool_plan | hybrid | 17 | 0.440 | 374.3 | 12.268 |
+
+## End-to-end seconds per cell (prompt + decode tokens, from the two throughput columns; load excluded)
+
+### q35
+
+| arm | 4000/512 | 8000/512 | full/512 | 4000/4k | 8000/4k | full/4k |
+|---|---|---|---|---|---|---|
+| stock | 4.65 s | 3.81 s | 2.42 s | 12.40 s | 9.89 s | 5.93 s |
+| auto | 3.23 s | 2.71 s | 1.88 s | 3.73 s | 3.26 s | 2.48 s |
+| s3 | 3.14 s | 2.67 s | 1.79 s | 4.11 s | 3.73 s | 2.85 s |
+| pool:fetch | 2.63 s | 2.18 s | 2.03 s | 3.69 s | 2.63 s | 2.48 s |
+| pool:fetch+pred | 2.60 s | 2.18 s | 2.08 s | 3.72 s | 2.71 s | 2.55 s |
+| pool:hybrid | 2.82 s | 2.45 s | 2.37 s | 3.79 s | 2.93 s | 2.83 s |
+| pool:plan | 2.81 s | 2.43 s | 2.04 s | 3.77 s | 2.98 s | 2.51 s |
+| poolauto | 2.86 s | 2.48 s | 2.11 s | 3.47 s | 3.01 s | 2.78 s |
+
+### dsv4
+
+| arm | 8000/512 | full/512 | 8000/4k | full/4k |
+|---|---|---|---|---|
+| stock | 24.41 s | 17.19 s | 63.74 s | 52.68 s |
+| auto | 14.84 s | 14.45 s | 21.05 s | 16.30 s |
+| s3 | 14.50 s | 13.82 s | 20.43 s | 19.24 s |
+| pool:fetch | - | 11.21 s | - | 16.91 s |
+| pool:fetch+pred | - | 11.14 s | - | 16.79 s |
+| pool:hybrid | - | 11.15 s | - | 16.50 s |
+| pool:plan | - | 11.01 s | - | 16.61 s |
+| poolauto | - | 11.17 s | - | 16.30 s |
+
+### q35mtp + mtp
+
+| arm | 4000/512 | 8000/512 | full/512 | 4000/4k | 8000/4k | full/4k |
+|---|---|---|---|---|---|---|
+| stock | 4.95 s | 4.08 s | 2.77 s | 12.68 s | 9.92 s | 6.28 s |
+| auto | 3.91 s | 2.74 s | 2.04 s | 4.64 s | 3.45 s | 2.94 s |
+| s3 | 3.73 s | 2.98 s | 1.99 s | 4.44 s | 3.91 s | 2.93 s |
+| pool:fetch | - | 2.14 s | 1.90 s | - | 2.59 s | 2.34 s |
+| pool:fetch+pred | - | 2.12 s | 1.89 s | - | 2.57 s | 2.33 s |
+| pool:hybrid | 2.84 s | 1.94 s | 2.02 s | 3.92 s | 2.86 s | 2.68 s |
+| pool:plan | 2.86 s | 1.96 s | 1.97 s | 3.98 s | 2.98 s | 2.67 s |
+| poolauto | 2.96 s | 2.50 s | 2.12 s | 3.66 s | 2.84 s | 2.76 s |
+
+### dsv4 + dspark
+
+| arm | 8000/512 | full/512 | 8000/4k | full/4k |
+|---|---|---|---|---|
+| stock | 56.31 s (@3000, peak 12765 MiB) | 56.31 s (@3000, peak 12765 MiB) | 111.37 s (@3000, peak 12723 MiB) | 111.37 s (@3000, peak 12723 MiB) |
+| auto | - | 22.56 s | 51.36 s | 27.04 s |
+| s3 | - | 21.95 s | 42.12 s | 28.25 s |
+| pool:hybrid | - | 14.37 s | - | 42.29 s |
+| pool:plan | - | 14.44 s | - | 42.37 s |
+| poolauto | - | 19.50 s | - | 51.03 s |
+
+## Planner predicted vs measured decode t/s (tier 0 of the gate log's warmup summary vs the perf row)
+
+| cell | strategy | predicted | measured | measured/predicted |
+|---|---|---|---|---|
+| q35-4000-512-none-auto | STATIC_ATTNPRIO_ALLMODELS | 44.7 | 47.16 | 1.06x |
+| q35-4000-512-none-s0 | GPUONLY_LAYERPIN_LAYERSTREAM | 2.4 | 2.39 | 1.00x |
+| q35-4000-512-none-s1 | GPUONLY_ATTNPIN_FFNSTREAM | 26.0 | 29.78 | 1.15x |
+| q35-4000-512-none-s2 | DYNAMIC_FFNCPU_ATTNSTREAM | 17.9 | 16.58 | 0.93x |
+| q35-4000-512-none-s3 | STATIC_ATTNPRIO_ALLMODELS | 44.7 | 47.54 | 1.06x |
+| q35-4000-512-none-s4 | DYNAMIC_FFN_ALTERNATE | 36.8 | 42.09 | 1.14x |
+| q35-4000-512-none-pool_fetch | EXPERT_POOL | 49.6 | 59.92 | 1.21x |
+| q35-4000-512-none-pool_fetch-pred | EXPERT_POOL | 49.6 | 61.05 | 1.23x |
+| q35-4000-512-none-pool_fetch-pred-warm | EXPERT_POOL | 49.6 | 60.39 | 1.22x |
+| q35-4000-512-none-pool_hybrid | EXPERT_POOL | 54.1 | 55.17 | 1.02x |
+| q35-4000-512-none-pool_cpu_admit | EXPERT_POOL | 45.5 | 48.72 | 1.07x |
+| q35-4000-512-none-pool_cpu_exec | EXPERT_POOL | 28.8 | 40.97 | 1.42x |
+| q35-4000-512-none-pool_fetch_on_2nd_miss | EXPERT_POOL | 45.7 | 54.35 | 1.19x |
+| q35-8000-512-none-auto | STATIC_ATTNPRIO_ALLMODELS | 52.3 | 56.70 | 1.08x |
+| q35-8000-512-none-s0 | GPUONLY_LAYERPIN_LAYERSTREAM | 3.0 | 3.04 | 1.01x |
+| q35-8000-512-none-s1 | GPUONLY_ATTNPIN_FFNSTREAM | 30.6 | 34.97 | 1.14x |
+| q35-8000-512-none-s2 | DYNAMIC_FFNCPU_ATTNSTREAM | 21.9 | 20.50 | 0.94x |
+| q35-8000-512-none-s3 | STATIC_ATTNPRIO_ALLMODELS | 52.3 | 56.03 | 1.07x |
+| q35-8000-512-none-s4 | DYNAMIC_FFN_ALTERNATE | 43.5 | 51.08 | 1.17x |
+| q35-8000-512-none-pool_fetch | EXPERT_POOL | 62.2 | 76.59 | 1.23x |
+| q35-8000-512-none-pool_fetch-pred | EXPERT_POOL | 62.2 | 76.21 | 1.23x |
+| q35-8000-512-none-pool_fetch-pred-warm | EXPERT_POOL | 62.2 | 74.32 | 1.19x |
+| q35-8000-512-none-pool_hybrid | EXPERT_POOL | 63.0 | 65.85 | 1.05x |
+| q35-8000-512-none-pool_cpu_admit | EXPERT_POOL | 56.2 | 63.84 | 1.14x |
+| q35-8000-512-none-pool_cpu_exec | EXPERT_POOL | 28.8 | 42.48 | 1.47x |
+| q35-8000-512-none-pool_fetch_on_2nd_miss | EXPERT_POOL | 56.4 | 66.68 | 1.18x |
+| q35-full-512-none-auto | STATIC_ATTNPRIO_ALLMODELS | 74.5 | 82.29 | 1.10x |
+| q35-full-512-none-s0 | GPUONLY_LAYERPIN_LAYERSTREAM | 5.4 | 5.19 | 0.96x |
+| q35-full-512-none-s1 | GPUONLY_ATTNPIN_FFNSTREAM | 42.1 | 47.41 | 1.13x |
+| q35-full-512-none-s2 | DYNAMIC_FFNCPU_ATTNSTREAM | 34.3 | 32.34 | 0.94x |
+| q35-full-512-none-s3 | STATIC_ATTNPRIO_ALLMODELS | 74.5 | 85.70 | 1.15x |
+| q35-full-512-none-s4 | DYNAMIC_FFN_ALTERNATE | 63.7 | 75.88 | 1.19x |
+| q35-full-512-none-pool_fetch | EXPERT_POOL | 75.5 | 84.00 | 1.11x |
+| q35-full-512-none-pool_fetch-pred | EXPERT_POOL | 75.5 | 81.18 | 1.08x |
+| q35-full-512-none-pool_fetch-pred-warm | EXPERT_POOL | 75.5 | 79.89 | 1.06x |
+| q35-full-512-none-pool_hybrid | EXPERT_POOL | 67.2 | 69.00 | 1.03x |
+| q35-full-512-none-pool_cpu_admit | EXPERT_POOL | 67.2 | 66.97 | 1.00x |
+| q35-full-512-none-pool_cpu_exec | EXPERT_POOL | 28.8 | 42.31 | 1.47x |
+| q35-full-512-none-pool_fetch_on_2nd_miss | EXPERT_POOL | 67.2 | 68.41 | 1.02x |
+| dsv4-8000-512-none-auto | STATIC_ATTNPRIO_ALLMODELS | 10.6 | 11.07 | 1.04x |
+| dsv4-8000-512-none-s0 | GPUONLY_LAYERPIN_LAYERSTREAM | 0.2 | 0.24 | 1.20x |
+| dsv4-8000-512-none-s2 | DYNAMIC_FFNCPU_ATTNSTREAM | 3.0 | 2.72 | 0.91x |
+| dsv4-8000-512-none-s3 | STATIC_ATTNPRIO_ALLMODELS | 10.6 | 11.38 | 1.07x |
+| dsv4-8000-512-none-s4 | DYNAMIC_FFN_ALTERNATE | 4.4 | 3.62 | 0.82x |
+| dsv4-full-512-none-auto | STATIC_ATTNPRIO_ALLMODELS | 11.1 | 12.17 | 1.10x |
+| dsv4-full-512-none-s0 | GPUONLY_LAYERPIN_LAYERSTREAM | 0.3 | 0.26 | 0.87x |
+| dsv4-full-512-none-s1 | GPUONLY_ATTNPIN_FFNSTREAM | 7.1 | 8.90 | 1.25x |
+| dsv4-full-512-none-s2 | DYNAMIC_FFNCPU_ATTNSTREAM | 3.2 | 2.83 | 0.88x |
+| dsv4-full-512-none-s3 | STATIC_ATTNPRIO_ALLMODELS | 11.1 | 12.08 | 1.09x |
+| dsv4-full-512-none-s4 | DYNAMIC_FFN_ALTERNATE | 8.9 | 10.27 | 1.15x |
+| dsv4-full-512-none-pool_fetch | EXPERT_POOL | 12.2 | 17.70 | 1.45x |
+| dsv4-full-512-none-pool_fetch-pred | EXPERT_POOL | 12.2 | 17.88 | 1.47x |
+| dsv4-full-512-none-pool_fetch-pred-warm | EXPERT_POOL | 12.2 | 17.70 | 1.45x |
+| dsv4-full-512-none-pool_hybrid | EXPERT_POOL | 12.9 | 17.76 | 1.38x |
+| dsv4-full-512-none-pool_cpu_admit | EXPERT_POOL | 8.9 | 13.99 | 1.57x |
+| dsv4-full-512-none-pool_cpu_exec | EXPERT_POOL | 5.2 | 11.12 | 2.14x |
+| dsv4-full-512-none-pool_fetch_on_2nd_miss | EXPERT_POOL | 10.2 | 16.35 | 1.60x |
+| q35-4000-4k-none-auto | STATIC_ATTNPRIO_ALLMODELS | 41.8 | 45.71 | 1.09x |
+| q35-4000-4k-none-pool_fetch | EXPERT_POOL | 46.7 | 54.63 | 1.17x |
+| q35-8000-4k-none-auto | STATIC_ATTNPRIO_ALLMODELS | 49.4 | 54.70 | 1.11x |
+| q35-8000-4k-none-pool_fetch | EXPERT_POOL | 57.8 | 75.96 | 1.31x |
+| q35-full-4k-none-auto | STATIC_ATTNPRIO_ALLMODELS | 68.7 | 81.60 | 1.19x |
+| q35-full-4k-none-pool_fetch | EXPERT_POOL | 69.4 | 83.49 | 1.20x |
+| dsv4-8000-4k-none-auto | STATIC_ATTNPRIO_ALLMODELS | 9.6 | 10.66 | 1.11x |
+| dsv4-full-4k-none-auto | STATIC_ATTNPRIO_ALLMODELS | 9.9 | 11.90 | 1.20x |
+| dsv4-full-4k-none-pool_fetch | EXPERT_POOL | 10.8 | 15.50 | 1.44x |
+
+Prefill tier predicted vs measured prompt t/s (the tier at bs >= the prompt's ubatch; predicted from the same gate log):
+
+| cell | tier | strategy | predicted | measured | measured/predicted |
+|---|---|---|---|---|---|
+| q35-4000-512-none-auto | bs=512 | GPUONLY_LAYERPIN_LAYERSTREAM | 1172.7 | 683.8 | 0.58x |
+| q35-4000-512-none-s0 | bs=512 | GPUONLY_LAYERPIN_LAYERSTREAM | 1172.7 | 705.9 | 0.60x |
+| q35-4000-512-none-s1 | bs=512 | GPUONLY_ATTNPIN_FFNSTREAM | 1126.3 | 720.2 | 0.64x |
+| q35-4000-512-none-s2 | bs=512 | DYNAMIC_FFNCPU_ATTNSTREAM | 143.1 | 218.4 | 1.53x |
+| q35-4000-512-none-s3 | bs=512 | STATIC_ATTNPRIO_ALLMODELS | 899.2 | 778.8 | 0.87x |
+| q35-4000-512-none-s4 | bs=512 | DYNAMIC_FFN_ALTERNATE | 334.7 | 312.5 | 0.93x |
+| q35-4000-512-none-pool_fetch | bs=512 | EXPERT_POOL | 1079.3 | 710.3 | 0.66x |
+| q35-4000-512-none-pool_fetch-pred | bs=512 | EXPERT_POOL | 1079.3 | 702.5 | 0.65x |
+| q35-4000-512-none-pool_fetch-pred-warm | bs=512 | EXPERT_POOL | 1079.3 | 701.5 | 0.65x |
+| q35-4000-512-none-pool_hybrid | bs=512 | EXPERT_POOL | 1079.3 | 707.9 | 0.66x |
+| q35-4000-512-none-pool_cpu_admit | bs=512 | EXPERT_POOL | 1079.3 | 705.5 | 0.65x |
+| q35-4000-512-none-pool_cpu_exec | bs=512 | EXPERT_POOL | 1079.3 | 712.7 | 0.66x |
+| q35-4000-512-none-pool_fetch_on_2nd_miss | bs=512 | EXPERT_POOL | 1079.3 | 703.2 | 0.65x |
+| q35-8000-512-none-auto | bs=512 | GPUONLY_LAYERPIN_LAYERSTREAM | 1362.4 | 780.3 | 0.57x |
+| q35-8000-512-none-s0 | bs=512 | GPUONLY_LAYERPIN_LAYERSTREAM | 1362.4 | 795.5 | 0.58x |
+| q35-8000-512-none-s1 | bs=512 | GPUONLY_ATTNPIN_FFNSTREAM | 1324.8 | 825.0 | 0.62x |
+| q35-8000-512-none-s2 | bs=512 | DYNAMIC_FFNCPU_ATTNSTREAM | 186.1 | 291.2 | 1.56x |
+| q35-8000-512-none-s3 | bs=512 | STATIC_ATTNPRIO_ALLMODELS | 1060.2 | 899.1 | 0.85x |
+| q35-8000-512-none-s4 | bs=512 | DYNAMIC_FFN_ALTERNATE | 414.6 | 382.9 | 0.92x |
+| q35-8000-512-none-pool_fetch | bs=512 | EXPERT_POOL | 1079.3 | 708.0 | 0.66x |
+| q35-8000-512-none-pool_fetch-pred | bs=512 | EXPERT_POOL | 1079.3 | 706.9 | 0.65x |
+| q35-8000-512-none-pool_fetch-pred-warm | bs=512 | EXPERT_POOL | 1079.3 | 714.9 | 0.66x |
+| q35-8000-512-none-pool_hybrid | bs=512 | EXPERT_POOL | 1079.3 | 708.4 | 0.66x |
+| q35-8000-512-none-pool_cpu_admit | bs=512 | EXPERT_POOL | 1079.3 | 714.9 | 0.66x |
+| q35-8000-512-none-pool_cpu_exec | bs=512 | EXPERT_POOL | 1079.3 | 706.8 | 0.65x |
+| q35-8000-512-none-pool_fetch_on_2nd_miss | bs=512 | EXPERT_POOL | 1079.3 | 708.4 | 0.66x |
+| q35-full-512-none-auto | bs=512 | GPUONLY_ATTNPIN_FFNSTREAM | 1864.2 | 1097.0 | 0.59x |
+| q35-full-512-none-s0 | bs=512 | GPUONLY_LAYERPIN_LAYERSTREAM | 1799.1 | 1056.0 | 0.59x |
+| q35-full-512-none-s1 | bs=512 | GPUONLY_ATTNPIN_FFNSTREAM | 1864.2 | 1134.8 | 0.61x |
+| q35-full-512-none-s2 | bs=512 | DYNAMIC_FFNCPU_ATTNSTREAM | 363.4 | 502.4 | 1.38x |
+| q35-full-512-none-s3 | bs=512 | STATIC_ATTNPRIO_ALLMODELS | 1544.3 | 1202.1 | 0.78x |
+| q35-full-512-none-s4 | bs=512 | DYNAMIC_FFN_ALTERNATE | 692.2 | 617.8 | 0.89x |
+| q35-full-512-none-pool_fetch | bs=512 | EXPERT_POOL | 1079.3 | 706.6 | 0.65x |
+| q35-full-512-none-pool_fetch-pred | bs=512 | EXPERT_POOL | 1079.3 | 707.4 | 0.66x |
+| q35-full-512-none-pool_fetch-pred-warm | bs=512 | EXPERT_POOL | 1079.3 | 702.3 | 0.65x |
+| q35-full-512-none-pool_hybrid | bs=512 | EXPERT_POOL | 1079.3 | 697.2 | 0.65x |
+| q35-full-512-none-pool_cpu_admit | bs=512 | EXPERT_POOL | 1079.3 | 705.8 | 0.65x |
+| q35-full-512-none-pool_cpu_exec | bs=512 | EXPERT_POOL | 1079.3 | 704.6 | 0.65x |
+| q35-full-512-none-pool_fetch_on_2nd_miss | bs=512 | EXPERT_POOL | 1079.3 | 710.8 | 0.66x |
+| dsv4-8000-512-none-auto | bs=512 | STATIC_ATTNPRIO_ALLMODELS | 62.2 | 103.5 | 1.66x |
+| dsv4-8000-512-none-s0 | bs=512 | GPUONLY_LAYERPIN_LAYERSTREAM | 61.5 | 71.0 | 1.15x |
+| dsv4-8000-512-none-s2 | bs=512 | DYNAMIC_FFNCPU_ATTNSTREAM | 7.3 | 18.3 | 2.51x |
+| dsv4-8000-512-none-s3 | bs=512 | STATIC_ATTNPRIO_ALLMODELS | 62.2 | 104.3 | 1.68x |
+| dsv4-8000-512-none-s4 | bs=512 | DYNAMIC_FFN_ALTERNATE | 12.4 | 27.5 | 2.22x |
+| dsv4-full-512-none-auto | bs=512 | GPUONLY_ATTNPIN_FFNSTREAM | 101.1 | 86.7 | 0.86x |
+| dsv4-full-512-none-s0 | bs=512 | GPUONLY_LAYERPIN_LAYERSTREAM | 63.8 | 73.6 | 1.15x |
+| dsv4-full-512-none-s1 | bs=512 | GPUONLY_ATTNPIN_FFNSTREAM | 101.1 | 88.1 | 0.87x |
+| dsv4-full-512-none-s2 | bs=512 | DYNAMIC_FFNCPU_ATTNSTREAM | 7.8 | 19.7 | 2.53x |
+| dsv4-full-512-none-s3 | bs=512 | STATIC_ATTNPRIO_ALLMODELS | 64.3 | 105.1 | 1.63x |
+| dsv4-full-512-none-s4 | bs=512 | DYNAMIC_FFN_ALTERNATE | 13.2 | 29.8 | 2.26x |
+| dsv4-full-512-none-pool_fetch | bs=512 | EXPERT_POOL | 100.3 | 86.2 | 0.86x |
+| dsv4-full-512-none-pool_fetch-pred | bs=512 | EXPERT_POOL | 100.3 | 86.2 | 0.86x |
+| dsv4-full-512-none-pool_fetch-pred-warm | bs=512 | EXPERT_POOL | 100.3 | 86.3 | 0.86x |
+| dsv4-full-512-none-pool_hybrid | bs=512 | EXPERT_POOL | 100.3 | 87.1 | 0.87x |
+| dsv4-full-512-none-pool_cpu_admit | bs=512 | EXPERT_POOL | 100.3 | 87.1 | 0.87x |
+| dsv4-full-512-none-pool_cpu_exec | bs=512 | EXPERT_POOL | 100.3 | 86.0 | 0.86x |
+| dsv4-full-512-none-pool_fetch_on_2nd_miss | bs=512 | EXPERT_POOL | 100.3 | 86.1 | 0.86x |
+| q35-4000-4k-none-auto | bs=4096 | GPUONLY_LAYERPIN_LAYERSTREAM | 1764.7 | 4173.3 | 2.36x |
+| q35-4000-4k-none-pool_fetch | bs=4096 | STATIC_ATTNPRIO_ALLMODELS | 1563.2 | 2924.2 | 1.87x |
+| q35-8000-4k-none-auto | bs=4096 | GPUONLY_LAYERPIN_LAYERSTREAM | 1781.6 | 4260.7 | 2.39x |
+| q35-8000-4k-none-pool_fetch | bs=4096 | EXPERT_POOL | 1708.3 | 4146.5 | 2.43x |
+| q35-full-4k-none-auto | bs=4096 | GPUONLY_LAYERPIN_LAYERSTREAM | 1810.6 | 4285.4 | 2.37x |
+| q35-full-4k-none-pool_fetch | bs=4096 | EXPERT_POOL | 1708.3 | 4142.8 | 2.43x |
+| dsv4-8000-4k-none-auto | bs=4096 | STATIC_ATTNPRIO_ALLMODELS | 54.0 | 427.9 | 7.92x |
+| dsv4-full-4k-none-auto | bs=4096 | GPUONLY_ATTNPIN_FFNSTREAM | 57.0 | 694.5 | 12.18x |
 
