@@ -11,6 +11,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <functional>
 #include <string_view>
 #include <vector>
 #include <map>
@@ -965,6 +966,32 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 // (common_init_from_params) and llama-pshard-plan-params call this, so plan and run
 // price the same effective budget.
 size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx);
+
+// the context length the spec contexts follow (0 = the target's trained context, from the gguf)
+uint32_t common_pshard_resolve_n_ctx(const common_params & params, uint32_t n_ctx);
+
+// device need (MiB) of the MTP draft context under a FITTED plan's placement: plan_overrides is
+// an override array of that placement (the one the fit left in params.tensor_buft_overrides, or a
+// tier's from llama_pshard_registry_tier_overrides; every buft host; backend id 0 = the compute
+// device). 0 = no MTP context or a separate draft; a probe that ran and failed also returns 0 and
+// sets *probe_failed (callers must not read that as "fits"). The pre-fit reserve is measured with
+// everything pinned; a plan that moves the MTP head or the MTP layer's FFN off the device grows the
+// context's compute by ~180 MiB on q35 (2026-09-05 grid: +177.5 MiB rows).
+size_t common_pshard_mtp_need_mb(common_params & params, uint32_t n_ctx,
+        const struct llama_model_tensor_buft_override * plan_overrides, bool * probe_failed = nullptr);
+
+// pshard one-budget fit: run `fit` (the runtime's llama_params_fit_pshard or the plan tool's
+// llama_params_fit_pshard_plan), re-measure the MTP context under the fitted plan - the MAX over
+// its viable tiers' distinct placements, since the MTP context is a stock context over whichever
+// tier is active and its scheduler buffer never shrinks - and, when it needs more than the reserve,
+// refit ONCE with the reserve raised (the budget lowered). Both callers must take the same passes -
+// the registry variant is keyed on the budget.
+typedef void (*common_pshard_fit_fn)(const char * path_model, struct llama_model_params * mparams,
+        struct llama_context_params * cparams, struct llama_model_tensor_buft_override * overrides,
+        size_t max_vram_mb, size_t fit_target_mb);
+void common_pshard_fit_one_budget(common_params & params, struct llama_model_params & mparams,
+        struct llama_context_params & cparams, size_t mva_eff, size_t fit_target_eff, uint32_t n_ctx_res,
+        common_pshard_fit_fn fit, const std::function<struct llama_pshard_plan_registry * ()> & make_registry);
 
 // pshard one-budget v2: hand the budget left beyond the target arena's canonical union to a
 // spilled MoE draft's experts (leading layers first). Runtime-only; called after the fit.

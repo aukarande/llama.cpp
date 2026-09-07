@@ -124,12 +124,17 @@ line sit the CUDA context + workspaces, ~250 MiB on every arm by the user's deci
 arms at the 4k prompt another ~250 MiB of CUDA temporaries on the redirect backends during the
 A/B prefill - dsv4-full-4k pool_fetch peaks at +492 with the sched buffer exactly at the arena;
 this pool-side overhead is measured, not priced by the planner);
-OVER_RESERVE (a speculative context outgrew what the target left it by > 64 MiB);
+OVER_RESERVE (a speculative context outgrew what the target left it by > 64 MiB; since
+2026-09-06 the MTP reserve is re-measured after the fit under the plan's placement and the fit
+repeats once with the larger reserve, so this now flags a probe-vs-runtime gap, not a placement
+the reserve never saw);
 CLOCK (the SM clock left the lock window while the card was busy); DEGENERATE (2026-09-06: the
 generation collapsed - one token repeated, a digit run, a 3-gram loop - so the pool's h measures
 the loop, not the workload); SCHED_GREW (2026-09-06: the target's scheduler buffer at exit is
 larger than after the warmup - the scheduler's own re-reserve spilled outside the arena; the
-run log carries the ggml_backend_sched_alloc_splits WARN with the bytes). Rows other than OK are
+run log carries the ggml_backend_sched_alloc_splits WARN with the bytes. Since the 2026-09-06
+fix an arena overflow is REFUSED - the allocation fails with "allocation refused" and the bytes,
+the row is FAIL - so SCHED_GREW can only come from a non-arena buffer). Rows other than OK are
 not comparable numbers. `qa/perf-grid-tables.py <out-dir> --md results.md` renders the ledger
 (plain and speculative tables, gate hash groups, PPL, pool counters; speculative rows carry the
 per-target-step rate decode/(1 + accept x n_draft) because acceptance follows the sampled text).

@@ -234,7 +234,6 @@ struct llama_pshard_search_ctx {
     size_t                                     exps_total_bytes = 0;   // all routed experts, all layers
     size_t                                     exps_total_weights = 0; // element count of the same (CPU FLOPs)
     uint32_t                                   n_layers_moe     = 0;
-    uint32_t                                   n_vocab          = 0;   // tokenizer size (the MTP head-on-CPU charge)
 };
 
 // accumulate routed-expert tensor bytes per layer from a gguf tensor table
@@ -353,7 +352,12 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
     mparams_probe_clean.pshard_registry = nullptr;
 
     const uint32_t probe_n_tokens  = std::max<uint32_t>(1, cparams.n_batch ? cparams.n_batch : cparams.n_ubatch);
-    const uint32_t probe_n_outputs = probe_n_tokens;
+    // the outputs the runtime reserve requests for this tier (pshard_reserve_and_save clamps them
+    // to n_outputs_max; 0 = n_batch, llama_context's own rule). Probing every token as an output
+    // charged (bs - n_outputs_max) x n_vocab x 4 B of logits the runtime never reserves - ~1 GiB
+    // at DSv4 bs=2048 under a speculative target's cap of 4 (review 2026-09-06)
+    const uint32_t probe_n_outputs = std::max<uint32_t>(1, cparams.n_outputs_max
+        ? std::min<uint32_t>(probe_n_tokens, cparams.n_outputs_max) : probe_n_tokens);
 
     llama_context_params cparams_probe = cparams;
     cparams_probe.pshard_overlap = overlap;
@@ -965,6 +969,31 @@ uint32_t llama_pshard_registry_mtp_head_extra_mb(const struct llama_pshard_plan_
     return registry ? registry->mtp_head_extra_mb : 0;
 }
 
+size_t llama_pshard_registry_n_tiers(const struct llama_pshard_plan_registry * registry) {
+    return registry ? registry->tier_sizes.size() : 0;
+}
+
+uint32_t llama_pshard_registry_tier_batch_size(const struct llama_pshard_plan_registry * registry, size_t tier) {
+    return registry && tier < registry->tier_sizes.size() ? registry->tier_sizes[tier] : 0;
+}
+
+size_t llama_pshard_registry_tier_overrides(const struct llama_pshard_plan_registry * registry, size_t tier,
+        struct llama_model_tensor_buft_override * out, size_t n_max) {
+    if (registry == nullptr || out == nullptr || n_max == 0 || tier >= registry->best_plans.size()) {
+        return 0;
+    }
+    const llama_pshard_plan & p = registry->best_plans[tier];
+    if (!p.is_viable || p.overrides.empty() || p.overrides.size() + 1 > n_max) {
+        return 0;
+    }
+    size_t n = 0;
+    for (const auto & ov : p.overrides) {
+        out[n++] = { ov.pattern.c_str(), ov.buft, ov.backend_id };
+    }
+    out[n] = { nullptr, nullptr, -1 };
+    return n;
+}
+
 bool pshard_registry_save(
         const llama_pshard_plan_registry * registry, uint64_t fingerprint,
         const char * cache_path, ggml_backend_buffer_type_t host_buft,
@@ -1564,7 +1593,7 @@ static void pshard_enforce_union_budget(
     }
 
     const size_t alignment    = ggml_backend_buft_get_alignment(ctx.gpu_buft);
-    size_t budget_bytes = (size_t) mparams->max_vram_alloc * 1024ULL * 1024ULL;   // shrinks by the MTP head charge below
+    const size_t budget_bytes = (size_t) mparams->max_vram_alloc * 1024ULL * 1024ULL;
     auto align_up = [alignment](size_t off) { return ((off + alignment - 1) / alignment) * alignment; };
 
     // resident set of a plan: first override (emission order) with backend_id >= 0
@@ -1711,22 +1740,18 @@ static void pshard_enforce_union_budget(
 
         // trunk shaving did not converge: MTP head lever (once), then shave again
         if (g_pshard_n_layers_mtp > 0 && !g_pshard_mtp_head_cpu) {
-            // the MTP context's reserve (common_pshard_draft_reserve_mb) was measured with the
-            // head pinned; on the CPU its device compute grows by the logits scratch (n_vocab x
-            // 128, its ubatch, x 6 B: measured 5.9 B per entry on q35, +177.5 / +179.5 MiB in the
-            // three 2026-09-04 grid cells that took this lever). Charge it to the arena, so the
-            // tiers are re-planned under a budget that leaves the MTP context its room.
-            const size_t extra    = (size_t) ctx.n_vocab * 128ull * 6ull;
-            const size_t extra_mb = (extra + (1ull << 20) - 1) >> 20;
-            LLAMA_LOG_WARN("%s: union still overshoots after %d rounds with the MTP head pinned; re-planning all tiers with the head on CPU, arena charged %zu MiB for the MTP context's logits scratch (n_vocab %u x 128 x 6 B)\n",
-                __func__, max_rounds, extra_mb, ctx.n_vocab);
+            // the MTP context's pre-fit reserve (common_pshard_draft_reserve_mb) was measured with
+            // the head pinned; with the head on the CPU its device compute grows by the logits
+            // scratch (+177.5 / +179.5 MiB on q35, 2026-09-04 grid). The one-budget fit
+            // (common_pshard_fit_one_budget) re-measures the context under the fitted placement and
+            // refits once with the larger reserve; the analytical arena charge that stood in for
+            // that (2026-09-05, n_vocab x 128 x 6 B, mtp_head_extra_mb) is retired (2026-09-06)
+            LLAMA_LOG_WARN("%s: union still overshoots after %d rounds with the MTP head pinned; re-planning all tiers with the head on CPU\n",
+                __func__, max_rounds);
             g_pshard_mtp_head_cpu  = true;
             registry->mtp_head_cpu = true;
-            registry->mtp_head_extra_mb = (uint32_t) extra_mb;
-            budget_bytes = budget_bytes > extra ? budget_bytes - extra : 0;
-            const size_t replan_budget = ctx.vram_free > extra ? ctx.vram_free - extra : 0;
             for (size_t t = 0; t < registry->best_plans.size(); t++) {
-                if (orig_viable[t]) { replan_tier(t, replan_budget); }
+                if (orig_viable[t]) { replan_tier(t, ctx.vram_free); }
             }
             continue;
         }
@@ -1937,6 +1962,34 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         return plan;
     }
 
+    // the pool graph reads device-resident expert VIEWS and allocates no slot copies, so its scratch
+    // is that of the same graph with the experts pinned: probe that shape too (no_alloc - nothing is
+    // allocated) and take only its compute buffer. The streaming probe above priced the tier and
+    // measured its placement bytes, but its compute holds the transient per-layer expert copies; the
+    // old credit of "2 x b_layer" for them under-estimated the pool graph's scratch by 0.7-2.2 GiB
+    // and let the planner emit A/B tiers the runtime carve could not host (DSv4 @14500 bs=4096/8192,
+    // q35 @4000 bs>=1024: 2026-09-05 grid, design 11.C.19).
+    size_t scratch_pool = 0;
+    {
+        std::vector<llama_model_tensor_buft_override> pinned;
+        for (const auto * ov = tensor_buft_overrides; ov->pattern != nullptr; ov++) {
+            if (strstr(ov->pattern, "_exps") != nullptr) {
+                continue;   // drop the streamed-expert line: the layer's own line then pins the experts
+            }
+            pinned.push_back(*ov);
+        }
+        pinned.push_back({ nullptr, nullptr, -1 });
+        llama_model_params mp_pin = mp;
+        mp_pin.tensor_buft_overrides = pinned.data();
+        try {
+            const auto d2 = llama_pshard_probe_memory(ctx, mp_pin, *cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, true);
+            scratch_pool = d2[0].mb.compute;
+        } catch (...) {
+            LLAMA_LOG_WARN("%s: [EXPERT_POOL] pool-graph scratch probe failed (bs=%u)\n", __func__, cparams->n_batch);
+            return plan;   // not viable
+        }
+    }
+
     // routed-expert geometry: the gguf tensor table when the scan found it (the
     // runtime carve uses the same real nb[2] bytes, so plan and runtime agree),
     // else the ids-cross file-size heuristic
@@ -1952,13 +2005,16 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     const double   b_expert     = b_slot / n_layers_exp;                                      // average expert (per miss)
     const uint32_t bs = cparams->n_batch;
     const bool ab_tier = (uint64_t) bs * ctx.n_expert_used * 2 >= ctx.n_expert; // whole-stack regime
-    // the probe graph streams the experts, so its compute buffer holds the transient
-    // per-layer expert copies (one layer at bs=1, two with the prefetch keepalive on
-    // whole-stack tiers - the probe's fixed+pins minus weights+cache says exactly that)
-    // which the pool graph never allocates (persistent views). Return them to the pool
-    // and keep the runtime carve's 32 MiB margin, so plan and runtime slot counts agree.
-    const double  dup_bytes  = (ab_tier ? 2.0 : 1.0) * b_layer_exps;
-    const int64_t pool_bytes = (int64_t) vram_free - gpu_used + (int64_t) dup_bytes - (32ll << 20);
+    // fixed = the pool placement's pinned weights + KV (the streaming probe's total minus its
+    // compute); scratch = the pool graph's own compute buffer. Mirror the runtime carve: it charges
+    // the measured chunk0 + 32 MiB. The extra 64 MiB stands in for what the pinned-expert probe does
+    // not see of the pool graph: the runtime's chunk0 measured 8.9% above this probe at every bs on
+    // DSv4 (+26 / +52 / +104 / +209 MiB at bs 512 / 1024 / 2048 / 4096, verify-three-20260906), a
+    // per-token term of ~50 KB whose source is not attributed yet. The verdicts agreed at both
+    // verified cells (DSv4 @14500, q35 @4000); a modelled residual is a proposed change (design 11.C.19 x).
+    const int64_t fixed_bytes = gpu_used - (int64_t) plan.scratch_measured;
+    const int64_t pool_bytes  = (int64_t) vram_free - fixed_bytes - (int64_t) scratch_pool - (32ll << 20) - (64ll << 20);
+    plan.scratch_measured = scratch_pool;   // the tier's real scratch (union enforcer, pool setup, carve)
     const uint64_t floor_slots = std::min<uint64_t>(ctx.n_expert, (uint64_t) bs * ctx.n_expert_used);
     const double floor_bytes = ab_tier
         ? 2.0 * b_layer_exps
@@ -2150,9 +2206,9 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         plan.overrides.push_back({ov->pattern, ov->buft, ov->backend_id});
     }
 
-    LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u fixed+pins=%.1f MiB pool=%.1f MiB floor=%.1f MiB (%s, %s bytes) "
+    LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u fixed=%.1f scratch=%.1f MiB pool=%.1f MiB floor=%.1f MiB (%s, %s bytes) "
         "-> s=%u slots/layer, miss_policy=%s %s\n",
-        __func__, bs, gpu_used / (1024.0 * 1024.0), pool_bytes / (1024.0 * 1024.0),
+        __func__, bs, fixed_bytes / (1024.0 * 1024.0), scratch_pool / (1024.0 * 1024.0), pool_bytes / (1024.0 * 1024.0),
         floor_bytes / (1024.0 * 1024.0), ab_tier ? "A/B pair" : "fetch floor", real_bytes ? "real" : "heuristic",
         plan.pool_slots, llama_pshard_miss_policy_name((llama_pshard_miss_policy) plan.pool_miss),
         plan.is_viable ? "VIABLE" : "NOT VIABLE");
@@ -2679,16 +2735,6 @@ void llama_params_fit_pshard_plan(
     if (ctx.n_layers_moe > 0) {
         LLAMA_LOG_INFO("%s: routed experts: %u layers, %.1f MiB per layer, %.2f MiB per expert (gguf tensor table)\n",
             __func__, ctx.n_layers_moe, ctx.exps_layer_bytes / (1024.0 * 1024.0), ctx.exps_row_bytes / (1024.0 * 1024.0));
-    }
-    {
-        // vocabulary size: the union enforcer's MTP head lever charges the MTP context's
-        // logits scratch (n_vocab x 128 x 6 B) to the arena, see pshard_enforce_union_budget
-        struct gguf_init_params gip_v = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };
-        if (struct gguf_context * g = gguf_init_from_file(path_model, gip_v)) {
-            const int64_t kt = gguf_find_key(g, "tokenizer.ggml.tokens");
-            if (kt >= 0) { ctx.n_vocab = (uint32_t) gguf_get_arr_n(g, kt); }
-            gguf_free(g);
-        }
     }
     if (hp_nex > 0) {
         struct gguf_init_params gip = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };

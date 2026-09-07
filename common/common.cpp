@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "ggml-backend.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1353,7 +1354,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             mva_eff = params.fit_params_budget[0] / (1024 * 1024);
             LOG_INF("%s: pshard budget taken from --fit-budget: %zu MiB\n", __func__, mva_eff);
         }
-        if (const size_t dres = common_pshard_draft_reserve_mb(params, cparams.n_ctx); dres > 0) {
+        const uint32_t n_ctx_res = common_pshard_resolve_n_ctx(params, cparams.n_ctx);
+        if (const size_t dres = common_pshard_draft_reserve_mb(params, n_ctx_res); dres > 0) {
             if (mva_eff > 0) {
                 if (mva_eff <= dres) {
                     LOG_WRN("%s: the spec context reserve (%zu MiB) leaves nothing of the %zu MiB pshard budget for the target; pshard will fall back to stock\n", __func__, dres, mva_eff);
@@ -1365,20 +1367,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 LOG_INF("%s: pshard fit target after draft reserve: %zu MiB\n", __func__, fit_target_eff);
             }
         }
-        llama_params_fit_pshard(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_buft_overrides.data(), mva_eff, fit_target_eff);
+        // fit, re-measure the MTP context under the plan's placement, refit once if it is short
+        // (the plan tool takes the same passes: llama-pshard-plan-params calls the same helper)
+        common_pshard_fit_one_budget(params, mparams, cparams, mva_eff, fit_target_eff, n_ctx_res,
+            llama_params_fit_pshard,
+            [&]() { return llama_pshard_registry_create(params.pshard_tier_max, cparams.n_seq_max, n_draft_tier); });
         if (mparams.pshard && mparams.pshard_registry != nullptr && mparams.max_vram_alloc > 1) {
             // the fit may have shrunk the arena budget below mva_eff (DeepSeek-V4 compressor state
             // lives outside the arena): the leftover is what the ARENA's budget has beyond the arena
             common_pshard_draft_leftover(params, mparams.pshard_registry, mparams.max_vram_alloc);
-            // the planner moved the MTP head to the CPU and left the MTP context's larger logits
-            // scratch outside the arena: account it as reserve so the one-budget check compares
-            // the context against what the target really left it
-            if (const uint32_t extra = llama_pshard_registry_mtp_head_extra_mb(mparams.pshard_registry); extra > 0) {
-                params.speculative.draft.pshard_reserve_mb += (int32_t) extra;
-                LOG_INF("%s: MTP head on CPU: %u MiB left outside the arena for the MTP context (reserve now %d MiB)\n",
-                    __func__, extra, params.speculative.draft.pshard_reserve_mb);
-            }
         }
         if (!mparams.pshard) {
             // this process continues on the STOCK path: undo the pshard-only env gates so the
@@ -1526,6 +1523,164 @@ static uint32_t common_gguf_arch_u32(gguf_context * g, const char * arch, const 
     }
 }
 
+uint32_t common_pshard_resolve_n_ctx(const common_params & params, uint32_t n_ctx) {
+    if (n_ctx != 0) {
+        return n_ctx;
+    }
+    gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+    if (gguf_context * g = gguf_init_from_file(params.model.path.c_str(), ip)) {
+        const int64_t ka = gguf_find_key(g, "general.architecture");
+        if (ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING) {
+            n_ctx = common_gguf_arch_u32(g, gguf_get_val_str(g, ka), "context_length", 0);
+        }
+        gguf_free(g);
+    }
+    return n_ctx == 0 ? 4096 : n_ctx;
+}
+
+// pattern + backend id of every entry: two arrays with equal signatures are the same placement
+static std::string common_pshard_overrides_signature(const llama_model_tensor_buft_override * ovr) {
+    std::string sig;
+    for (const auto * o = ovr; o != nullptr && o->pattern != nullptr; ++o) {
+        sig += o->pattern;
+        sig += '=';
+        sig += std::to_string(o->backend_id);
+        sig += ';';
+    }
+    return sig;
+}
+
+size_t common_pshard_mtp_need_mb(common_params & params, uint32_t n_ctx,
+        const llama_model_tensor_buft_override * plan_overrides, bool * probe_failed) {
+    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (!spec_mtp || params.speculative.has_dft() || plan_overrides == nullptr || plan_overrides->pattern == nullptr) {
+        return 0;   // a separate draft has its own placement: the pre-fit probe priced it
+    }
+    ggml_backend_dev_t gpu = params.devices.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : params.devices[0];
+    if (gpu == nullptr) {
+        return 0;
+    }
+    ggml_backend_buffer_type_t dev_buft  = ggml_backend_dev_buffer_type(gpu);
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu);
+    if (host_buft == nullptr) {
+        host_buft = ggml_backend_cpu_buffer_type();
+    }
+    // the plan's placement, materialized: backend id 0 (the compute device) -> device buft, any
+    // other id (host homes, the CPU) -> host buft. A stock no_alloc probe of the MTP context over
+    // these overrides reserves the graph the runtime's MTP context builds.
+    std::vector<llama_model_tensor_buft_override> ovr;
+    for (const auto * o = plan_overrides; o->pattern != nullptr; ++o) {
+        ovr.push_back({ o->pattern, o->backend_id == 0 ? dev_buft : host_buft, o->backend_id });
+    }
+    ovr.push_back({ nullptr, nullptr, -1 });
+
+    common_params params_dft = common_base_params_to_speculative(params);   // pshard off, ubatch min(., 128)
+    params_dft.tensor_buft_overrides = ovr;
+    auto mparams_dft = common_model_params_to_llama(params_dft);
+    auto cparams_dft = common_context_params_to_llama(params_dft);
+    cparams_dft.n_ctx    = n_ctx;
+    cparams_dft.n_rs_seq = 0;
+    cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    const common_device_memory_need m = common_get_device_memory_need(params.model.path.c_str(), &mparams_dft, &cparams_dft, GGML_LOG_LEVEL_ERROR);
+    if (!m.ok) {
+        if (probe_failed) {
+            *probe_failed = true;
+        }
+        return 0;
+    }
+    const size_t mib = 1024ULL * 1024ULL;
+    return (m.context + m.compute + mib - 1) / mib;   // the weights are the target's
+}
+
+void common_pshard_fit_one_budget(common_params & params, llama_model_params & mparams,
+        llama_context_params & cparams, size_t mva_eff, size_t fit_target_eff, uint32_t n_ctx_res,
+        common_pshard_fit_fn fit, const std::function<llama_pshard_plan_registry * ()> & make_registry) {
+    const llama_model_params   mparams0 = mparams;   // the fit mutates both; pass 2 starts clean
+    const llama_context_params cparams0 = cparams;
+    for (int pass = 0; pass < 2; pass++) {
+        fit(params.model.path.c_str(), &mparams, &cparams, params.tensor_buft_overrides.data(), mva_eff, fit_target_eff);
+        if (!mparams.pshard || mparams.pshard_registry == nullptr) {
+            return;
+        }
+        // the MTP context is a stock context over the target's CURRENT placement: it is created
+        // under the initial tier, drafts after the prompt under the prompt's tier and at decode
+        // under the decode tier, and its scheduler buffer never shrinks - so its need is the MAX
+        // over the viable tiers' placements, not the highest tier's alone (the MTP head's home is
+        // per tier: pinned where the tier pins layers, on the CPU where it pins none; review
+        // 2026-09-06). Probe each distinct placement once; the fit's own array is the highest tier's.
+        bool     probe_failed = false;
+        size_t   need         = common_pshard_mtp_need_mb(params, n_ctx_res, params.tensor_buft_overrides.data(), &probe_failed);
+        uint32_t need_tier_bs = 0;   // 0 = the fit's own array
+        size_t   n_placements = 1;
+        if (need > 0 && !probe_failed) {
+            std::vector<std::string> seen;
+            seen.push_back(common_pshard_overrides_signature(params.tensor_buft_overrides.data()));
+            std::vector<llama_model_tensor_buft_override> tier_ovr(4096, llama_model_tensor_buft_override{ nullptr, nullptr, -1 });
+            const size_t n_tiers = llama_pshard_registry_n_tiers(mparams.pshard_registry);
+            for (size_t t = 0; t < n_tiers && !probe_failed; t++) {
+                if (llama_pshard_registry_tier_overrides(mparams.pshard_registry, t, tier_ovr.data(), tier_ovr.size()) == 0) {
+                    continue;
+                }
+                const std::string sig = common_pshard_overrides_signature(tier_ovr.data());
+                if (std::find(seen.begin(), seen.end(), sig) != seen.end()) {
+                    continue;
+                }
+                seen.push_back(sig);
+                const size_t need_t = common_pshard_mtp_need_mb(params, n_ctx_res, tier_ovr.data(), &probe_failed);
+                if (need_t > need) {
+                    need         = need_t;
+                    need_tier_bs = llama_pshard_registry_tier_batch_size(mparams.pshard_registry, t);
+                }
+            }
+            n_placements = seen.size();
+        }
+        if (probe_failed) {
+            LOG_WRN("%s: could not measure the MTP context under the plan's placement (probe failed): keeping the %d MiB reserve; the exit one-budget check reports any overshoot\n",
+                __func__, params.speculative.draft.pshard_reserve_mb);
+            return;
+        }
+        if (n_placements > 1) {
+            if (need_tier_bs > 0) {
+                LOG_INF("%s: MTP context need measured under %zu distinct tier placements: max %zu MiB (tier bs=%u)\n",
+                    __func__, n_placements, need, need_tier_bs);
+            } else {
+                LOG_INF("%s: MTP context need measured under %zu distinct tier placements: max %zu MiB (the fit's own placement)\n",
+                    __func__, n_placements, need);
+            }
+        }
+        const int32_t reserve = params.speculative.draft.pshard_reserve_mb;
+        const int32_t margin  = 16;   // probe-vs-runtime slack (the lever cells measured <= 4.5 MiB)
+        if (need == 0 || (int64_t) need <= (int64_t) reserve + margin) {
+            if (pass > 0) {
+                LOG_INF("%s: MTP context needs %zu MiB under the re-fitted plan, %d MiB reserved\n", __func__, need, reserve);
+            }
+            return;
+        }
+        if (pass > 0) {
+            LOG_WRN("%s: MTP context still needs %zu MiB under the re-fitted plan (%d MiB reserved); keeping this plan\n", __func__, need, reserve);
+            return;
+        }
+        const size_t delta = need - (size_t) reserve;
+        LOG_WRN("%s: the MTP context needs %zu MiB under the plan's placement, %d MiB were reserved: re-fitting with the reserve raised by %zu MiB\n",
+            __func__, need, reserve, delta);
+        params.speculative.draft.pshard_reserve_mb = (int32_t) need;
+        if (mva_eff > 0) {
+            mva_eff = mva_eff > delta ? mva_eff - delta : 1;
+            LOG_INF("%s: pshard target budget after the MTP re-measure: %zu MiB\n", __func__, mva_eff);
+        } else {
+            fit_target_eff += delta;
+            LOG_INF("%s: pshard fit target after the MTP re-measure: %zu MiB\n", __func__, fit_target_eff);
+        }
+        // undo the first pass: a fresh registry, pristine params, an empty override list
+        llama_pshard_registry_free(mparams.pshard_registry);
+        mparams = mparams0;
+        cparams = cparams0;
+        mparams.pshard_registry = make_registry();
+        std::fill(params.tensor_buft_overrides.begin(), params.tensor_buft_overrides.end(), llama_model_tensor_buft_override{ nullptr, nullptr, -1 });
+    }
+}
+
 size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
@@ -1547,17 +1702,7 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
 
     // n_ctx == 0 means "the target's trained context" (resolved later by the fit): the spec
     // contexts follow the target's n_ctx, so resolve it here from the target's metadata
-    if (n_ctx == 0) {
-        gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
-        if (gguf_context * g = gguf_init_from_file(params.model.path.c_str(), ip)) {
-            const int64_t ka = gguf_find_key(g, "general.architecture");
-            if (ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING) {
-                n_ctx = common_gguf_arch_u32(g, gguf_get_val_str(g, ka), "context_length", 0);
-            }
-            gguf_free(g);
-        }
-        if (n_ctx == 0) { n_ctx = 4096; }
-    }
+    n_ctx = common_pshard_resolve_n_ctx(params, n_ctx);
 
     // ---- separate draft gguf: metadata footprint over ALL shards + analytical KV bytes/token
     size_t w_total = 0, w_exps = 0, kv_bytes_per_token = 0;

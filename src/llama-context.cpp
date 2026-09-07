@@ -923,7 +923,19 @@ bool llama_context::memory_update(bool optimize) {
     }
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
-    {
+    if (cparams.pshard && pshard_active_plan != nullptr && model.get_dev_preload_buf() != nullptr) {
+        // pshard: the active tier's warmup reserve IS its worst case and its saved allocation is the
+        // arena's layout. The stock worst-case reserve below would place a min(n_ctx, n_ubatch)-token
+        // graph into the active tier's window through ggml_backend_sched_reserve, which grows
+        // overflow chunks outside the budget with no refusal - and a stale chunk it left behind
+        // would stay resident for the context's lifetime (review 2026-09-06; the K-shift path is
+        // the one llama_kv_cache::update marks "pshard + KV shift -- testing pending"). Restore the
+        // tier's layout instead: a runtime graph it does not fit re-reserves in alloc_splits under
+        // the overflow refusal.
+        if (!pshard_restore_active_alloc()) {
+            LLAMA_LOG_WARN("%s: could not restore the active tier's allocation after the memory update\n", __func__);
+        }
+    } else {
         const auto mctx = memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory context");
@@ -1482,12 +1494,37 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            // the graph's tensors hold no (or stale) allocations: an equal-shape ubatch that came
+            // next would take the reuse branch above and compute on them (review 2026-09-06: the
+            // pshard arena's overflow refusal made this a recurring soft error, and callers such as
+            // speculative-simple keep decoding after -2). Same reset as graph_reserve / memory_update.
+            res->reset();
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
 
         if (cparams.pshard) {
             pshard_refresh_stream_views(memory.get());
+            // the arena is the budget: a graph the scheduler could only place by growing overflow
+            // chunks (ggml_backend_sched_alloc_splits' re-reserve) ran outside it. Name the ubatch
+            // so the shape mismatch against the tier's reserve can be traced (2026-09-06: DSv4 +
+            // DSpark at 8000 spilled 1088 MiB on its first decode graph, 10757 nodes).
+            if (model.get_dev_preload_buf()) {
+                const int n_chunks = ggml_backend_sched_get_n_chunks(sched.get(), backends[pshard_layout.compute].get());
+                if (n_chunks == 1) {
+                    pshard_spill_chunks_seen = 1;   // released: a later spill of the same count is news again
+                } else if (n_chunks != pshard_spill_chunks_seen) {
+                    pshard_spill_chunks_seen = n_chunks;
+                    uint32_t n_out = 0;
+                    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) { n_out += (ubatch.output && ubatch.output[i]) ? 1 : 0; }
+                    // node count = the llama graph's (the reserve log's count); the scheduler's own
+                    // split graph in the alloc_splits ERROR line is larger (input copies)
+                    LLAMA_LOG_WARN("%s: pshard arena spill: %d overflow chunk(s) after allocating a graph of %d nodes for a ubatch of n_tokens=%u n_outputs=%u n_seqs=%u (active tier bs=%u, %s)\n",
+                        __func__, n_chunks - 1, ggml_graph_n_nodes(gf), ubatch.n_tokens, n_out, ubatch.n_seqs,
+                        pshard_active_plan ? pshard_active_plan->batch_size : 0,
+                        pshard_active_plan ? llama_pshard_strategy_name(pshard_active_plan->strategy) : "-");
+                }
+            }
         }
     }
 

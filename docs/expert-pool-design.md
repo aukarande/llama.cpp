@@ -1718,7 +1718,8 @@ remain the unchanged external baselines the ladder prices POOL against.
     failure, not a spill). (ii) `find_optimal_ubatch` without TPS data defaults to the largest
     VIABLE tier, not the top tier; `pshard_maybe_switch` uses `viable_tier_for`. (iii) The MTP
     head lever (union enforcer moves the MTP head to the CPU) now charges the arena n_vocab x
-    128 x 6 B for the MTP context's larger device compute (measured 5.9 B/entry: +177.5 and
+    128 x 6 B (RETIRED 2026-09-06, ix: the reserve is measured post-fit instead) for the MTP
+    context's larger device compute (measured 5.9 B/entry: +177.5 and
     +179.5 MiB in the three 09-04 cells that took the lever, which ran 4.4% over a 4000
     budget); persisted as `mtp_head_extra_mb=` in the variant, applied through
     `arena_bytes()`, added to the draft reserve the one-budget check compares against.
@@ -1759,7 +1760,102 @@ remain the unchanged external baselines the ladder prices POOL against.
     generation). Also from the grid: the MTP draft reserve is short by ~178 MiB under
     GPUONLY_ATTNPIN_FFNSTREAM too (q35mtp-4000-4k s1, OVER_RESERVE): the MTP layer's FFN is
     streamed and the MTP context's compute grows, the same class as the head lever - the general
-    fix is to measure the MTP reserve after the plan under its placement (open).
+    fix is to measure the MTP reserve after the plan under its placement (closed 2026-09-06, ix).
+    THREE FIXES (2026-09-06, "fix all three"; verified in grid-results/verify-three-20260906, GPC
+    2100, a foreign GPU context present so the prefill rates are indicative only):
+    (viii) The +1088 MiB scheduler re-reserve spill (vii) is root-caused and closed. DSv4's
+    hc_head tail (the affine mul/add before the sigmoid) was unnamed, so pshard's delegated-mode
+    pin could not anchor it and the scheduler's op-offload rule placed it by row count: CUDA0 in a
+    tier's reserve graph (n_outputs = bs >= 32) and CPU for a prompt graph (0/1 outputs). A
+    different backend assignment makes alloc_splits re-plan the arena for the first prompt graph of
+    every tier, and the bs=512 window was 1088 MiB short of what the re-plan wanted. Fix: the tail
+    nodes are named (hc_head_scale / hc_head_affine) and follow the head; the reserve requests
+    min(n_tokens, n_outputs_max) outputs (what a runtime batch can ask for - reserving every token
+    as an output also oversized the logits scratch); a reserve that fits keeps the WHOLE window as
+    the alloc range so a re-planned graph has every byte the tier owns; and alloc_splits REFUSES
+    overflow chunks for an external (arena) buffer - frees them, forgets the dead galloc plan, logs
+    the bytes it needed beyond the range and fails the allocation (stock buffers may still grow).
+    The DSpark @8000 cell now runs with no spill, no refusal and no backend mismatch; every tier's
+    reserve logs its node count and scratch use inside its window.
+    (ix) The MTP reserve is MEASURED after the fit, under the plan's placement, in the runtime and
+    the plan tool alike (common_pshard_fit_one_budget): fit, materialize the plan's overrides
+    (backend 0 -> device buft, else host), no_alloc-probe the MTP context, and if it needs more than
+    the pre-fit reserve, refit once with the reserve raised by the shortfall (+16 MiB margin). Both
+    callers take identical passes because the registry variant is keyed on the budget. q35 MTP
+    forced s1 @4000 ctx 8192 (the OVER_RESERVE cell): 35 MiB reserved -> "needs 213" -> budget
+    3965 -> 3787 -> the context used 212.5 vs 213 reserved (-0.5 MiB). q35 MTP auto @4000 ctx
+    8192 (the lever cell): pass 1 took the head lever and needed 213; the re-fitted plan at 3787
+    kept the head on the GPU and needs 35, and 213 stays reserved - the fit is monotone (the
+    reserve only rises, two passes, no oscillation), so 178 MiB of budget sits idle at that cell
+    (the log says so: "needs 35 MiB under the re-fitted plan, 213 MiB reserved"); decode 38.9 t/s
+    at 46.7% acceptance vs the grid's 40.1 at 49.2% (speculative noise band). The plan tool's
+    two auto passes took 17 minutes there. The (iii) head-lever arena charge (n_vocab x 128 x
+    6 B) is RETIRED - it was an analytical stand-in for the same effect; `mtp_head_extra_mb`
+    stays in the registry format but is no longer charged.
+    (x) The planner-side pool tier bound (open since row 31) is closed: after the streaming probe
+    prices a pool tier, a second no_alloc probe of the same graph with the experts PINNED (the
+    `_exps` override lines dropped) measures the pool graph's own scratch - the streaming probe's
+    compute holds transient per-layer expert copies the pool graph never allocates, and the old
+    "2 x b_layer" credit under-estimated the pool graph's scratch by 0.7-2.2 GiB. pool = vram_free
+    - fixed - scratch_pool - 32 MiB (the carve's margin) - 64 MiB (redirected-split input copies and
+    packing rounding the pinned probe does not see); below the A/B pair or the fetch floor the tier
+    is NOT VIABLE at plan time and the forced-strategy attn-pin substitute takes it (WARN). DSv4
+    @14500 ctx 8192: bs=8192 (pool 2921 < 5312) and bs=4096 (5261 < 5312) rejected, bs=2048 s=19
+    and bs=1 s=22 kept - the runtime's own carve gave 19 and 22 before; q35 @4000 ctx 8192:
+    bs>=1024 rejected (pool negative, or 766 < 996), bs=512 s=17, bs=16 s=23, bs=1 s=24 kept.
+    Warmup shows no "tier unviable" in either; the 4k prompt runs on the bs=2048 pool tier (DSv4,
+    the predicted-TTFT optimum, 436 t/s) and on the bs=4096 attn-pin substitute (q35, 2885 t/s).
+    Residual: the planner's pool-graph scratch runs ~8% below the runtime's measured chunk0 (DSv4
+    bs=4096: 2340 vs 2549 MiB), so the bs=4096 verdict holds by 51 MiB at plan time and 184 at
+    runtime - the verdicts agree, the margin is thin. Regression gates unchanged under the new
+    reserve shape: q35 pool fetch @8000/512 c5aacfaa3646, DSv4 pool fetch @14500/512 a4406c7d1a91.
+    (xi) REVIEW FOLLOW-UPS (2026-09-06, 21-agent adversarial review of the three-fix diff: 3
+    reviewers, 2 refuters per finding; 7 confirmed, 2 refuted; verified in
+    grid-results/verify-review-20260906): (1) the overflow refusal in alloc_splits ran AFTER
+    ggml_gallocr_alloc_graph had handed the graph's tensors pointers into the chunks it then
+    released, and process_ubatch left the failed graph reusable - an equal-shape ubatch (a
+    speculative verify batch; speculative-simple ignores -2 and keeps decoding) would have taken
+    the reuse branch and computed through freed device memory. The check now runs right after the
+    re-reserve, before any tensor is initialized, and the alloc-failure path resets the graph
+    result as graph_reserve/memory_update do. (2) memory_update's stock worst-case graph_reserve
+    after a KV shift ran a min(n_ctx, n_ubatch)-token graph into the active tier's window through
+    ggml_backend_sched_reserve, which has no refusal: overflow chunks outside the budget, or a
+    stale chunk left resident for the context's lifetime. Under pshard it now restores the active
+    tier's layout instead (the tier's warmup reserve is its worst case; an unseen shape re-reserves
+    in alloc_splits under the refusal). Reachable via K-shift on models whose memory can shift
+    (Qwen3-30B-A3B; q35's hybrid memory and DSv4 cannot) and cross-stream seq_cp; exercised on
+    Qwen3-30B pool fetch @8000 ctx 512 with --context-shift: the shift ran, 399 tokens, no spill,
+    refusal or restore failure. The K-shift NUMERICS under pshard stay "testing pending" (the text
+    after the shift degenerates; stock loops at this ctx too) - out of scope here. (3) The planner
+    probed every token as an output while the runtime reserve (a2) clamps to n_outputs_max, so
+    under a speculative target's cap the plan over-charged (bs - cap) x logits; the probes now
+    clamp the same way. First attempt keyed "speculative configured" on the types list being
+    non-empty - it defaults to { NONE }, so plain plans were priced at ONE output (DSv4 bs=4096
+    scratch 2340 -> 1974 MiB, wrongly VIABLE); caught by re-running the plain plan, condition
+    corrected to "a draft model or a non-zero draft length". Verified: the plain DSv4 plan is
+    byte-identical to (x); DSv4 + DSpark (cap 4) planner 205.6 vs runtime 205.1 MiB at bs=512,
+    475.1 vs 410.1 at bs=1024 (conservative); the cap itself is worth 227 MiB of runtime scratch
+    at bs=1024 (637 with all outputs). Side result: the planner's 8.9% residual is NOT logits - at
+    DSv4 bs=2048 the pinned probe measures 987 MiB with 1 output and 1170 with 2048, the runtime
+    1274.5. (4) pshard_setup_expert_pool gated the pool on the largest scratch of EVERY viable
+    tier, legacy attn-pin substitutes included (4680 MiB for DSv4's bs=8192 substitute); a legacy
+    tier never shares the window with the pool, and within a ~366 MiB band of budgets the gate
+    would have refused the pool for the decode tiers on a fresh in-process plan (cache-loaded
+    registries carry no scratch column, so it saw 64 MiB). Pool tiers only now. (5) The MTP need
+    is the MAX over the viable tiers' distinct placements (3 on the s1 cell): the MTP context is a
+    stock context over whichever tier is active - created under the bs=16 tier, drafting under the
+    prompt's and the decode tier - and its scheduler buffer never shrinks, while the head's home is
+    per tier (pinned where the tier pins layers, CPU where it pins none, always pinned in pool
+    tiers); a failed probe is now reported (WARN, reserve kept) instead of read as "fits". New
+    public accessors llama_pshard_registry_n_tiers / tier_batch_size / tier_overrides. (6) The
+    spill detector re-arms when the chunks are released and labels its node count; the dead
+    n_vocab read of the retired charge is gone. Refuted, recorded: a cross-process budget-key
+    drift (both callers probe deterministically and take identical passes) and a registry version
+    salt (the plan tool always re-plans; a stale registry's bad tiers are dropped at warmup; a salt
+    would send load-only runtimes to stock silently). Kept as notes: 17..31-token prompts landing
+    a >= 512 tier flip host-weight trunk ops under the 32-row op-offload rule and re-plan the
+    arena on every such prompt - safe after (viii)'s whole-window range, perf-only; a 32 tier
+    would avoid it.
 
 ### 11.D QA
 
@@ -1828,7 +1924,7 @@ the consequence in the doc.
 | 28 | s2 identity is hard: ALL routed FFN on CPU, attention streamed; NO pool in any s2 plan (2026-09-02) | s2 keeps zero expert VRAM; all budget -> attention/KV/scratch; the '5b cache-mode translation of s2' retracted |
 | 29 | s3 = STATIC attn-prio split: SOME FFN statically on GPU (whole layers today), rest on CPU, zero inference-time transfers (2026-09-02) | static-population POOL variant recorded as open point 11.B.24, not an s3 change |
 | 30 | Taxonomy: the expert pool is ONE new strategy (POOL, proposed LLAMA_PSHARD_EXPERT_POOL); legacy s0-s4 unchanged, compete as baselines/fallbacks, retire on ledger evidence (2026-09-02) | per-strategy pool translations retracted (5b table, 3b.3 constraint-set framing); gates follow the plan; POOL owns miss_policy/prefill_mode/K/s/pool_mb; ladder = legacy candidates + POOL |
-| 31 | the arena is the budget: a reserve that leaves it (overflow chunks) or a pool tier without room for its region is an UNVIABLE tier, never a spill (2026-09-05) | DSv4 pool after a 4k prompt 5.2 -> 16.5 t/s; the 4k prompt prefills on bs=2048 (two A/B passes) at this ctx/budget; planner-side tier bound left open (11.C.19) |
+| 31 | the arena is the budget: a reserve that leaves it (overflow chunks) or a pool tier without room for its region is an UNVIABLE tier, never a spill (2026-09-05) | DSv4 pool after a 4k prompt 5.2 -> 16.5 t/s; the 4k prompt prefills on bs=2048 (two A/B passes) at this ctx/budget; planner-side tier bound closed 2026-09-06 (11.C.19 x); the scheduler's own re-reserve now refuses overflow for the arena (11.C.19 viii) |
 
 Corrected (assistant claims retracted in the same discussion; do not re-propose):
 - corrected: "split-op hybrid is v2/v3 with a separate gate" -> v1; PPL-parity gate.

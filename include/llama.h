@@ -609,6 +609,15 @@ extern "C" {
     LLAMA_API size_t llama_pshard_registry_arena_bytes(const struct llama_pshard_plan_registry * registry, size_t budget_bytes);
     // MiB the arena leaves to the MTP context when the planner moved the MTP head to the CPU (0 otherwise)
     LLAMA_API uint32_t llama_pshard_registry_mtp_head_extra_mb(const struct llama_pshard_plan_registry * registry);
+    // the registry's tier count / a tier's batch size, and a tier's viable plan's load overrides
+    // (pattern + backend id; the placement is keyed on the backend id: 0 = the compute device, any
+    // other = a host home) copied into `out` (capacity n_max entries, terminator included). Returns
+    // the entries written without the terminator; 0 = no viable plan at that tier or no room. The
+    // patterns point into the registry and live as long as it does.
+    LLAMA_API size_t   llama_pshard_registry_n_tiers(const struct llama_pshard_plan_registry * registry);
+    LLAMA_API uint32_t llama_pshard_registry_tier_batch_size(const struct llama_pshard_plan_registry * registry, size_t tier);
+    LLAMA_API size_t   llama_pshard_registry_tier_overrides(const struct llama_pshard_plan_registry * registry, size_t tier,
+        struct llama_model_tensor_buft_override * out, size_t n_max);
 
     // true when the loaded model runs under pshard (false after a silent stock fallback)
     LLAMA_API bool llama_model_pshard_active(const struct llama_model * model);

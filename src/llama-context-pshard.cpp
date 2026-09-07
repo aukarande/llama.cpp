@@ -250,14 +250,16 @@ void llama_context::pshard_setup_expert_pool() {
     bool any = false;
     for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
         const llama_pshard_plan * p = registry->get_best(t);
-        if (p == nullptr || !p->is_viable) {
+        if (p == nullptr || !p->is_viable || p->strategy != LLAMA_PSHARD_EXPERT_POOL) {
+            // a legacy tier never shares the window with the pool (pshard_update_pool_mode
+            // disengages it and the tier takes the whole scratch window), so its scratch says
+            // nothing about whether the pool can exist - counting it refused the pool for the
+            // decode tiers whenever a large attn-pin substitute sat on top (review 2026-09-06)
             continue;
         }
         scratch_need = std::max(scratch_need, p->scratch_measured + (64ull << 20));
-        if (p->strategy == LLAMA_PSHARD_EXPERT_POOL) {
-            any   = true;
-            slots = slots > 0 ? std::min(slots, p->pool_slots) : p->pool_slots;
-        }
+        any   = true;
+        slots = slots > 0 ? std::min(slots, p->pool_slots) : p->pool_slots;
     }
     if (!any || slots == 0) {
         return;
@@ -551,7 +553,14 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
 
     const uint32_t n_seqs   = cparams.n_seq_max;
     const uint32_t n_tokens = plan.batch_size;
-    const uint32_t n_outputs = n_tokens;
+    // the outputs a runtime batch of this tier can request: n_outputs_max caps them (decode asserts
+    // it). Reserving every token as an output over-sized the logits scratch by (bs - n_outputs_max)
+    // x n_vocab x 4 B; that bites only when the tool caps n_outputs_max below n_batch (speculative
+    // targets: n_parallel x (n_draft + 1); the server: n_parallel x (1 + n_max)) - completion and
+    // perplexity leave n_outputs_max = n_batch and reserve bs outputs as before. The planner's probes
+    // clamp the same way (llama_pshard_probe_memory), so plan and runtime scratch agree. The DSv4
+    // head-tail backend flip this once masked is fixed by the hc_head node names (2026-09-06).
+    const uint32_t n_outputs = std::max<uint32_t>(1, std::min<uint32_t>(n_tokens, cparams.n_outputs_max));
 
     // start with unconstrained scratch packing
     ggml_backend_t gpu = backends[pshard_layout.compute].get();
@@ -627,8 +636,16 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
         }
 
         if (chunk0_used <= scratch_avail) {
-            ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, chunk0_used);
+            // the whole window, not the measured size: a runtime graph the scheduler re-plans (a
+            // shape it has not seen) must have every byte the tier owns
+            ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, scratch_avail);
             pshard_save_alloc_state(plan);
+            // the reference a runtime graph of this tier is compared to (see the spill detector in
+            // llama_context::process_ubatch): a differently shaped graph re-reserves inside the
+            // window and spills past it when larger
+            LLAMA_LOG_INFO("%s: tier bs=%u (%s): reserved graph nodes=%d, scratch %.1f of %.1f MiB\n",
+                __func__, plan.batch_size, llama_pshard_strategy_name(plan.strategy),
+                ggml_graph_n_nodes(gf), chunk0_used / (1024.0 * 1024.0), scratch_avail / (1024.0 * 1024.0));
             return;
         }
 

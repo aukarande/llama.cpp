@@ -286,6 +286,7 @@ private:
     void pshard_assign_pool_tensors();
     void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true, bool force_upload = false);
     void pshard_reapply_active_plan();
+    int  pshard_spill_chunks_seen = 1;                 // overflow-chunk count already reported by the spill detector
     bool pshard_restore_active_alloc();               // reserve if invalid, then range + state; false = reserve failed
     uint32_t pshard_land_tier(size_t tier, uint32_t n_tokens); // land `tier` or the nearest viable tier below; returns its batch size
     void pshard_reserve_and_save(const llama_pshard_plan & plan);

@@ -80,6 +80,7 @@ GGML_API size_t ggml_gallocr_get_chunk_max_size(ggml_gallocr_t galloc, int buffe
 // allocation range. Returns the bytes freed. Allocation state saved from that reserve is void; the
 // next reserve re-seeds the range.
 GGML_API size_t ggml_gallocr_free_overflow_chunks(ggml_gallocr_t galloc, int buffer_id);
+GGML_API bool   ggml_gallocr_buffer_is_external(ggml_gallocr_t galloc, int buffer_id);
 
 // set an externally-owned buffer for a buffer slot (must be called before reserve)
 GGML_API void ggml_gallocr_set_buffer(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t buffer, size_t alloc_offset, size_t alloc_size);

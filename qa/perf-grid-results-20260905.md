@@ -176,14 +176,25 @@ are what mis-prices hybrid: cpu_exec is predicted 28.8 vs 41-42 measured on q35 
 
 - Arena overflow at the pool tiers (bs=4096/8192 at DSv4 full, bs>=1024 at q35 4000): fixed
   before the grid (9b6d6488d, a1a7a4881); the ledger's OVER_BUDGET/SCHED_GREW statuses watch it.
-- Scheduler's own re-reserve spill (DSv4 + DSpark at 8000, +1088 MiB, twice): instrumented
-  (WARN with bytes and graph size; runner status SCHED_GREW); the graph that spills is the
-  speculative target's first decode graph, 10757 nodes, whose shape differs from the bs=512
-  tier's reserved graph - root cause open.
+- Scheduler's own re-reserve spill (DSv4 + DSpark at 8000, +1088 MiB, twice): fixed 2026-09-06
+  (design 11.C.19 viii). Root cause: DSv4's unnamed hc_head tail nodes were placed by the
+  scheduler's op-offload row-count rule - CUDA0 in the tier's reserve (n_outputs = bs), CPU in
+  the prompt graph (0/1 outputs) - so the backend assignment differed and the scheduler re-planned
+  the arena. The nodes are named and follow the head, the reserve requests min(n_tokens,
+  n_outputs_max) outputs, a fitting reserve keeps the whole window as its range, and an arena
+  overflow is now refused (allocation fails with the bytes) instead of growing. Verified: the cell
+  runs with no spill and no refusal (grid-results/verify-three-20260906).
 - Warm start seeding while disengaged: fixed 2026-09-06 (10a87cc1d), knobs recommended for removal.
-- MTP reserve short by ~178 MiB under streaming strategies (s1 at 4000/4k, OVER_RESERVE): the
-  head-lever charge covers the lever only; the general fix is measuring the reserve after the
-  plan under its placement - open.
+- MTP reserve short by ~178 MiB under streaming strategies (s1 at 4000/4k, OVER_RESERVE): fixed
+  2026-09-06 (design 11.C.19 ix) - the reserve is re-measured after the fit under the plan's
+  placement and the fit repeats once with the larger reserve, in the runtime and the plan tool
+  alike; the head-lever arena charge is retired. Verified: the cell now reserves 213 MiB and the
+  MTP context uses 212.5.
+- Planner emitted pool tiers the runtime carve could not host (DSv4 full bs=4096/8192, q35 4000
+  bs>=1024; the warmup marked them unviable and landed the tier below): fixed 2026-09-06 (design
+  11.C.19 x) - a second plan-time probe with the experts pinned measures the pool graph's own
+  scratch; those tiers are NOT VIABLE in the plan and the attn-pin substitute takes them. Verified
+  on both models; the two 512-prompt gate hashes are unchanged.
 - Missing PPL parity for CPU-route policies: cells added and run; all five pool policies are
   perplexity-identical per budget on both models (section 5).
 

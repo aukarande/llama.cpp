@@ -1908,24 +1908,31 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
-        if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
-            GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            return false;
-        }
         // an external (pshard arena) buffer that no longer fits its range grew overflow chunks: real
-        // allocations outside the budget that outlive this graph. Say so - the 2026-09-05 grid found
-        // 1088 MiB of them under a speculative verify graph with no line in any log.
+        // allocations outside the budget that outlive this graph (the 2026-09-05 grid found 1088 MiB
+        // of them under a speculative prompt graph with no line in any log). The arena IS the budget:
+        // release them and fail the allocation - the caller reports it and stops - instead of running
+        // oversubscribed. Non-external buffers may grow (that is the stock behaviour). Checked BEFORE
+        // ggml_gallocr_alloc_graph initializes the graph's tensors from this reserve, so no tensor
+        // ever receives a pointer into a chunk released here (review 2026-09-06: a refused graph a
+        // caller reused would have computed through freed device memory).
         for (int i = 0; i < sched->n_backends; i++) {
             const int n_chunks = ggml_gallocr_get_n_chunks(sched->galloc, i);
-            if (n_chunks > 1) {
+            if (n_chunks > 1 && ggml_gallocr_buffer_is_external(sched->galloc, i)) {
                 size_t over = 0;
                 for (int c = 1; c < n_chunks; c++) {
                     over += ggml_gallocr_get_chunk_max_size(sched->galloc, i, c);
                 }
-                GGML_LOG_WARN("%s: graph re-reserve on %s spilled %.1f MiB into %d overflow chunk(s) outside the buffer range (graph nodes=%d leafs=%d, backend_ids_changed=%d)\n",
-                    __func__, ggml_backend_name(sched->backends[i]), over / (1024.0 * 1024.0), n_chunks - 1,
-                    sched->graph.n_nodes, sched->graph.n_leafs, (int) backend_ids_changed);
+                const size_t freed = ggml_gallocr_free_overflow_chunks(sched->galloc, i);
+                GGML_LOG_ERROR("%s: graph re-reserve on %s needs %.1f MiB beyond the buffer range (graph nodes=%d leafs=%d, backend_ids_changed=%d); %.1f MiB of overflow chunks released, allocation refused\n",
+                    __func__, ggml_backend_name(sched->backends[i]), over / (1024.0 * 1024.0),
+                    sched->graph.n_nodes, sched->graph.n_leafs, (int) backend_ids_changed, freed / (1024.0 * 1024.0));
+                return false;
             }
+        }
+        if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+            GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            return false;
         }
     }
 

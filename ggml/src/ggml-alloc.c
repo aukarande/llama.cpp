@@ -1268,7 +1268,16 @@ size_t ggml_gallocr_free_overflow_chunks(ggml_gallocr_t galloc, int buffer_id) {
     if (talloc->n_chunks > 1) {
         talloc->n_chunks = 1;
     }
+    // the node/leaf allocs still index the freed chunks: forget them so the next alloc_graph
+    // re-reserves instead of dereferencing a NULL chunk
+    galloc->n_nodes = 0;
+    galloc->n_leafs = 0;
     return freed;
+}
+
+bool ggml_gallocr_buffer_is_external(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    return galloc->buf_external[buffer_id];
 }
 
 void ggml_gallocr_set_buffer(ggml_gallocr_t galloc, int buffer_id,

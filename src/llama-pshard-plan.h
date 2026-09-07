@@ -325,11 +325,10 @@ struct llama_pshard_plan_registry {
     float switch_head_mb   = 0.0f;  // est. MB of the output head
     float switch_pcie_gb_s = 0.0f;  // upload rate for pinned weights
     bool  mtp_head_cpu     = false; // MTP head demoted to CPU by union-budget enforcement
-    // arena charge that goes with mtp_head_cpu: the MTP context was priced with the head pinned
-    // (common_pshard_draft_reserve_mb, before the fit); with the head on the CPU its device
-    // compute grows by the logits scratch, n_vocab x 128 (its ubatch) x 6 B (measured 5.9 B per
-    // entry on q35: +177.5 / +179.5 MiB, 2026-09-05). arena_bytes() keeps it outside the arena;
-    // persisted as mtp_head_extra_mb= (older parsers ignore the field).
+    // RETIRED 2026-09-06 (kept so existing registry files still parse; never charged): the
+    // analytical arena charge for the MTP context's larger device compute with the head on the
+    // CPU. The one-budget fit measures that need under the fitted placement instead
+    // (common_pshard_fit_one_budget).
     uint32_t mtp_head_extra_mb = 0;
     uint32_t n_layers      = 0;     // trunk layer count (set in-memory by planner and runtime;
                                     // 0 = unknown -> structural attention pins are not priced)
@@ -358,9 +357,10 @@ struct llama_pshard_plan_registry {
     size_t arena_bytes(size_t budget_bytes) const {
         const size_t mib      = 1024ULL * 1024;
         const size_t headroom = 64 * mib;
-        // the MTP head-on-CPU charge lives outside the arena (see mtp_head_extra_mb)
-        const size_t charge   = (size_t) mtp_head_extra_mb * mib;
-        const size_t budget   = budget_bytes > charge ? budget_bytes - charge : budget_bytes;
+        // mtp_head_extra_mb is retired (2026-09-06): the MTP context's need under the plan's
+        // placement is measured by the one-budget fit instead; the field stays for registry
+        // compatibility and is not charged here
+        const size_t budget   = budget_bytes;
         if (union_bytes == 0 || has_pool()) {
             return (budget / mib) * mib; // whole MiB, see below
         }
