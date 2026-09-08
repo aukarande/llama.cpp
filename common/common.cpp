@@ -1609,13 +1609,20 @@ void common_pshard_fit_one_budget(common_params & params, llama_model_params & m
         // over the viable tiers' placements, not the highest tier's alone (the MTP head's home is
         // per tier: pinned where the tier pins layers, on the CPU where it pins none; review
         // 2026-09-06). Probe each distinct placement once; the fit's own array is the highest tier's.
+        // The placements measured are the REGISTRY tiers' own override lists (what pshard_apply_plan
+        // applies at every tier switch, the planner's generator in both processes). The array the
+        // fit left in params.tensor_buft_overrides is the LOAD-time placement from the runtime's
+        // cache-path generator, which is not what any MTP context ever computes under (the initial
+        // plan lands before the context exists) - it is used only when the registry offers no tier
+        // lists (2026-09-07: the two generators disagreed on a pool tier's MTP layer; the runtime
+        // measured 193 MiB against the plan tool's 21, refit to a budget with no variant and fell
+        // to stock on every q35 MTP pool cell).
         bool     probe_failed = false;
-        size_t   need         = common_pshard_mtp_need_mb(params, n_ctx_res, params.tensor_buft_overrides.data(), &probe_failed);
-        uint32_t need_tier_bs = 0;   // 0 = the fit's own array
-        size_t   n_placements = 1;
-        if (need > 0 && !probe_failed) {
+        size_t   need         = 0;
+        uint32_t need_tier_bs = 0;
+        size_t   n_placements = 0;
+        {
             std::vector<std::string> seen;
-            seen.push_back(common_pshard_overrides_signature(params.tensor_buft_overrides.data()));
             std::vector<llama_model_tensor_buft_override> tier_ovr(4096, llama_model_tensor_buft_override{ nullptr, nullptr, -1 });
             const size_t n_tiers = llama_pshard_registry_n_tiers(mparams.pshard_registry);
             for (size_t t = 0; t < n_tiers && !probe_failed; t++) {
@@ -1632,8 +1639,15 @@ void common_pshard_fit_one_budget(common_params & params, llama_model_params & m
                     need         = need_t;
                     need_tier_bs = llama_pshard_registry_tier_batch_size(mparams.pshard_registry, t);
                 }
+                if (need_t == 0 && !probe_failed) {
+                    break;   // no MTP context / a separate draft: nothing to measure
+                }
             }
             n_placements = seen.size();
+            if (n_placements == 0 && !probe_failed) {
+                need = common_pshard_mtp_need_mb(params, n_ctx_res, params.tensor_buft_overrides.data(), &probe_failed);
+                n_placements = 1;
+            }
         }
         if (probe_failed) {
             LOG_WRN("%s: could not measure the MTP context under the plan's placement (probe failed): keeping the %d MiB reserve; the exit one-budget check reports any overshoot\n",
@@ -1662,6 +1676,11 @@ void common_pshard_fit_one_budget(common_params & params, llama_model_params & m
             return;
         }
         const size_t delta = need - (size_t) reserve;
+        // pass 2 is a fresh plan at the lower budget (pin-priority head, the lever only if its union
+        // overshoots again). When pass 1 took the lever and pass 2 does not need it, the raised
+        // reserve is idle (178 MiB at q35 MTP @4000/4k) and the ladder may pick a different shape -
+        // a planner pricing matter (the head home is never priced), recorded in design 11.C.19 xiii;
+        // a protocol that kept pass 1's head home was tried and reverted (2026-09-07)
         LOG_WRN("%s: the MTP context needs %zu MiB under the plan's placement, %d MiB were reserved: re-fitting with the reserve raised by %zu MiB\n",
             __func__, need, reserve, delta);
         params.speculative.draft.pshard_reserve_mb = (int32_t) need;

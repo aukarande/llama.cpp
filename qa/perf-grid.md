@@ -113,7 +113,18 @@ tier and keep another (2026-09-05 audit: seven speculative "pool" rows had run l
 Speculative `prompt_tps` is the tool's own prefill line ("encoded N tokens ... speed"), not
 llama's "prompt eval" figure, which books every verification batch as prompt work.
 
-Status (2026-09-05): OK; FAIL (rc != 0); PLAN_FAILED; FALLBACK (pshard disabled itself - a
+QUIET MACHINE (2026-09-07): the idle guard sees CUDA compute contexts only; host-side load and
+graphics contexts it cannot see move the host-bound cells. In grid 20260906-fixes the q35 pool
+512-prompt blocks ran while a 9-agent code-review workflow (git/grep/file reads) was active on the
+machine and the user's RDP session (hardware H.264 encode on the GPU) was connected: A/B prefill
+-3.6..-4.0% on 36 of 36 cells, decode -2.6..-3.7%, the CPU-bound cpu_exec probe -5..-6% at the
+same minutes, unchanged-code phases (mmap preload, context construction) +11..26%, while the
+compute-bound PPL passes were identical and the full/4k block at 02:43-02:49 reproduced the old
+numbers to +0.7%; on a disconnected idle machine the six q35 pool-fetch cells came back within
+0-3% of the old grid (8000/512 identical). Rules: no agent workflows, builds, greps over the result trees or interactive
+sessions while cells run; compare the ledger header's idle_used with the previous run (OLD 581-781
+MiB, the contaminated run 953-962); the expert pool's home is the mmap'd model, so miss uploads are
+staged through host RAM and are the first to suffer. Status (2026-09-05): OK; FAIL (rc != 0); PLAN_FAILED; FALLBACK (pshard disabled itself - a
 fingerprint mismatch or no viable plan); SHORT (decode window < 64 tokens);
 STRATEGY_FALLBACK (the executing tier's strategy is not the arm's: the planner substituted
 STATIC_ATTNPRIO_ALLMODELS for a forced s0..s4 or for a pool policy whose floor did not fit -

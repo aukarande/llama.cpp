@@ -249,8 +249,12 @@ decode_runs() { strip < "$1" | grep -a " eval time" | tail -1 | grep -aoE "/ +[0
 spec_speed()  { strip < "$1" | grep -a "decoded .* tokens in" | tail -1 | grep -aoE 'speed: +[0-9.]+' | grep -aoE '[0-9.]+$'; }
 spec_ntok()   { strip < "$1" | grep -a "decoded .* tokens in" | tail -1 | grep -aoE 'decoded +[0-9]+' | grep -aoE '[0-9]+'; }
 spec_accept() { strip < "$1" | grep -a "accept  *=" | tail -1 | grep -aoE '[0-9.]+%' | tr -d '%'; }
-# llama-speculative-simple books every verification batch as "prompt eval": its prompt figure is
-# the target's aggregate, 33-56% below its own prefill line (audit 2026-09-05)
+# llama-speculative-simple's "prompt eval" line is the VERIFY batches only: the draft's
+# set_embeddings_layer_inp re-arms the target's scheduler reserve, whose synchronize resets the
+# compute timer before the prefill graph runs (llama-context.cpp sched_reserve after
+# t_compute_start_us), so the prefill's seconds are dropped while its tokens are counted. The
+# prefill rate is the tool's own "encoded" wall line (2026-09-07 analysis; the 2026-09-05 audit's
+# "aggregate 33-56% below" reading was wrong)
 spec_prefill() { strip < "$1" | grep -a "encoded .* tokens in" | tail -1 | grep -aoE 'speed: +[0-9.]+' | grep -aoE '[0-9.]+$'; }
 # the spec context's real device footprint vs what the target left it ("(+X MiB)" = over)
 reserve_over() { strip < "$1" | grep -a 'pshard one-budget check' | tail -1 | grep -aoE '\(\+[0-9.]+ MiB\)' | grep -aoE '[0-9]+' | head -1; }

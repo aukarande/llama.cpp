@@ -1726,8 +1726,9 @@ remain the unchanged external baselines the ladder prices POOL against.
     (iv) The planner's attn-pin substitution for a forced strategy or an unfitting pool tier
     logs at WARN; the grid runner reads the EXECUTING tier (tier 1 for speculative cells) and
     marks STRATEGY_FALLBACK / NOPOOL / OVER_BUDGET / OVER_RESERVE / CLOCK instead of OK.
-    (v) `~llama_context`'s buffer-size check now expects the post-warmup sizes, so it warns
-    only when a buffer grew during the run. Refuted by the review: the DSv4 pool-vs-stock hash
+    (v) `~llama_context`'s buffer-size check now expects the post-warmup sizes; it WARNs on any
+    mismatch (a shrink of the CUDA_Host buffer still prints - e.g. "19.3 MiB vs 205.2 expected" on
+    speculative targets), and the runner's SCHED_GREW reads the CUDA0 line only. Refuted by the review: the DSv4 pool-vs-stock hash
     at full/512 is a token-1 near-tie (head IS on the GPU; every ulp-level prefill difference,
     fusion or placement, lands on the same flip - the 09-04 "CPU head" attribution was wrong,
     the 12000 exact match a coin flip), fetch_on_2nd_miss's third hash is a token-2 flip of the
@@ -1856,6 +1857,54 @@ remain the unchanged external baselines the ladder prices POOL against.
     a >= 512 tier flip host-weight trunk ops under the 32-row op-offload rule and re-plan the
     arena on every such prompt - safe after (viii)'s whole-window range, perf-only; a 32 tier
     would avoid it.
+    (xii) GRID RERUN DEFECT (2026-09-07, grid-results/20260906-fixes): every q35 MTP pool cell at
+    8000 and full came back FALLBACK - pshard disabled itself and the runner recorded STOCK
+    numbers under the pool label. Cause: there are TWO copies of the override generator
+    (llama_pshard_generate_overrides in src/llama-pshard-plan.cpp for the planner and in
+    src/llama-pshard-cache.cpp for the runtime's load-time placement), and the cache copy's
+    EXPERT_POOL branch lacked the planner's MTP special case (the MTP layer pinned whole, experts
+    included - the draft context is a stock sched with no pool). The runtime's load-time array
+    therefore homed the MTP layer's experts on the shard bid; (ix)'s post-fit probe over that
+    array measured 193 MiB (experts on the host for the stock-sched MTP context) where the plan
+    tool's probe over the planner's array measured 21 (the old grid's exit check: 20.5 MiB used -
+    the planner's placement is the one that runs, pshard_apply_plan applies the registry's
+    lists), so the runtime refit to 7807 while the plan tool had saved only 7979 -> "no matching
+    plan cache ... disabling pshard". The review had noted the generator divergence ((xi), the
+    B-2 refuter's adjacent note) and it went unfixed. Fixed: the cache copy pins the MTP layer
+    whole in pool tiers like the planner, and the post-fit probe measures the REGISTRY tiers'
+    own override lists (what every tier switch applies; identical in both processes), using
+    the fit's load-time array only when the registry offers none. The two generator copies
+    remain a divergence hazard (open: fold them into one). The 16 FALLBACK cells (q35mtp x
+    {pool_fetch, pool_fetch-pred, pool_hybrid, pool_plan} x {8000, full} x {512, 4k}; the four
+    poolauto cells at 8000/full had run their pool tiers and were kept) were rerun with the fix
+    after the main pass, together with the five lever cells; at 4000 the lever puts the MTP
+    layer on the CPU in both generators, so those cells agreed and were unaffected. Two modes of
+    the failure: at 512 the stock fallback ran and the runner recorded stock numbers under the
+    pool label (rc=0, ~330 t/s prompt, VRAM peak 14042 MiB at an 8000 budget - the fallback
+    ignores -mva); at 4k the fallback died (rc=1, no numbers).
+    (xiii) THE HEAD HOME IS A PRICING DECISION (2026-09-07; narrative
+    qa/perf-grid-results-20260906-fixes.md). The one-budget fit's second pass is a fresh plan at
+    the lower budget: pin-priority head, the lever only if the union overshoots again. Where pass 1
+    took the lever and pass 2 does not, the raised reserve is idle (178 MiB at q35mtp-4000-4k) and
+    the ladder may change shape: poolauto lost its pool verify tier there (NOPOOL, 21.6 target
+    steps/s vs 24.4 in the 09-05 grid's lever plan). A protocol that kept pass 1's head home for
+    pass 2 was tried and REVERTED the same day: same-arm A/B on the five lever cells (head-pinned
+    pass 2 from the main pass vs head-on-CPU preset, both on a quiet machine) - poolauto 21.6 ->
+    23.6 (+9%) but auto 21.9 -> 19.3 (-12%), 8000-4k s4 23.6 -> 22.1, every lever cell's prefill
+    -15..-24%, and peak VRAM 4400-4439 MiB at a 4000 budget vs 3981-4003 head-pinned (the MTP
+    context's compute sits outside the arena). One arm rescued, the others taxed: the head home is
+    something the PLANNER must price (today the lever is a last resort when the union overshoots),
+    not a protocol rule - a planner-model change for the user. Rerun outcome (306 affected cells, 85 kept from build a1a7a4881 after a 9-agent check that none
+    can change): 290 OK -> OK, the 13 STRATEGY_FALLBACK cells unchanged, the two DSpark @8000 spill
+    cells OVER_BUDGET -> OK, the MTP s1 @4000/4k cell OVER_RESERVE -> OK; PPL identical on all 22
+    cells; 3 DSv4 legacy gate hashes moved (s0/s2/s4: the hc_head tail now follows the head to the
+    CPU, see the narrative for the near-tie classification). The pool's wins hold (q35 +21/+33%
+    over stock at 4000/8000 with the 512 prompt, DSv4 full 16.8 vs 11.2/12.4). METHOD FINDING: the
+    main pass's first hour ran alongside a 9-agent workflow and the user's RDP session; host-bound
+    cells (pool miss uploads staged through host RAM from the mmap'd model, A/B prefill, CPU-route
+    policies) lost 2.6-4% while compute-bound work was identical; quiet repeats restored the old
+    numbers (8000/512 identical); one cell (q35-8000-4k pool_fetch) has a 9% run-to-run spread of
+    its own. Rules in qa/perf-grid.md.
 
 ### 11.D QA
 

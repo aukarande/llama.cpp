@@ -2582,7 +2582,10 @@ void llama_params_fit_pshard_plan(
     const int32_t           cpu_bid = pshard_dev_layout::compute_cpu_backend_id(devs.size());
     const pshard_dev_layout layout  = pshard_dev_layout::for_device(0, cpu_bid);
     // every variant starts with the MTP head pin-priority placement; the union-budget
-    // enforcer flips this (and records it in the registry) only when the pinned head overshoots
+    // enforcer flips this (and records it in the registry) only when the pinned head overshoots.
+    // The one-budget fit's second pass starts here too: a preset that kept pass 1's head home was
+    // tried and reverted on 2026-09-07 (design 11.C.19 xiii) - it rescued one arm and cost the
+    // others; the head home is a planner pricing decision, not a protocol rule.
     g_pshard_mtp_head_cpu = false;
 
     std::unique_ptr<llama_benchmark_predictor> predictor;

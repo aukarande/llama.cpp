@@ -93,6 +93,17 @@ void llama_pshard_generate_overrides(
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
 
         if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
+            // MTP head layers: pinned whole, experts included, exactly as the planner's copy
+            // prices them (the draft context is a stock sched with no pool and reads them every
+            // draft step). This branch lacked the special case until 2026-09-07: the load-time
+            // array then homed the MTP layer's experts on the shard bid, and the post-fit MTP
+            // probe over that array measured 193 MiB where the plan tool (planner array, layer
+            // pinned) measured 21 - the runtime refit to a budget with no saved variant and
+            // disabled pshard (grid 20260906-fixes, every q35 MTP pool cell at 8000/full).
+            if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
+                emit(patterns_layer[il].c_str(), host_buft, g_pshard_mtp_head_cpu ? layout.cpu : layout.compute);
+                continue;
+            }
             // fetch corner: routed experts live in host RAM (the pool's home);
             // everything else pins - see the planner copy for the rationale
             if (patterns_layer_moe_exps[il].empty()) {
