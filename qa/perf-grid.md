@@ -23,7 +23,7 @@ work targets, plus the correctness gates and perplexity mirrors those perf cells
   arms still diverge where their numerics differ (DSv4 pool vs stock after ~22 tokens), so
   pool rows carry `h` as the comparability check.
 - Every pshard cell plans fresh with exactly the environment the run will use
-  (`PSHARD_STRATEGY`, `PSHARD_MISS_POLICY`, `GGML_SCHED_NO_CPU_OVERLAP`, the spec flags and
+  (`PSHARD_STRATEGY`, `PSHARD_MISS_POLICY`, the spec flags and
   the budget are all fingerprinted; a mismatch silently falls back to stock - the runner
   greps the run log for that fallback and marks the row FALLBACK). Consecutive cells that
   differ only in runtime-only knobs (`PSHARD_POOL_PREDICT`, `PSHARD_POOL_WARM/ALLOC`) share
@@ -51,7 +51,11 @@ work targets, plus the correctness gates and perplexity mirrors those perf cells
 draft) and is recorded at that budget. Prompts (all non-repetitive since 2026-09-05; every older prompt-*.txt, the 512 one included, was one yoga article repeated - the 512 prompt twice, the 4k one twelve times - and models copied it, which also flatters the pool because a copied continuation routes to the prompt experts): `512` = prompt-512-v2.txt (CONTRIBUTING.md opening, 1709 bytes, 366 q35 / 348 DSv4 tokens; the old one was 346 / 343) at ctx 2048, `4k` =
 prompt-4k-v2.txt (repository docs, no repetition; 2026-09-05) at ctx 8192.
 
-## The pool arm = 13 variants (plain decode), 5 (speculative)
+## The pool arm = 11 variants (plain decode), 5 (speculative)
+
+Variants 6 and 9 (hybrid / cpu_admit with the CPU/GPU overlap switched off) were removed on
+2026-09-09 together with the switch itself: the 20260905 and 20260906 grids certified the CPU/GPU
+overlap in all 16 pairs (identical counters, never slower). The noovl ledger column stays, always 0.
 
 | # | variant | env | decides |
 |---|---|---|---|
@@ -60,10 +64,8 @@ prompt-4k-v2.txt (repository docs, no repetition; 2026-09-05) at ctx 8192.
 | 3 | fetch + pred + warm | + `PSHARD_POOL_WARM=8 PSHARD_POOL_ALLOC=1` | prompt-end LRU seeding + per-layer slots |
 | 4 | hybrid | `PSHARD_MISS_POLICY=hybrid` | the FreeToken q* split |
 | 5 | hybrid + pred | + `PSHARD_POOL_PREDICT=1` | whether prefetch hurts CPU-route policies everywhere |
-| 6 | hybrid noovl | + `GGML_SCHED_NO_CPU_OVERLAP=1` | certify the CPU/GPU overlap, then delete the switch |
 | 7 | cpu_admit | `PSHARD_MISS_POLICY=cpu_admit` | background admission |
 | 8 | cpu_admit + pred | + `PSHARD_POOL_PREDICT=1` | |
-| 9 | cpu_admit noovl | + `GGML_SCHED_NO_CPU_OVERLAP=1` | |
 | 10 | cpu_exec | `PSHARD_MISS_POLICY=cpu_exec` | the never-admit floor |
 | 11 | fetch_on_2nd_miss | `PSHARD_MISS_POLICY=fetch_on_2nd_miss` | certify it is dominated, then delete the policy |
 | 12 | plan | `PSHARD_STRATEGY=5`, planner picks the policy | does the pricing pick the measured winner |

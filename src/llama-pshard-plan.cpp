@@ -2119,9 +2119,10 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         const double distinct = std::min<double>(E, (double) bs * ctx.n_expert_used);
         const double misses   = distinct * (1.0 - h);
         const double hits     = distinct - misses;
-        // the CPU chain runs concurrently with the GPU chain once the scheduler
-        // lookahead lands (flip with it); until then the two chains are serial
-        const bool cpu_chain_overlaps = getenv("GGML_SCHED_NO_CPU_OVERLAP") == nullptr;
+        // the CPU chain runs concurrently with the GPU chain (scheduler lookahead); the
+        // serial variant is no longer priced (its switch was removed after the grid
+        // certified the overlap)
+        const bool cpu_chain_overlaps = true;
         auto miss_ms_layer = [&](int pol) -> double {
             switch (pol) {
                 case LLAMA_PSHARD_MISS_CPU_EXEC:

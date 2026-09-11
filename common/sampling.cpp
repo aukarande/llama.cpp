@@ -579,6 +579,21 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         LOG_INF("%s: unaccounted time = %10.2f ms / %5.1f %%      (total - sampling - prompt eval - eval) / (total)\n", __func__, t_unacc_ms, t_unacc_pc);
         LOG_INF("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 
+        // pshard tier switches (weight re-upload + KV rows when the plan changes between batches) are
+        // part of the eval / prompt eval totals above; show them and the eval rate without them.
+        // Stock runs never switch, so their output is unchanged. The labels deliberately do not
+        // contain "eval time": the perf-grid runner selects the eval lines by that substring.
+        if (data.n_pshard_switch > 0) {
+            LOG_INF("%s:   pshard switches = %10.2f ms / %5d switches (%8.2f ms inside eval, %8.2f ms inside prompt eval)\n",
+                    __func__, data.t_pshard_switch_ms, data.n_pshard_switch, data.t_pshard_switch_eval_ms,
+                    data.t_pshard_switch_ms - data.t_pshard_switch_eval_ms);
+            const double t_eval_x_ms = data.t_eval_ms - data.t_pshard_switch_eval_ms;
+            if (t_eval_x_ms > 0.0) {
+                LOG_INF("%s: eval excl. switch = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
+                        __func__, t_eval_x_ms, data.n_eval, t_eval_x_ms / data.n_eval, 1e3 / t_eval_x_ms * data.n_eval);
+            }
+        }
+
         common_memory_breakdown_print(ctx);
     }
 }

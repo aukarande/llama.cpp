@@ -3629,6 +3629,10 @@ llama_perf_context_data llama_context::perf_get_data() const {
     data.n_eval      = std::max(1, n_eval);
     data.n_reused    = std::max(0, n_reused);
 
+    data.t_pshard_switch_ms      = 1e-3 * t_pshard_switch_us;
+    data.t_pshard_switch_eval_ms = 1e-3 * t_pshard_switch_eval_us;
+    data.n_pshard_switch         = std::max(0, n_pshard_switch);
+
     return data;
 }
 
@@ -3637,6 +3641,9 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+
+    t_pshard_switch_us = t_pshard_switch_eval_us = 0;
+    n_pshard_switch    = 0;
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -4555,6 +4562,19 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    // pshard tier switches are part of the eval / prompt eval totals above; show them and the
+    // eval rate without them (stock runs never switch, so their output is unchanged)
+    if (data.n_pshard_switch > 0) {
+        LLAMA_LOG_INFO("%s:   pshard switches = %10.2f ms / %5d switches (%8.2f ms inside eval, %8.2f ms inside prompt eval)\n",
+                __func__, data.t_pshard_switch_ms, data.n_pshard_switch, data.t_pshard_switch_eval_ms,
+                data.t_pshard_switch_ms - data.t_pshard_switch_eval_ms);
+        const double t_eval_x_ms = data.t_eval_ms - data.t_pshard_switch_eval_ms;
+        if (t_eval_x_ms > 0.0) {
+            LLAMA_LOG_INFO("%s: eval excl. switch = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
+                    __func__, t_eval_x_ms, data.n_eval, t_eval_x_ms / data.n_eval, 1e3 / t_eval_x_ms * data.n_eval);
+        }
+    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

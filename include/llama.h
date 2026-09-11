@@ -1653,6 +1653,12 @@ extern "C" {
         int32_t n_p_eval;   // number of prompt tokens
         int32_t n_eval;     // number of generated tokens
         int32_t n_reused;   // number of times a ggml compute graph had been reused
+
+        // pshard tier switches (weight re-upload + KV rows when the plan changes between batches);
+        // their time is INCLUDED in t_p_eval_ms / t_eval_ms, these fields let a caller take it out
+        double  t_pshard_switch_ms;      // all switches
+        double  t_pshard_switch_eval_ms; // the part that landed in 1-token batches (inside t_eval_ms)
+        int32_t n_pshard_switch;         // number of switches
     };
 
     struct llama_perf_sampler_data {

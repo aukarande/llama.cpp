@@ -443,6 +443,12 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // pshard tier switches: time spent re-uploading weights / KV rows when the active plan
+    // changes between batches (lands inside t_eval_us for 1-token batches, else t_p_eval_us)
+    mutable int64_t t_pshard_switch_us      = 0;
+    mutable int64_t t_pshard_switch_eval_us = 0;
+    mutable int32_t n_pshard_switch         = 0;
 };
 
 llama_context * llama_init_from_model_internal(

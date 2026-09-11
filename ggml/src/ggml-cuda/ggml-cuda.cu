@@ -95,6 +95,41 @@
 // pageable host->device staging (defined with the CUDA backend below; used by the buffer ops above it)
 static void ggml_cuda_stage_drain(int device, cudaStream_t stream);
 static void ggml_cuda_stage_drain_device(int device);
+
+// device-accessible pinned host regions (cudaMallocHost buffers, cudaHostRegister'd model mappings) with their
+// device-side addresses: the kernel-copy paths translate a host pointer through this table instead of asking
+// cudaPointerGetAttributes per transfer. Kept in sync by the host allocator and the register/unregister calls.
+struct ggml_cuda_host_region { const char * base; size_t size; char * dev; };
+static std::vector<ggml_cuda_host_region> ggml_cuda_host_regions;
+static std::mutex ggml_cuda_host_regions_mutex;
+static void ggml_cuda_host_region_add(const void * base, size_t size) {
+    void * dev = nullptr;
+    if (cudaHostGetDevicePointer(&dev, const_cast<void *>(base), 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        dev = nullptr;   // registered but not mappable: transfers from it keep the copy engine
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_regions_mutex);
+    ggml_cuda_host_regions.push_back({ (const char *) base, size, (char *) dev });
+}
+static void ggml_cuda_host_region_del(const void * base) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_regions_mutex);
+    for (size_t i = 0; i < ggml_cuda_host_regions.size(); i++) {
+        if (ggml_cuda_host_regions[i].base == (const char *) base) {
+            ggml_cuda_host_regions.erase(ggml_cuda_host_regions.begin() + i);
+            return;
+        }
+    }
+}
+// device-side address of a host pointer when it lies in a device-accessible pinned region, else nullptr
+static void * ggml_cuda_host_device_ptr(const void * p) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_regions_mutex);
+    for (const auto & r : ggml_cuda_host_regions) {
+        if ((const char *) p >= r.base && (const char *) p < r.base + r.size) {
+            return r.dev != nullptr ? r.dev + ((const char *) p - r.base) : nullptr;
+        }
+    }
+    return nullptr;
+}
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -1291,6 +1326,7 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_cuda_host_region_del(buffer->context);
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1309,6 +1345,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
         return nullptr;
     }
 
+    ggml_cuda_host_region_add(ptr, size);
     return ptr;
 }
 
@@ -2981,12 +3018,129 @@ static bool ggml_cuda_stage_queue_memset(int device, cudaStream_t stream, void *
 }
 #endif // !GGML_USE_HIP && !GGML_USE_MUSA
 
+// kernel copies (GGML_CUDA_KERNEL_COPY=1). On WDDM a copy-engine transfer ordered behind a kernel, or a
+// kernel behind a transfer, costs 35-55 us of GPU idle: the OS scheduler fences the two engines. A copy
+// performed by a kernel through the device mapping of pinned host memory (cudaMallocHost, cudaHostRegister)
+// stays on the compute engine. Measured 2026-09-10 on an RTX 5070 Ti: kernel -> DMA D2H 8 KB -> sync 43 us
+// vs copy kernel 12 us; kernel -> DMA H2D 2 MB -> kernel 154 us vs copy kernel 58 us (~30 GB/s from host).
+// Transfers above GGML_CUDA_KERNEL_COPY_MAX_MB (default 16) keep the copy engine (bandwidth-bound bulk).
+static std::atomic<bool> ggml_cuda_kernel_copy_flag{false};   // runtime switch (the expert pool turns it on while active)
+static bool ggml_cuda_kernel_copy_enabled() {
+    static const int env_mode = [] { const char * e = getenv("GGML_CUDA_KERNEL_COPY"); return e != nullptr ? (atoi(e) != 0 ? 1 : 0) : -1; }();
+    return env_mode >= 0 ? env_mode != 0 : ggml_cuda_kernel_copy_flag.load(std::memory_order_relaxed);
+}
+bool ggml_backend_cuda_kernel_copy_set(bool on) {
+    ggml_cuda_kernel_copy_flag.store(on, std::memory_order_relaxed);
+    return ggml_cuda_kernel_copy_enabled();
+}
+static size_t ggml_cuda_kernel_copy_max_bytes() {
+    static const size_t mx = [] { const char * e = getenv("GGML_CUDA_KERNEL_COPY_MAX_MB"); return (size_t) ((e != nullptr ? atof(e) : 16.0) * 1024.0 * 1024.0); }();
+    return mx;
+}
+template <typename T>
+static __global__ void k_kernel_copy(const T * __restrict__ src, T * __restrict__ dst, size_t n) {
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        dst[i] = src[i];
+    }
+}
+// batched upload: one launch for a layer's expert-row segments (the per-tensor launches left ~30 us gaps
+// between consecutive copy kernels and delayed the CPU chain's start by the host's issue time)
+#define GGML_CUDA_COPY_SEG_MAX 32
+struct ggml_cuda_copy_seg { const int4 * src; int4 * dst; size_t n16; };
+struct ggml_cuda_copy_seg_batch { ggml_cuda_copy_seg s[GGML_CUDA_COPY_SEG_MAX]; };
+static __global__ void k_kernel_copy_segs(const ggml_cuda_copy_seg_batch batch, int blocks_per_seg) {
+    const ggml_cuda_copy_seg sg = batch.s[blockIdx.x / blocks_per_seg];
+    const size_t stride = (size_t) blocks_per_seg * blockDim.x;
+    for (size_t i = (size_t) (blockIdx.x % blocks_per_seg) * blockDim.x + threadIdx.x; i < sg.n16; i += stride) {
+        sg.dst[i] = sg.src[i];
+    }
+}
+bool ggml_backend_cuda_copy_segments_async(ggml_backend_t backend, const ggml_backend_copy_segment * segs, int n) {
+    if (n <= 0 || !ggml_backend_is_cuda(backend) || !ggml_cuda_kernel_copy_enabled()) {
+        return false;
+    }
+    // validate and translate everything first: nothing is issued when any segment cannot take this path
+    std::vector<ggml_cuda_copy_seg> v((size_t) n);
+    size_t max_n16 = 0;
+    for (int i = 0; i < n; i++) {
+        const void * src_dev = ggml_cuda_host_device_ptr(segs[i].src);
+        if (src_dev == nullptr || segs[i].dst == nullptr ||
+            (((uintptr_t) src_dev | (uintptr_t) segs[i].dst | (uintptr_t) segs[i].size) & 15) != 0 ||
+            segs[i].size > ggml_cuda_kernel_copy_max_bytes()) {
+            return false;
+        }
+        v[i] = { (const int4 *) src_dev, (int4 *) segs[i].dst, segs[i].size / 16 };
+        max_n16 = std::max(max_n16, v[i].n16);
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    // one int4 per thread for the largest segment (PCIe reads need many requests in flight: 22 blocks per
+    // 704 KB segment ran at 16 GB/s, the per-tensor kernels with one int4 per thread at ~30 GB/s)
+    const int blocks_per_seg = (int) std::max<size_t>(1, std::min<size_t>(256, (max_n16 + 255) / 256));
+    for (int i0 = 0; i0 < n; i0 += GGML_CUDA_COPY_SEG_MAX) {
+        ggml_cuda_copy_seg_batch batch;
+        const int nb = std::min(n - i0, GGML_CUDA_COPY_SEG_MAX);
+        for (int i = 0; i < nb; i++) {
+            batch.s[i] = v[i0 + i];
+        }
+        k_kernel_copy_segs<<<nb * blocks_per_seg, 256, 0, cuda_ctx->stream()>>>(batch, blocks_per_seg);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+template <typename T>
+static __global__ void k_kernel_fill(T * __restrict__ dst, T value, size_t n) {
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        dst[i] = value;
+    }
+}
+// memset by a kernel: on WDDM cudaMemsetAsync behaves like a copy-engine op (traced 2026-09-10: 36 us of GPU
+// idle between a 64 KB memset and the kernel after it)
+static void ggml_cuda_kernel_fill(void * dst, uint8_t value, size_t size, cudaStream_t stream) {
+    const uintptr_t align = (uintptr_t) dst | (uintptr_t) size;
+    if ((align & 15) == 0) {
+        const size_t n = size / 16;
+        const int nb = (int) std::max<size_t>(1, std::min<size_t>(1024, (n + 255) / 256));
+        const int w = (int) value * 0x01010101;
+        k_kernel_fill<int4><<<nb, 256, 0, stream>>>((int4 *) dst, make_int4(w, w, w, w), n);
+    } else {
+        const int nb = (int) std::max<size_t>(1, std::min<size_t>(1024, (size + 255) / 256));
+        k_kernel_fill<char><<<nb, 256, 0, stream>>>((char *) dst, (char) value, size);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+static void ggml_cuda_kernel_copy(void * dst, const void * src, size_t size, cudaStream_t stream) {
+    const uintptr_t align = (uintptr_t) dst | (uintptr_t) src | (uintptr_t) size;
+    if ((align & 15) == 0) {
+        const size_t n = size / 16;
+        const int nb = (int) std::max<size_t>(1, std::min<size_t>(1024, (n + 255) / 256));
+        k_kernel_copy<int4><<<nb, 256, 0, stream>>>((const int4 *) src, (int4 *) dst, n);
+    } else if ((align & 3) == 0) {
+        const size_t n = size / 4;
+        const int nb = (int) std::max<size_t>(1, std::min<size_t>(1024, (n + 255) / 256));
+        k_kernel_copy<int><<<nb, 256, 0, stream>>>((const int *) src, (int *) dst, n);
+    } else {
+        const int nb = (int) std::max<size_t>(1, std::min<size_t>(1024, (size + 255) / 256));
+        k_kernel_copy<char><<<nb, 256, 0, stream>>>((const char *) src, (char *) dst, size);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (ggml_cuda_kernel_copy_enabled() && size <= ggml_cuda_kernel_copy_max_bytes()) {
+        if (const void * src_dev = ggml_cuda_host_device_ptr(data)) {
+            ggml_cuda_set_device(cuda_ctx->device);
+            ggml_cuda_kernel_copy((char *) tensor->data + offset, src_dev, size, cuda_ctx->stream());
+            return;
+        }
+    }
     if (ggml_cuda_staged_h2d(cuda_ctx->device, (char *) tensor->data + offset, data, size, cuda_ctx->stream())) {
         return;
     }
@@ -3001,6 +3155,13 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (ggml_cuda_kernel_copy_enabled() && size <= ggml_cuda_kernel_copy_max_bytes()) {
+        if (void * dst_dev = ggml_cuda_host_device_ptr(data)) {
+            ggml_cuda_set_device(cuda_ctx->device);
+            ggml_cuda_kernel_copy(dst_dev, (const char *) tensor->data + offset, size, cuda_ctx->stream());
+            return;
+        }
+    }
     if (!ggml_cuda_stage_queue_d2h(cuda_ctx->device, cuda_ctx->stream(), data, (const char *) tensor->data + offset, size)) {
         CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
     }
@@ -5161,6 +5322,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 static void ggml_backend_cuda_memset_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
+    if (ggml_cuda_kernel_copy_enabled() && size <= ggml_cuda_kernel_copy_max_bytes()) {
+        ggml_cuda_kernel_fill((char *) tensor->data + offset, value, size, cuda_ctx->stream());
+        return;
+    }
     if (!ggml_cuda_stage_queue_memset(cuda_ctx->device, cuda_ctx->stream(), (char *)tensor->data + offset, value, size)) {
         CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + offset, value, size, cuda_ctx->stream()));
     }
@@ -5251,6 +5416,7 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
                           size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return false;
     }
+    ggml_cuda_host_region_add(buffer, size);
     return true;
 #else
     GGML_UNUSED(buffer);
@@ -5264,6 +5430,7 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     // and the env may legitimately be unset by then (e.g. pshard stock-fallback) -
     // gating here would silently leak the page-lock
 
+    ggml_cuda_host_region_del(buffer);
     cudaError_t err = cudaHostUnregister(buffer);
     if (err != cudaSuccess) {
         // clear the error
@@ -6089,6 +6256,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_copy_segments_async") == 0) {
+        return (void *)ggml_backend_cuda_copy_segments_async;
+    }
+    if (strcmp(name, "ggml_backend_kernel_copy_set") == 0) {
+        return (void *)ggml_backend_cuda_kernel_copy_set;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

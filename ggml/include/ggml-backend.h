@@ -414,6 +414,32 @@ extern "C" {
             struct ggml_tensor * view, ggml_backend_t copy_backend, void * user_data);
     GGML_API void ggml_backend_sched_set_pool_prefetch_cb(ggml_backend_sched_t sched,
             ggml_backend_sched_pool_prefetch_cb cb);
+    // optional: consulted right before a split computes (never with an eval callback). Return
+    // true when every node of the split graph is known to evaluate to zeros this time (an expert
+    // chain whose routing ids are all -1): the scheduler skips the compute and zero-fills, in
+    // stream order on the consumer's backend, every copy a later split takes from the skipped
+    // split instead of moving it.
+    typedef bool (*ggml_backend_sched_split_skip_cb)(const struct ggml_cgraph * split_graph,
+            ggml_backend_t backend, void * user_data);
+    GGML_API void ggml_backend_sched_set_split_skip_cb(ggml_backend_sched_t sched,
+            ggml_backend_sched_split_skip_cb cb, void * user_data);
+    // asynchronous host<->device input handling on pshard layouts (off by default): a CPU split's device
+    // inputs download asynchronously behind an event, host-sourced inputs of device splits upload on the
+    // split stream without a drain, the user's inputs upload asynchronously and drain once per graph, and
+    // an alias stream is synchronized only when something was issued on it. Pays off with kernel copies
+    // (the expert pool turns both on while a pool tier is active); legacy tiers keep the synchronous paths.
+    GGML_API void ggml_backend_sched_set_async_host_copies(ggml_backend_sched_t sched, bool on);
+
+    // optional backend procs (ggml_backend_reg_get_proc_address), implemented by the CUDA backend:
+    // "ggml_backend_copy_segments_async": one launch uploading many pinned host segments to the device
+    //   on the backend's stream (false = not taken, the caller falls back to per-tensor set_async)
+    // "ggml_backend_kernel_copy_set": run copies to/from device-accessible pinned host memory as kernels
+    //   (no copy-engine transitions - on WDDM each costs 35-55 us of GPU idle); GGML_CUDA_KERNEL_COPY=0/1
+    //   overrides the switch
+    struct ggml_backend_copy_segment { void * dst; const void * src; size_t size; };
+    typedef bool (*ggml_backend_copy_segments_async_t)(ggml_backend_t backend,
+            const struct ggml_backend_copy_segment * segs, int n);
+    typedef bool (*ggml_backend_kernel_copy_set_t)(bool on);
 
     // Per-split info snapshot for timing prediction.
     struct ggml_backend_sched_split_info {

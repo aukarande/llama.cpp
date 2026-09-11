@@ -20,7 +20,7 @@
 #     the pool's headline counters print at WARN, so perf rows still carry h;
 #   - thread count is always the default (never set -t);
 #   - every pshard cell plans fresh with the run's own environment (PSHARD_STRATEGY,
-#     PSHARD_MISS_POLICY, GGML_SCHED_NO_CPU_OVERLAP and the spec flags are fingerprinted);
+#     PSHARD_MISS_POLICY and the spec flags are fingerprinted);
 #     consecutive cells that differ only in runtime-only knobs (PSHARD_POOL_PREDICT,
 #     PSHARD_POOL_WARM/ALLOC) share one plan;
 #   - benches get the whole machine; one instance at a time.
@@ -74,21 +74,20 @@ mva_of()      { case $1 in full) echo "$FULL" ;; *) echo "$1" ;; esac; }
 #   prompt 512 | 4k
 #   arm    stock | auto | s0..s4 (forced legacy) | pool:<policy> | pool:plan | poolauto
 #   warm   1 = PSHARD_POOL_WARM=8 PSHARD_POOL_ALLOC=1 (prompt-end LRU seeding + per-layer slots)
-#   noovl  1 = GGML_SCHED_NO_CPU_OVERLAP=1 (plan and run)
+#   noovl  always 0 (column kept for ledger compatibility; the no-overlap switch was removed
+#          2026-09-09 after the 20260905/20260906 grids certified the overlap in all 16 pairs)
 CELLS=""
 add() { CELLS="$CELLS
 $1|$2|$3|$4|$5|$6|$7|$8|$9"; }
-pool_block() { # model mva prompt  -> the 13 pool perf variants (pred/warm variants right after their base: one plan)
+pool_block() { # model mva prompt  -> the 11 pool perf variants (pred/warm variants right after their base: one plan)
     M=$1; B=$2; PR=$3
     add perf $M $B $PR none pool:fetch     0 0 0
     add perf $M $B $PR none pool:fetch     1 0 0
     add perf $M $B $PR none pool:fetch     1 1 0
     add perf $M $B $PR none pool:hybrid    0 0 0
     add perf $M $B $PR none pool:hybrid    1 0 0
-    add perf $M $B $PR none pool:hybrid    0 0 1
     add perf $M $B $PR none pool:cpu_admit 0 0 0
     add perf $M $B $PR none pool:cpu_admit 1 0 0
-    add perf $M $B $PR none pool:cpu_admit 0 0 1
     add perf $M $B $PR none pool:cpu_exec  0 0 0
     add perf $M $B $PR none pool:fetch_on_2nd_miss 0 0 0
     add perf $M $B $PR none pool:plan      0 0 0
@@ -353,7 +352,7 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
         pool:*)   ENVF="PSHARD_STRATEGY=5 PSHARD_MISS_POLICY=${A#pool:} PSHARD_POOL_RUNTIME=1" ;;
         poolauto) ENVF="PSHARD_POOL_AUTO=1 PSHARD_POOL_RUNTIME=1" ;;
     esac
-    [ "$N" = "1" ] && ENVF="$ENVF GGML_SCHED_NO_CPU_OVERLAP=1"   # the planner prices the overlap
+    [ "$N" = "1" ] && { echo "noovl cells are gone: the no-overlap switch was removed 2026-09-09 ($NM)" >&2; exit 2; }
     ENVV=$ENVF
     [ "$P" = "1" ] && ENVV="$ENVV PSHARD_POOL_PREDICT=1"
     [ "$W" = "1" ] && ENVV="$ENVV PSHARD_POOL_WARM=8 PSHARD_POOL_ALLOC=1"

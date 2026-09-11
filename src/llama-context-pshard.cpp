@@ -983,7 +983,16 @@ uint32_t llama_context::pshard_land_tier(size_t tier, uint32_t n_tokens) {
                     for (size_t i = 0; i < registry->best_plans.size(); i++) {
                         if (&registry->best_plans[i] == pshard_active_plan) { old_tier = i; break; }
                     }
+                    // perf: the switch (weight re-upload + KV rows + fence) lands inside this
+                    // batch's eval or prompt-eval time; count it so both views can be reported
+                    const int64_t t_switch_start_us = ggml_time_us();
                     pshard_switch_plan(*pshard_active_plan, *best, old_tier, tier, n_tokens);
+                    const int64_t t_switch_us = ggml_time_us() - t_switch_start_us;
+                    t_pshard_switch_us += t_switch_us;
+                    if (n_tokens == 1) {
+                        t_pshard_switch_eval_us += t_switch_us;
+                    }
+                    n_pshard_switch++;
                 } else {
                     pshard_apply_plan(*best);
                 }

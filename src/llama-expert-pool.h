@@ -22,6 +22,7 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <vector>
 
 struct llama_model;
@@ -35,6 +36,41 @@ struct llama_expert_pool {
         size_t              row_bytes  = 0;       // one expert = host->nb[2]
         size_t              region_off = 0;       // slot 0 offset inside the region (cache mode)
         size_t              ab_off[2]  = {0, 0};  // layer-half offsets (A/B mode)
+    };
+
+    // int32 id buffer: lives in the pool's page-locked arena when it fits (the CUDA backend then uploads
+    // it with a kernel copy instead of a copy-engine transfer), else in an owned vector. Same call surface
+    // as the vector it replaces; a copy gets its own vector storage.
+    struct ids_buf {
+        int32_t * pin     = nullptr;   // arena slice (may be null)
+        size_t    pin_cap = 0;         // elements
+        std::vector<int32_t> vec;      // fallback storage
+        int32_t * p = nullptr;
+        size_t    n = 0;
+        ids_buf() = default;
+        ids_buf(const ids_buf & o) { *this = o; }
+        ids_buf & operator=(const ids_buf & o) {
+            if (this != &o) {
+                assign(o.n, 0);
+                std::copy(o.p, o.p + o.n, p);
+            }
+            return *this;
+        }
+        void assign(size_t count, int32_t v) {
+            n = count;
+            if (pin != nullptr && count <= pin_cap) {
+                p = pin;
+                std::fill(p, p + n, v);
+            } else {
+                vec.assign(count, v);
+                p = vec.data();
+            }
+        }
+        int32_t &       operator[](size_t i)       { return p[i]; }
+        const int32_t & operator[](size_t i) const { return p[i]; }
+        int32_t *       data()       { return p; }
+        const int32_t * data() const { return p; }
+        size_t          size() const { return n; }
     };
 
     struct layer_state {
@@ -56,7 +92,10 @@ struct llama_expert_pool {
         uint64_t evicted  = 0;              // residents displaced by a fetch
         uint64_t ab_pass  = 0;              // last pass this layer's A/B half was filled
         uint64_t serve_gen = 0;             // last generation serve() ran the full work
-        std::vector<int32_t> mapped_buf;    // remapped-ids upload buffer: MUST outlive the
+        bool     cpu_dead     = false;      // dual chain: this generation routes nothing to the CPU
+        uint64_t cpu_dead_gen = 0;          // generation cpu_dead was decided for
+        uint64_t cpu_dead_passes = 0;       // passes whose CPU chain had no routes (skippable)
+        ids_buf mapped_buf;                 // remapped-ids upload buffer: MUST outlive the
                                             // async copy (the staging worker may queue the
                                             // host pointer behind pending staged fetches)
 
@@ -98,7 +137,7 @@ struct llama_expert_pool {
         uint32_t              prompt_pos = 0;   // tokens of this prompt seen by this layer
         ggml_backend_event_t  warm_event   = nullptr;   // this layer's seeds landed (copy stream)
         bool                  warm_pending = false;
-        std::vector<int32_t> bias_buf;        // persistent upload buffers (async-safe)
+        ids_buf bias_buf;                     // persistent upload buffers (async-safe)
         std::vector<int32_t> cpu_buf;
         std::vector<uint64_t> expert_last_gen; // [n_expert] recency: last generation routed
         std::vector<uint32_t> miss_count;      // [n_expert] fetch_on_2nd_miss admission counter
@@ -118,11 +157,34 @@ struct llama_expert_pool {
     // predicts layer il+k's experts (PSHARD_POOL_PREDICT=k, 0 = off)
     int32_t  predict_k     = 0;
     bool     prefetch_on   = true;   // PSHARD_POOL_PREFETCH=0: predict and score only
+    // dead CPU chains (every route of the pass resident or promoted): the sched skips the
+    // chain's compute and zero-fills its merge input instead of the host join copy.
+    // PSHARD_POOL_SKIP_DEAD=0 computes them anyway (A/B switch)
+    bool     skip_dead     = true;
+    uint64_t skipped_splits = 0;     // CPU chains the sched skipped on our word
     int32_t  prefetch_n    = 1;      // PSHARD_POOL_PREFETCH_N: at most this many of the predicted
                                      // experts per layer, highest predicted score first (0 = all).
                                      // Mispredicted uploads share the PCIe link with the critical-
                                      // path misses: DSv4 @12000 N=1 +6.5%, N=2 +3.7%, N=3 -2%
     std::vector<char> pred_read_buf;
+    // page-locked staging: the ids / prediction downloads and every layer's id upload buffers.
+    // Device-accessible, so with GGML_CUDA_KERNEL_COPY the backend moves them with kernels instead
+    // of copy-engine transfers (a DMA ordered behind kernels costs 30-55 us of GPU idle on WDDM
+    // whether the host side is pinned or pageable - the pinned arena of 2026-09-10 regressed for
+    // that reason). Allocated only when that env is set; larger batches fall back to the vectors.
+    ggml_backend_buffer_t read_staging = nullptr;
+    bool   read_staging_tried = false;
+    bool   kernel_copies      = false;   // the backend runs pinned-memory copies as kernels while we are active
+    ggml_backend_copy_segments_async_t copy_segments = nullptr;   // batched upload proc (CUDA), else per-tensor
+    ggml_backend_kernel_copy_set_t     kernel_copy_set = nullptr;
+    bool   procs_looked_up = false;
+    void lookup_backend_procs();
+    struct upload_seg { ggml_tensor * view; size_t off; const void * src; size_t size; };
+    std::vector<upload_seg> upload_segs;   // one pass's admitted rows, issued as one launch
+    char * read_ids  = nullptr;
+    char * read_pred = nullptr;
+    size_t read_cap  = 0;
+    void ensure_read_staging(ggml_backend_t backend);
     uint64_t epoch         = 0;        // bumped on active/ab flips; joins graph reuse
     uint64_t generation    = 0;        // bumped once per decode call; dedupes serve()
 
@@ -240,6 +302,11 @@ struct llama_expert_pool {
     static bool sched_prefetch_cb(const ggml_tensor * src, ggml_tensor * view,
                                   ggml_backend_t copy_backend, void * user_data);
     bool prefetch(const ggml_tensor * src, ggml_backend_t copy_backend);
+
+    // compute-time service (sched callback): true when the split is one of our CPU chains
+    // and serve() routed nothing to it this generation, so every node is zeros
+    static bool sched_split_skip_cb(const ggml_cgraph * split_graph, ggml_backend_t backend, void * user_data);
+    bool split_is_zero(const ggml_cgraph * split_graph);
 
     void reset_slots();
     void log_counters() const;
