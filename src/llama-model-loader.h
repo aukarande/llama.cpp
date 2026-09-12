@@ -23,6 +23,8 @@ struct weight_preload_entry {
     void *                    gpu_addr    = nullptr;
     ggml_backend_buffer_t     host_buffer = nullptr;
     bool                      device_only_common = false;
+    bool                      dev_valid   = false;   // the bytes at the current device address have landed
+                                                     // (uploaded or moved) since that address was assigned
 };
 
 

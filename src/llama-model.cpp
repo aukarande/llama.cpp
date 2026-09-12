@@ -2947,18 +2947,194 @@ size_t llama_model::pshard_apply_plan(const llama_pshard_plan & plan, ggml_backe
             }
         }
 
-        size_t n_uploaded = 0;
-        size_t bytes_uploaded = 0;
+        // Land the bytes. A tensor whose device address changed but whose bytes are already in the arena
+        // (entry.dev_valid: resident in the previous plan, landed there) is moved device-to-device instead of
+        // re-uploaded from the host. Moves run in dependency order (a move whose destination overlaps
+        // another move's source runs after it); a self-overlapping move goes through a small bounce buffer
+        // in memmove order; a dependency cycle stages one member's whole source; whatever cannot be staged
+        // is uploaded. Host uploads follow the moves on the same stream.
+        size_t n_uploaded = 0, bytes_uploaded = 0, n_moved = 0, bytes_moved = 0, n_staged = 0, n_fallback = 0;
+        struct move_t {
+            ggml_tensor *          t;
+            weight_preload_entry * e;
+            char *                 src;
+            char *                 dst;
+            size_t                 n;
+            ggml_backend_buffer_t  stage;   // whole-source stage (cycle break), NULL = source in the arena
+        };
+        std::vector<move_t> moves;
+        std::vector<std::pair<ggml_tensor *, weight_preload_entry *>> uploads;
+        const char * arena_lo = (const char *) buf_base;
+        const char * arena_hi = arena_lo + buf_size;
 
         for (auto & [tensor, entry] : pimpl->weight_preload_map) {
             if (entry.device_only_common || entry.cpu_addr == nullptr) continue;
-            if (tensor->data == entry.cpu_addr) continue;
-            void * old = old_addrs[tensor];
-            if ((force_upload || old != tensor->data) && gpu) {
-                ggml_backend_tensor_set_async(gpu, tensor, entry.cpu_addr, 0, ggml_nbytes(tensor));
-                n_uploaded++;
-                bytes_uploaded += ggml_nbytes(tensor);
+            if (tensor->data == entry.cpu_addr) {
+                entry.dev_valid = false;   // back on the host
+                continue;
             }
+            void * old = old_addrs[tensor];
+            if (gpu == nullptr) {
+                // addresses applied without landing (tier warmup): the bytes are not there
+                if (old != tensor->data) entry.dev_valid = false;
+                continue;
+            }
+            if (!force_upload && old == tensor->data && entry.dev_valid) continue;   // same address, bytes present
+            const size_t n = ggml_nbytes(tensor);
+            const bool movable = !force_upload && entry.dev_valid && old != nullptr && old != tensor->data &&
+                old != entry.cpu_addr && (const char *) old >= arena_lo && (const char *) old + n <= arena_hi;
+            if (movable) {
+                moves.push_back({ tensor, &entry, (char *) old, (char *) tensor->data, n, nullptr });
+            } else {
+                uploads.push_back({ tensor, &entry });
+            }
+        }
+
+        std::vector<ggml_backend_buffer_t> stages;
+        if (!moves.empty()) {
+            auto byte_view = [](void * p, size_t n, ggml_backend_buffer_t buf) {
+                ggml_tensor v = {};
+                v.type  = GGML_TYPE_I8;
+                v.ne[0] = (int64_t) n; v.ne[1] = v.ne[2] = v.ne[3] = 1;
+                v.nb[0] = 1; v.nb[1] = v.nb[2] = v.nb[3] = n;
+                v.data   = p;
+                v.buffer = buf;
+                return v;
+            };
+            auto d2d = [&](char * dst, ggml_backend_buffer_t dst_buf, const char * src_p, ggml_backend_buffer_t src_buf, size_t n) {
+                ggml_tensor s = byte_view((void *) src_p, n, src_buf);
+                ggml_tensor d = byte_view(dst, n, dst_buf);
+                ggml_backend_tensor_copy_async(gpu, gpu, &s, &d);
+            };
+            auto overlaps = [](const char * a, size_t an, const char * b, size_t bn) {
+                return a < b + bn && b < a + an;
+            };
+            // one bounce buffer for self-overlapping moves: each chunk goes source -> bounce -> destination,
+            // ascending for a downward move and descending for an upward one, so every source byte is read
+            // before the destination that covers it is written, whatever the shift
+            const size_t bounce_size = (size_t) 32 << 20;
+            ggml_backend_buffer_t bounce = nullptr;
+            bool bounce_tried = false;
+            auto get_bounce = [&]() -> char * {
+                if (!bounce_tried) {
+                    bounce_tried = true;
+                    bounce = ggml_backend_alloc_buffer(gpu, bounce_size);
+                    if (bounce != nullptr) stages.push_back(bounce);
+                }
+                return bounce != nullptr ? (char *) ggml_backend_buffer_get_base(bounce) : nullptr;
+            };
+            auto stage_source = [&](move_t & m) -> bool {   // whole source into a fresh buffer (cycle break)
+                if (m.stage != nullptr) return true;
+                ggml_backend_buffer_t st = ggml_backend_alloc_buffer(gpu, m.n);
+                if (st == nullptr) return false;
+                char * base = (char *) ggml_backend_buffer_get_base(st);
+                d2d(base, st, m.src, pimpl->dev_preload_buf, m.n);
+                stages.push_back(st);
+                m.src   = base;
+                m.stage = st;
+                n_staged++;
+                return true;
+            };
+            auto execute = [&](move_t & m) -> bool {
+                ggml_backend_buffer_t src_buf = m.stage != nullptr ? m.stage : pimpl->dev_preload_buf;
+                if (m.stage == nullptr && overlaps(m.src, m.n, m.dst, m.n)) {
+                    char * bb = get_bounce();
+                    if (bb == nullptr) return false;
+                    if (m.dst < m.src) {
+                        for (size_t off = 0; off < m.n; off += bounce_size) {
+                            const size_t c = std::min(bounce_size, m.n - off);
+                            d2d(bb, bounce, m.src + off, src_buf, c);
+                            d2d(m.dst + off, pimpl->dev_preload_buf, bb, bounce, c);
+                        }
+                    } else {
+                        for (size_t off = m.n; off > 0;) {
+                            const size_t c = std::min(bounce_size, off);
+                            off -= c;
+                            d2d(bb, bounce, m.src + off, src_buf, c);
+                            d2d(m.dst + off, pimpl->dev_preload_buf, bb, bounce, c);
+                        }
+                    }
+                } else {
+                    d2d(m.dst, pimpl->dev_preload_buf, m.src, src_buf, m.n);
+                }
+                m.e->dev_valid = true; n_moved++; bytes_moved += m.n;
+                return true;
+            };
+
+            // dependency graph: i waits for j when dst_i overlaps src_j. Sources are disjoint, so the
+            // sources overlapping a destination are contiguous in source order: one binary search each.
+            const size_t nm = moves.size();
+            std::vector<size_t> by_src(nm);
+            for (size_t i = 0; i < nm; i++) by_src[i] = i;
+            std::sort(by_src.begin(), by_src.end(), [&](size_t x, size_t y) { return moves[x].src < moves[y].src; });
+            std::vector<std::vector<size_t>> waiters(nm);   // waiters[j] = moves that wait for j's source to be read
+            std::vector<size_t> indeg(nm, 0);
+            for (size_t i = 0; i < nm; i++) {
+                const char * d0 = moves[i].dst;
+                const char * d1 = d0 + moves[i].n;
+                // first source that ends after d0
+                size_t lo = 0, hi = nm;
+                while (lo < hi) {
+                    const size_t mid = (lo + hi) / 2;
+                    const move_t & mj = moves[by_src[mid]];
+                    if (mj.src + mj.n <= d0) lo = mid + 1; else hi = mid;
+                }
+                for (size_t k = lo; k < nm; k++) {
+                    const size_t j = by_src[k];
+                    if (moves[j].src >= d1) break;
+                    if (j == i) continue;
+                    waiters[j].push_back(i);
+                    indeg[i]++;
+                }
+            }
+            std::vector<size_t> ready;
+            std::vector<uint8_t> done(nm, 0);
+            for (size_t i = 0; i < nm; i++) if (indeg[i] == 0) ready.push_back(i);
+            size_t n_done = 0;
+            auto release = [&](size_t j) {   // j's source has been read (moved or staged): its waiters may proceed
+                for (size_t i : waiters[j]) {
+                    if (indeg[i] > 0 && --indeg[i] == 0) ready.push_back(i);
+                }
+                waiters[j].clear();
+            };
+            while (n_done < nm) {
+                if (ready.empty()) {
+                    // dependency cycle: stage the smallest unstaged pending source, or give it up to the host
+                    size_t pick = nm;
+                    for (size_t i = 0; i < nm; i++) {
+                        if (!done[i] && moves[i].stage == nullptr && (pick == nm || moves[i].n < moves[pick].n)) pick = i;
+                    }
+                    if (pick == nm) {   // every pending move is staged and still blocked: cannot happen (staged sources block nobody)
+                        for (size_t i = 0; i < nm; i++) if (!done[i]) { uploads.push_back({ moves[i].t, moves[i].e }); n_fallback++; done[i] = 1; n_done++; }
+                        break;
+                    }
+                    if (stage_source(moves[pick])) {
+                        release(pick);
+                    } else {
+                        uploads.push_back({ moves[pick].t, moves[pick].e });
+                        n_fallback++;
+                        done[pick] = 1; n_done++;
+                        release(pick);   // it will be re-uploaded: its old bytes are free to overwrite
+                    }
+                    continue;
+                }
+                const size_t i = ready.back();
+                ready.pop_back();
+                if (done[i]) continue;
+                if (!execute(moves[i])) {
+                    uploads.push_back({ moves[i].t, moves[i].e });
+                    n_fallback++;
+                }
+                done[i] = 1; n_done++;
+                release(i);
+            }
+        }
+
+        for (auto & [tensor, e] : uploads) {
+            ggml_backend_tensor_set_async(gpu, tensor, e->cpu_addr, 0, ggml_nbytes(tensor));
+            e->dev_valid = true;
+            n_uploaded++;
+            bytes_uploaded += ggml_nbytes(tensor);
         }
 
         if (gpu) {
@@ -2966,10 +3142,13 @@ size_t llama_model::pshard_apply_plan(const llama_pshard_plan & plan, ggml_backe
             // async KV D2H copies that must complete before compute resumes
             ggml_backend_synchronize(gpu);
         }
+        for (ggml_backend_buffer_t st : stages) {
+            ggml_backend_buffer_free(st);
+        }
 
-        LLAMA_LOG_DEBUG("%s: strategy=%s bs=%u scratch_off=%.2f MiB, %zu uploaded (%.2f MiB), cached=%d\n",
+        LLAMA_LOG_DEBUG("%s: strategy=%s bs=%u scratch_off=%.2f MiB, %zu uploaded (%.2f MiB), %zu moved on device (%.2f MiB, %zu staged, %zu fell back to upload), cached=%d\n",
             __func__, llama_pshard_strategy_name(plan.strategy), plan.batch_size, scratch_off / (1024.0 * 1024.0),
-            n_uploaded, bytes_uploaded / (1024.0 * 1024.0), (int)plan.addrs_cached);
+            n_uploaded, bytes_uploaded / (1024.0 * 1024.0), n_moved, bytes_moved / (1024.0 * 1024.0), n_staged, n_fallback, (int)plan.addrs_cached);
     }
 
     return scratch_off;
