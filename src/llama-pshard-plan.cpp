@@ -1,4 +1,5 @@
 #include "llama-pshard-plan.h"
+#include "llama-pshard-workload.h"
 
 #include <cmath>
 
@@ -241,6 +242,10 @@ struct llama_pshard_search_ctx {
     size_t                                     attn_bytes_all   = 0;   // the attention-priority resident set (layer minus FFN) of the same
     uint32_t                                   n_layers_scanned = 0;   // layers with any blk.N tensor
     size_t                                     head_bytes       = 0;   // output head (output*), token_embd when the head is tied
+    // routing workload: Zipf exponent of the router's expert popularity (<model>.pshard_workload written by
+    // pool runs, else the plan-time calibration); -1 = unknown -> pool tiers cannot be priced
+    double                                     zipf_alpha  = -1.0;
+    std::string                                zipf_source;
 };
 
 // accumulate tensor bytes from a gguf tensor table: routed experts per layer
@@ -2117,6 +2122,9 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         if (ctx.exps_total_weights == 0 || ctx.n_expert == 0) {
             missing += " expert-weight-count(gguf)";
         }
+        if (ctx.zipf_alpha < 0.0 && getenv("PSHARD_POOL_ZIPF") == nullptr) {
+            missing += " zipf_alpha(routing-workload)";
+        }
         if (!missing.empty()) {
             LLAMA_LOG_WARN("%s: [EXPERT_POOL] bs=%u not priced - missing:%s (run llama-profiler-cpu --splice cpu_profile.txt); tier refused\n",
                 __func__, bs, missing.c_str());
@@ -2163,19 +2171,17 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         // weight-upload term (full expert stacks) is replaced by
         //   distinct(bs) * (1 - h(s)) * t_miss   per pooled layer,
         // distinct(bs) = min(E, bs*top_k) (token union), h(s) = Zipf(alpha) mass of
-        // the s most popular of E experts (the static optimum). Calibrated to the
-        // STEADY STATE: q35 (fetch,
-        // 512-token prompt + 256 greedy) counted h(14)=0.452 and h(86)=0.822, which
-        // alpha=0.95 reproduces as 0.49 / 0.80 with no shortfall. Short generations
-        // pay the fill: over 32 tokens the same pool counted h(86)=0.70 (an 86-slot
-        // layer needs ~10 tokens of misses to fill) - the planner prices the long-run
-        // rate, the 32-token QA gate reports the cold one. (An LRU-shortfall factor
-        // and admission gating were both measured unnecessary and removed.)
-        // PSHARD_POOL_ZIPF overrides alpha until the grid calibrates it; the QA
-        // ledger's mean_h column is the re-fit input.
+        // the s most popular of E experts (the static optimum). alpha is MEASURED:
+        // the pool histograms every cache-mode route and refits it at exit into
+        // <model>.pshard_workload; a model without one is calibrated at plan time
+        // (sampled generation). The planner prices the long-run rate; short
+        // generations pay the fill (an 86-slot layer needs ~10 tokens of misses),
+        // which the 32-token QA gate reports as the cold one. (An LRU-shortfall
+        // factor and admission gating were both measured unnecessary and removed.)
+        // PSHARD_POOL_ZIPF overrides alpha for experiments.
         const double E = (double) ctx.n_expert;
         const double s = std::min<double>(plan.pool_slots, E);
-        double alpha = 0.95;
+        double alpha = ctx.zipf_alpha;
         if (const char * za = getenv("PSHARD_POOL_ZIPF")) {
             alpha = atof(za);
         }
@@ -2859,6 +2865,33 @@ void llama_params_fit_pshard_plan(
         }
         LLAMA_LOG_INFO("%s: ids-cross inputs: n_expert=%u n_expert_used=%u model_mb=%lld\n",
             __func__, ctx.n_expert, ctx.n_expert_used, (long long)(total_file_size / (1024 * 1024)));
+    }
+
+    // routing workload: the Zipf exponent the pool's hit-rate model h(s) uses. From <model>.pshard_workload
+    // (pool runs accumulate their route histograms into it at exit), else calibrated now: a CPU-only sampled
+    // generation (256 tokens, seed 1234, temperature 1) whose router top-k ids are histogrammed - a measured
+    // stand-in for the workload that the first real run replaces. Nothing is assumed: without either, pool
+    // tiers are refused.
+    if (hp_nex > 0) {
+        llama_pshard_workload wl;
+        const std::string wl_path = llama_pshard_workload::path_for(path_model);
+        if (wl.load(wl_path)) {
+            LLAMA_LOG_INFO("%s: routing workload: zipf_alpha=%.3f (rms %.4f, %llu routes over %u layers, %s) from %s\n",
+                __func__, wl.zipf_alpha, wl.fit_rms, (unsigned long long) wl.samples, wl.n_layers, wl.source.c_str(), wl_path.c_str());
+        } else {
+            LLAMA_LOG_INFO("%s: no routing workload file - calibrating (CPU-only sampled generation, 256 tokens, seed 1234)...\n", __func__);
+            std::string err;
+            if (llama_pshard_workload_calibrate(path_model, mparams, cparams->n_threads, 256, 1234, hp_nex, wl, err)) {
+                const bool saved = wl.save(wl_path);
+                LLAMA_LOG_INFO("%s: routing calibration: zipf_alpha=%.3f (rms %.4f, %llu routes over %u layers)%s %s\n",
+                    __func__, wl.zipf_alpha, wl.fit_rms, (unsigned long long) wl.samples, wl.n_layers,
+                    saved ? " saved to" : " NOT saved:", wl_path.c_str());
+            } else {
+                LLAMA_LOG_WARN("%s: routing calibration failed (%s) - pool tiers cannot be priced\n", __func__, err.c_str());
+            }
+        }
+        ctx.zipf_alpha  = wl.zipf_alpha;
+        ctx.zipf_source = wl.source;
     }
 
     llama_pshard_plan_registry * registry  = mparams->pshard_registry;

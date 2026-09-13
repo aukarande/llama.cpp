@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -141,6 +142,7 @@ struct llama_expert_pool {
         std::vector<int32_t> cpu_buf;
         std::vector<uint64_t> expert_last_gen; // [n_expert] recency: last generation routed
         std::vector<uint32_t> miss_count;      // [n_expert] fetch_on_2nd_miss admission counter
+        std::vector<uint64_t> use_count;       // [n_expert] cache-mode routes per expert (the routing workload histogram)
         std::vector<uint32_t> expert_pending;  // [n_expert] generation whose pass admitted the expert
                                                // in the background (cpu_admit: CPU route that pass)
     };
@@ -148,6 +150,7 @@ struct llama_expert_pool {
     uint32_t n_expert      = 0;
     uint32_t n_expert_used = 0;
     uint32_t n_slots       = 0;        // cache-mode slots per layer (the uniform baseline)
+    std::string workload_path;         // <model>.pshard_workload: the routing skew refit written at exit (empty = not persisted)
     bool     ab_mode       = false;    // active tier is a whole-stack prefill tier
     bool     active        = false;    // the ACTIVE plan is EXPERT_POOL (legacy tiers
                                        // in a mixed registry must stream normally)

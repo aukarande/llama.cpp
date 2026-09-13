@@ -1,5 +1,6 @@
 #include "llama-expert-pool.h"
 #include "llama-pshard-plan.h"
+#include "llama-pshard-workload.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -41,6 +42,7 @@ llama_expert_pool::~llama_expert_pool() {
 }
 
 bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint32_t n_expert_used_) {
+    workload_path = model.get_path_model().empty() ? std::string() : llama_pshard_workload::path_for(model.get_path_model());
     if (const char * pk = getenv("PSHARD_POOL_PREDICT")) {
         predict_k = (int32_t) std::min<long>(8, std::max<long>(0, strtol(pk, nullptr, 10)));
     }
@@ -99,6 +101,7 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
             n_pooled++;
             layer_full_bytes = std::max(layer_full_bytes, full);
             L.expert_slot.assign(n_expert, -1);
+            L.use_count.assign(n_expert, 0);
         }
     }
 
@@ -833,6 +836,9 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                 const int32_t e = *(const int32_t *)
                     (idbuf + i1*ids->nb[1] + i0*ids->nb[0]);
                 GGML_ASSERT(e >= 0 && e < (int32_t) n_expert);
+                if (!L.use_count.empty()) {
+                    L.use_count[e]++;   // routing workload histogram: every route, before the per-pass dedup
+                }
                 if (seen_gen[e] != 0) {
                     continue;
                 }
@@ -1223,5 +1229,34 @@ void llama_expert_pool::log_counters() const {
         const double mpt1 = (double) misses_1 / (double) passes_1;
         LLAMA_LOG_WARN("%s: expert pool decode: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
             __func__, (unsigned long long) hits_1, (unsigned long long) misses_1, (unsigned long long) passes_1, h1, mpt1, n_slots);
+    }
+    // routing workload: this run's cache-mode route histogram goes into <model>.pshard_workload. Real runs
+    // ACCUMULATE (a 128-token run alone has ~4 routes per expert on a 256-expert model, too few on its own; the
+    // module's split-half fit is unbiased at small samples and the store grows with every run); a file holding
+    // only the plan-time calibration stand-in is replaced by the first real run. The 64-pass floor keeps trivial
+    // runs out. The fitted exponent is what the planner prices h(s) with.
+    if (passes >= 64) {
+        std::vector<std::pair<uint32_t, std::vector<uint64_t>>> mine;
+        uint64_t mine_routes = 0;
+        for (const auto & L : layers) {
+            if (!L.tensors.empty() && !L.use_count.empty()) {
+                mine.push_back({ (uint32_t) L.il, L.use_count });
+                for (uint64_t v : L.use_count) {
+                    mine_routes += v;
+                }
+            }
+        }
+        llama_pshard_workload wl;
+        const bool had = !workload_path.empty() && wl.load(workload_path);
+        const bool ok  = (had && wl.source == "runtime" && wl.n_expert == n_expert)
+            ? wl.merge_counts(mine)
+            : wl.set_counts(mine, n_expert, "runtime");
+        if (ok) {
+            const bool saved = !workload_path.empty() && wl.save(workload_path);
+            LLAMA_LOG_WARN("%s: expert pool workload: zipf_alpha=%.3f (rms %.4f, %llu routes accumulated, %llu this run, %u layers): model h(%u)=%.3f vs observed %.3f%s%s\n",
+                __func__, wl.zipf_alpha, wl.fit_rms, (unsigned long long) wl.samples, (unsigned long long) mine_routes, wl.n_layers,
+                n_slots, llama_pshard_workload::zipf_h(wl.zipf_alpha, n_slots, n_expert), h,
+                saved ? " -> " : " (not saved)", saved ? workload_path.c_str() : "");
+        }
     }
 }

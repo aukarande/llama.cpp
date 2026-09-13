@@ -744,6 +744,11 @@ struct llama_model {
 
     llama_pshard_plan_registry * get_plan_registry() const;
 
+    // the main gguf path the model was loaded from (empty for memory-sourced loads): the pshard sidecar
+    // files (plan registry, routing workload) live next to it
+    void                set_path_model(const std::string & path);
+    const std::string & get_path_model() const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

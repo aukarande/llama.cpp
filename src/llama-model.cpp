@@ -1202,6 +1202,7 @@ struct llama_model::impl {
     std::unordered_map<int, int32_t> layer_backend_ids;
 
     llama_pshard_plan_registry * plan_registry = nullptr;
+    std::string path_model;   // main gguf path (see llama_model::set_path_model)
 
     ggml_backend_buffer_t dev_preload_buf = nullptr;
     ggml_backend_t dev_preload_backend = nullptr;
@@ -2474,6 +2475,14 @@ bool llama_model::pshard_delegates_compute() const {
 
 llama_pshard_plan_registry * llama_model::get_plan_registry() const {
     return pimpl->plan_registry;
+}
+
+void llama_model::set_path_model(const std::string & path) {
+    pimpl->path_model = path;
+}
+
+const std::string & llama_model::get_path_model() const {
+    return pimpl->path_model;
 }
 
 bool llama_model_pshard_active(const struct llama_model * model) {
