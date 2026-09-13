@@ -236,18 +236,40 @@ struct llama_pshard_search_ctx {
     uint32_t                                   n_layers_moe     = 0;
     uint32_t                                   exps_tensors_per_layer = 0; // expert tensors in a layer (3 = up/gate/down,
                                                                            // 2 = gate_up/down): the pool's segment size
+    // whole-layer, attention and head bytes from the gguf table (the switch-cost estimator's inputs; 0 = no scan)
+    size_t                                     layer_bytes_all  = 0;   // every blk.N tensor, summed over the scanned layers
+    size_t                                     attn_bytes_all   = 0;   // the attention-priority resident set (layer minus FFN) of the same
+    uint32_t                                   n_layers_scanned = 0;   // layers with any blk.N tensor
+    size_t                                     head_bytes       = 0;   // output head (output*), token_embd when the head is tied
 };
 
-// accumulate routed-expert tensor bytes per layer from a gguf tensor table
-// (blk.N.ffn_(up|down|gate|gate_up)_exps.weight); per_layer[il] gets the sum,
-// per_expert gets the max over layers of the summed per-expert row bytes
-static void pshard_scan_expert_bytes(const struct gguf_context * g, uint32_t n_expert,
-        std::vector<size_t> & per_layer, size_t & per_expert, size_t & total_weights, uint32_t & tensors_per_layer) {
+// accumulate tensor bytes from a gguf tensor table: routed experts per layer
+// (blk.N.ffn_(up|down|gate|gate_up)_exps.weight; per_layer[il] gets the sum, per_expert
+// the max over layers of the summed per-expert row bytes), every blk.N tensor
+// (per_layer_all), the attention-priority resident set of llama_pshard_generate_overrides
+// (the layer minus its FFN pattern set patterns_layer_ffn: attention, norms, routers,
+// anything that is not ffn_(up|gate|down). or an expert tensor: per_layer_attn), the
+// output head (output*) and the token embeddings (the head when the embeddings are tied)
+static void pshard_scan_tensor_bytes(const struct gguf_context * g, uint32_t n_expert,
+        std::vector<size_t> & per_layer, size_t & per_expert, size_t & total_weights, uint32_t & tensors_per_layer,
+        std::vector<size_t> & per_layer_all, std::vector<size_t> & per_layer_attn, size_t & head_bytes, size_t & tok_embd_bytes,
+        bool & has_output_weight) {
     const int64_t n = gguf_get_n_tensors(g);
     std::vector<size_t>   row_this(per_layer.size(), 0);
     std::vector<uint32_t> cnt_this(per_layer.size(), 0);
     for (int64_t i = 0; i < n; i++) {
         const char * name = gguf_get_tensor_name(g, i);
+        if (strncmp(name, "output", 6) == 0) {       // the head and its norm (override pattern "^output")
+            head_bytes += gguf_get_tensor_size(g, i);
+            if (strcmp(name, "output.weight") == 0) {
+                has_output_weight = true;            // absent = tied embeddings
+            }
+            continue;
+        }
+        if (strncmp(name, "token_embd", 10) == 0) {  // the head when the embeddings are tied (no output.weight)
+            tok_embd_bytes += gguf_get_tensor_size(g, i);
+            continue;
+        }
         if (strncmp(name, "blk.", 4) != 0) {
             continue;
         }
@@ -257,6 +279,17 @@ static void pshard_scan_expert_bytes(const struct gguf_context * g, uint32_t n_e
             continue;
         }
         const char * rest = end + 1;
+        {
+            const size_t bytes = gguf_get_tensor_size(g, i);
+            per_layer_all[il] += bytes;
+            // patterns_layer_ffn: ffn_((up|gate|down)\.|(up|down|gate|gate_up)_(ch|)exps).*
+            const bool is_ffn = strncmp(rest, "ffn_up.", 7) == 0 || strncmp(rest, "ffn_gate.", 9) == 0 ||
+                                strncmp(rest, "ffn_down.", 9) == 0 ||
+                                (strncmp(rest, "ffn_", 4) == 0 && strstr(rest, "exps") != nullptr);
+            if (!is_ffn) {
+                per_layer_attn[il] += bytes;
+            }
+        }
         if (strcmp(rest, "ffn_up_exps.weight") != 0 && strcmp(rest, "ffn_gate_exps.weight") != 0 &&
             strcmp(rest, "ffn_down_exps.weight") != 0 && strcmp(rest, "ffn_gate_up_exps.weight") != 0) {
             continue;
@@ -930,24 +963,29 @@ static bool pshard_parse_variant_header(const std::string & line, uint32_t & bud
 static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current);
 
 // estimate, for every tier plan, the one-way cost of switching into it from the decode
-// (tier 0) plan: the pinned-residency delta uploaded over PCIe. Byte counts are coarse
-// (file-size based - the registry has no per-layer tensor sizes), which is fine: the term
-// exists to separate "same residency, free switch" from "multi-GB pin swap around every
-// prompt", not to rank close calls.
+// (tier 0) plan: the pinned-residency delta uploaded over PCIe. Byte counts are the gguf
+// table's per-layer averages (the registry persists the averages, not per-layer sizes):
+// the term separates "same residency, free switch" from "multi-GB pin swap around every
+// prompt". Unpriced (fields stay 0) without a scanned table or a profiled upload rate.
 static void pshard_compute_switch_costs(
-        llama_pshard_plan_registry * registry,
-        int64_t model_file_size, uint32_t n_layers, bool is_moe, double pcie_gb_s) {
-    if (!registry || registry->best_plans.empty() || n_layers == 0 ||
-            model_file_size <= 0 || pcie_gb_s <= 0.0) {
+        llama_pshard_plan_registry * registry, const llama_pshard_search_ctx & ctx,
+        uint32_t n_layers, double pcie_gb_s) {
+    if (!registry || registry->best_plans.empty() || n_layers == 0) {
+        return;
+    }
+    if (ctx.n_layers_scanned == 0 || ctx.layer_bytes_all == 0 || pcie_gb_s <= 0.0) {
+        LLAMA_LOG_WARN("%s: switch costs not priced - %s\n", __func__,
+            pcie_gb_s <= 0.0 ? "no upload rate in the machine profile (missing, or no Threads line for this thread count)"
+                             : "no layer bytes (gguf tensor table scan)");
         return;
     }
     const llama_pshard_plan & base = registry->best_plans[0];
     if (!base.is_viable) {
         return;
     }
-    const double layer_bytes = 0.92 * (double)model_file_size / n_layers;
-    const double attn_frac   = is_moe ? 0.12 : 0.35;  // attention share of a layer's bytes
-    const double head_bytes  = 0.04 * (double)model_file_size;
+    const double layer_bytes = (double) ctx.layer_bytes_all / ctx.n_layers_scanned;          // every blk.N tensor
+    const double attn_frac   = (double) ctx.attn_bytes_all / (double) ctx.layer_bytes_all;  // the attention-priority pin set's share
+    const double head_bytes  = (double) ctx.head_bytes;
 
     // publish the estimate constants: switches are pairwise (any plan to any plan), so
     // the runtime evaluates switch_cost_ms(from, to) on demand from these
@@ -1917,9 +1955,8 @@ static llama_pshard_plan llama_pshard_attn_pin_fallback(
 //   whole-stack tiers (bs*top_k*2 >= E): the prefill A/B pair, 2 expert-layers
 //   cache tiers: min(E, top_k*bs) slots/layer (one MUL_MAT_ID, no -1 skip, a
 //   token's experts must all be resident at once)
-// Expert bytes come from the same file-size heuristic as ids-cross (0.85 of
-// the total file over the layers). tps stays 0 until the pool predictor terms
-// land, so this is reached only under forced PSHARD_STRATEGY=5.
+// Expert bytes come from the gguf tensor table (pshard_scan_tensor_bytes); a
+// table without routed-expert tensors cannot host a pool and the tier is refused.
 static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx & ctx) {
     const auto * mparams    = ctx.mparams;
     const auto * cparams    = ctx.cparams;
@@ -2014,18 +2051,20 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         }
     }
 
-    // routed-expert geometry: the gguf tensor table when the scan found it (the
-    // runtime carve uses the same real nb[2] bytes, so plan and runtime agree),
-    // else the ids-cross file-size heuristic
+    // routed-expert geometry: the gguf tensor table (the runtime carve uses the same
+    // real nb[2] bytes, so plan and runtime agree); nothing else is accepted
     // dynamic quants (Unsloth UD etc.) give layers different expert bytes: the A/B
     // pair is sized by the LARGEST layer, one slot across all layers by the SUM of
     // per-layer expert rows (what the runtime carve charges), the per-miss transfer
     // by the average expert
-    const bool     real_bytes   = ctx.exps_layer_bytes > 0 && ctx.exps_row_bytes > 0 && ctx.n_layers_moe > 0;
-    const double   b_layer_exps = real_bytes ? (double) ctx.exps_layer_bytes : 0.85 * (double) ctx.model_size / n_layers;
-    const uint32_t n_layers_exp = real_bytes ? ctx.n_layers_moe : n_layers;
-    const double   b_slot       = real_bytes ? (double) ctx.exps_total_bytes / ctx.n_expert
-                                             : b_layer_exps / ctx.n_expert * n_layers_exp;   // one slot in every layer
+    if (ctx.exps_layer_bytes == 0 || ctx.exps_row_bytes == 0 || ctx.n_layers_moe == 0) {
+        LLAMA_LOG_WARN("%s: [EXPERT_POOL] bs=%u no routed-expert tensors in the gguf table - tier refused\n",
+            __func__, cparams->n_batch);
+        return plan;   // not viable
+    }
+    const double   b_layer_exps = (double) ctx.exps_layer_bytes;
+    const uint32_t n_layers_exp = ctx.n_layers_moe;
+    const double   b_slot       = (double) ctx.exps_total_bytes / ctx.n_expert;   // one slot in every layer
     const double   b_expert     = b_slot / n_layers_exp;                                      // average expert (per miss)
     const uint32_t bs = cparams->n_batch;
     const bool ab_tier = (uint64_t) bs * ctx.n_expert_used * 2 >= ctx.n_expert; // whole-stack regime
@@ -2244,7 +2283,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u fixed=%.1f scratch=%.1f MiB pool=%.1f MiB floor=%.1f MiB (%s, %s bytes) "
         "-> s=%u slots/layer, miss_policy=%s %s\n",
         __func__, bs, fixed_bytes / (1024.0 * 1024.0), scratch_pool / (1024.0 * 1024.0), pool_bytes / (1024.0 * 1024.0),
-        floor_bytes / (1024.0 * 1024.0), ab_tier ? "A/B pair" : "fetch floor", real_bytes ? "real" : "heuristic",
+        floor_bytes / (1024.0 * 1024.0), ab_tier ? "A/B pair" : "fetch floor", "gguf",
         plan.pool_slots, llama_pshard_miss_policy_name((llama_pshard_miss_policy) plan.pool_miss),
         plan.is_viable ? "VIABLE" : "NOT VIABLE");
 
@@ -2671,8 +2710,8 @@ void llama_params_fit_pshard_plan(
     // runtime registers whole mappings greedily in split order, all-or-nothing)
     // and reprice the predictor's weight-upload rate with the blended value.
     // Also compute the TOTAL file size: the main split of a sharded gguf can be
-    // tiny (DeepSeek-V4's is 6 MB), which broke every file-size-derived
-    // heuristic downstream (ids-cross expert bytes, switch-cost layer bytes).
+    // tiny (DeepSeek-V4's is 6 MB); the byte counts the planner prices with come
+    // from the gguf tensor table (scan below), the total only feeds sanity checks.
     // NOTE: the registry fingerprint above stays on the MAIN split size - the
     // runtime computes it the same way, and changing it would strand every
     // cached registry into silent stock fallback.
@@ -2681,6 +2720,9 @@ void llama_params_fit_pshard_plan(
     size_t exps_per_expert = 0;
     size_t exps_weights    = 0;
     uint32_t exps_tensors  = 0;
+    std::vector<size_t> all_per_layer(n_layers, 0), attn_per_layer(n_layers, 0);
+    size_t head_bytes = 0, tok_embd_bytes = 0;
+    bool   has_output_weight = false;
     {
         std::vector<int64_t> map_sizes;
         map_sizes.push_back(model_file_size);
@@ -2691,7 +2733,8 @@ void llama_params_fit_pshard_plan(
             if (ks >= 0 && gguf_get_kv_type(g, ks) == GGUF_TYPE_UINT16) {
                 n_split = (int) gguf_get_val_u16(g, ks);
             }
-            pshard_scan_expert_bytes(g, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors);
+            pshard_scan_tensor_bytes(g, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors,
+                all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight);
             gguf_free(g);
             if (n_split > 1) {
                 char prefix[1024];
@@ -2709,18 +2752,19 @@ void llama_params_fit_pshard_plan(
 #endif
                             fclose(sf);
                             if (struct gguf_context * gs = gguf_init_from_file(split_path, gip_s)) {
-                                pshard_scan_expert_bytes(gs, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors);
+                                pshard_scan_tensor_bytes(gs, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors,
+                                    all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight);
                                 gguf_free(gs);
                             }
                         } else {
                             LLAMA_LOG_WARN("%s: split %d/%d not readable at %s - "
-                                "file-size heuristics fall back to the main split only\n",
+                                "the gguf tensor scan covers the main split only\n",
                                 __func__, idx + 1, n_split, split_path);
                         }
                     }
                 } else {
                     LLAMA_LOG_WARN("%s: model path does not match the split naming pattern - "
-                        "file-size heuristics fall back to the main split only\n", __func__);
+                        "the gguf tensor scan covers the main split only\n", __func__);
                 }
             }
         }
@@ -2778,6 +2822,23 @@ void llama_params_fit_pshard_plan(
     ctx.exps_row_bytes    = exps_per_expert;
     ctx.exps_total_weights = exps_weights;
     ctx.exps_tensors_per_layer = exps_tensors;
+    for (uint32_t il = 0; il < n_layers; il++) {
+        if (all_per_layer[il] > 0) {
+            ctx.n_layers_scanned++;
+            ctx.layer_bytes_all += all_per_layer[il];
+            ctx.attn_bytes_all  += attn_per_layer[il];
+        }
+    }
+    // tied embeddings (no output.weight): under pshard the loader duplicates the head into a real token_embd-sized
+    // output.weight (force_duplicate_tied), which the ^output override moves like any head - so those bytes count
+    ctx.head_bytes = has_output_weight ? head_bytes : head_bytes + tok_embd_bytes;
+    if (ctx.n_layers_scanned > 0) {
+        LLAMA_LOG_INFO("%s: layer bytes (gguf table): %u layers, %.1f MiB per layer, non-FFN (attention-priority pin) %.1f MiB per layer (share %.3f), head %.1f MiB%s\n",
+            __func__, ctx.n_layers_scanned, ctx.layer_bytes_all / (1024.0 * 1024.0) / ctx.n_layers_scanned,
+            ctx.attn_bytes_all / (1024.0 * 1024.0) / ctx.n_layers_scanned,
+            (double) ctx.attn_bytes_all / (double) ctx.layer_bytes_all,
+            ctx.head_bytes / (1024.0 * 1024.0), has_output_weight ? "" : " (tied embeddings: token_embd duplicated)");
+    }
     if (ctx.n_layers_moe > 0) {
         LLAMA_LOG_INFO("%s: routed experts: %u layers, %.1f MiB per layer, %.2f MiB per expert (gguf tensor table)\n",
             __func__, ctx.n_layers_moe, ctx.exps_layer_bytes / (1024.0 * 1024.0), ctx.exps_row_bytes / (1024.0 * 1024.0));
@@ -3037,9 +3098,9 @@ void llama_params_fit_pshard_plan(
         pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
             path_model, mparams);
         registry->kernel_copy_cap_mb = predictor ? (float) predictor->stats.kernel_copy_cap_mb : -1.0f;
-        pshard_compute_switch_costs(registry, total_file_size, n_layers, ctx.is_moe,
+        pshard_compute_switch_costs(registry, ctx, n_layers,
             predictor ? (predictor->stats.upload_bw > 0.0
-                ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 25.0);
+                ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 0.0);   // no profile: unpriced
         pshard_registry_save(registry, fp, cache_path.c_str(), host_buft, cparams);
     }
 
@@ -3069,9 +3130,9 @@ void llama_params_fit_pshard_plan(
                     pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
                         path_model, mparams);
                     registry->kernel_copy_cap_mb = predictor ? (float) predictor->stats.kernel_copy_cap_mb : -1.0f;
-                    pshard_compute_switch_costs(registry, total_file_size, n_layers, ctx.is_moe,
+                    pshard_compute_switch_costs(registry, ctx, n_layers,
                         predictor ? (predictor->stats.upload_bw > 0.0
-                            ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 25.0);
+                            ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 0.0);   // no profile: unpriced
                     pshard_registry_save(registry, fp, cache_path.c_str(), host_buft, cparams);
                     break;
                 }
