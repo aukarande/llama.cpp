@@ -324,6 +324,10 @@ struct llama_pshard_plan_registry {
     float switch_attn_frac = 0.0f;  // attention share of a layer's bytes
     float switch_head_mb   = 0.0f;  // est. MB of the output head
     float switch_pcie_gb_s = 0.0f;  // upload rate for pinned weights
+    // the machine profile's measured kernel-copy crossover (largest transfer at which a copy kernel still beats
+    // a copy-engine transfer ordered against kernels); the pool sets it as the engine's cap while active.
+    // -1 = not in the profile -> the engine keeps its default
+    float kernel_copy_cap_mb = -1.0f;
     bool  mtp_head_cpu     = false; // MTP head demoted to CPU by union-budget enforcement
     // RETIRED 2026-09-06 (kept so existing registry files still parse; never charged): the
     // analytical arena charge for the MTP context's larger device compute with the head on the

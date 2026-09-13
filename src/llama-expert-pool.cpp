@@ -14,6 +14,9 @@ llama_expert_pool::~llama_expert_pool() {
     if (kernel_copy_set != nullptr && kernel_copies) {
         kernel_copy_set(false);
     }
+    if (kernel_copy_max_set != nullptr && kernel_copy_cap_set && active) {
+        kernel_copy_max_set(kernel_copy_cap_prev);   // the engine's cap before we applied the profile's
+    }
     for (auto & L : layers) {
         if (L.warm_event != nullptr) {
             ggml_backend_event_free(L.warm_event);
@@ -280,6 +283,7 @@ void llama_expert_pool::lookup_backend_procs() {
     }
     copy_segments   = (ggml_backend_copy_segments_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_segments_async");
     kernel_copy_set = (ggml_backend_kernel_copy_set_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_set");
+    kernel_copy_max_set = (ggml_backend_kernel_copy_max_set_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_max_set");
 }
 
 void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
@@ -293,6 +297,15 @@ void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
     // engine (their bulk uploads are bandwidth-bound). GGML_CUDA_KERNEL_COPY=0/1 overrides in the backend.
     lookup_backend_procs();
     kernel_copies = kernel_copy_set != nullptr ? kernel_copy_set(on) : false;
+    if (kernel_copy_max_set != nullptr && kernel_copy_cap_set) {
+        // the machine profile's measured crossover replaces the engine's compiled cap while we are active
+        // (0 = the profile found no size at which a copy kernel beats the copy engine: every transfer keeps it)
+        if (on) {
+            kernel_copy_cap_prev = kernel_copy_max_set(kernel_copy_cap_bytes);
+        } else {
+            kernel_copy_max_set(kernel_copy_cap_prev);
+        }
+    }
     epoch++;   // pooled-layer graph topology changes with this flag
     reset_slots();
     if (!on) {

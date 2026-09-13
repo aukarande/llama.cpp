@@ -177,6 +177,10 @@ struct llama_expert_pool {
     bool   kernel_copies      = false;   // the backend runs pinned-memory copies as kernels while we are active
     ggml_backend_copy_segments_async_t copy_segments = nullptr;   // batched upload proc (CUDA), else per-tensor
     ggml_backend_kernel_copy_set_t     kernel_copy_set = nullptr;
+    ggml_backend_kernel_copy_max_set_t kernel_copy_max_set = nullptr;
+    bool   kernel_copy_cap_set   = false; // the registry carried the machine profile's measured crossover (kernel_cap_mb)
+    size_t kernel_copy_cap_bytes = 0;    // that crossover in bytes; 0 is a valid measurement (kernel copies never win)
+    size_t kernel_copy_cap_prev  = 0;    // the engine's value before we set ours, restored on deactivation
     bool   procs_looked_up = false;
     void lookup_backend_procs();
     struct upload_seg { ggml_tensor * view; size_t off; const void * src; size_t size; };

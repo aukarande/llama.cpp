@@ -291,6 +291,10 @@ void llama_context::pshard_setup_expert_pool() {
     // measured scratch): pool + scratch is constant, so decode tiers turn the
     // prefill scratch delta into slots
     pool->backend_router = backends[pshard_layout.compute].get();
+    if (registry->kernel_copy_cap_mb >= 0.0f) {
+        pool->kernel_copy_cap_set   = true;
+        pool->kernel_copy_cap_bytes = (size_t) (registry->kernel_copy_cap_mb * 1024.0 * 1024.0);
+    }
     expert_pool = std::move(pool);
 }
 

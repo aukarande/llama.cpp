@@ -234,15 +234,18 @@ struct llama_pshard_search_ctx {
     size_t                                     exps_total_bytes = 0;   // all routed experts, all layers
     size_t                                     exps_total_weights = 0; // element count of the same (CPU FLOPs)
     uint32_t                                   n_layers_moe     = 0;
+    uint32_t                                   exps_tensors_per_layer = 0; // expert tensors in a layer (3 = up/gate/down,
+                                                                           // 2 = gate_up/down): the pool's segment size
 };
 
 // accumulate routed-expert tensor bytes per layer from a gguf tensor table
 // (blk.N.ffn_(up|down|gate|gate_up)_exps.weight); per_layer[il] gets the sum,
 // per_expert gets the max over layers of the summed per-expert row bytes
 static void pshard_scan_expert_bytes(const struct gguf_context * g, uint32_t n_expert,
-        std::vector<size_t> & per_layer, size_t & per_expert, size_t & total_weights) {
+        std::vector<size_t> & per_layer, size_t & per_expert, size_t & total_weights, uint32_t & tensors_per_layer) {
     const int64_t n = gguf_get_n_tensors(g);
-    std::vector<size_t> row_this(per_layer.size(), 0);
+    std::vector<size_t>   row_this(per_layer.size(), 0);
+    std::vector<uint32_t> cnt_this(per_layer.size(), 0);
     for (int64_t i = 0; i < n; i++) {
         const char * name = gguf_get_tensor_name(g, i);
         if (strncmp(name, "blk.", 4) != 0) {
@@ -260,6 +263,7 @@ static void pshard_scan_expert_bytes(const struct gguf_context * g, uint32_t n_e
         }
         const size_t bytes = gguf_get_tensor_size(g, i);
         per_layer[il] += bytes;
+        cnt_this[il]++;
         {
             // element count from the block type (exact for block quants)
             const enum ggml_type t = gguf_get_tensor_type(g, i);
@@ -272,6 +276,9 @@ static void pshard_scan_expert_bytes(const struct gguf_context * g, uint32_t n_e
     }
     for (size_t r : row_this) {
         per_expert = std::max(per_expert, r);
+    }
+    for (uint32_t c : cnt_this) {
+        tensors_per_layer = std::max(tensors_per_layer, c);
     }
 }
 
@@ -292,23 +299,36 @@ static bool pshard_alternate_ids_cross_wins(const struct llama_pshard_search_ctx
     if ((uint64_t) bs * ctx.n_expert_used * 2 >= ctx.n_expert) {
         return false;
     }
-    double pcie = (ctx.predictor && ctx.predictor->stats.eff_pcie_bw > 0.0)
-        ? ctx.predictor->stats.eff_pcie_bw : 25.0;
-    if (ctx.predictor && ctx.predictor->stats.upload_bw > 0.0) {
+    // every rate from the machine profile and every byte count from the gguf table; without them the
+    // decision cannot be priced and the full-upload prefetch (the default placement) stands
+    const llama_benchmark_stats * st = ctx.predictor ? &ctx.predictor->stats : nullptr;
+    if (st == nullptr || st->eff_pcie_bw <= 0.0 || st->peak_system_bw <= 0.0 ||
+            st->pool_serve_us <= 0.0 || st->engine_switch_us < 0.0 || ctx.exps_layer_bytes == 0) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: ids-cross not priced - the machine profile lacks PCIe_Concurrent / DRAM_BW / Pool_Serve_us / "
+                "Engine_Switch_us or the gguf expert scan failed; full-upload prefetch stands\n", __func__);
+        }
+        return false;
+    }
+    double pcie = st->eff_pcie_bw;
+    if (st->upload_bw > 0.0) {
         // expert streams source from the mmap mappings; past the pin ceiling they
         // move at the staged (host-DRAM-bound) rate, not the pinned-concurrent one
-        pcie = std::min(pcie, ctx.predictor->stats.upload_bw);
+        pcie = std::min(pcie, st->upload_bw);
     }
-    const double dram = (ctx.predictor && ctx.predictor->stats.peak_system_bw > 0.0)
-        ? ctx.predictor->stats.peak_system_bw : 40.0;
-    const double b_full  = 0.85 * (double) ctx.model_size / ctx.n_layers;  // full expert set per layer
+    const double dram    = st->peak_system_bw;
+    const double b_full  = (double) ctx.exps_layer_bytes;   // full expert set of the largest layer (gguf table)
     const double frac    = std::min(1.0, (double) bs * ctx.n_expert_used / ctx.n_expert);
     const double b_slice = b_full * frac;
     const double t_full_ms  = b_full  / 1e9 / pcie * 1000.0;
-    const double t_slice_ms = b_slice / 1e9 / pcie * 1000.0 + 0.3;  // + ids sync latency
-    // cover the full upload could hide behind: the paired CPU-FFN (DRAM-bound expert
-    // reads) plus the attention compute of the streamed layer
-    const double cover_ms   = b_slice / 1e9 / dram * 1000.0 + 0.1;
+    // the sliced path's ids round trip (readback, sync, decision, upload launch) plus the copy-engine
+    // transition its DMA readback pays on this machine: the legacy sliced tiers keep the copy engine
+    const double t_slice_ms = b_slice / 1e9 / pcie * 1000.0 + (st->pool_serve_us + st->engine_switch_us) / 1000.0;
+    // cover the full upload could hide behind: the paired CPU-FFN's DRAM-bound expert reads (the streamed
+    // layer's attention compute was a 0.1 ms constant here: unmeasured, no longer charged)
+    const double cover_ms   = b_slice / 1e9 / dram * 1000.0;
     return t_slice_ms < std::max(0.0, t_full_ms - cover_ms);
 }
 
@@ -1125,12 +1145,13 @@ bool pshard_registry_save(
 
     // trailing fields after cache_ubatch are ignored by older parsers (sscanf assigns
     // the two %u before the literal ']' mismatch and still returns 2)
-    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu]\n",
+    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu kernel_cap_mb=%.0f]\n",
         budget_mib, cache_ubatch,
         registry->switch_layer_mb, registry->switch_attn_frac,
         registry->switch_head_mb, registry->switch_pcie_gb_s,
         registry->mtp_head_cpu ? 1 : 0, registry->mtp_head_extra_mb,
-        (size_t) ((registry->union_bytes + 1024 * 1024 - 1) / (1024 * 1024)));  // whole MiB, rounded up
+        (size_t) ((registry->union_bytes + 1024 * 1024 - 1) / (1024 * 1024)),  // whole MiB, rounded up
+        registry->kernel_copy_cap_mb);
     if (registry->pshard_disabled) {
         fprintf(f, "pshard_disabled=1 baseline_vram=%.1f\n", registry->baseline_vram_req / (1024.0 * 1024.0));
     } else {
@@ -1212,6 +1233,7 @@ bool pshard_registry_load(
         float switch_attn_frac = 0.0f;
         float switch_head_mb = 0.0f;
         float switch_pcie_gb_s = 0.0f;
+        float kernel_copy_cap_mb = -1.0f;
         bool  mtp_head_cpu     = false;
         uint32_t mtp_head_extra_mb = 0;
         size_t union_bytes     = 0;
@@ -1244,6 +1266,7 @@ bool pshard_registry_load(
             if ((p = strstr(s.c_str(), "attn_frac=")) != NULL) cur_variant->switch_attn_frac = (float)atof(p + 10);
             if ((p = strstr(s.c_str(), "head_mb="))   != NULL) cur_variant->switch_head_mb   = (float)atof(p + 8);
             if ((p = strstr(s.c_str(), "pcie="))      != NULL) cur_variant->switch_pcie_gb_s = (float)atof(p + 5);
+            if ((p = strstr(s.c_str(), "kernel_cap_mb=")) != NULL) cur_variant->kernel_copy_cap_mb = (float)atof(p + 14);
             if ((p = strstr(s.c_str(), "mtp_head_cpu=")) != NULL) cur_variant->mtp_head_cpu = atoi(p + 13) != 0;
             if ((p = strstr(s.c_str(), "mtp_head_extra_mb=")) != NULL) cur_variant->mtp_head_extra_mb = (uint32_t) atoi(p + 18);
             if ((p = strstr(s.c_str(), "union_mb="))    != NULL) cur_variant->union_bytes = (size_t)(atof(p + 9) * 1024.0 * 1024.0);
@@ -1499,6 +1522,7 @@ bool pshard_registry_load(
         registry->switch_attn_frac = best_whole->switch_attn_frac;
         registry->switch_head_mb   = best_whole->switch_head_mb;
         registry->switch_pcie_gb_s = best_whole->switch_pcie_gb_s;
+        registry->kernel_copy_cap_mb = best_whole->kernel_copy_cap_mb;
         registry->mtp_head_cpu     = best_whole->mtp_head_cpu;
         registry->mtp_head_extra_mb = best_whole->mtp_head_extra_mb;
         registry->union_bytes      = best_whole->union_bytes;
@@ -2024,54 +2048,63 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     plan.pool_slots = pool_bytes > 0 && b_slot > 0.0
         ? (uint32_t) ((double) pool_bytes / b_slot) : 0;
 
-    // per-expert rates shared by the miss pricing and the hybrid q* share.
-    //   t_fetch: expert bytes at the gathered-slice PCIe rate (profile curve).
-    //   t_cpu:   the CPU chain's per-expert cost at small batch = expert bytes at
-    //            the host DRAM rate (design 4b's B_H). Calibrated on q35 (8 threads,
-    //            40 pooled layers): cpu_exec never admits, so it runs every route on
-    //            the CPU and its price is s-independent - 27.0 t/s at s=75 and 26.7
-    //            at s=7 = 8*t_cpu + t_split = 0.56 ms/layer; hybrid at s=75 (h~0.70,
-    //            2 fetched + 0.4 CPU per layer) 34.4 t/s = 0.36 ms/layer. Solving:
-    //            t_cpu = 0.044 ms/expert (~46 GB/s = DRAM-bound as designed) and
-    //            t_split = 0.20 ms/layer for the GPU->CPU->GPU handoff (the
-    //            dominant CPU-route cost: 8 ms/token over 40 layers).
-    //            PSHARD_POOL_CPU_GBS overrides the rate; the paired bench entry
-    //            (11.B.10) is the real replacement.
-    const double bp_gbs = (ctx.predictor && ctx.predictor->stats.slice_bw(b_expert) > 0.0)
-        ? ctx.predictor->stats.slice_bw(b_expert) : 25.0;
-    double cpu_gbs = (ctx.predictor && ctx.predictor->stats.peak_system_bw > 0.0)
-        ? ctx.predictor->stats.peak_system_bw : 45.0;
+    // per-expert rates shared by the miss pricing and the hybrid q* share. Every machine number comes from
+    // the profile (schema 2, 2026-09-12); a pool tier is refused rather than priced with a built-in value.
+    //   t_fetch: expert bytes at the segment-batch kernel's gathered rate for the pool's own segment size
+    //            (one expert row of one expert tensor): the IDLE curve for fetch (no CPU chain runs while it
+    //            uploads), the LOADED curve for the CPU-route policies (the chain shares the memory bus).
+    //   t_cpu:   the CPU chain's per-expert cost at small batch = expert bytes at the host DRAM rate (light
+    //            quants are DRAM-bound), or the dequant compute at the slowest measured matmul rate (DSv4
+    //            UD-Q2_K_XL is compute-bound): max of the two.
+    //   t_serve: the pooled layer's host round trip (ids readback, sync, decision, upload, launch), paid per
+    //            layer by every cache-tier policy (Pool_Serve_us).
+    //   t_split: the CPU route's handoff (activation download, host graph, partial upload, join), paid per
+    //            layer with CPU routes (Pool_Split_us); the CPU compute itself is t_cpu per expert.
+    //   PSHARD_POOL_CPU_GBS / PSHARD_POOL_CPU_GFLOPS override the two CPU rates for experiments.
+    const llama_benchmark_stats * st = ctx.predictor ? &ctx.predictor->stats : nullptr;
+    const double b_row = ctx.exps_tensors_per_layer > 0 ? b_expert / ctx.exps_tensors_per_layer : b_expert;
+    {
+        std::string missing;
+        if (st == nullptr) {
+            missing += " cpu_profile.txt";
+        } else {
+            if (st->slice_bw_kernel(b_row, false) <= 0.0) missing += " PCIe_Segs_Kernel_Idle";
+            if (st->slice_bw_kernel(b_row, true)  <= 0.0) missing += " PCIe_Segs_Kernel";
+            if (st->peak_system_bw <= 0.0)                 missing += " DRAM_BW";
+            if (st->cpu_matmul_floor_gflops <= 0.0)        missing += " MUL_MAT-batch-entries";
+            if (st->pool_serve_us <= 0.0)                  missing += " Pool_Serve_us";
+            if (st->pool_split_us <= 0.0)                  missing += " Pool_Split_us";
+        }
+        if (ctx.exps_total_weights == 0 || ctx.n_expert == 0) {
+            missing += " expert-weight-count(gguf)";
+        }
+        if (!missing.empty()) {
+            LLAMA_LOG_WARN("%s: [EXPERT_POOL] bs=%u not priced - missing:%s (run llama-profiler-cpu --splice cpu_profile.txt); tier refused\n",
+                __func__, bs, missing.c_str());
+            return plan;   // not viable
+        }
+    }
+    const double bp_idle   = st->slice_bw_kernel(b_row, false);
+    const double bp_loaded = st->slice_bw_kernel(b_row, true);
+    double cpu_gbs = st->peak_system_bw;
     if (const char * cg = getenv("PSHARD_POOL_CPU_GBS")) {
         cpu_gbs = std::max(0.5, atof(cg));
     }
-    // the CPU chain is DRAM-bound on light quants (q35 Q4_K: 0.044 ms/expert = 46 GB/s)
-    // and compute-bound on heavy dequant (DSv4 UD-Q2_K_XL: ~0.68 ms per 10.4 MiB expert
-    // = 15 GB/s): price max(bytes at DRAM rate, 2 FLOP/weight at the CPU rate)
-    double cpu_gflops = (ctx.predictor && ctx.predictor->stats.cpu_matmul_floor_gflops > 0.0)
-        ? ctx.predictor->stats.cpu_matmul_floor_gflops : 150.0;
+    double cpu_gflops = st->cpu_matmul_floor_gflops;
     if (const char * cg = getenv("PSHARD_POOL_CPU_GFLOPS")) {
         cpu_gflops = std::max(1.0, atof(cg));
     }
-    const double w_expert = (ctx.exps_total_weights > 0 && ctx.n_expert > 0 && n_layers_exp > 0)
-        ? (double) ctx.exps_total_weights / ((double) ctx.n_expert * n_layers_exp)
-        : b_expert * 2.0;                                       // ~Q4: 2 weights per byte
-    const double t_fetch = b_expert / 1e9 / bp_gbs  * 1000.0;   // ms per fetched expert
+    const double w_expert = (double) ctx.exps_total_weights / ((double) ctx.n_expert * n_layers_exp);
+    const double t_fetch_idle   = b_expert / 1e9 / bp_idle   * 1000.0;   // ms per fetched expert, CPU idle
+    const double t_fetch_loaded = b_expert / 1e9 / bp_loaded * 1000.0;   // ms per fetched expert beside the CPU chain
     const double t_cpu   = std::max(b_expert / 1e9 / cpu_gbs * 1000.0,
                                     2.0 * w_expert / 1e9 / cpu_gflops * 1000.0);   // ms per CPU-computed expert
-    // per-layer fixed costs, from GGML_SCHED_TIMING on q35 @8000 (40 layers):
-    //   t_serve: the pool service's synchronous ids readback + the split boundaries
-    //            it adds, paid by EVERY cache-tier policy (fetch included): the
-    //            single-chain graph spends ~4 ms/token more than the probe predicts
-    //   t_split: the dual chain's handoff - device->host copy of x (fallback_cpy
-    //            ~1.1 ms/token) + host->device partial (set_async ~0.3 ms/token)
-    //            = ~1.4 ms/token, 0.035 ms/layer; the CPU compute itself is the
-    //            larger part of a CPU route's cost (the earlier 0.20 folded the
-    //            compute rate error into the handoff)
-    const double t_serve = 0.10;                                // ms per layer, all policies
-    const double t_split = 0.04;                                // ms per layer: GPU->CPU->GPU handoff
-    // hybrid q* share = B_P / B_H (design 4b): the FreeToken balance for concurrent
-    // chains; serial chains (today) cap the fetched share by the free slots anyway
-    plan.pool_hybrid_frac = (float) std::min(1.0, std::max(0.05, bp_gbs / cpu_gbs));
+    const double t_serve = st->pool_serve_us / 1000.0;   // ms per layer, all policies
+    const double t_split = st->pool_split_us / 1000.0;   // ms per layer with CPU routes
+    // hybrid q* share = B_P / B_H (design 4b): the FreeToken balance for concurrent chains, at the upload
+    // rate the two chains actually share (the loaded kernel curve); serial chains cap the fetched share by
+    // the free slots anyway
+    plan.pool_hybrid_frac = (float) std::min(1.0, std::max(0.05, bp_loaded / cpu_gbs));
 
     if (ab_tier) {
         // whole-stack tier: one resident chain over the A/B half, so the pair must
@@ -2134,12 +2167,12 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
                     // With the scheduler overlap the CPU chain runs while the GPU split
                     // uploads its q experts and computes: max(); serial otherwise
                     const double q = std::min(std::round(plan.pool_hybrid_frac * misses), std::max(0.0, s - hits));
-                    const double up_ms  = q * t_fetch;
+                    const double up_ms  = q * t_fetch_loaded;
                     const double cpu_ms = (misses - q) * t_cpu;
                     return (cpu_chain_overlaps ? std::max(up_ms, cpu_ms) : up_ms + cpu_ms) + t_split;
                 }
                 case LLAMA_PSHARD_MISS_FETCH_ON_2ND:
-                    return 0.5 * misses * t_cpu + 0.5 * misses * t_fetch + t_split; // half admitted (TBD: counters)
+                    return 0.5 * misses * t_cpu + 0.5 * misses * t_fetch_loaded + t_split; // half admitted (TBD: counters)
                 case LLAMA_PSHARD_MISS_CPU_ADMIT: {
                     // misses run on the CPU chain this pass, their rows upload on the pool's
                     // copy stream for the next pass. The GPU expert chain (hits, VRAM-bound)
@@ -2147,12 +2180,12 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
                     // visible whole; the background upload leaves the critical path as
                     // long as the copy engine keeps up with the layer.
                     const double cpu_ms    = misses * t_cpu;
-                    const double upload_ms = misses * t_fetch;
+                    const double upload_ms = misses * t_fetch_loaded;
                     const double excess_up = std::max(0.0, upload_ms - (cpu_ms + t_split));
                     return cpu_ms + excess_up + t_split;
                 }
                 default:
-                    return misses * t_fetch;
+                    return misses * t_fetch_idle;   // fetch: no CPU chain shares the bus
             }
         };
         const bool  priced    = ctx.predictor && plan.tps > 0.0f;
@@ -2192,11 +2225,12 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             if (priced) {
                 plan.tps = best_tps;
                 LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u priced: probe %.1f t/s (compute %.1f + upload %.1f + other %.1f ms) -> "
-                    "pool %.1f t/s (h(%u)=%.2f, %.1f misses/layer, %.2f ms/layer, %s; t_fetch %.3f t_cpu %.3f ms/expert%s)\n",
+                    "pool %.1f t/s (h(%u)=%.2f, %.1f misses/layer, %.2f ms/layer, %s; t_fetch %.3f idle / %.3f loaded, t_cpu %.3f ms/expert, "
+                    "serve %.3f, split %.3f ms/layer%s)\n",
                     __func__, bs, probe_tps, bd.compute_ms, bd.weight_upload_ms, bd.other_ms, plan.tps,
                     plan.pool_slots, h, misses, miss_ms_layer(best),
-                    llama_pshard_miss_policy_name((llama_pshard_miss_policy) best), t_fetch, t_cpu,
-                    cpu_chain_overlaps ? ", overlap" : ", serial");
+                    llama_pshard_miss_policy_name((llama_pshard_miss_policy) best), t_fetch_idle, t_fetch_loaded, t_cpu,
+                    t_serve, t_split, cpu_chain_overlaps ? ", overlap" : ", serial");
             }
         }
     }
@@ -2646,6 +2680,7 @@ void llama_params_fit_pshard_plan(
     std::vector<size_t> exps_per_layer(n_layers, 0);
     size_t exps_per_expert = 0;
     size_t exps_weights    = 0;
+    uint32_t exps_tensors  = 0;
     {
         std::vector<int64_t> map_sizes;
         map_sizes.push_back(model_file_size);
@@ -2656,7 +2691,7 @@ void llama_params_fit_pshard_plan(
             if (ks >= 0 && gguf_get_kv_type(g, ks) == GGUF_TYPE_UINT16) {
                 n_split = (int) gguf_get_val_u16(g, ks);
             }
-            pshard_scan_expert_bytes(g, hp_nex, exps_per_layer, exps_per_expert, exps_weights);
+            pshard_scan_expert_bytes(g, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors);
             gguf_free(g);
             if (n_split > 1) {
                 char prefix[1024];
@@ -2674,7 +2709,7 @@ void llama_params_fit_pshard_plan(
 #endif
                             fclose(sf);
                             if (struct gguf_context * gs = gguf_init_from_file(split_path, gip_s)) {
-                                pshard_scan_expert_bytes(gs, hp_nex, exps_per_layer, exps_per_expert, exps_weights);
+                                pshard_scan_expert_bytes(gs, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors);
                                 gguf_free(gs);
                             }
                         } else {
@@ -2696,9 +2731,15 @@ void llama_params_fit_pshard_plan(
         if (predictor && predictor->stats.host_pin_ceiling_gb > 0.0 &&
                 predictor->stats.peak_system_bw > 0.0 && predictor->stats.peak_pcie_bw > 0.0) {
             const double pcie_r = predictor->stats.peak_pcie_bw;
-            // staging moves every byte three times over host DRAM (mapping read,
-            // ring write, DMA read), so the staged rate is a third of DRAM BW
-            const double staged_r = std::min(pcie_r, predictor->stats.peak_system_bw / 3.0);
+            // the staged rate is measured (PCIe_Staged: a pageable source through the staging ring). A
+            // profile without the line prices staged bytes at the pinned rate and says so; step 5 makes an
+            // incomplete profile a refusal.
+            double staged_r = pcie_r;
+            if (predictor->stats.staged_bw > 0.0) {
+                staged_r = std::min(pcie_r, predictor->stats.staged_bw);
+            } else {
+                LLAMA_LOG_WARN("%s: profile has no PCIe_Staged line - staged mappings priced at the pinned rate (run llama-profiler-cpu --splice cpu_profile.txt)\n", __func__);
+            }
             // pinned allocations made outside the page-lock loop (load staging,
             // the ring itself, the pinned KV shadow) share the driver's ceiling
             double ceiling_b = (predictor->stats.host_pin_ceiling_gb - 2.0) * 1e9;
@@ -2736,6 +2777,7 @@ void llama_params_fit_pshard_plan(
     }
     ctx.exps_row_bytes    = exps_per_expert;
     ctx.exps_total_weights = exps_weights;
+    ctx.exps_tensors_per_layer = exps_tensors;
     if (ctx.n_layers_moe > 0) {
         LLAMA_LOG_INFO("%s: routed experts: %u layers, %.1f MiB per layer, %.2f MiB per expert (gguf tensor table)\n",
             __func__, ctx.n_layers_moe, ctx.exps_layer_bytes / (1024.0 * 1024.0), ctx.exps_row_bytes / (1024.0 * 1024.0));
@@ -2994,6 +3036,7 @@ void llama_params_fit_pshard_plan(
 
         pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
             path_model, mparams);
+        registry->kernel_copy_cap_mb = predictor ? (float) predictor->stats.kernel_copy_cap_mb : -1.0f;
         pshard_compute_switch_costs(registry, total_file_size, n_layers, ctx.is_moe,
             predictor ? (predictor->stats.upload_bw > 0.0
                 ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 25.0);
@@ -3025,6 +3068,7 @@ void llama_params_fit_pshard_plan(
                     registry->active_plan = &registry->best_plans[t];
                     pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
                         path_model, mparams);
+                    registry->kernel_copy_cap_mb = predictor ? (float) predictor->stats.kernel_copy_cap_mb : -1.0f;
                     pshard_compute_switch_costs(registry, total_file_size, n_layers, ctx.is_moe,
                         predictor ? (predictor->stats.upload_bw > 0.0
                             ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 25.0);
