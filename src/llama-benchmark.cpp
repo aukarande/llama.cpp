@@ -204,6 +204,37 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                 if (sscanf(line, "#   Host_Pin_Ceiling: %lf GB", &pc) == 1) {
                     stats.host_pin_ceiling_gb = pc;
                 }
+                // schema 2 lines: kernel-copy era measurements and the machine fingerprint
+                if (sscanf(line, "#   PCIe_Sliced_Kernel: 0.5MB=%lf 2MB=%lf 8MB=%lf 32MB=%lf GB/s", &s0, &s1, &s2, &s3) == 4) {
+                    stats.sliced_kernel_bw[0] = s0; stats.sliced_kernel_bw[1] = s1;
+                    stats.sliced_kernel_bw[2] = s2; stats.sliced_kernel_bw[3] = s3;
+                }
+                if (sscanf(line, "#   PCIe_Segs_Kernel: 0.5MB=%lf 2MB=%lf 8MB=%lf 32MB=%lf GB/s", &s0, &s1, &s2, &s3) == 4) {
+                    stats.segs_kernel_bw[0] = s0; stats.segs_kernel_bw[1] = s1;
+                    stats.segs_kernel_bw[2] = s2; stats.segs_kernel_bw[3] = s3;
+                }
+                if (sscanf(line, "#   PCIe_Segs_Kernel_Idle: 0.5MB=%lf 2MB=%lf 8MB=%lf 32MB=%lf GB/s", &s0, &s1, &s2, &s3) == 4) {
+                    stats.segs_kernel_idle_bw[0] = s0; stats.segs_kernel_idle_bw[1] = s1;
+                    stats.segs_kernel_idle_bw[2] = s2; stats.segs_kernel_idle_bw[3] = s3;
+                }
+                double v = 0.0;
+                if (sscanf(line, "#   PCIe_Staged: %lf GB/s", &v) == 1)   { stats.staged_bw          = v; }
+                if (sscanf(line, "#   Kernel_Copy_Cap_MB: %lf", &v) == 1) { stats.kernel_copy_cap_mb = v; }
+                if (sscanf(line, "#   Engine_Switch_us: %lf", &v) == 1)   { stats.engine_switch_us   = v; }
+                if (sscanf(line, "#   Pool_Serve_us: %lf", &v) == 1)      { stats.pool_serve_us      = v; }
+                if (sscanf(line, "#   Pool_Split_us: %lf", &v) == 1)      { stats.pool_split_us      = v; }
+                char gpu[160] = { 0 }, cpu[160] = { 0 }, os[32] = { 0 };
+                unsigned long long vram = 0;
+                int mt = 0, schema = 0;
+                if (sscanf(line, "#   Machine: gpu=\"%159[^\"]\" vram_mib=%llu cpu=\"%159[^\"]\" threads=%d os=%31s schema=%d",
+                           gpu, &vram, cpu, &mt, os, &schema) == 6) {
+                    stats.machine.gpu      = gpu;
+                    stats.machine.cpu      = cpu;
+                    stats.machine.os       = os;
+                    stats.machine.vram_mib = (size_t) vram;
+                    stats.machine.threads  = mt;
+                    stats.machine.schema   = schema;
+                }
             }
             continue;
         }
@@ -262,6 +293,15 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                    __func__, cpu_entries.size(), n_threads,
                    stats.peak_system_bw, stats.peak_pcie_bw,
                    stats.eff_system_bw, stats.eff_pcie_bw);
+    if (stats.machine.schema >= 2) {
+        LLAMA_LOG_INFO("%s: profile schema %d measured on gpu=\"%s\" (%zu MiB) cpu=\"%s\" os=%s threads=%d\n",
+                       __func__, stats.machine.schema, stats.machine.gpu.c_str(), stats.machine.vram_mib,
+                       stats.machine.cpu.c_str(), stats.machine.os.c_str(), stats.machine.threads);
+        LLAMA_LOG_INFO("%s: kernel-copy measurements: sliced kernel 2MB=%.1f GB/s, segment kernel 2MB=%.1f GB/s loaded / %.1f idle,"
+                       " staged %.1f GB/s, kernel-copy cap %.0f MB, engine switch %.1f us, pool serve %.1f us, split %.1f us\n",
+                       __func__, stats.sliced_kernel_bw[1], stats.segs_kernel_bw[1], stats.segs_kernel_idle_bw[1], stats.staged_bw,
+                       stats.kernel_copy_cap_mb, stats.engine_switch_us, stats.pool_serve_us, stats.pool_split_us);
+    }
 
     return !cpu_entries.empty();
 }

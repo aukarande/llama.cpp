@@ -10,10 +10,18 @@
 #include "ggml-cuda.h"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <cstring>
 #include <functional>
+#include <string>
 #include <thread>
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>
+#endif
 
 #if defined(_MSC_VER)
 #include <malloc.h>
@@ -110,9 +118,15 @@ struct pcie_stress_ctx {
     ggml_context * ctx = nullptr;
     size_t transfer_size = 256 * 1024 * 1024;
     double calibrated_bw_gb_s = 0.0;
+    // bytes the stress loop moved and the time it ran: the concurrent PCIe rate is measured, not derived
+    std::atomic<uint64_t> stress_bytes{0};
+    std::atomic<uint64_t> stress_ns{0};
 };
 
 static void pcie_stress_loop(pcie_stress_ctx * pcie) {
+    bench_timer t;
+    t.start();
+    uint64_t bytes = 0;
     pcie->active.store(true, std::memory_order_release);
     while (!pcie->stop.load(std::memory_order_acquire)) {
         ggml_backend_tensor_set_async(pcie->gpu_backend, pcie->d_tensor,
@@ -121,71 +135,529 @@ static void pcie_stress_loop(pcie_stress_ctx * pcie) {
         ggml_backend_tensor_get_async(pcie->gpu_backend, pcie->d_tensor,
             pcie->h_tensor->data, 0, pcie->transfer_size);
         ggml_backend_synchronize(pcie->gpu_backend);
+        bytes += 2 * (uint64_t) pcie->transfer_size;
     }
+    pcie->stress_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    pcie->stress_ns.fetch_add((uint64_t)(t.stop() * 1e9), std::memory_order_relaxed);
     pcie->active.store(false, std::memory_order_release);
 }
 
-// gathered-slice upload bandwidth: many small strided host->device chunks per burst
-// (mirrors the runtime's sliced-by-used-ids expert copies: ~top-k experts x 3 expert
-// tensors enqueued back-to-back, one synchronize per split), measured under
-// concurrent CPU DRAM load (decode runs the CPU FFN while slices upload). Small
-// chunks run far below peak PCIe; the predictor interpolates this curve to price
-// sliced uploads (pricing them at peak mis-ranked 6 of 14 audited cells).
-static void calibrate_pcie_sliced(pcie_stress_ctx * pcie, int threads, double sliced_bw[4]) {
-    static const double chunk_mb[4] = { 0.5, 2.0, 8.0, 32.0 };
-    printf("Calibrating gathered-slice upload bandwidth (concurrent CPU load)...\n");
+// ---- machine calibrations (profile schema 2, 2026-09-12) ------------------------------------------------
+// Every machine-specific number the planner prices with is measured here and written as a header line; the
+// planner keeps no fallback constants for them. Kernel copies (transfers performed by kernels through the
+// device mapping of pinned host memory, no copy-engine transition) are the expert pool's per-token path, so
+// the gathered-upload curve is measured for the copy engine AND the two kernel paths, and the pool's per-layer
+// fixed costs (host round trip, CPU-route handoff) are timed the way the runtime issues them.
+#define CPU_PROFILE_SCHEMA 2
+static const char * CPU_PROFILE_COLUMNS =
+    "# op_name quant threads AI(FLOP/byte) BW(GB/s) GFLOP/s Ridge(FLOP/byte) Concurrent_GFLOP/s PCIe_Concurrent_BW N K B n_tokens ctx_len n_heads head_dim n_elements";
 
-    std::atomic<bool> stress_stop{false};
-    const size_t pool_bytes = 512ULL * 1024 * 1024;
-    std::vector<uint8_t> pool(pool_bytes);
-    for (size_t i = 0; i < pool.size(); i += 4096) {
-        pool[i] = (uint8_t)(i & 0xFF);
+struct machine_id {
+    std::string gpu = "none";
+    std::string cpu = "unknown";
+    std::string os  = "unknown";
+    size_t      vram_mib = 0;
+};
+
+static std::string cpu_brand_string() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    char brand[49] = { 0 };
+    for (int i = 0; i < 3; i++) {
+        int r[4] = { 0, 0, 0, 0 };
+#if defined(_MSC_VER)
+        __cpuid(r, 0x80000002 + i);
+#else
+        __cpuid(0x80000002 + i, r[0], r[1], r[2], r[3]);
+#endif
+        memcpy(brand + 16 * i, r, 16);
     }
+    std::string s;
+    for (const char * p = brand; *p; p++) {
+        if (*p == ' ' && (s.empty() || s.back() == ' ')) continue;
+        s += *p;
+    }
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    return s.empty() ? std::string("unknown") : s;
+#else
+    return "unknown";
+#endif
+}
+
+static machine_id identify_machine(ggml_backend_t gpu) {
+    machine_id m;
+    m.cpu = cpu_brand_string();
+#if defined(_WIN32)
+    m.os = "windows";
+#elif defined(__APPLE__)
+    m.os = "macos";
+#elif defined(__linux__)
+    m.os = "linux";
+#endif
+    if (gpu) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(gpu);
+        if (dev) {
+            const char * d = ggml_backend_dev_description(dev);
+            if (d) m.gpu = d;
+            size_t fr = 0, tot = 0;
+            ggml_backend_dev_memory(dev, &fr, &tot);
+            m.vram_mib = tot >> 20;
+        }
+    }
+    return m;
+}
+
+// backend procs the calibrations drive (the CUDA backend implements them; elsewhere only the copy-engine
+// paths are measured and the kernel-copy lines are omitted)
+struct gpu_procs {
+    ggml_backend_copy_segments_async_t copy_segments       = nullptr;
+    ggml_backend_kernel_copy_set_t     kernel_copy_set     = nullptr;
+    ggml_backend_kernel_copy_max_set_t kernel_copy_max_set = nullptr;
+    bool kernel_copies = false;   // the backend takes the switch
+};
+
+static gpu_procs lookup_gpu_procs(ggml_backend_t gpu) {
+    gpu_procs p;
+    ggml_backend_dev_t dev = gpu ? ggml_backend_get_device(gpu) : nullptr;
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) return p;
+    p.copy_segments       = (ggml_backend_copy_segments_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_segments_async");
+    p.kernel_copy_set     = (ggml_backend_kernel_copy_set_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_set");
+    p.kernel_copy_max_set = (ggml_backend_kernel_copy_max_set_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_max_set");
+    if (p.kernel_copy_set && p.kernel_copy_max_set) {
+        p.kernel_copies = p.kernel_copy_set(true);
+        p.kernel_copy_set(false);
+    }
+    return p;
+}
+
+// kernel copies on for a scope with the size cap lifted so every chunk takes the kernel path; restored on exit
+struct kernel_copy_scope {
+    const gpu_procs & p;
+    bool   on;
+    size_t prev_cap = 0;
+    kernel_copy_scope(const gpu_procs & procs, bool enable) : p(procs), on(enable) {
+        if (p.kernel_copy_set) p.kernel_copy_set(on);
+        if (on && p.kernel_copy_max_set) prev_cap = p.kernel_copy_max_set(SIZE_MAX);
+    }
+    ~kernel_copy_scope() {
+        if (on && p.kernel_copy_max_set) p.kernel_copy_max_set(prev_cap);
+        if (p.kernel_copy_set) p.kernel_copy_set(false);
+    }
+};
+
+// concurrent host DRAM load (decode runs the CPU expert chain while the pool uploads): threads-1 readers
+struct dram_stress {
+    std::atomic<bool>        stop{false};
     std::vector<std::thread> workers;
-    const int n_stress = std::max(1, threads - 1);  // leave one core for the enqueue thread
-    for (int tid = 0; tid < n_stress; ++tid) {
-        workers.emplace_back([&pool, &stress_stop, tid, n_stress, pool_bytes]() {
-            const size_t chunk = pool_bytes / n_stress;
-            const size_t start = tid * chunk;
-            const size_t limit = start + chunk - sizeof(uint64_t);
-            volatile uint64_t sink = 0;
-            while (!stress_stop.load(std::memory_order_acquire)) {
-                for (size_t off = start; off + 64 <= limit; off += 64) {
-                    sink += *(const uint64_t *)(pool.data() + off);
+    std::vector<uint8_t>     pool;
+    void start(int threads) {
+        const size_t pool_bytes = 512ULL * 1024 * 1024;
+        pool.resize(pool_bytes);
+        for (size_t i = 0; i < pool.size(); i += 4096) pool[i] = (uint8_t)(i & 0xFF);
+        const int n = std::max(1, threads - 1);   // one core stays with the enqueue thread
+        for (int tid = 0; tid < n; ++tid) {
+            workers.emplace_back([this, tid, n, pool_bytes]() {
+                const size_t chunk = pool_bytes / n;
+                const size_t start = tid * chunk;
+                const size_t limit = start + chunk - sizeof(uint64_t);
+                volatile uint64_t sink = 0;
+                while (!stop.load(std::memory_order_acquire)) {
+                    for (size_t off = start; off + 64 <= limit; off += 64) {
+                        sink += *(const uint64_t *)(pool.data() + off);
+                    }
                 }
-            }
-            (void)sink;
-        });
+                (void)sink;
+            });
+        }
     }
+    void finish() {
+        stop.store(true, std::memory_order_release);
+        for (auto & w : workers) w.join();
+        workers.clear();
+    }
+};
 
+struct calib_results {
+    bool       has_gpu = false;
+    machine_id machine;
+    double dram_bw = 0.0, pcie_standalone = 0.0, pcie_concurrent = 0.0;
+    double cpu_eff = -1.0;                                  // CPU efficiency under PCIe load, from the op tables (-1 = not run)
+    double sliced_bw[4]        = { 0.0, 0.0, 0.0, 0.0 };    // gathered uploads, copy engine
+    double sliced_kernel_bw[4] = { 0.0, 0.0, 0.0, 0.0 };    // gathered uploads, one copy kernel per chunk
+    double segs_kernel_bw[4]   = { 0.0, 0.0, 0.0, 0.0 };    // gathered uploads, one segment-batch launch per burst
+    double segs_kernel_idle_bw[4] = { 0.0, 0.0, 0.0, 0.0 }; // the same with the CPU idle (fetch-only pool: no CPU chain)
+    double staged_bw = 0.0;                                 // pageable source through the staging ring
+    static const int n_cross = 9;
+    static constexpr double cross_mb[n_cross] = { 1, 2, 4, 8, 16, 32, 64, 128, 256 };
+    double kernel_bw[n_cross] = { 0 };                      // one transfer ordered behind a kernel, copy kernel
+    double dma_bw[n_cross]    = { 0 };                      // the same on the copy engine
+    double kernel_cap_mb = -1.0;                            // largest size at which the kernel copy still wins (-1 = not measured)
+    double engine_switch_us = 0.0;
+    double pool_serve_us = 0.0, pool_split_us = 0.0;
+    double pin_ceiling_gb = 0.0;
+};
+
+enum sliced_mode { SLICED_DMA = 0, SLICED_KERNEL = 1, SLICED_SEGS = 2 };
+static const double sliced_chunk_mb[4] = { 0.5, 2.0, 8.0, 32.0 };
+
+// gathered-slice upload bandwidth: many small strided host->device chunks per burst (the runtime's
+// sliced-by-used-ids expert copies: ~top-k experts x 3 expert tensors enqueued back-to-back, one synchronize
+// per split), under concurrent CPU DRAM load. Three paths: the copy engine (legacy sliced tiers), one copy
+// kernel per chunk, and the segment-batch kernel (the pool's per-layer upload). Small chunks run far below
+// peak PCIe; the predictor interpolates these curves to price sliced uploads.
+static void calibrate_pcie_sliced(pcie_stress_ctx * pcie, const gpu_procs & procs, int threads, int mode, bool loaded, double out_bw[4]) {
+    static const char * names[3] = { "copy engine", "copy kernels", "segment-batch kernel" };
+    printf("Calibrating gathered-slice upload bandwidth, %s (%s)...\n", names[mode], loaded ? "concurrent CPU load" : "CPU idle");
+    kernel_copy_scope kc(procs, mode != SLICED_DMA);
+    dram_stress stress;
+    if (loaded) stress.start(threads);
     for (int c = 0; c < 4; c++) {
-        const size_t chunk  = (size_t)(chunk_mb[c] * 1024.0 * 1024.0);
+        const size_t chunk  = (size_t)(sliced_chunk_mb[c] * 1024.0 * 1024.0);
         const int    burst  = 24;                      // ~ top-k(8) experts x gate/up/down
         const size_t stride = chunk + 1024 * 1024;     // gathered: non-adjacent sources
         const size_t span   = pcie->transfer_size - chunk;
         const int    iters  = std::max(2, (int)(3.0e9 / ((double)burst * chunk)));
+        std::vector<ggml_backend_copy_segment> segs(burst);
+        bool taken = true;
         bench_timer t;
         t.start();
         double bytes = 0.0;
-        for (int it = 0; it < iters; ++it) {
+        for (int it = 0; it < iters && taken; ++it) {
             for (int b = 0; b < burst; b++) {
                 const size_t off = ((size_t)(it * burst + b) * stride) % span;
-                ggml_backend_tensor_set_async(pcie->gpu_backend, pcie->d_tensor,
-                    (const char *)pcie->h_tensor->data + off, off, chunk);
+                if (mode == SLICED_SEGS) {
+                    segs[b] = { (char *)pcie->d_tensor->data + off, (const char *)pcie->h_tensor->data + off, chunk };
+                } else {
+                    ggml_backend_tensor_set_async(pcie->gpu_backend, pcie->d_tensor,
+                        (const char *)pcie->h_tensor->data + off, off, chunk);
+                }
+            }
+            if (mode == SLICED_SEGS) {
+                taken = procs.copy_segments(pcie->gpu_backend, segs.data(), burst);
             }
             ggml_backend_synchronize(pcie->gpu_backend);
             bytes += (double)burst * chunk;
         }
         const double elapsed = t.stop();
-        sliced_bw[c] = bytes / elapsed / 1e9;
-        printf("  %4.1fMB chunks: %.1f GB/s\n", chunk_mb[c], sliced_bw[c]);
+        out_bw[c] = taken ? bytes / elapsed / 1e9 : 0.0;
+        if (taken) printf("  %4.1fMB chunks: %.1f GB/s\n", sliced_chunk_mb[c], out_bw[c]);
+        else       printf("  %4.1fMB chunks: segment kernel not taken\n", sliced_chunk_mb[c]);
     }
-
-    stress_stop.store(true, std::memory_order_release);
-    for (auto & w : workers) {
-        w.join();
-    }
+    if (loaded) stress.finish();
     printf("\n");
+}
+
+// PCIe rate while the CPU streams DRAM. A full run measures it per op while the tables run; the
+// calibration-only modes measure it against the same DRAM readers the sliced curves use.
+static double calibrate_pcie_concurrent(pcie_stress_ctx * pcie, int threads) {
+    printf("Calibrating concurrent PCIe bandwidth (CPU DRAM load)...\n");
+    dram_stress stress;
+    stress.start(threads);
+    const uint64_t b0 = pcie->stress_bytes.load(), n0 = pcie->stress_ns.load();
+    pcie->stop.store(false, std::memory_order_release);
+    std::thread th(pcie_stress_loop, pcie);
+    while (!pcie->active.load(std::memory_order_acquire)) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    pcie->stop.store(true, std::memory_order_release);
+    th.join();
+    stress.finish();
+    const uint64_t db = pcie->stress_bytes.load() - b0, dn = pcie->stress_ns.load() - n0;
+    const double bw = dn > 0 ? (double)db / ((double)dn / 1e9) / 1e9 : 0.0;
+    printf("  Concurrent PCIe BW: %.1f GB/s\n\n", bw);
+    return bw;
+}
+
+// small graphs to order transfers against and to stand in for the pool's router / expert / join kernels
+struct small_graph {
+    ggml_context *        ctx    = nullptr;
+    ggml_backend_buffer_t buf    = nullptr;
+    ggml_tensor *         x      = nullptr;
+    ggml_tensor *         y      = nullptr;
+    ggml_tensor *         ids    = nullptr;   // 16 x i32: a router's top-k ids
+    ggml_tensor *         ids2   = nullptr;
+    ggml_cgraph *         g_x    = nullptr;   // scale(x)
+    ggml_cgraph *         g_y    = nullptr;   // scale(y)
+    ggml_cgraph *         g_join = nullptr;   // add(x, y)
+    bool init(ggml_backend_t be, int64_t n) {
+        ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead() * 3 + 4096, nullptr, true };
+        ctx = ggml_init(ip);
+        if (!ctx) return false;
+        x    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        y    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ids  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 16);
+        ids2 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 16);
+        ggml_tensor * sx = ggml_scale(ctx, x, 1.0f);
+        ggml_tensor * sy = ggml_scale(ctx, y, 1.0f);
+        ggml_tensor * j  = ggml_add(ctx, x, y);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        if (!buf) return false;
+        g_x = ggml_new_graph(ctx);    ggml_build_forward_expand(g_x, sx);
+        g_y = ggml_new_graph(ctx);    ggml_build_forward_expand(g_y, sy);
+        g_join = ggml_new_graph(ctx); ggml_build_forward_expand(g_join, j);
+        return true;
+    }
+    void release() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        buf = nullptr;
+        ctx = nullptr;
+    }
+};
+
+// copy kernel vs copy engine for one transfer ordered behind a kernel: on WDDM a copy-engine transfer ordered
+// against a kernel idles the GPU for the engine transition (35-55 us measured 2026-09-10); a copy kernel does
+// not. The cap is the largest size at which the kernel still wins; the transition is measured on its own.
+static void calibrate_copy_crossover(pcie_stress_ctx * pcie, const gpu_procs & procs, calib_results & cr) {
+    printf("Calibrating copy kernel vs copy engine for transfers ordered behind a kernel...\n");
+    ggml_backend_t gpu = pcie->gpu_backend;
+    small_graph sg;
+    if (!sg.init(gpu, 4096)) { printf("  could not build the probe graph - skipped\n\n"); return; }
+    for (int pass = 0; pass < 2; pass++) {
+        kernel_copy_scope kc(procs, pass == 1);
+        double * out = pass == 1 ? cr.kernel_bw : cr.dma_bw;
+        for (int i = 0; i < calib_results::n_cross; i++) {
+            const size_t size  = (size_t)(calib_results::cross_mb[i] * 1024.0 * 1024.0);
+            const int    iters = std::max(4, (int)(1.5e9 / (double)size));
+            auto body = [&]() {
+                ggml_backend_graph_compute_async(gpu, sg.g_x);
+                ggml_backend_tensor_set_async(gpu, pcie->d_tensor, pcie->h_tensor->data, 0, size);
+            };
+            for (int w = 0; w < 2; w++) body();
+            ggml_backend_synchronize(gpu);
+            bench_timer t;
+            t.start();
+            for (int it = 0; it < iters; it++) body();
+            ggml_backend_synchronize(gpu);
+            out[i] = (double)iters * size / t.stop() / 1e9;
+        }
+    }
+    printf("  %8s %12s %12s\n", "size", "kernel GB/s", "engine GB/s");
+    for (int i = 0; i < calib_results::n_cross; i++) {
+        printf("  %6.0fMB %12.1f %12.1f\n", calib_results::cross_mb[i], cr.kernel_bw[i], cr.dma_bw[i]);
+    }
+    cr.kernel_cap_mb = 0.0;
+    for (int i = 0; i < calib_results::n_cross; i++) {
+        if (cr.kernel_bw[i] > cr.dma_bw[i]) cr.kernel_cap_mb = calib_results::cross_mb[i]; else break;
+    }
+    // the transition itself: a small readback behind a kernel, synchronized each time, copy engine vs kernel
+    double tt[2] = { 0.0, 0.0 };
+    for (int pass = 0; pass < 2; pass++) {
+        kernel_copy_scope kc(procs, pass == 1);
+        const int iters = 1000;
+        auto body = [&]() {
+            ggml_backend_graph_compute_async(gpu, sg.g_x);
+            ggml_backend_tensor_get_async(gpu, pcie->d_tensor, pcie->h_tensor->data, 0, 8192);
+            ggml_backend_synchronize(gpu);
+        };
+        for (int w = 0; w < 20; w++) body();
+        bench_timer t;
+        t.start();
+        for (int it = 0; it < iters; it++) body();
+        tt[pass] = t.stop() / iters * 1e6;
+    }
+    cr.engine_switch_us = std::max(0.0, tt[0] - tt[1]);
+    printf("  kernel -> 8 KB readback -> sync: copy engine %.1f us, copy kernel %.1f us: engine switch %.1f us\n",
+        tt[0], tt[1], cr.engine_switch_us);
+    printf("  kernel copies win up to %.0f MB\n\n", cr.kernel_cap_mb);
+    sg.release();
+}
+
+// the expert pool's per-layer fixed costs, issued the way the runtime issues them (kernel copies on):
+//   serve: router kernel -> ids readback (64 B) -> event sync -> decision -> ids upload (64 B) -> expert launch
+//   split: router kernel -> activation download (8 KB) -> event sync -> CPU graph on a persistent thread pool
+//          -> partial upload (8 KB) -> join kernel
+// each reported net of the same kernels launched back to back (the GPU with nothing in between)
+static void calibrate_pool_latencies(pcie_stress_ctx * pcie, ggml_backend_t cpu_be, int threads, const gpu_procs & procs, calib_results & cr) {
+    printf("Calibrating the expert pool's per-layer host round trips (kernel copies on)...\n");
+    kernel_copy_scope kc(procs, true);
+    ggml_backend_t gpu = pcie->gpu_backend;
+    ggml_backend_dev_t dev = ggml_backend_get_device(gpu);
+    small_graph sg;
+    if (!sg.init(gpu, 2048)) { printf("  could not build the probe graph - skipped\n\n"); return; }
+    ggml_init_params ip = { ggml_tensor_overhead() * 4 + ggml_graph_overhead() + 4096, nullptr, true };
+    ggml_context * cctx = ggml_init(ip);
+    ggml_tensor * xc = ggml_new_tensor_1d(cctx, GGML_TYPE_F32, 2048);
+    ggml_tensor * sc = ggml_scale(cctx, xc, 1.0f);
+    ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors(cctx, cpu_be);
+    ggml_cgraph * g_cpu = ggml_new_graph(cctx);
+    ggml_build_forward_expand(g_cpu, sc);
+    ggml_threadpool_params tpp = ggml_threadpool_params_default(threads);
+    ggml_threadpool_t tp = ggml_threadpool_new(&tpp);
+    ggml_backend_cpu_set_n_threads(cpu_be, threads);
+    ggml_backend_cpu_set_threadpool(cpu_be, tp);
+    ggml_backend_event_t ev = ggml_backend_event_new(dev);
+    char * host = (char *)pcie->h_tensor->data;   // pinned and device-mapped: the kernel-copy paths apply
+    char * ids_host = host, * ids_host2 = host + 4096, * x_host = host + 8192, * y_host = host + 65536;
+
+    auto timed = [&](const std::function<void()> & body) {
+        const int iters = 1000;
+        for (int w = 0; w < 50; w++) body();
+        ggml_backend_synchronize(gpu);
+        bench_timer t;
+        t.start();
+        for (int it = 0; it < iters; it++) body();
+        ggml_backend_synchronize(gpu);
+        return t.stop() / iters * 1e6;
+    };
+    const double t_kk = timed([&]() {
+        ggml_backend_graph_compute_async(gpu, sg.g_x);
+        ggml_backend_graph_compute_async(gpu, sg.g_y);
+    });
+    const double t_serve = timed([&]() {
+        ggml_backend_graph_compute_async(gpu, sg.g_x);
+        ggml_backend_tensor_get_async(gpu, sg.ids, ids_host, 0, 64);
+        ggml_backend_event_record(ev, gpu);
+        ggml_backend_event_synchronize(ev);
+        ggml_backend_tensor_set_async(gpu, sg.ids2, ids_host2, 0, 64);
+        ggml_backend_graph_compute_async(gpu, sg.g_y);
+    });
+    const double t_kj = timed([&]() {
+        ggml_backend_graph_compute_async(gpu, sg.g_x);
+        ggml_backend_graph_compute_async(gpu, sg.g_join);
+    });
+    const double t_split = timed([&]() {
+        ggml_backend_graph_compute_async(gpu, sg.g_x);
+        ggml_backend_tensor_get_async(gpu, sg.x, x_host, 0, 8192);
+        ggml_backend_event_record(ev, gpu);
+        ggml_backend_event_synchronize(ev);
+        ggml_backend_graph_compute_async(cpu_be, g_cpu);
+        ggml_backend_tensor_set_async(gpu, sg.y, y_host, 0, 8192);
+        ggml_backend_graph_compute_async(gpu, sg.g_join);
+    });
+    cr.pool_serve_us = std::max(0.0, t_serve - t_kk);
+    cr.pool_split_us = std::max(0.0, t_split - t_kj);
+    printf("  two kernels back to back %.1f us; with the ids round trip %.1f us: serve %.1f us per layer\n",
+        t_kk, t_serve, cr.pool_serve_us);
+    printf("  kernel + join %.1f us; with the CPU-route handoff %.1f us: split %.1f us per route\n\n",
+        t_kj, t_split, cr.pool_split_us);
+
+    ggml_backend_event_free(ev);
+    ggml_backend_cpu_set_threadpool(cpu_be, nullptr);
+    ggml_threadpool_free(tp);
+    ggml_backend_buffer_free(cbuf);
+    ggml_free(cctx);
+    sg.release();
+}
+
+// pageable upload through the staging ring: the loader's path for mmap mappings past the host pin ceiling
+static double calibrate_staged_upload(pcie_stress_ctx * pcie) {
+    printf("Calibrating pageable upload through the staging ring...\n");
+    std::vector<uint8_t> src(pcie->transfer_size);
+    for (size_t i = 0; i < src.size(); i += 4096) src[i] = (uint8_t)(i & 0xFF);
+    const size_t chunk = 64ULL << 20;   // the loader's chunking
+    auto pass = [&]() {
+        for (size_t off = 0; off < pcie->transfer_size; off += chunk) {
+            ggml_backend_tensor_set(pcie->d_tensor, src.data() + off, off, std::min(chunk, pcie->transfer_size - off));
+        }
+        ggml_backend_synchronize(pcie->gpu_backend);
+    };
+    pass();
+    const int iters = 4;
+    bench_timer t;
+    t.start();
+    for (int it = 0; it < iters; it++) pass();
+    const double bw = (double)iters * pcie->transfer_size / t.stop() / 1e9;
+    printf("  Staged (pageable) upload BW: %.1f GB/s\n\n", bw);
+    return bw;
+}
+
+// the profile header: every measured machine number as one parseable line
+static void write_profile_header(FILE * f, const calib_results & cr, int threads, const std::vector<int32_t> * batch_sizes, const char * first_line) {
+    if (first_line) {
+        fprintf(f, "%s\n", first_line);
+    } else {
+        fprintf(f, "# Concurrent Profiling (threads=%d, batch_sizes=[", threads);
+        if (batch_sizes) {
+            for (size_t i = 0; i < batch_sizes->size(); i++) {
+                fprintf(f, "%d%s", (*batch_sizes)[i], i + 1 < batch_sizes->size() ? "," : "");
+            }
+        }
+        fprintf(f, "])\n");
+    }
+    fprintf(f, "#   Machine: gpu=\"%s\" vram_mib=%zu cpu=\"%s\" threads=%d os=%s schema=%d\n",
+        cr.machine.gpu.c_str(), cr.machine.vram_mib, cr.machine.cpu.c_str(), threads, cr.machine.os.c_str(), CPU_PROFILE_SCHEMA);
+    fprintf(f, "# Measured Bandwidths Per Thread Count:\n");
+    if (!cr.has_gpu) {
+        fprintf(f, "#   Threads=%d: DRAM_BW=%.1f GB/s\n", threads, cr.dram_bw);
+        return;
+    }
+    fprintf(f, "#   Threads=%d: DRAM_BW=%.1f GB/s, PCIe_Standalone=%.1f GB/s, PCIe_Concurrent=%.1f GB/s (CPU_Eff=%.1f%%)\n",
+        threads, cr.dram_bw, cr.pcie_standalone, cr.pcie_concurrent, cr.cpu_eff >= 0.0 ? cr.cpu_eff : 100.0);
+    auto curve = [&](const char * name, const double bw[4]) {
+        if (bw[0] > 0.0) {
+            fprintf(f, "#   %s: 0.5MB=%.1f 2MB=%.1f 8MB=%.1f 32MB=%.1f GB/s\n", name, bw[0], bw[1], bw[2], bw[3]);
+        }
+    };
+    curve("PCIe_Sliced", cr.sliced_bw);
+    curve("PCIe_Sliced_Kernel", cr.sliced_kernel_bw);
+    curve("PCIe_Segs_Kernel", cr.segs_kernel_bw);
+    curve("PCIe_Segs_Kernel_Idle", cr.segs_kernel_idle_bw);
+    if (cr.staged_bw > 0.0) fprintf(f, "#   PCIe_Staged: %.1f GB/s\n", cr.staged_bw);
+    if (cr.kernel_cap_mb >= 0.0) {
+        auto line = [&](const char * name, const double bw[]) {
+            fprintf(f, "#   %s:", name);
+            for (int i = 0; i < calib_results::n_cross; i++) fprintf(f, " %.0fMB=%.1f", calib_results::cross_mb[i], bw[i]);
+            fprintf(f, " GB/s\n");
+        };
+        line("Kernel_Copy", cr.kernel_bw);
+        line("Engine_Copy", cr.dma_bw);
+        fprintf(f, "#   Kernel_Copy_Cap_MB: %.0f\n", cr.kernel_cap_mb);
+        fprintf(f, "#   Engine_Switch_us: %.1f\n", cr.engine_switch_us);
+    }
+    if (cr.pool_serve_us > 0.0 || cr.pool_split_us > 0.0) {
+        fprintf(f, "#   Pool_Serve_us: %.1f\n", cr.pool_serve_us);
+        fprintf(f, "#   Pool_Split_us: %.1f\n", cr.pool_split_us);
+    }
+    if (cr.pin_ceiling_gb > 0.0) fprintf(f, "#   Host_Pin_Ceiling: %.1f GB\n", cr.pin_ceiling_gb);
+}
+
+// replace the header block of an existing profile with freshly measured lines, keeping its op tables (they
+// take the long run; the calibrations take seconds). Values the calibration modes do not measure (CPU_Eff,
+// the pin ceiling when its probe was skipped) are carried over from the old header. The old file is kept
+// as <path>.bak.
+static bool splice_profile_header(const char * path, calib_results & cr, int threads) {
+    FILE * in = fopen(path, "r");
+    if (!in) { fprintf(stderr, "cannot open %s\n", path); return false; }
+    std::vector<std::string> lines;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), in)) lines.push_back(buf);
+    fclose(in);
+    size_t cols = lines.size();
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (lines[i].compare(0, 9, "# op_name") == 0) { cols = i; break; }
+    }
+    if (cols == lines.size() || lines.empty()) {
+        fprintf(stderr, "%s: no column header line - not a CPU profile\n", path);
+        return false;
+    }
+    std::string first = lines[0];
+    while (!first.empty() && (first.back() == '\n' || first.back() == '\r')) first.pop_back();
+    for (size_t i = 0; i < cols; i++) {
+        double a = 0.0, b = 0.0, c = 0.0, d = 0.0;
+        int tc = 0;
+        if (sscanf(lines[i].c_str(), "#   Threads=%d: DRAM_BW=%lf GB/s, PCIe_Standalone=%lf GB/s, PCIe_Concurrent=%lf GB/s (CPU_Eff=%lf%%)",
+                   &tc, &a, &b, &c, &d) == 5) {
+            if (cr.cpu_eff < 0.0) cr.cpu_eff = d;
+            if (cr.pcie_concurrent <= 0.0) cr.pcie_concurrent = c;
+        }
+        double pc = 0.0;
+        if (sscanf(lines[i].c_str(), "#   Host_Pin_Ceiling: %lf GB", &pc) == 1 && cr.pin_ceiling_gb <= 0.0) {
+            cr.pin_ceiling_gb = pc;
+        }
+    }
+    const std::string bak = std::string(path) + ".bak";
+    FILE * fb = fopen(bak.c_str(), "w");
+    if (fb) {
+        for (auto & l : lines) fputs(l.c_str(), fb);
+        fclose(fb);
+    }
+    FILE * out = fopen(path, "w");
+    if (!out) { fprintf(stderr, "cannot write %s\n", path); return false; }
+    write_profile_header(out, cr, threads, nullptr, first.c_str());
+    for (size_t i = cols; i < lines.size(); i++) fputs(lines[i].c_str(), out);
+    fclose(out);
+    printf("Header replaced in %s (previous copy in %s)\n", path, bak.c_str());
+    return true;
 }
 
 // host pin ceiling: how many bytes of ordinary process memory the driver will
@@ -280,6 +752,7 @@ struct bench_result_cpu : bench_result {
     float concurrent_gflops = 0.0f;
     float concurrent_efficiency_pct = 0.0f;
     float pcie_standalone_bw_gb_s = 0.0f;
+    float pcie_concurrent_gb_s = 0.0f;   // PCIe rate measured while this op ran under the stress loop
 
     void print(double pcie_bw_ref = 0.0) const {
         printf("%-20s quant=%-6s threads=%d AI=%.3f FLOP/byte BW=%.2f GB/s Perf=%.2f GFLOP/s",
@@ -287,9 +760,8 @@ struct bench_result_cpu : bench_result {
             arithmetic_intensity, effective_bw_gb_s, effective_gflops);
         if (concurrent_gflops > 0) {
             printf(" | Concur=%.2f (%.1f%%)", concurrent_gflops, concurrent_efficiency_pct);
-            if (pcie_bw_ref > 0) {
-                double est_pcie_bw = pcie_bw_ref * (concurrent_efficiency_pct / 100.0) * 0.9;
-                printf(" PCIe~%.1f GB/s (%.1f%%)", est_pcie_bw, 100.0 * est_pcie_bw / pcie_bw_ref);
+            if (pcie_bw_ref > 0 && pcie_concurrent_gb_s > 0) {
+                printf(" PCIe=%.1f GB/s (%.1f%%)", pcie_concurrent_gb_s, 100.0 * pcie_concurrent_gb_s / pcie_bw_ref);
             }
         }
         print_dims();
@@ -472,6 +944,7 @@ static bench_result_cpu run_concurrent(
     result.standalone_gflops = result.effective_gflops;
 
     if (pcie && pcie->gpu_backend) {
+        const uint64_t b0 = pcie->stress_bytes.load(), n0 = pcie->stress_ns.load();
         pcie->stop.store(false, std::memory_order_release);
         std::thread pcie_thread(pcie_stress_loop, pcie);
         while (!pcie->active.load(std::memory_order_acquire)) std::this_thread::yield();
@@ -480,6 +953,8 @@ static bench_result_cpu run_concurrent(
 
         pcie->stop.store(true, std::memory_order_release);
         pcie_thread.join();
+        const uint64_t db = pcie->stress_bytes.load() - b0, dn = pcie->stress_ns.load() - n0;
+        result.pcie_concurrent_gb_s = dn > 0 ? (float)((double)db / ((double)dn / 1e9) / 1e9) : 0.0f;
     } else {
         result.concurrent_gflops = result.standalone_gflops;
     }
@@ -581,34 +1056,15 @@ static void save_results_cpu(
         const char * path,
         const std::vector<bench_result_cpu> & results,
         const std::vector<int32_t> & batch_sizes,
-        int threads, double dram_bw, double pcie_standalone_bw, double pcie_concurrent_bw, double cpu_eff,
-        bool has_gpu, const double sliced_bw[4], double pin_ceiling_gb) {
+        int threads, const calib_results & cr) {
 
     FILE * f = fopen(path, "w");
     if (!f) { fprintf(stderr, "Failed to open %s for writing\n", path); return; }
 
-    fprintf(f, "# Concurrent Profiling (threads=%d, batch_sizes=[", threads);
-    for (size_t i = 0; i < batch_sizes.size(); i++)
-        fprintf(f, "%d%s", batch_sizes[i], i + 1 < batch_sizes.size() ? "," : "");
-    fprintf(f, "])\n");
+    write_profile_header(f, cr, threads, &batch_sizes, nullptr);
+    fprintf(f, "%s\n", CPU_PROFILE_COLUMNS);
 
-    fprintf(f, "# Measured Bandwidths Per Thread Count:\n");
-    if (has_gpu) {
-        fprintf(f, "#   Threads=%d: DRAM_BW=%.1f GB/s, PCIe_Standalone=%.1f GB/s, PCIe_Concurrent=%.1f GB/s (CPU_Eff=%.1f%%)\n",
-            threads, dram_bw, pcie_standalone_bw, pcie_concurrent_bw, cpu_eff);
-        if (sliced_bw != NULL && sliced_bw[0] > 0.0) {
-            fprintf(f, "#   PCIe_Sliced: 0.5MB=%.1f 2MB=%.1f 8MB=%.1f 32MB=%.1f GB/s\n",
-                sliced_bw[0], sliced_bw[1], sliced_bw[2], sliced_bw[3]);
-        }
-        if (pin_ceiling_gb > 0.0) {
-            fprintf(f, "#   Host_Pin_Ceiling: %.1f GB\n", pin_ceiling_gb);
-        }
-    } else {
-        fprintf(f, "#   Threads=%d: DRAM_BW=%.1f GB/s\n", threads, dram_bw);
-    }
-
-    fprintf(f, "# op_name quant threads AI(FLOP/byte) BW(GB/s) GFLOP/s Ridge(FLOP/byte) Concurrent_GFLOP/s PCIe_Concurrent_BW N K B n_tokens ctx_len n_heads head_dim n_elements\n");
-
+    const double dram_bw = cr.dram_bw;
     auto ridges = compute_ridge_points(results, dram_bw);
     std::map<std::string, double> ridge_map;
     for (const auto & rr : ridges) ridge_map[rr.key] = rr.ridge;
@@ -616,7 +1072,7 @@ static void save_results_cpu(
     for (const auto & r : results) {
         std::string key = r.op_name + "_" + r.quant_type;
         double ridge = ridge_map.count(key) ? ridge_map[key] : 0.0;
-        double est_pcie = pcie_standalone_bw * (r.standalone_gflops > 0 ? r.concurrent_gflops / r.standalone_gflops : 1.0) * 0.9;
+        const double est_pcie = r.pcie_concurrent_gb_s;   // measured while the op ran under the PCIe stress loop
 
         fprintf(f, "%s %s %d %.4f %.2f %.2f %.4f %.2f %.2f %d %d %d %d %d %d %d %lld\n",
             r.op_name.c_str(), r.quant_type.c_str(), r.threads,
@@ -632,8 +1088,9 @@ static void save_results_cpu(
 int main(int argc, char ** argv) {
     int32_t fixed_threads = -1;
     bool    fast_mode     = true;
-    bool    sliced_only   = false;
+    bool    calibrate_only = false;
     bool    no_pin_ceiling = false;
+    const char * splice_path = nullptr;
     const char * output_path = "cpu_profile.txt";
 
     for (int i = 1; i < argc; ++i) {
@@ -646,8 +1103,10 @@ int main(int argc, char ** argv) {
             fast_mode = true;
         } else if (!strcmp(argv[i], "--full")) {
             fast_mode = false;
-        } else if (!strcmp(argv[i], "--sliced-only")) {
-            sliced_only = true;
+        } else if (!strcmp(argv[i], "--sliced-only") || !strcmp(argv[i], "--calibrate-only")) {
+            calibrate_only = true;
+        } else if (!strcmp(argv[i], "--splice") && i + 1 < argc) {
+            splice_path = argv[++i];
         } else if (!strcmp(argv[i], "--no-pin-ceiling")) {
             no_pin_ceiling = true;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -657,8 +1116,10 @@ int main(int argc, char ** argv) {
             printf("  -h, --help\n");
             printf("  --fast              fast mode with fewer configs (default)\n");
             printf("  --full              full mode with all configs\n");
-            printf("  --sliced-only       run only the PCIe calibrations and print the\n");
-            printf("                      PCIe_Sliced header line (no table regeneration)\n");
+            printf("  --calibrate-only    run only the machine calibrations and print the\n");
+            printf("                      profile header block (no table regeneration)\n");
+            printf("  --splice <profile>  run the calibrations and replace that profile's header\n");
+            printf("                      block in place, keeping its op tables (old file -> .bak)\n");
             printf("  --no-pin-ceiling    skip the host pin ceiling probe (registers RAM\n");
             printf("                      in 2 GiB chunks until the driver refuses)\n");
             printf("  --threads <n>       number of CPU threads (default: auto)\n");
@@ -714,24 +1175,54 @@ int main(int argc, char ** argv) {
     }
     if (!has_gpu) printf("No GPU — standalone mode\n\n");
 
+    calib_results cr;
+    cr.has_gpu = has_gpu;
+    cr.machine = identify_machine(has_gpu ? pcie.gpu_backend : nullptr);
+    printf("Machine: gpu=\"%s\" (%zu MiB) cpu=\"%s\" os=%s\n\n",
+        cr.machine.gpu.c_str(), cr.machine.vram_mib, cr.machine.cpu.c_str(), cr.machine.os.c_str());
+
     printf("Measuring DRAM bandwidth...\n");
-    double dram_bw = benchmark_cpu_dram_bandwidth(threads);
-    printf("  DRAM BW: %.1f GB/s\n", dram_bw);
-    if (has_gpu) calibrate_pcie(&pcie);
+    cr.dram_bw = benchmark_cpu_dram_bandwidth(threads);
+    printf("  DRAM BW: %.1f GB/s\n", cr.dram_bw);
 
-    double sliced_bw[4] = { 0.0, 0.0, 0.0, 0.0 };
-    if (has_gpu) calibrate_pcie_sliced(&pcie, threads, sliced_bw);
+    gpu_procs procs;
+    if (has_gpu) {
+        calibrate_pcie(&pcie);
+        cr.pcie_standalone = pcie.calibrated_bw_gb_s;
+        procs = lookup_gpu_procs(pcie.gpu_backend);
+        if (getenv("GGML_CUDA_KERNEL_COPY") != nullptr || getenv("GGML_CUDA_KERNEL_COPY_MAX_MB") != nullptr) {
+            printf("GGML_CUDA_KERNEL_COPY / GGML_CUDA_KERNEL_COPY_MAX_MB are set and override the switches the\n"
+                   "profiler drives: unset them to measure the kernel-copy paths (their lines are omitted)\n\n");
+            procs.kernel_copies = false;
+        }
+        calibrate_pcie_sliced(&pcie, procs, threads, SLICED_DMA, true, cr.sliced_bw);
+        if (procs.kernel_copies) {
+            calibrate_pcie_sliced(&pcie, procs, threads, SLICED_KERNEL, true, cr.sliced_kernel_bw);
+            if (procs.copy_segments) {
+                calibrate_pcie_sliced(&pcie, procs, threads, SLICED_SEGS, true,  cr.segs_kernel_bw);
+                calibrate_pcie_sliced(&pcie, procs, threads, SLICED_SEGS, false, cr.segs_kernel_idle_bw);
+            }
+            calibrate_copy_crossover(&pcie, procs, cr);
+            calibrate_pool_latencies(&pcie, cpu_be, threads, procs, cr);
+        } else {
+            printf("Kernel copies not available on this backend - kernel-copy lines omitted\n\n");
+        }
+        cr.staged_bw = calibrate_staged_upload(&pcie);
+        if (calibrate_only || splice_path) {
+            cr.pcie_concurrent = calibrate_pcie_concurrent(&pcie, threads);
+        }
+        if (!no_pin_ceiling) cr.pin_ceiling_gb = calibrate_pin_ceiling(&pcie);
+    }
 
-    double pin_ceiling_gb = 0.0;
-    if (has_gpu && !no_pin_ceiling) pin_ceiling_gb = calibrate_pin_ceiling(&pcie);
-
-    if (sliced_only) {
-        // print the exact header line for splicing into an existing profile
-        printf("PCIe_Sliced header line (paste into the profile header block):\n");
-        printf("#   PCIe_Sliced: 0.5MB=%.1f 2MB=%.1f 8MB=%.1f 32MB=%.1f GB/s\n",
-            sliced_bw[0], sliced_bw[1], sliced_bw[2], sliced_bw[3]);
-        if (pin_ceiling_gb > 0.0) {
-            printf("#   Host_Pin_Ceiling: %.1f GB\n", pin_ceiling_gb);
+    if (calibrate_only || splice_path) {
+        if (splice_path) {
+            splice_profile_header(splice_path, cr, threads);
+        } else {
+            if (has_gpu) {
+                printf("CPU_Eff is measured by the op tables only: the header below carries 100%% (no derating)\n");
+            }
+            printf("Profile header block:\n");
+            write_profile_header(stdout, cr, threads, &batch_sizes, nullptr);
         }
         if (has_gpu) {
             if (pcie.ctx) ggml_free(pcie.ctx);
@@ -752,18 +1243,18 @@ int main(int argc, char ** argv) {
     run_moe_benchmarks(cpu_be, threads, batch_sizes, fast_mode, has_gpu ? &pcie : nullptr, all_results);
     run_attention_benchmarks(cpu_be, threads, batch_sizes, fast_mode, has_gpu ? &pcie : nullptr, all_results);
 
-    double pcie_concurrent_bw = 0.0, cpu_eff = 100.0;
     if (has_gpu && !all_results.empty()) {
         double sum_s = 0.0, sum_c = 0.0;
         for (const auto & r : all_results) { sum_s += r.standalone_gflops; sum_c += r.concurrent_gflops; }
-        cpu_eff = (sum_s > 0) ? 100.0 * sum_c / sum_s : 100.0;
-        pcie_concurrent_bw = pcie.calibrated_bw_gb_s * (cpu_eff / 100.0) * 0.9;
+        cr.cpu_eff = (sum_s > 0) ? 100.0 * sum_c / sum_s : 100.0;
+        // PCIe rate over every concurrent phase: bytes the stress loop moved while the op tables ran
+        const uint64_t ns = pcie.stress_ns.load();
+        cr.pcie_concurrent = ns > 0 ? (double)pcie.stress_bytes.load() / ((double)ns / 1e9) / 1e9 : 0.0;
     }
 
     printf("\nTotal time: %.1f s, %zu benchmarks\n", overall.stop(), all_results.size());
 
-    save_results_cpu(output_path, all_results, batch_sizes, threads, dram_bw,
-        pcie.calibrated_bw_gb_s, pcie_concurrent_bw, cpu_eff, has_gpu, sliced_bw, pin_ceiling_gb);
+    save_results_cpu(output_path, all_results, batch_sizes, threads, cr);
 
     if (has_gpu) {
         if (pcie.ctx) ggml_free(pcie.ctx);

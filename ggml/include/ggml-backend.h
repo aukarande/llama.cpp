@@ -440,6 +440,10 @@ extern "C" {
     typedef bool (*ggml_backend_copy_segments_async_t)(ggml_backend_t backend,
             const struct ggml_backend_copy_segment * segs, int n);
     typedef bool (*ggml_backend_kernel_copy_set_t)(bool on);
+    // "ggml_backend_kernel_copy_max_set": bytes above which a transfer keeps the copy engine even with kernel
+    //   copies on (bandwidth-bound bulk). The runtime sets the machine profile's measured crossover here;
+    //   GGML_CUDA_KERNEL_COPY_MAX_MB overrides it. Returns the previous runtime value.
+    typedef size_t (*ggml_backend_kernel_copy_max_set_t)(size_t bytes);
 
     // Per-split info snapshot for timing prediction.
     struct ggml_backend_sched_split_info {

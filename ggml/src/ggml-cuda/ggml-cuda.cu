@@ -3023,7 +3023,9 @@ static bool ggml_cuda_stage_queue_memset(int device, cudaStream_t stream, void *
 // performed by a kernel through the device mapping of pinned host memory (cudaMallocHost, cudaHostRegister)
 // stays on the compute engine. Measured 2026-09-10 on an RTX 5070 Ti: kernel -> DMA D2H 8 KB -> sync 43 us
 // vs copy kernel 12 us; kernel -> DMA H2D 2 MB -> kernel 154 us vs copy kernel 58 us (~30 GB/s from host).
-// Transfers above GGML_CUDA_KERNEL_COPY_MAX_MB (default 16) keep the copy engine (bandwidth-bound bulk).
+// Transfers above the kernel-copy cap keep the copy engine (bandwidth-bound bulk): 16 MiB until the runtime sets
+// the machine profile's measured crossover through "ggml_backend_kernel_copy_max_set"; GGML_CUDA_KERNEL_COPY_MAX_MB
+// overrides both.
 static std::atomic<bool> ggml_cuda_kernel_copy_flag{false};   // runtime switch (the expert pool turns it on while active)
 static bool ggml_cuda_kernel_copy_enabled() {
     static const int env_mode = [] { const char * e = getenv("GGML_CUDA_KERNEL_COPY"); return e != nullptr ? (atoi(e) != 0 ? 1 : 0) : -1; }();
@@ -3033,9 +3035,13 @@ bool ggml_backend_cuda_kernel_copy_set(bool on) {
     ggml_cuda_kernel_copy_flag.store(on, std::memory_order_relaxed);
     return ggml_cuda_kernel_copy_enabled();
 }
+static std::atomic<size_t> ggml_cuda_kernel_copy_max_flag{(size_t) 16 << 20};
 static size_t ggml_cuda_kernel_copy_max_bytes() {
-    static const size_t mx = [] { const char * e = getenv("GGML_CUDA_KERNEL_COPY_MAX_MB"); return (size_t) ((e != nullptr ? atof(e) : 16.0) * 1024.0 * 1024.0); }();
-    return mx;
+    static const long long env_mx = [] { const char * e = getenv("GGML_CUDA_KERNEL_COPY_MAX_MB"); return e != nullptr ? (long long) (atof(e) * 1024.0 * 1024.0) : -1LL; }();
+    return env_mx >= 0 ? (size_t) env_mx : ggml_cuda_kernel_copy_max_flag.load(std::memory_order_relaxed);
+}
+size_t ggml_backend_cuda_kernel_copy_max_set(size_t bytes) {
+    return ggml_cuda_kernel_copy_max_flag.exchange(bytes, std::memory_order_relaxed);
 }
 template <typename T>
 static __global__ void k_kernel_copy(const T * __restrict__ src, T * __restrict__ dst, size_t n) {
@@ -6262,6 +6268,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kernel_copy_set") == 0) {
         return (void *)ggml_backend_cuda_kernel_copy_set;
+    }
+    if (strcmp(name, "ggml_backend_kernel_copy_max_set") == 0) {
+        return (void *)ggml_backend_cuda_kernel_copy_max_set;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

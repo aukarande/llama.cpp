@@ -100,28 +100,65 @@ struct llama_benchmark_stats {
     double upload_staged_bw   = 0.0;
     double upload_staged_frac = 0.0;
 
-    // interpolated gathered-upload BW for a chunk size; falls back to the measured
+    // machine fingerprint (schema 2 profiles, 2026-09-12): the machine that measured the profile. The
+    // planner compares it with the running machine; a profile from another box prices nothing.
+    struct machine_t {
+        std::string gpu;
+        std::string cpu;
+        std::string os;
+        size_t      vram_mib = 0;
+        int         threads  = 0;
+        int         schema   = 0;   // 0 = pre-fingerprint profile
+    } machine;
+
+    // kernel-copy era measurements (schema 2). 0 / -1 = not in the profile; there is no fallback value:
+    // a planner term that needs one refuses to price without it (nothing machine-specific is a constant).
+    double sliced_kernel_bw[n_sliced_bw] = { 0.0, 0.0, 0.0, 0.0 };   // gathered uploads as single copy kernels
+    double segs_kernel_bw[n_sliced_bw]   = { 0.0, 0.0, 0.0, 0.0 };   // gathered uploads as one segment-batch launch (the pool's per-layer path)
+                                                                     // under the CPU chain's DRAM load (hybrid / cpu_admit)
+    double segs_kernel_idle_bw[n_sliced_bw] = { 0.0, 0.0, 0.0, 0.0 };// the same with the CPU idle (fetch-only: no CPU chain)
+    double staged_bw          = 0.0;    // GB/s, pageable source through the staging ring (mappings past the pin ceiling)
+    double kernel_copy_cap_mb = -1.0;   // largest chunk at which a kernel copy still beats a DMA ordered against kernels
+    double engine_switch_us   = -1.0;   // copy-engine transition: DMA 8 KB readback behind a kernel minus the kernel-copy version;
+                                        // -1 = not in the profile (a measured 0.0 is legitimate on a box without the WDDM fence)
+    double pool_serve_us      = 0.0;    // a pooled layer's host round trip: ids readback, sync, decision, upload, launch
+    double pool_split_us      = 0.0;    // a CPU route's handoff: activation download, host graph, partial upload, join
+
+    // log-linear interpolation of a 4-point chunk-size curve (bandwidth ramps with transfer size);
+    // 0 when the curve is not in the profile
+    static double interp_curve(const double curve[n_sliced_bw], double chunk_bytes) {
+        if (curve[0] <= 0.0) {
+            return 0.0;
+        }
+        const double mb = chunk_bytes / (1024.0 * 1024.0);
+        if (mb <= sliced_bw_chunk_mb[0]) {
+            return curve[0];
+        }
+        for (int i = 1; i < n_sliced_bw; i++) {
+            if (curve[i] <= 0.0) {
+                return curve[i - 1];
+            }
+            if (mb <= sliced_bw_chunk_mb[i]) {
+                const double t = (std::log(mb) - std::log(sliced_bw_chunk_mb[i - 1])) /
+                                 (std::log(sliced_bw_chunk_mb[i]) - std::log(sliced_bw_chunk_mb[i - 1]));
+                return curve[i - 1] + t * (curve[i] - curve[i - 1]);
+            }
+        }
+        return curve[n_sliced_bw - 1];
+    }
+
+    // interpolated gathered-upload BW for a chunk size on the copy engine; falls back to the measured
     // concurrent rate (eff_pcie_bw), then peak, when the curve is not in the profile
     double slice_bw(double chunk_bytes) const {
         if (sliced_bw[0] <= 0.0) {
             return eff_pcie_bw > 0.0 ? eff_pcie_bw : peak_pcie_bw;
         }
-        const double mb = chunk_bytes / (1024.0 * 1024.0);
-        if (mb <= sliced_bw_chunk_mb[0]) {
-            return sliced_bw[0];
-        }
-        for (int i = 1; i < n_sliced_bw; i++) {
-            if (sliced_bw[i] <= 0.0) {
-                return sliced_bw[i - 1];
-            }
-            if (mb <= sliced_bw_chunk_mb[i]) {
-                // log-linear in chunk size (bandwidth ramps with transfer size)
-                const double t = (std::log(mb) - std::log(sliced_bw_chunk_mb[i - 1])) /
-                                 (std::log(sliced_bw_chunk_mb[i]) - std::log(sliced_bw_chunk_mb[i - 1]));
-                return sliced_bw[i - 1] + t * (sliced_bw[i] - sliced_bw[i - 1]);
-            }
-        }
-        return sliced_bw[n_sliced_bw - 1];
+        return interp_curve(sliced_bw, chunk_bytes);
+    }
+    // the same for the pool's per-layer path (segment-batch kernel), under the CPU chain's load or with the
+    // CPU idle; 0 = not measured, no fallback
+    double slice_bw_kernel(double chunk_bytes, bool cpu_loaded) const {
+        return interp_curve(cpu_loaded ? segs_kernel_bw : segs_kernel_idle_bw, chunk_bytes);
     }
 };
 
