@@ -340,7 +340,7 @@ struct common_params_speculative_draft {
     int32_t pshard_reserve_mb = 0; // MiB carved out of the target's pshard budget for this context (self-check at teardown)
     int32_t n_ubatch     = 0;  // ubatch for the draft/MTP context; 0 = inherit the target's. pshard records
                                // the pre-plan value here so draft contexts do not reserve compute buffers at
-                               // the target's tier ubatch (a dflash draft at ubatch 2048 reserved 4.3 GiB)
+                               // the target's tier ubatch, which is far larger than a draft needs
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -960,7 +960,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 //   - spec contexts run at the pre-plan ubatch (recorded in speculative.draft.n_ubatch)
 //   - big MoE drafts (> 2 GiB with expert stacks) spill their experts to CPU through the
 //     draft override list when the user gave none (-otd) and reserve dense bytes only
-//   - measured with the fit's memory probe; drafts that need a target context to build
+//   - sized by the fit's memory probe; drafts that need a target context to build
 //     their graph fall back to gguf metadata + a fixed margin
 // Returns the reserve in MiB (0 without speculation). Both the runtime
 // (common_init_from_params) and llama-pshard-plan-params call this, so plan and run
@@ -974,9 +974,9 @@ uint32_t common_pshard_resolve_n_ctx(const common_params & params, uint32_t n_ct
 // an override array of that placement (the one the fit left in params.tensor_buft_overrides, or a
 // tier's from llama_pshard_registry_tier_overrides; every buft host; backend id 0 = the compute
 // device). 0 = no MTP context or a separate draft; a probe that ran and failed also returns 0 and
-// sets *probe_failed (callers must not read that as "fits"). The pre-fit reserve is measured with
-// everything pinned; a plan that moves the MTP head or the MTP layer's FFN off the device grows the
-// context's compute by ~180 MiB on q35 (2026-09-05 grid: +177.5 MiB rows).
+// sets *probe_failed (callers must not read that as "fits"). The pre-fit reserve assumes everything
+// pinned; a plan that moves the MTP head or the MTP layer's FFN off the device grows the context's
+// compute, so the need is probed again under the fitted placement.
 size_t common_pshard_mtp_need_mb(common_params & params, uint32_t n_ctx,
         const struct llama_model_tensor_buft_override * plan_overrides, bool * probe_failed = nullptr);
 

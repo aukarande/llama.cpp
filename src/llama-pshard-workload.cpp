@@ -335,9 +335,8 @@ bool llama_pshard_workload_calibrate(const std::string & path_model, const llama
     if (bos < 0) {
         bos = 0;   // no BOS token: start from the first vocabulary entry
     }
-    // segments of 32 tokens, the first from BOS, the others from a random vocabulary token: the continuation
-    // of one start is one topic in one register and routes to few experts (q35: 4 experts took every token
-    // in the first layers), diverse starts spread the routing the way a real prompt mix does
+    // segments of 32 tokens, the first from BOS, the others from a random vocabulary token: one continuation
+    // routes to few experts (one topic, one register); diverse starts spread the routing like a real prompt mix
     std::mt19937   seg_rng(seed);
     const int32_t  n_vocab = llama_vocab_n_tokens(vocab);
     const uint32_t seg_len = 32;

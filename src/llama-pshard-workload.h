@@ -7,11 +7,10 @@
 
 struct llama_model_params;
 
-// The model's routing workload: how skewed the router's expert choices are, as the Zipf exponent alpha the
-// planner's hit-rate model h(s) is built on. Measured, never assumed: the expert pool histograms every
-// cache-mode route and folds each run into <model>.pshard_workload at exit (real runs ACCUMULATE; the plan-time
-// calibration below is a stand-in that the first real run replaces); a model without a file is calibrated at
-// plan time (CPU-only sampled generation through the eval callback).
+// The model's routing workload: the Zipf exponent alpha of the router's expert choices, the input of the
+// planner's hit-rate model h(s). The expert pool histograms every cache-mode route and folds each run into
+// <model>.pshard_workload at exit (runs accumulate); a model without a file is calibrated at plan time
+// (llama_pshard_workload_calibrate below), and the first real run replaces that calibration.
 struct llama_pshard_workload {
     double      zipf_alpha = -1.0;   // -1 = unknown
     double      fit_rms    = 0.0;    // RMS of h_obs(s) - h_zipf(s; alpha) over s = 1..n_expert
@@ -32,12 +31,11 @@ struct llama_pshard_workload {
     bool merge_counts(const std::vector<std::pair<uint32_t, std::vector<uint64_t>>> & c);
     bool refit();
 
-    // fit alpha from per-layer expert use counts. h_obs(s) is the SPLIT-HALF top-s mass: each expert's routes
-    // are assigned to two folds (deterministic binomial split), the experts are ranked on one fold and the
-    // cumulative share of the s top-ranked is measured on the other, both ways, averaged over layers - ranking
-    // and measuring on the same sample inflates the top-s mass when routes per expert are few (a 128-token
-    // run has ~4 per expert on a 256-expert model), which read as a too-skewed alpha. alpha minimises
-    // sum_s (h_obs(s) - h_zipf(s; alpha))^2 over s = 1..n_expert on a 0.005 grid in [0, 3].
+    // fit alpha from per-layer expert use counts. h_obs(s) is a split-half top-s mass: each expert's routes are
+    // split into two folds (deterministic binomial split), the experts are ranked on one fold and the cumulative
+    // share of the s top-ranked is taken on the other, both ways, averaged over layers - ranking and scoring on
+    // the same sample inflates the top-s mass when routes per expert are few, which reads as a too-skewed alpha.
+    // alpha minimises sum_s (h_obs(s) - h_zipf(s; alpha))^2 over s = 1..n_expert on a 0.005 grid in [0, 3].
     static bool fit(const std::vector<std::vector<uint64_t>> & counts, uint32_t n_expert, llama_pshard_workload & out);
 
     // Zipf mass of the s most popular of n_expert experts at exponent alpha (the planner's h(s))

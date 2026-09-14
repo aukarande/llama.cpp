@@ -205,11 +205,11 @@ static bool plan_pshard_context(common_params & params, uint32_t n_ctx, uint32_t
     const uint32_t tier_max      = bench_plan ? tier_max_user : std::min(tier_max_user, cparams.n_ctx);
 
     // spec verify tier: mirror the runtime's output-limits derivation. n_outputs_max is what the
-    // runtime reserve (and, since 2026-09-06, the planner's probes) clamp a tier's outputs to:
-    // speculative tools set it to the output limits' total; completion/perplexity leave it 0
-    // (= n_batch, every token may be an output), so a plain plan must too, or the probes would
-    // price the logits scratch at 1 output while the runtime reserves bs (types defaults to
-    // { NONE }, so "configured" means a draft model or a non-zero draft length)
+    // runtime reserve and the planner's probes clamp a tier's outputs to: speculative tools set it
+    // to the output limits' total; completion/perplexity leave it 0 (= n_batch, every token may be
+    // an output), so a plain plan must too, or the probes would price the logits scratch at 1 output
+    // while the runtime reserves bs (types defaults to { NONE }, so "configured" means a draft model
+    // or a non-zero draft length)
     const bool spec_cfg = params.speculative.has_dft() || common_speculative_n_max(&params.speculative) > 0;
     const auto output_limits = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));

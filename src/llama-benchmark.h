@@ -68,24 +68,24 @@ struct llama_benchmark_stats {
     double peak_gpu_mem_bw  = 0.0;   // peak GPU memory BW (GB/s)
     double peak_gpu_compute = 0.0;   // peak GPU compute (GFLOP/s)
 
-    // derived at load: the slowest measured CPU matmul rate. Quantized matmuls with
-    // no benchmark entry for their type (e.g. IQ quants) are dequant-compute-bound;
-    // pricing them by memory bandwidth alone under-charges 10-20x, so the fallback
-    // uses max(bytes/bw, ops/this) as a conservative compute floor.
+    // derived at load: the slowest CPU matmul rate in the profile. Quantized matmuls with
+    // no benchmark entry for their type (e.g. IQ quants) are dequant-compute-bound, so
+    // pricing them by memory bandwidth alone under-charges them; the fallback uses
+    // max(bytes/bw, ops/this) as a conservative compute floor.
     double cpu_matmul_floor_gflops = 0.0;
 
-    // gathered-slice upload bandwidth curve (from cpu profiler header, measured under
+    // gathered-slice upload bandwidth curve (from cpu profiler header, taken under
     // concurrent CPU memory load): effective host->device BW for small strided chunks.
-    // Sliced expert uploads (0.3-13 MB per expert) run far below peak PCIe; pricing
-    // them at peak over-predicted sliced strategies by 10-24% (selector-gap audit).
+    // sliced expert uploads run far below peak PCIe, so pricing them at peak
+    // over-predicts sliced strategies.
     static constexpr int    n_sliced_bw = 4;
     static constexpr double sliced_bw_chunk_mb[n_sliced_bw] = { 0.5, 2.0, 8.0, 32.0 };
     double sliced_bw[n_sliced_bw] = { 0.0, 0.0, 0.0, 0.0 };
 
     // host pin ceiling (GB): how much ordinary process memory the driver will
-    // page-lock (cudaHostRegister), measured by the profiler by registering
+    // page-lock (cudaHostRegister); the profiler finds it by registering
     // chunks until refusal. 0 = not in the profile -> assume every mmap
-    // mapping page-locks (the pre-per-mapping behavior).
+    // mapping page-locks.
     double host_pin_ceiling_gb = 0.0;
 
     // model-level blended weight-upload rate (GB/s), set by the planner from
@@ -97,13 +97,12 @@ struct llama_benchmark_stats {
     // mixture terms behind upload_bw: the staged mappings' rate and their byte
     // fraction. A split's streamed weights come from ONE mapping (layers are
     // contiguous in the file), so a pass mixes pinned-rate and staged-rate
-    // splits; pricing every split at the blended rate lets predicted compute
-    // hide the staged splits' stalls under the overlap max (measured 117 vs 84
-    // t/s on a half-staged model; the mixture prices ~100).
+    // splits; pricing every split at the blended rate would let predicted compute
+    // hide the staged splits' stalls under the overlap max.
     double upload_staged_bw   = 0.0;
     double upload_staged_frac = 0.0;
 
-    // machine fingerprint (schema 2 profiles, 2026-09-12): the machine that measured the profile. The
+    // machine fingerprint (schema 2 profiles): the machine that produced the profile. The
     // planner compares it with the running machine; a profile from another box prices nothing.
     struct machine_t {
         std::string gpu;
@@ -121,7 +120,7 @@ struct llama_benchmark_stats {
     // "" when the profile's machine is the running one (gpu, cpu, os, threads), else what differs
     static std::string machine_mismatch(const machine_t & profile, const machine_t & current);
 
-    // kernel-copy era measurements (schema 2). 0 / -1 = not in the profile; there is no fallback value:
+    // kernel-copy path terms (schema 2). 0 / -1 = not in the profile; there is no fallback value:
     // a planner term that needs one refuses to price without it (nothing machine-specific is a constant).
     double sliced_kernel_bw[n_sliced_bw] = { 0.0, 0.0, 0.0, 0.0 };   // gathered uploads as single copy kernels
     double segs_kernel_bw[n_sliced_bw]   = { 0.0, 0.0, 0.0, 0.0 };   // gathered uploads as one segment-batch launch (the pool's per-layer path)
@@ -129,8 +128,8 @@ struct llama_benchmark_stats {
     double segs_kernel_idle_bw[n_sliced_bw] = { 0.0, 0.0, 0.0, 0.0 };// the same with the CPU idle (fetch-only: no CPU chain)
     double staged_bw          = 0.0;    // GB/s, pageable source through the staging ring (mappings past the pin ceiling)
     double kernel_copy_cap_mb = -1.0;   // largest chunk at which a kernel copy still beats a DMA ordered against kernels
-    double engine_switch_us   = -1.0;   // copy-engine transition: DMA 8 KB readback behind a kernel minus the kernel-copy version;
-                                        // -1 = not in the profile (a measured 0.0 is legitimate on a box without the WDDM fence)
+    double engine_switch_us   = -1.0;   // copy-engine transition: a small DMA readback ordered behind a kernel minus the kernel-copy version;
+                                        // -1 = not in the profile (0.0 is legitimate where the driver imposes no copy-engine transition fence)
     double pool_serve_us      = 0.0;    // a pooled layer's host round trip: ids readback, sync, decision, upload, launch
     double pool_split_us      = 0.0;    // a CPU route's handoff: activation download, host graph, partial upload, join
 
@@ -157,8 +156,8 @@ struct llama_benchmark_stats {
         return curve[n_sliced_bw - 1];
     }
 
-    // interpolated gathered-upload BW for a chunk size on the copy engine; falls back to the measured
-    // concurrent rate (eff_pcie_bw), then peak, when the curve is not in the profile
+    // interpolated gathered-upload BW for a chunk size on the copy engine; falls back to the concurrent
+    // PCIe rate (eff_pcie_bw), then peak, when the curve is not in the profile
     double slice_bw(double chunk_bytes) const {
         if (sliced_bw[0] <= 0.0) {
             return eff_pcie_bw > 0.0 ? eff_pcie_bw : peak_pcie_bw;
@@ -166,7 +165,7 @@ struct llama_benchmark_stats {
         return interp_curve(sliced_bw, chunk_bytes);
     }
     // the same for the pool's per-layer path (segment-batch kernel), under the CPU chain's load or with the
-    // CPU idle; 0 = not measured, no fallback
+    // CPU idle; 0 = not in the profile, no fallback
     double slice_bw_kernel(double chunk_bytes, bool cpu_loaded) const {
         return interp_curve(cpu_loaded ? segs_kernel_bw : segs_kernel_idle_bw, chunk_bytes);
     }

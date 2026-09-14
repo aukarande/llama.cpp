@@ -198,10 +198,10 @@ static void common_params_fit_impl(
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
-    uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    uint32_t n_ctx_extra = 0;  // context size dmds_extra was evaluated at
 
     // the extra model competes for the same memory as the main model, add it to every measurement
-    // its memory is measured again whenever the context it follows changes
+    // its memory is re-evaluated whenever the context it follows changes
     auto add_extra_memory = [&](dmds_t & dmds) {
         if (extra == nullptr) {
             return;

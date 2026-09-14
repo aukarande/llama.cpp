@@ -28,7 +28,7 @@
 #include <intrin.h>
 #endif
 
-// pin-ceiling probe: physical-memory query + env set
+// pin-ceiling probe: physical-memory query
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -118,7 +118,7 @@ struct pcie_stress_ctx {
     ggml_context * ctx = nullptr;
     size_t transfer_size = 256 * 1024 * 1024;
     double calibrated_bw_gb_s = 0.0;
-    // bytes the stress loop moved and the time it ran: the concurrent PCIe rate is measured, not derived
+    // bytes the stress loop moved and the time it ran: the concurrent PCIe rate is computed from these
     std::atomic<uint64_t> stress_bytes{0};
     std::atomic<uint64_t> stress_ns{0};
 };
@@ -142,11 +142,11 @@ static void pcie_stress_loop(pcie_stress_ctx * pcie) {
     pcie->active.store(false, std::memory_order_release);
 }
 
-// ---- machine calibrations (profile schema 2, 2026-09-12) ------------------------------------------------
-// Every machine-specific number the planner prices with is measured here and written as a header line; the
+// ---- machine calibrations (the profile header block) ----------------------------------------------------
+// Every machine-specific number the planner prices with is calibrated here and written as a header line; the
 // planner keeps no fallback constants for them. Kernel copies (transfers performed by kernels through the
 // device mapping of pinned host memory, no copy-engine transition) are the expert pool's per-token path, so
-// the gathered-upload curve is measured for the copy engine AND the two kernel paths, and the pool's per-layer
+// the gathered-upload curve is taken for the copy engine AND the two kernel paths, and the pool's per-layer
 // fixed costs (host round trip, CPU-route handoff) are timed the way the runtime issues them.
 #define CPU_PROFILE_SCHEMA 2
 static const char * CPU_PROFILE_COLUMNS =
@@ -207,7 +207,7 @@ static machine_id identify_machine(ggml_backend_t gpu) {
 }
 
 // backend procs the calibrations drive (the CUDA backend implements them; elsewhere only the copy-engine
-// paths are measured and the kernel-copy lines are omitted)
+// paths are calibrated and the kernel-copy lines are omitted)
 struct gpu_procs {
     ggml_backend_copy_segments_async_t copy_segments       = nullptr;
     ggml_backend_kernel_copy_set_t     kernel_copy_set     = nullptr;
@@ -291,7 +291,7 @@ struct calib_results {
     static constexpr double cross_mb[n_cross] = { 1, 2, 4, 8, 16, 32, 64, 128, 256 };
     double kernel_bw[n_cross] = { 0 };                      // one transfer ordered behind a kernel, copy kernel
     double dma_bw[n_cross]    = { 0 };                      // the same on the copy engine
-    double kernel_cap_mb = -1.0;                            // largest size at which the kernel copy still wins (-1 = not measured)
+    double kernel_cap_mb = -1.0;                            // largest size at which the kernel copy still wins (-1 = not calibrated)
     double engine_switch_us = 0.0;
     double pool_serve_us = 0.0, pool_split_us = 0.0;
     double pin_ceiling_gb = 0.0;
@@ -405,8 +405,8 @@ struct small_graph {
 };
 
 // copy kernel vs copy engine for one transfer ordered behind a kernel: on WDDM a copy-engine transfer ordered
-// against a kernel idles the GPU for the engine transition (35-55 us measured 2026-09-10); a copy kernel does
-// not. The cap is the largest size at which the kernel still wins; the transition is measured on its own.
+// against a kernel idles the GPU for the engine transition, a copy kernel does not. The cap is the largest size
+// at which the kernel still wins; the transition is timed on its own.
 static void calibrate_copy_crossover(pcie_stress_ctx * pcie, const gpu_procs & procs, calib_results & cr) {
     printf("Calibrating copy kernel vs copy engine for transfers ordered behind a kernel...\n");
     ggml_backend_t gpu = pcie->gpu_backend;
@@ -561,7 +561,7 @@ static double calibrate_staged_upload(pcie_stress_ctx * pcie) {
     return bw;
 }
 
-// the profile header: every measured machine number as one parseable line
+// the profile header: every calibrated machine number as one parseable line
 static void write_profile_header(FILE * f, const calib_results & cr, int threads, const std::vector<int32_t> * batch_sizes, const char * first_line) {
     if (first_line) {
         fprintf(f, "%s\n", first_line);
@@ -611,8 +611,8 @@ static void write_profile_header(FILE * f, const calib_results & cr, int threads
     if (cr.pin_ceiling_gb > 0.0) fprintf(f, "#   Host_Pin_Ceiling: %.1f GB\n", cr.pin_ceiling_gb);
 }
 
-// replace the header block of an existing profile with freshly measured lines, keeping its op tables (they
-// take the long run; the calibrations take seconds). Values the calibration modes do not measure (CPU_Eff,
+// replace the header block of an existing profile with freshly calibrated lines, keeping its op tables (they
+// take the long run; the calibrations take seconds). Values the calibration modes do not produce (CPU_Eff,
 // the pin ceiling when its probe was skipped) are carried over from the old header. The old file is kept
 // as <path>.bak.
 static bool splice_profile_header(const char * path, calib_results & cr, int threads) {
@@ -696,9 +696,9 @@ static double calibrate_pin_ceiling(pcie_stress_ctx * pcie) {
     }
 #endif
     const size_t cap = avail > 0 ? (size_t)(0.90 * avail) : (256ull << 30);
-    // descending chunk sizes: after a refusal, smaller chunks tighten the measured
-    // floor to 256 MiB granularity (a sub-2 GiB ceiling would otherwise read as 0
-    // = "not measured", and the planner would price everything at the pinned rate)
+    // descending chunk sizes: after a refusal, smaller chunks tighten the floor to
+    // 256 MiB granularity (a sub-2 GiB ceiling would otherwise read as 0 = probe
+    // skipped, and the planner would price everything at the pinned rate)
     static const size_t chunk_sizes[] = { 2ull << 30, 1ull << 30, 512ull << 20, 256ull << 20 };
     std::vector<std::pair<void *, size_t>> chunks;
     size_t total = 0;
@@ -749,7 +749,7 @@ struct bench_result_cpu : bench_result {
     float concurrent_gflops = 0.0f;
     float concurrent_efficiency_pct = 0.0f;
     float pcie_standalone_bw_gb_s = 0.0f;
-    float pcie_concurrent_gb_s = 0.0f;   // PCIe rate measured while this op ran under the stress loop
+    float pcie_concurrent_gb_s = 0.0f;   // PCIe rate while this op ran under the stress loop
 
     void print(double pcie_bw_ref = 0.0) const {
         printf("%-20s quant=%-6s threads=%d AI=%.3f FLOP/byte BW=%.2f GB/s Perf=%.2f GFLOP/s",
@@ -1069,7 +1069,7 @@ static void save_results_cpu(
     for (const auto & r : results) {
         std::string key = r.op_name + "_" + r.quant_type;
         double ridge = ridge_map.count(key) ? ridge_map[key] : 0.0;
-        const double est_pcie = r.pcie_concurrent_gb_s;   // measured while the op ran under the PCIe stress loop
+        const double est_pcie = r.pcie_concurrent_gb_s;   // the rate while the op ran under the PCIe stress loop
 
         fprintf(f, "%s %s %d %.4f %.2f %.2f %.4f %.2f %.2f %d %d %d %d %d %d %d %lld\n",
             r.op_name.c_str(), r.quant_type.c_str(), r.threads,

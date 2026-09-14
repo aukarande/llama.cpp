@@ -295,7 +295,7 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                 if (sscanf(line, "#   Host_Pin_Ceiling: %lf GB", &pc) == 1) {
                     stats.host_pin_ceiling_gb = pc;
                 }
-                // schema 2 lines: kernel-copy era measurements and the machine fingerprint
+                // schema 2 lines: kernel-copy upload rates, pool latencies and the machine fingerprint
                 if (sscanf(line, "#   PCIe_Sliced_Kernel: 0.5MB=%lf 2MB=%lf 8MB=%lf 32MB=%lf GB/s", &s0, &s1, &s2, &s3) == 4) {
                     stats.sliced_kernel_bw[0] = s0; stats.sliced_kernel_bw[1] = s1;
                     stats.sliced_kernel_bw[2] = s2; stats.sliced_kernel_bw[3] = s3;
@@ -363,7 +363,7 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
     if (stats.eff_pcie_bw   == 0.0) { stats.eff_pcie_bw   = stats.peak_pcie_bw;   }
 
     // conservative compute floor for quantized matmuls with no benchmark entry:
-    // the slowest measured CPU matmul rate (any quant, any shape)
+    // the slowest CPU matmul rate in the profile (any quant, any shape)
     stats.cpu_matmul_floor_gflops = 0.0;
     for (const auto & e : cpu_entries) {
         if (e.op_name != "MUL_MAT" && e.op_name != "MUL_MAT_ID") continue;
@@ -600,12 +600,10 @@ llama_split_timing llama_benchmark_predictor::predict_split(
             } else {
                 const double ai = m.bytes > 0.0 ? (m.ops / m.bytes) : 0.0;
                 if (ai < match->ridge) {
-                    // memory-bound op. The matched entry's observed bytes/s is only a
-                    // bandwidth measurement if that entry ALSO ran memory-bound; a
-                    // compute-bound benchmark's byte throughput is an artifact far below
-                    // the machine's streaming rate (seen: FLASH_ATTN entry at 2.6 GB/s on
-                    // a 45.7 GB/s machine -> CPU attention priced 18x too slow, hiding
-                    // attn-pinned plans from the search)
+                    // memory-bound op. the matched entry's observed bytes/s is a bandwidth
+                    // only if that entry also ran memory-bound; a compute-bound entry's byte
+                    // throughput sits far below the machine's streaming rate and would price
+                    // the op far too slow, hiding plans that pin it from the search
                     double mem_bw = match->bw_gb_s;
                     if (match->ai >= match->ridge || mem_bw <= 0.0) {
                         mem_bw = is_gpu ? stats.peak_gpu_mem_bw
@@ -635,8 +633,8 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                     price_branch = "fall-mem";
                 }
                 // quantized CPU matmuls with no benchmark entry (e.g. IQ quants) are
-                // dequant-compute-bound at batch; memory bandwidth alone under-charges
-                // them 10-20x. Floor with the slowest measured CPU matmul rate.
+                // dequant-compute-bound at batch and memory bandwidth alone under-charges
+                // them; floor with the slowest CPU matmul rate in the profile.
                 // batch only: at small row counts the matmul is memory-bound (dequant
                 // streams at DRAM speed) and bytes/bw is already the right price
                 if (!is_gpu && m.ops > 0.0 && m.M >= 32 && stats.cpu_matmul_floor_gflops > 0.0 &&
@@ -793,8 +791,8 @@ double llama_benchmark_predictor::predict_tps(
     // per-class writeback ratios, matching what the runtime actually moves:
     //   attention KV: write-cells delta sync -> batch_size/kv_size in both directions
     //   recurrent state: FULL mode, entire tensor every eval -> 1.0
-    // A blanket has_rs ratio charged hybrid models' attention KV at full-cache cost per
-    // decode step, under-predicting pinned-attn plans 2-12x at 16k ctx.
+    // one ratio for both would charge a hybrid model's attention KV at full-cache cost
+    // per decode step and under-predict plans that pin attention
     GGML_UNUSED(has_rs);
     const double kv_ratio = (kv_size > 0) ? std::min(1.0, (double)batch_size / kv_size) : 1.0;
     double total_ms = 0.0;
@@ -813,11 +811,9 @@ double llama_benchmark_predictor::predict_tps(
         if (is_gpu && pcie_bw > 0.0) {
             // a prefetched split still pays its sliced-by-used-ids expert copies at
             // consume time (the prefetch pass skips those tensors on purpose).
-            // Sliced expert uploads are many small gathered transfers and run far
-            // below peak PCIe (measured 29.5 GB/s at 0.6MB chunks vs 45 peak);
-            // pricing them at peak over-predicted sliced strategies by 10-24% and
-            // mis-ranked 6 of 14 audited cells. Price the sliced share at the
-            // profiled chunk-size-dependent rate, the contiguous rest at peak.
+            // sliced expert uploads are many small gathered transfers and run far
+            // below peak PCIe, so pricing them at peak over-predicts sliced strategies;
+            // price the sliced share at the profiled chunk-size rate, the contiguous rest at peak.
             const double sliced_bytes = (double)si.input_weight_sliced_bytes;
             const double rest_weight_bytes = copy_prefetched
                 ? 0.0
@@ -866,9 +862,9 @@ double llama_benchmark_predictor::predict_tps(
 
         // prefetch cost: use concurrent PCIe BW for CPU splits (bus shared with DRAM),
         // peak PCIe BW for GPU splits (GPU compute doesn't contend with PCIe DMA).
-        // The per-op aggregate eff_pcie_bw can be far below the machine's measured
-        // concurrent PCIe rate (same unrepresentative-entry disease as the memory-branch
-        // bandwidth) - floor it with the profiler's directly measured concurrent value.
+        // the per-op aggregate eff_pcie_bw can sit far below the machine's concurrent
+        // PCIe rate when the matched entries are unrepresentative (as in the memory-bound
+        // branch) - floor it with the profiler's own concurrent value
         double prefetch_ms = 0.0;
         if (prefetch_bytes > 0.0) {
             double eff_bw = pcie_bw;

@@ -12,7 +12,7 @@ enum common_params_fit_status {
 };
 
 // a second model that shares the devices of the main model, e.g. a draft model
-//   - its context follows the context of the main model, so its memory is measured again whenever that context changes
+//   - its context follows the context of the main model, so the fit re-evaluates its memory whenever that context changes
 //   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
 struct common_fit_extra_model {
     const char * path_model;
@@ -68,9 +68,9 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
 
-// Measured device-memory need of a model + context at the given params, summed over
-// the GPU devices, in bytes (ok=false if it could not be measured - e.g. drafts whose
-// graph needs a target context). Used by pshard's one-budget rule for spec contexts.
+// device-memory need of a model + context at the given params, in bytes, device 0's share only (pshard budgets are device-0 scoped)
+//   - ok=false if the no_alloc load failed, e.g. a draft whose graph needs a target context
+//   - used by common_pshard_mtp_need_mb and common_pshard_draft_reserve_mb to size the spec-context reserve
 struct common_device_memory_need {
     size_t model   = 0;
     size_t context = 0;

@@ -458,10 +458,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_head(
     cb(mixes, "hc_head_mixes", -1);
 
     // named so pshard's delegated-mode pin anchors them to the head's backend: unnamed, the
-    // scheduler's op-offload rule placed them by row count (n_outputs), on CUDA0 in a tier's
-    // reserve (n_outputs = bs) and on the CPU for a prompt (0 or 1 outputs) - a different backend
-    // assignment forces the scheduler to re-plan the arena for the first prefill graph of every
-    // tier (2026-09-06: 1088 MiB overflow on DSv4 + DSpark at -mva 8000)
+    // scheduler's op-offload rule places them by row count (n_outputs), which differs between a
+    // tier's reserve graph and a prompt graph and forces an arena re-plan on every tier's first prefill
     ggml_tensor * pre = ggml_mul(ctx0, mixes, hc_scale);
     cb(pre, "hc_head_scale", -1);
     pre = ggml_add(ctx0, pre, hc_base);

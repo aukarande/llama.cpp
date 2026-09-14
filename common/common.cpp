@@ -1330,9 +1330,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (params.pshard) {
         LOG_INF("%s: pshard enabled, probing and loading plan cache\n", __func__);
-        // fused-GLU is certified for pshard as of 2026-09-01: the fusion memory-range
-        // check now sees scheduler input copies, so fusion self-disables exactly on
-        // layers where the fused dst would alias recycled slot bytes.
+        // room for the placement the fit writes back
         params.tensor_buft_overrides.resize(4096);
         // spec verify tier: the target context advertises n_draft+1 outputs per sequence
         const uint32_t n_draft_tier = cparams.n_outputs_max_per_seq > 1 ? cparams.n_outputs_max_per_seq - 1 : 0;
@@ -1590,16 +1588,13 @@ void common_pshard_fit_one_budget(common_params & params, llama_model_params & m
         // under the initial tier, drafts after the prompt under the prompt's tier and at decode
         // under the decode tier, and its scheduler buffer never shrinks - so its need is the MAX
         // over the viable tiers' placements, not the highest tier's alone (the MTP head's home is
-        // per tier: pinned where the tier pins layers, on the CPU where it pins none; review
-        // 2026-09-06). Probe each distinct placement once; the fit's own array is the highest tier's.
-        // The placements measured are the REGISTRY tiers' own override lists (what pshard_apply_plan
-        // applies at every tier switch, the planner's generator in both processes). The array the
-        // fit left in params.tensor_buft_overrides is the LOAD-time placement from the runtime's
-        // cache-path generator, which is not what any MTP context ever computes under (the initial
-        // plan lands before the context exists) - it is used only when the registry offers no tier
-        // lists (2026-09-07: the two generators disagreed on a pool tier's MTP layer; the runtime
-        // measured 193 MiB against the plan tool's 21, refit to a budget with no variant and fell
-        // to stock on every q35 MTP pool cell).
+        // per tier: pinned where the tier pins layers, on the CPU where it pins none).
+        // Probe each distinct placement once, taking the REGISTRY tiers' own override lists (what
+        // pshard_apply_plan applies at every tier switch). The array the fit left in
+        // params.tensor_buft_overrides is the LOAD-time placement from the cache-path generator,
+        // which no MTP context ever computes under (the initial plan lands before the context
+        // exists) and may home a layer differently: it is used only when the registry offers no
+        // tier lists.
         bool     probe_failed = false;
         size_t   need         = 0;
         uint32_t need_tier_bs = 0;
@@ -1647,7 +1642,7 @@ void common_pshard_fit_one_budget(common_params & params, llama_model_params & m
             }
         }
         const int32_t reserve = params.speculative.draft.pshard_reserve_mb;
-        const int32_t margin  = 16;   // probe-vs-runtime slack (the lever cells measured <= 4.5 MiB)
+        const int32_t margin  = 16;   // probe-vs-runtime slack
         if (need == 0 || (int64_t) need <= (int64_t) reserve + margin) {
             if (pass > 0) {
                 LOG_INF("%s: MTP context needs %zu MiB under the re-fitted plan, %d MiB reserved\n", __func__, need, reserve);
@@ -1661,9 +1656,8 @@ void common_pshard_fit_one_budget(common_params & params, llama_model_params & m
         const size_t delta = need - (size_t) reserve;
         // pass 2 is a fresh plan at the lower budget (pin-priority head, the lever only if its union
         // overshoots again). When pass 1 took the lever and pass 2 does not need it, the raised
-        // reserve is idle (178 MiB at q35 MTP @4000/4k) and the ladder may pick a different shape -
-        // a planner pricing matter (the head home is never priced), recorded in design 11.C.19 xiii;
-        // a protocol that kept pass 1's head home was tried and reverted (2026-09-07)
+        // reserve sits idle and the ladder may pick a different shape: a planner pricing matter,
+        // the head home is never priced (docs/expert-pool-design.md 11.C.19 xiii)
         LOG_WRN("%s: the MTP context needs %zu MiB under the plan's placement, %d MiB were reserved: re-fitting with the reserve raised by %zu MiB\n",
             __func__, need, reserve, delta);
         params.speculative.draft.pshard_reserve_mb = (int32_t) need;
@@ -1738,11 +1732,9 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
                         (ggml_row_size(params.speculative.draft.cache_type_k, (int64_t) n_headkv * k_len) +
                          ggml_row_size(params.speculative.draft.cache_type_v, (int64_t) n_headkv * v_len));
                 }
-                // compute buffer per token of ubatch: an activation term (~956 B per embedding
-                // element: the block decoder's residual/MLP temporaries) plus an attention term
-                // (~49 B per head per k+v element: projections and scores). Fitted on two drafts:
-                // q35 dflash (n_embd 2048, 32 heads, k+v 256) 2.25 MiB/token and the DSv4 DSpark
-                // (4096, 64 heads, k+v 1024) 6.80 MiB/token, both at ubatch 128.
+                // compute buffer per token of ubatch: an activation term per embedding element (the
+                // block decoder's residual/MLP temporaries) plus an attention term per head per k+v
+                // element (projections and scores); the coefficients are fits over draft models
                 if (n_embd && n_head && k_len) {
                     compute_per_token = 956.0 * n_embd + 49.0 * n_head * (double) (k_len + v_len);
                 }
@@ -1768,7 +1760,7 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
                     unsigned il = 0;
                     if (sscanf(name, "blk.%u.", &il) == 1) {
                         if (exps_per_layer.size() <= il) { exps_per_layer.resize(il + 1, 0); }
-                        exps_per_layer[il] += sz;  // v2: per-layer expert bytes for leftover pinning
+                        exps_per_layer[il] += sz;  // per-layer expert bytes for the leftover pinning (common_pshard_draft_leftover)
                     }
                 }
             }
@@ -1793,13 +1785,13 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
         // The user's own -otd list wins; a spill applied by an earlier call is recognized.
         auto & ovr = params.speculative.draft.tensor_buft_overrides;
         // a spill applied by an earlier call of THIS rule (possibly rewritten to a partial list
-        // by the v2 leftover pinning) is recognized by its flag, never by pattern text: an
+        // by the leftover pinning) is recognized by its flag, never by pattern text: an
         // identical pattern from the user's own list must keep counting as the user's
         spill = params.speculative.draft.exps_spill_auto;
         if (spill) {
-            // re-entry (e.g. server sleep/wake): the v2 leftover step may have rewritten the
+            // re-entry (e.g. server sleep/wake): the leftover step may have rewritten the
             // list to a partial spill after the previous fit. Restore the canonical full spill
-            // the v1 rule prices, so this pass measures the same placement the plan tool did
+            // this rule prices, so this pass measures the same placement the plan tool did
             // and derives the same budget; the leftover step re-applies its pins after the fit.
             ovr.clear();
             ovr.push_back(llm_ffn_exps_cpu_override());
@@ -1815,9 +1807,9 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
         }
     }
 
-    // ---- measured device need: the probe the stock fit runs for its extra model. The MTP
+    // ---- probed device need: the probe the stock fit runs for its extra model. The MTP
     //      context shares the target's weights (model bytes excluded); drafts whose graph
-    //      taps a target context (dflash/eagle) cannot be measured standalone -> model below
+    //      taps a target context (dflash/eagle) cannot be probed standalone -> modeled below
     common_params params_dft = common_base_params_to_speculative(params);
     auto mparams_dft = common_model_params_to_llama(params_dft);
     auto cparams_dft = common_context_params_to_llama(params_dft);
@@ -1839,8 +1831,7 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
             (has_draft ? m.model : 0) / (double) mib, m.context / (double) mib, m.compute / (double) mib);
     } else {
         // analytical model: device weights + KV(n_ctx) + compute(ubatch). The compute term is
-        // affine in the ubatch the context is reserved for: a 256 MiB base (measured intercept
-        // on the q35 dflash draft: 520 MiB at ubatch 128, 1373 MiB at 512) plus the per-token
+        // affine in the ubatch the context is reserved for: a fitted base plus the per-token
         // architecture term computed above. The MTP context has no weights of its own. The
         // context reports its real footprint at teardown (pshard one-budget check).
         const size_t w_dev    = has_draft ? (spill ? w_total - w_exps : w_total) : 0;
@@ -1864,13 +1855,13 @@ size_t common_pshard_draft_reserve_mb(common_params & params, uint32_t n_ctx) {
     return reserve_mb;
 }
 
-// pshard one-budget v2 (joint target + draft, greedy): the target's plan is fixed by the
-// registry and its arena is sized to the canonical union, so whatever the budget has beyond
-// the arena is real device memory nobody uses. A separate MoE draft whose experts the v1 rule
-// spilled to the CPU gets that leftover: the leading layers' experts move back to the device
-// while they fit. Runtime-only (the registry does not depend on it); the plan tool still prices
-// the draft with the v1 reserve, so the pair stays inside the budget: arena + reserve + pinned
-// experts <= -mva. Drafts placed by a user -otd list are left alone.
+// pshard one-budget v2, the leftover pinning (joint target + draft, greedy): the target's plan is
+// fixed by the registry and its arena is sized to the canonical union, so whatever the budget has
+// beyond the arena is real device memory nobody uses. A separate MoE draft whose experts the spill
+// rule in common_pshard_draft_reserve_mb sent to the CPU gets that leftover: the leading layers'
+// experts move back to the device while they fit. Runtime-only (the registry does not depend on
+// it); the plan tool prices the draft with the full-spill reserve, so the pair stays inside the
+// budget: arena + reserve + pinned experts <= -mva. Drafts placed by a user -otd list are left alone.
 void common_pshard_draft_leftover(common_params & params, const struct llama_pshard_plan_registry * registry, size_t arena_budget_mb) {
     const size_t mva_eff_mb = arena_budget_mb;  // the arena's budget after every shrink the fit applied
     auto & d = params.speculative.draft;

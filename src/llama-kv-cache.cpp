@@ -184,9 +184,8 @@ llama_kv_cache::llama_kv_cache(
             map_layer_ids[il] = (int32_t)specs.size();
 
             // size rows with the SAME accessors as the stock allocation below - they are
-            // the per-arch source of truth (a hand-rolled n_lora_kv + n_rot here computed
-            // 64 instead of 576 for DeepSeek-V4-Flash, whose rank lives elsewhere, and the
-            // probe then crashed writing 512-wide latents into a 64-wide cache).
+            // the per-arch source of truth (a hand-rolled n_lora_kv + n_rot misses the
+            // DeepSeek-V4 latent width and the cache comes out too narrow for the graph).
             // MLA still has no separate V cache; dim_t2=0 signals "skip t2".
             const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
             const uint32_t n_embd_v_gqa = is_mla
@@ -264,8 +263,7 @@ llama_kv_cache::llama_kv_cache(
         }
         // the constructor tail below (attention rotation + Hadamard tables) must run for
         // pshard caches too: without it build_input_k_rot() returns nullptr and DeepSeek-V4
-        // silently builds RAW attention instead of its compressed-cache + lightning-indexer
-        // path (garbage from the first token, 2026-09-01)
+        // silently builds RAW attention instead of its compressed-cache + lightning-indexer path
         init_attn_rot(other);
         return;
     }

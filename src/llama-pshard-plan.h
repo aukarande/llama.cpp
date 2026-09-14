@@ -23,7 +23,7 @@ enum llama_pshard_strategy {
     LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE               = 4,
     // routed experts become a managed VRAM cache (docs/expert-pool-design.md):
     // per-tier variables n_attn_pinned / K / miss_policy / prefill_mode; the
-    // pool region serves prefill A/B streaming and decode LRU slots
+    // pool region serves the prefill ab_stream double buffer and decode LRU slots
     LLAMA_PSHARD_EXPERT_POOL                         = 5,
     LLAMA_PSHARD_COUNT
 };
@@ -77,7 +77,7 @@ enum llama_pshard_miss_policy {
 
 // EXPERT_POOL: how a prefill tier moves an unpinned layer's experts
 enum llama_pshard_prefill_mode {
-    LLAMA_PSHARD_PREFILL_AB_STREAM = 0,  // whole expert set through the A/B span, hidden under GEMMs
+    LLAMA_PSHARD_PREFILL_AB_STREAM = 0,  // whole expert set streamed through the double-buffered span, hidden under GEMMs
     LLAMA_PSHARD_PREFILL_CPU_TAIL  = 1,  // ab_stream + the ubatch's coldest experts computed on CPU
     LLAMA_PSHARD_PREFILL_COUNT
 };
@@ -160,11 +160,9 @@ inline thread_local bool g_pshard_mtp_head_cpu = false;
 
 // architecture support gate: both model probes (runtime cache loader and planner) set this
 // from the loaded model; nullptr = supported. pshard refuses LOUDLY (WARN + stock fallback)
-// rather than run a memory layout it cannot stream. No architecture is refused today:
-// DeepSeek-V4 (llama_kv_cache_dsv4) was the case until 2026-09-01 - its wrapper hid its pipe
-// shards, the pshard cache constructor skipped the attention-rotation tail (so the compressed
-// attention + lightning indexer were silently never built), and the scheduler let streamed
-// layers read views of host weights directly. Keep the gate for the next such architecture.
+// rather than run a memory layout it cannot stream. No architecture is refused today; the gate
+// stays for the next memory wrapper that hides its pipe shards from the pshard cache constructor
+// or lets streamed layers read views of host weights directly.
 inline thread_local const char * g_pshard_unsupported_reason = nullptr;
 
 // device bytes the model's memory keeps OUTSIDE the pshard arena (today: DeepSeek-V4's
@@ -281,8 +279,7 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         uint32_t probe_n_tokens = 0,
         uint32_t probe_n_outputs = 0);
 
-// fit params entry point used by pshard planning (relocated from the
-// base-era src/llama.cpp; upstream's generic fit moved to common/fit)
+// fit params entry point used by pshard planning; upstream's generic fit lives in common/fit
 void llama_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -320,7 +317,7 @@ struct llama_pshard_plan_registry {
     float switch_attn_frac = 0.0f;  // attention share of a layer's bytes
     float switch_head_mb   = 0.0f;  // est. MB of the output head
     float switch_pcie_gb_s = 0.0f;  // upload rate for pinned weights
-    // the machine profile's measured kernel-copy crossover (largest transfer at which a copy kernel still beats
+    // the machine profile's kernel-copy crossover (largest transfer at which a copy kernel still beats
     // a copy-engine transfer ordered against kernels); the pool sets it as the engine's cap while active.
     // -1 = not in the profile -> the engine keeps its default
     float kernel_copy_cap_mb = -1.0f;
@@ -328,10 +325,8 @@ struct llama_pshard_plan_registry {
     // variant planned elsewhere. 0 = unknown (older registry)
     uint64_t machine_hash = 0;
     bool  mtp_head_cpu     = false; // MTP head demoted to CPU by union-budget enforcement
-    // RETIRED 2026-09-06 (kept so existing registry files still parse; never charged): the
-    // analytical arena charge for the MTP context's larger device compute with the head on the
-    // CPU. The one-budget fit measures that need under the fitted placement instead
-    // (common_pshard_fit_one_budget).
+    // retired, never charged; kept so existing registry files still parse. The one-budget fit
+    // measures the MTP context's device need under the fitted placement (common_pshard_fit_one_budget).
     uint32_t mtp_head_extra_mb = 0;
     uint32_t n_layers      = 0;     // trunk layer count (set in-memory by planner and runtime;
                                     // 0 = unknown -> structural attention pins are not priced)
@@ -360,9 +355,7 @@ struct llama_pshard_plan_registry {
     size_t arena_bytes(size_t budget_bytes) const {
         const size_t mib      = 1024ULL * 1024;
         const size_t headroom = 64 * mib;
-        // mtp_head_extra_mb is retired (2026-09-06): the MTP context's need under the plan's
-        // placement is measured by the one-budget fit instead; the field stays for registry
-        // compatibility and is not charged here
+        // mtp_head_extra_mb is retired and not charged here (see the field comment)
         const size_t budget   = budget_bytes;
         if (union_bytes == 0 || has_pool()) {
             return (budget / mib) * mib; // whole MiB, see below
@@ -377,8 +370,8 @@ struct llama_pshard_plan_registry {
     // ATTNPRIO/ALTERNATE budget knob and stays 0 for strategies that pin attention
     // structurally: ATTNPIN_FFNSTREAM keeps every layer's attention resident, the
     // LAYERSTREAM/FFNCPU_ATTNSTREAM strategies only the fully pinned layers'. Pricing a
-    // switch from the raw field charged an ATTNPIN <-> ATTNPRIO(attn=40) swap as 40
-    // layers of attention traffic that never moves (selector-gap audit caveat, 2026-08-31).
+    // switch from the raw field would charge an ATTNPIN <-> ATTNPRIO swap for structurally
+    // resident attention that never moves.
     uint32_t attn_resident(const llama_pshard_plan & p) const {
         uint32_t r = p.n_attn_pinned > p.n_pinned ? p.n_attn_pinned : p.n_pinned;
         if (p.strategy == LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM && n_layers > 0) {
@@ -497,7 +490,7 @@ struct llama_pshard_plan_registry {
 
     // pick the prefill ubatch with the lowest predicted ttft. Without TPS data the default
     // is the LARGEST VIABLE tier <= max_ubatch, never max_ubatch itself: the top tier can be
-    // unviable by design (a pool tier whose scratch leaves no room for its region, 2026-09-05)
+    // unviable by design (a pool tier whose scratch leaves no room for its region)
     // and a ubatch routed to it would run on the decode plan and spill past its window.
     uint32_t find_optimal_ubatch(uint32_t n_prompt, uint32_t max_ubatch,
                                  const llama_pshard_plan * from_plan = nullptr) const {
