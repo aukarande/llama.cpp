@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -232,13 +233,13 @@ void llama_context::pshard_pack_cache_region() {
 #include "llama-expert-pool.h"
 
 // EXPERT_POOL: create the pool and carve its region from the arena, directly
-// below the pinned KV cache: [weights | scratch | POOL | pinned KV]. The slot
-// count comes from the plan; when the planner's file-size heuristic oversized
-// it, clamp to what actually fits after the largest measured tier scratch.
+// below the pinned KV cache: [weights | scratch | POOL | pinned KV]. Only the
+// existence check happens here: one slot per layer must fit beside the largest
+// pool tier's scratch; the region itself is sized per tier in pshard_pool_resize.
 void llama_context::pshard_setup_expert_pool() {
     expert_pool.reset();
     expert_pool_bytes = 0;
-    if (!cparams.pshard || getenv("PSHARD_POOL_RUNTIME") == nullptr) {
+    if (!cparams.pshard) {
         return;
     }
     auto * registry = const_cast<llama_pshard_plan_registry *>(model.get_plan_registry());
@@ -253,8 +254,7 @@ void llama_context::pshard_setup_expert_pool() {
         if (p == nullptr || !p->is_viable || p->strategy != LLAMA_PSHARD_EXPERT_POOL) {
             // a legacy tier never shares the window with the pool (pshard_update_pool_mode
             // disengages it and the tier takes the whole scratch window), so its scratch says
-            // nothing about whether the pool can exist - counting it refused the pool for the
-            // decode tiers whenever a large attn-pin substitute sat on top (review 2026-09-06)
+            // nothing about whether the pool can exist
             continue;
         }
         scratch_need = std::max(scratch_need, p->scratch_measured + (64ull << 20));
@@ -288,14 +288,61 @@ void llama_context::pshard_setup_expert_pool() {
     GGML_UNUSED(slots);
 
     // the region itself is sized per tier (pshard_pool_resize, from the tier's own
-    // measured scratch): pool + scratch is constant, so decode tiers turn the
+    // reserved scratch): pool + scratch is constant, so decode tiers turn the
     // prefill scratch delta into slots
     pool->backend_router = backends[pshard_layout.compute].get();
-    if (registry->kernel_copy_cap_mb >= 0.0f) {
-        pool->kernel_copy_cap_set   = true;
-        pool->kernel_copy_cap_bytes = (size_t) (registry->kernel_copy_cap_mb * 1024.0 * 1024.0);
-    }
     expert_pool = std::move(pool);
+}
+
+// the kernel-copy flag and cap are process-wide: contexts holding the mode on are counted, the last one releases
+static std::mutex g_pshard_transfer_mutex;
+static int        g_pshard_transfer_users = 0;
+static size_t     g_pshard_transfer_cap_prev = 0;
+
+// the transfer mode follows the active tier, whatever its strategy: pinned transfers below the profile's cap run
+// as kernels through the device mapping and the scheduler uses its asynchronous host paths
+void llama_context::pshard_update_transfer_mode(const llama_pshard_plan * plan) {
+    const bool on = cparams.pshard && plan != nullptr && plan->is_viable;
+    if (on && pshard_kernel_copy_set == nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg != nullptr) {
+            pshard_kernel_copy_set     = (ggml_backend_kernel_copy_set_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_set");
+            pshard_kernel_copy_max_set = (ggml_backend_kernel_copy_max_set_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_max_set");
+        }
+        const llama_pshard_plan_registry * registry = model.get_plan_registry();
+        if (registry != nullptr && registry->kernel_copy_cap_mb >= 0.0f) {
+            pshard_kernel_cap_set   = true;
+            pshard_kernel_cap_bytes = (size_t) (registry->kernel_copy_cap_mb * 1024.0 * 1024.0);
+        }
+    }
+    if (on != pshard_transfer_on) {
+        pshard_transfer_on = on;
+        std::lock_guard<std::mutex> lock(g_pshard_transfer_mutex);
+        if (on && g_pshard_transfer_users++ == 0) {
+            if (pshard_kernel_copy_set != nullptr) {
+                pshard_kernel_copy_set(true);
+            }
+            if (pshard_kernel_copy_max_set != nullptr && pshard_kernel_cap_set) {
+                // the profile's crossover replaces the engine's default cap while a tier is active (0: never)
+                g_pshard_transfer_cap_prev = pshard_kernel_copy_max_set(pshard_kernel_cap_bytes);
+            }
+        } else if (!on && --g_pshard_transfer_users == 0) {
+            if (pshard_kernel_copy_set != nullptr) {
+                pshard_kernel_copy_set(false);
+            }
+            if (pshard_kernel_copy_max_set != nullptr && pshard_kernel_cap_set) {
+                pshard_kernel_copy_max_set(g_pshard_transfer_cap_prev);
+            }
+        }
+    }
+    // a rebuilt scheduler starts with the synchronous paths: re-assert every time
+    if (sched) {
+        ggml_backend_sched_set_async_host_copies(sched.get(), on);
+    }
+    if (expert_pool) {
+        expert_pool->kernel_copies = on;   // the pool's staging and batched uploads follow the mode
+    }
 }
 
 // size the region for ONE tier: everything between the weights + this tier's
@@ -316,9 +363,9 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
     // plus the plan's own extras (tensors it pins that some other tier streams)
     const size_t preloaded = std::max(model.get_dev_preloaded_size(), plan.addrs_cached ? plan.cached_scratch_off : (size_t) 0);
     const size_t cache     = total_pinned_cache_size(memory.get());
-    // this tier's compute scratch: measured at its first reserve when available
+    // this tier's compute scratch: taken from its first reserve when available
     // (registry plans carry no scratch, and the planner's probe streamed the
-    // experts so its number is not this graph's); before that, a 64 MiB provisional
+    // experts so its number is not this graph's); before that, a provisional margin
     size_t scratch = plan.scratch_measured + (64ull << 20);
     {
         const auto it = pshard_pool_scratch.find(plan.batch_size);
@@ -334,11 +381,11 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
     }
     const size_t avail = buf_total - preloaded - cache - scratch;
 
-    // whole-stack tiers need the 2-layer A/B pair in the region; cache tiers only
+    // whole-stack tiers need the two-layer double-buffer pair (ab) in the region; cache tiers only
     // their slots (the pair is not reserved for them: tight budgets turn it into slots)
     const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
     // slots = what the window holds (the plan's count estimates the same quantity
-    // from the probe; the measured scratch here is the authority - the log shows both)
+    // from the probe; the reserved scratch here is the authority - the log shows both)
     const size_t per_slot = expert_pool->region_bytes_needed(1, /*with_ab=*/false);
     uint32_t slots = per_slot > 0 ? (uint32_t) std::min<size_t>(avail / per_slot, expert_pool->n_expert) : 0;
     size_t   want  = expert_pool->region_bytes_needed(slots, ab);
@@ -384,6 +431,7 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
 }
 
 void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
+    pshard_update_transfer_mode(&plan);
     if (!expert_pool) {
         return;
     }
@@ -440,6 +488,7 @@ void llama_context::pshard_setup_sched() {
     if (expert_pool) {
         expert_pool->register_sched(sched.get());
     }
+    pshard_update_transfer_mode(pshard_active_plan);   // the new scheduler takes the active tier's paths
 
     if (model.get_dev_preload_buf()) {
         size_t preloaded_size = model.get_dev_preloaded_size();
@@ -558,12 +607,11 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
     const uint32_t n_seqs   = cparams.n_seq_max;
     const uint32_t n_tokens = plan.batch_size;
     // the outputs a runtime batch of this tier can request: n_outputs_max caps them (decode asserts
-    // it). Reserving every token as an output over-sized the logits scratch by (bs - n_outputs_max)
-    // x n_vocab x 4 B; that bites only when the tool caps n_outputs_max below n_batch (speculative
-    // targets: n_parallel x (n_draft + 1); the server: n_parallel x (1 + n_max)) - completion and
-    // perplexity leave n_outputs_max = n_batch and reserve bs outputs as before. The planner's probes
-    // clamp the same way (llama_pshard_probe_memory), so plan and runtime scratch agree. The DSv4
-    // head-tail backend flip this once masked is fixed by the hc_head node names (2026-09-06).
+    // it). Reserving every token as an output would over-size the logits scratch by (bs - n_outputs_max)
+    // x n_vocab x 4 B when the tool caps n_outputs_max below n_batch (speculative targets:
+    // n_parallel x (n_draft + 1); the server: n_parallel x (1 + n_max)); completion and perplexity
+    // leave n_outputs_max = n_batch. The planner's probes clamp the same way (llama_pshard_probe_memory),
+    // so plan and runtime scratch agree.
     const uint32_t n_outputs = std::max<uint32_t>(1, std::min<uint32_t>(n_tokens, cparams.n_outputs_max));
 
     // start with unconstrained scratch packing
@@ -612,14 +660,11 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
                 pshard_pool_scratch.find(plan.batch_size) == pshard_pool_scratch.end()) {
             pshard_pool_scratch[plan.batch_size] = chunk0_used + (32ull << 20);
             if (!pshard_pool_resize(plan)) {
-                // the measured scratch leaves no window for the region (or for the A/B pair a
-                // whole-stack tier streams through). Before 2026-09-05 this fell through to the
-                // constrained retry below against the PREVIOUS tier's region: the graph could
-                // not fit and the allocator packed it into overflow chunks OUTSIDE the arena
-                // (DSv4 @14500, ctx 8192: 2.2 GiB at bs=4096, 4.7 GiB at bs=8192). VRAM was
-                // oversubscribed, WDDM demoted the pool slots after a long prompt, and decode
-                // ran at 5 t/s instead of 22. A pool tier without its pool is unviable; the
-                // prompt falls to the largest viable tier.
+                // the reserved scratch leaves no window for the region (or for the double-buffer
+                // pair a whole-stack tier streams through). Falling through to the constrained retry
+                // below against the previous tier's region would pack the graph into overflow chunks
+                // outside the arena and oversubscribe VRAM. A pool tier without its pool is unviable;
+                // the prompt falls to the largest viable tier.
                 LLAMA_LOG_WARN("%s: tier bs=%u (expert pool): graph scratch %.1f MiB leaves no room for the pool region; tier unviable\n",
                     __func__, plan.batch_size, chunk0_used / (1024.0 * 1024.0));
                 ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, scratch_avail);
@@ -640,7 +685,7 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
         }
 
         if (chunk0_used <= scratch_avail) {
-            // the whole window, not the measured size: a runtime graph the scheduler re-plans (a
+            // the whole window, not the reserved size: a runtime graph the scheduler re-plans (a
             // shape it has not seen) must have every byte the tier owns
             ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, scratch_avail);
             pshard_save_alloc_state(plan);
@@ -750,7 +795,7 @@ void llama_context::pshard_warmup_plan_reserves() {
 
         // the planner's no_alloc probe can undershoot the runtime canonical packing by
         // alignment/padding; a tier whose packed weights + pinned cache exceed the managed
-        // buffer must degrade, not assert (seen: 24 MiB overshoot at a 2000 MiB budget)
+        // buffer must degrade, not assert
         if (model.get_dev_preload_buf()) {
             const size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
             // no expert-pool charge here: the region is carved per tier from what
@@ -824,10 +869,9 @@ void llama_context::pshard_apply_initial_plan() {
         pshard_active_plan = initial;
         pshard_update_pool_mode(*initial);
     }
-    // ~llama_context compares each backend's sched buffer against these: pshard skips the
-    // stock reserves that set them, so they stayed 0 and every run printed the mismatch WARN.
-    // Set them to the sizes after the warmup: a mismatch at exit then means the scheduler grew
-    // a buffer during the run (an arena overflow, the 2026-09-05 bug class) and nothing else.
+    // ~llama_context compares each backend's sched buffer against these and pshard skips the
+    // stock reserves that set them. Set them to the sizes after the warmup: a mismatch at exit
+    // then means the scheduler grew a buffer during the run (an arena overflow) and nothing else.
     if (backend_buf_exp_size.size() == backend_ptrs.size()) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
@@ -1059,7 +1103,7 @@ uint32_t llama_context::pshard_maybe_switch(uint32_t n_tokens) {
 
     // the tier that executes this ubatch: the smallest viable tier at or above it, else the
     // largest viable tier below (the caller clamps the ubatch to what we return). tier_index
-    // alone would hand an unviable top tier's batch to the decode plan (audit 2026-09-05).
+    // alone would hand an unviable top tier's batch to the decode plan.
     const size_t tier = registry->viable_tier_for(n_tokens);
     if (tier >= registry->tier_sizes.size()) {
         static bool warned = false;

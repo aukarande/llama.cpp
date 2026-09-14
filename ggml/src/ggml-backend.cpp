@@ -858,6 +858,7 @@ struct ggml_backend_sched {
     void * split_cb_user_data;
 
     ggml_backend_t       copy_backends[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_copy_segments_async_t copy_segments_fn[GGML_SCHED_MAX_BACKENDS]; // batched segment copy proc (NULL: not offered)
     ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS];
 
     ggml_backend_event_t compute_events[GGML_SCHED_MAX_BACKENDS];
@@ -1911,13 +1912,11 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
         // an external (pshard arena) buffer that no longer fits its range grew overflow chunks: real
-        // allocations outside the budget that outlive this graph (the 2026-09-05 grid found 1088 MiB
-        // of them under a speculative prompt graph with no line in any log). The arena IS the budget:
-        // release them and fail the allocation - the caller reports it and stops - instead of running
-        // oversubscribed. Non-external buffers may grow (that is the stock behaviour). Checked BEFORE
-        // ggml_gallocr_alloc_graph initializes the graph's tensors from this reserve, so no tensor
-        // ever receives a pointer into a chunk released here (review 2026-09-06: a refused graph a
-        // caller reused would have computed through freed device memory).
+        // allocations outside the budget that outlive this graph. The arena IS the budget: release them
+        // and fail the allocation - the caller reports it and stops - instead of running oversubscribed.
+        // Non-external buffers may grow (the stock behaviour). Checked BEFORE ggml_gallocr_alloc_graph
+        // initializes the graph's tensors from this reserve, so no tensor ever receives a pointer into a
+        // chunk released here (a refused graph a caller reused would compute through freed device memory).
         for (int i = 0; i < sched->n_backends; i++) {
             const int n_chunks = ggml_gallocr_get_n_chunks(sched->galloc, i);
             if (n_chunks > 1 && ggml_gallocr_buffer_is_external(sched->galloc, i)) {
@@ -1977,9 +1976,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
-    // pool tiers only (ggml_backend_sched_set_async_host_copies): the asynchronous input handling below.
-    // Legacy tiers keep the synchronous paths - measured 2026-09-11 (q35 @8000, 3 pairs): with DMA copies the
-    // asynchronous paths cost them 1% (58.3 -> 57.7 t/s), with the pool's kernel copies they are the win.
+    // asynchronous input handling (ggml_backend_sched_set_async_host_copies), on while a pshard tier is active
     const bool pshard_async = sched->async_host_copies;
     // splits whose compute was skipped this graph (all-zero on the split_skip_cb's word): a later
     // split's input produced by one of them is zero-filled in place of the copy
@@ -2015,9 +2012,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
     // pshard layouts: a host-sourced input of a device split is uploaded on the split stream, so stream
     // order already protects the previous reader of its copy - no drain of the split backend first
-    // (traced 2026-09-10: the drain before the CPU chain's result join idled the GPU for the host's
-    // launch latency every pooled layer; the immediate copies of the user's inputs cost a drain plus a
-    // copy-engine transition each on every attention layer)
+    // (a drain before the CPU chain's result join idles the GPU for the host's launch latency, and an
+    // immediate copy of a user input costs a drain plus a copy-engine transition per attention layer)
     auto host_upload_no_drain = [&](const struct ggml_tensor * input, const struct ggml_tensor * input_cpy,
                                     ggml_backend_buffer_t input_buf, int split_bid) -> bool {
         return pshard_async && sched->has_redirects && split_bid != sched->n_backends - 1 && input_cpy != input &&
@@ -2051,8 +2047,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (sched->redirect_target[split_backend_id] >= 0) {
             if (stage != 2) {
                 // the alias stream needs to drain only if something was issued on it since its last
-                // synchronize. Cache-tier decode issues nothing there (traced 2026-09-10: three idle
-                // synchronizes per pooled layer inside the 68 us GPU gap before the expert chains)
+                // synchronize; cache-tier decode issues nothing there, and an idle synchronize still
+                // costs a host round trip inside the GPU's gap before the expert chains
                 if (backend_busy[split_backend_id] || !pshard_async) {
                     ggml_backend_synchronize(sched->backends[split_backend_id]);
                     backend_busy[split_backend_id] = false;
@@ -2106,16 +2102,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             ggml_backend_t next_copy = sched->copy_backends[next_gpu->backend_id];
 
-            // conservative fence: slot regions are now dedicated (no aliasing with
-            // activations), but same-shard slot REUSE across splits still requires the
-            // previous tenant's consumer to finish. A per-bid latest-consumer event is
-            // NOT sufficient: prefetch for split N+2 is enqueued before split N launches,
-            // and N+2's slot bytes are typically N's own slot (verified: narrowed fence
-            // produced degenerate output on streamed cells). A sound per-slot fence needs
-            // previous-same-bytes-tenant tracking - future work.
-            // (probe result, q8d-s4: removing this fence entirely recovers nothing -
-            // the transfer/compute serialization is host-DRAM-bandwidth bound, so a
-            // finer-grained per-slot fence has no headroom either)
+            // conservative fence: slot regions never alias activations, but same-shard slot reuse across
+            // splits still needs the previous tenant's consumer to finish. A per-bid latest-consumer event
+            // is not enough: the prefetch for split N+2 is enqueued before split N launches, into what is
+            // typically N's own slot, so it would overwrite experts still being read; a narrower per-slot
+            // fence would have to track the previous tenant of the same bytes
             {
                 const int fence_bid = sched->redirect_target[next_gpu->backend_id];
                 if (fence_bid >= 0 && sched->compute_events[fence_bid] != NULL) {
@@ -2133,7 +2124,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     struct ggml_tensor * input_cpy = tensor_copy(next_input, next_gpu->backend_id, sched->cur_copy);
                     if (sched->n_copy_overrides > 0 &&
                         ggml_backend_sched_input_copy_override_for(sched, next_input) != NULL) {
-                        // expert-pool managed: whole-stack tiers fill the layer's A/B half here,
+                        // expert-pool managed: whole-stack tiers fill the layer's double-buffered half here,
                         // on the copy stream under the compute fence; cache tiers serve at
                         // consume time (the router ids do not exist yet)
                         if (sched->pool_prefetch_cb != NULL &&
@@ -2212,8 +2203,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (!skipped_splits.empty() && produced_by_skipped(input)) {
                 // the producer split was skipped as all-zero: zero the consumer's copy in stream order on
                 // the split backend instead of moving it (input_cpy is the tensor itself when the consumer
-                // shares the producer's backend). Replaces a host synchronize + host->device upload per
-                // dead expert chain (traced 2026-09-10: most of a 65 us GPU gap per pooled layer)
+                // shares the producer's backend); a host synchronize + upload here would idle the GPU before every pooled layer
                 if (input_cpy->data != NULL) {
                     ggml_backend_tensor_memset_async(split_backend, input_cpy, 0, 0, ggml_nbytes(input_cpy));
                     if (input_cpy != input) {
@@ -2302,13 +2292,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    // group consecutive experts and copy them together
+                    // group consecutive experts and copy them together; with a segment-copy proc the groups go
+                    // out as one launch
+                    std::vector<struct ggml_backend_copy_segment> segs;
+                    const bool batch_segments = sched->copy_segments_fn[split_backend_id] != NULL;
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        if (batch_segments) {
+                            segs.push_back({ (uint8_t *) input_cpy->data + expert_offset,
+                                             (const uint8_t *) input->data + expert_offset, expert_size_copy + padding_end });
+                            return;
+                        }
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
@@ -2344,6 +2342,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    if (batch_segments && !sched->copy_segments_fn[split_backend_id](split_backend, segs.data(), (int) segs.size())) {
+                        // the batch cannot take the kernel path: fall back to the per-group copies
+                        for (const struct ggml_backend_copy_segment & s : segs) {
+                            ggml_backend_tensor_set_async(split_backend, input_cpy, s.src,
+                                (size_t) ((const uint8_t *) s.dst - (const uint8_t *) input_cpy->data), s.size);
+                        }
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -2354,18 +2359,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         input->buffer->buft == ggml_backend_get_default_buffer_type(input_backend) &&
                         input_cpy->data != NULL && input_cpy->buffer != NULL && ggml_backend_buffer_is_host(input_cpy->buffer) &&
                         ggml_backend_sched_backend_id(sched, input_backend) >= 0) {
-                        // device -> CPU split input: an asynchronous download on the producer's stream (a kernel
-                        // copy into the pinned CPU buffer with kernel copies on, else a DMA) in place of a
-                        // host synchronize followed by a synchronous copy; the producer is synchronized right
-                        // before the CPU split computes. Traced 2026-09-10: the synchronous path left a 30 us
-                        // copy-engine gap behind every pooled layer's router kernels (WDDM engine switch).
-                        // Stock layouts (no redirects) keep the byte-identical synchronous path.
+                        // device -> CPU split input: download asynchronously on the producer's stream (a kernel copy
+                        // into the pinned CPU buffer when kernel copies are on, else a DMA) and fence it right before
+                        // the CPU split computes; a host synchronize here would idle the GPU behind every pooled
+                        // layer's router kernels (a copy-engine transfer ordered against kernels idles the GPU under WDDM)
                         ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
                         const int d2h_bid = ggml_backend_sched_backend_id(sched, input_backend);
                         if (sched->d2h_events[d2h_bid] != NULL) {
                             // fence just this download: a stream synchronize before the CPU compute would wait
                             // for everything queued after it (the pool's uploads and GPU chain) and serialize
-                            // the CPU chain behind the GPU chain again (traced 2026-09-10)
+                            // the CPU chain behind the GPU chain again
                             ggml_backend_event_record(sched->d2h_events[d2h_bid], input_backend);
                         }
                         pending_input_sync[d2h_bid] = true;
@@ -2384,7 +2387,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_sched_zero_copy_padding(split_backend, input_cpy);
                         } else {
                             // device->host handoff: the pool tiers take the asynchronous path above; this
-                            // synchronous copy is the legacy tiers' (measured 2026-09-11: it costs them nothing)
+                            // synchronous copy is the legacy tiers'
                             ggml_backend_tensor_copy(input, input_cpy);
                         }
                     }
@@ -2492,8 +2495,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     };
 
     // CPU/GPU overlap (expert pool dual chains). Split order stays [.., GPU chain,
-    // CPU chain, merge ..]; the only thing that serialized the CPU chain behind the
-    // GPU chain was its input stage: the device->host copy of x ends in a full
+    // CPU chain, merge ..]; what serializes the CPU chain behind the GPU chain is
+    // its input stage: the device->host copy of x ends in a full
     // synchronize of the compute stream, which - issued after the GPU chain's launch -
     // waits for those kernels. So when a device split is followed by a CPU split that
     // consumes nothing the device split produces, the CPU split's inputs are copied
@@ -2503,7 +2506,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // blocking on this thread - proceeds at its own iteration while the GPU works.
     // Split index order, galloc order and the prefetch bookkeeping are untouched; the
     // serial order remains correct by construction. Always on whenever the sched has copy
-    // overrides and no eval callback (the perf grid certified the overlap in all 16 pairs).
+    // overrides and no eval callback.
     const bool cpu_overlap = sched->n_copy_overrides > 0 && sched->callback_eval == NULL;
     auto cpu_overlap_ok = [&](int k) -> bool {
         if (!cpu_overlap || k + 1 >= sched->n_splits) {
@@ -2562,6 +2565,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
 
     return GGML_STATUS_SUCCESS;
+}
+
+// copy-stream backends keep the copy engine: a copy kernel there would compete with compute kernels for SMs
+static void ggml_backend_sched_deny_kernel_copies(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = backend != NULL ? ggml_backend_get_device(backend) : NULL;
+    ggml_backend_reg_t reg = dev != NULL ? ggml_backend_dev_backend_reg(dev) : NULL;
+    if (reg == NULL) {
+        return;
+    }
+    ggml_backend_kernel_copy_allow_t allow = (ggml_backend_kernel_copy_allow_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_allow");
+    if (allow != NULL) {
+        allow(backend, false);
+    }
+}
+
+static ggml_backend_copy_segments_async_t ggml_backend_sched_copy_segments_proc(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = backend != NULL ? ggml_backend_get_device(backend) : NULL;
+    ggml_backend_reg_t reg = dev != NULL ? ggml_backend_dev_backend_reg(dev) : NULL;
+    if (reg == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return NULL;
+    }
+    return (ggml_backend_copy_segments_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_segments_async");
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(
@@ -2624,6 +2649,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+        sched->copy_segments_fn[b] = ggml_backend_sched_copy_segments_proc(backends[b]);
 
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
@@ -2659,6 +2685,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_dev_get_props(dev_i, &props);
         if (props.caps.copy_stream) {
             sched->copy_backends[i]  = ggml_backend_dev_init(dev_i, NULL);
+            ggml_backend_sched_deny_kernel_copies(sched->copy_backends[i]);
             sched->copy_events[i]    = ggml_backend_event_new(dev_i);
             sched->compute_events[i] = ggml_backend_event_new(dev_i);
         }
@@ -2827,6 +2854,7 @@ void ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool en
             ggml_backend_dev_get_props(dev, &props);
             if (props.caps.copy_stream) {
                 sched->copy_backends[b]  = ggml_backend_dev_init(dev, NULL);
+                ggml_backend_sched_deny_kernel_copies(sched->copy_backends[b]);
                 sched->copy_events[b]    = ggml_backend_event_new(dev);
                 sched->compute_events[b] = ggml_backend_event_new(dev);
             }

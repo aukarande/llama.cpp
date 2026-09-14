@@ -7,16 +7,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 
 llama_expert_pool::~llama_expert_pool() {
     if (admit_backend != nullptr) {
         ggml_backend_synchronize(admit_backend);
-    }
-    if (kernel_copy_set != nullptr && kernel_copies) {
-        kernel_copy_set(false);
-    }
-    if (kernel_copy_max_set != nullptr && kernel_copy_cap_set && active) {
-        kernel_copy_max_set(kernel_copy_cap_prev);   // the engine's cap before we applied the profile's
     }
     if (admit_event != nullptr) {
         ggml_backend_event_free(admit_event);
@@ -25,6 +21,10 @@ llama_expert_pool::~llama_expert_pool() {
     if (admit_backend != nullptr) {
         ggml_backend_free(admit_backend);
         admit_backend = nullptr;
+    }
+    if (ids_host_buf != nullptr) {
+        ggml_backend_buffer_free(ids_host_buf);   // the alias first: it frees nothing, the staging owns the memory
+        ids_host_buf = nullptr;
     }
     if (read_staging != nullptr) {
         ggml_backend_buffer_free(read_staging);
@@ -112,7 +112,7 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
 
 size_t llama_expert_pool::region_bytes_needed(uint32_t slots_per_layer, bool with_ab) const {
     // cache mode: slots_per_layer rows of every pooled tensor, per layer;
-    // A/B mode reuses the same span (2 whole layers) - take the max when asked
+    // ab_mode reuses the same span for two whole layers - take the max when asked
     size_t cache_bytes = 0;
     for (const auto & L : layers) {
         for (const auto & e : L.tensors) {
@@ -141,8 +141,7 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
         return false;
     }
 
-    // per-layer counts: the last warm start's plan when it was made for this uniform
-    // count (same region), else uniform
+    // per-layer slot counts are uniform; the region must hold every layer's slot arrays
     size_t need = 0;
     for (auto & L : layers) {
         L.n_slots_l = slots_per_layer;
@@ -163,9 +162,8 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
     };
     ctx_views = ggml_init(ip);
 
-    // cache-mode layout: layer-major, per-tensor slot arrays; A/B halves overlay
-    // the region start (they are only live on whole-stack prefill tiers, where the
-    // cache contents are volatile by design)
+    // cache-mode layout: layer-major, per-tensor slot arrays; the ab_mode halves overlay the region start
+    // (they are only live on whole-stack prefill tiers, where the cache contents are volatile by design)
     size_t off = 0;
     for (auto & L : layers) {
         L.slot_expert.assign(L.n_slots_l, -1);
@@ -186,9 +184,8 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
         }
     }
 
-    // A/B halves: parity-alternating whole-layer sets at the region start. Only
-    // when the region holds the pair - a cache tier's region can be smaller, and
-    // the whole-stack tiers get their own (larger) carve when they are applied
+    // ab_mode halves: parity-alternating whole-layer sets at the region start, only when the region holds the pair;
+    // a cache tier's region can be smaller, and the whole-stack tiers get their own larger carve when they are applied
     ab_capable = bytes >= 2 * layer_full_bytes;
     for (auto & L : layers) {
         size_t sub = 0;
@@ -220,7 +217,6 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
 void llama_expert_pool::register_sched(ggml_backend_sched_t sched) {
     ggml_backend_sched_clear_input_copy_overrides(sched);
     ggml_backend_sched_set_split_skip_cb(sched, nullptr, nullptr);
-    ggml_backend_sched_set_async_host_copies(sched, false);
     if (!active) {
         // legacy tier active: pooled layers stream through the standard paths
         return;
@@ -239,9 +235,6 @@ void llama_expert_pool::register_sched(ggml_backend_sched_t sched) {
     if (cpu_routes()) {
         ggml_backend_sched_set_split_skip_cb(sched, sched_split_skip_cb, this);
     }
-    // the sched's asynchronous input paths pay off with kernel copies (2026-09-10 traces); legacy
-    // tiers keep the synchronous paths
-    ggml_backend_sched_set_async_host_copies(sched, true);
 }
 
 void llama_expert_pool::lookup_backend_procs() {
@@ -255,9 +248,8 @@ void llama_expert_pool::lookup_backend_procs() {
     if (reg == nullptr) {
         return;
     }
-    copy_segments   = (ggml_backend_copy_segments_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_segments_async");
-    kernel_copy_set = (ggml_backend_kernel_copy_set_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_set");
-    kernel_copy_max_set = (ggml_backend_kernel_copy_max_set_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_max_set");
+    copy_segments    = (ggml_backend_copy_segments_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_segments_async");
+    wrap_host_buffer = (ggml_backend_wrap_host_buffer_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_wrap_host_buffer");
 }
 
 void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
@@ -265,28 +257,16 @@ void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
         return;
     }
     active = on;
-    // kernel copies while a pool tier is active: the pool's downloads, uploads and the CPU chain's handoff
-    // are all small pinned transfers, and on WDDM each copy-engine transfer ordered against kernels costs
-    // 35-55 us of GPU idle (2026-09-10: hybrid 66 -> 84 t/s on q35 @8000). Legacy tiers keep the copy
-    // engine (their bulk uploads are bandwidth-bound).
     lookup_backend_procs();
-    kernel_copies = kernel_copy_set != nullptr ? kernel_copy_set(on) : false;
-    if (kernel_copy_max_set != nullptr && kernel_copy_cap_set) {
-        // the machine profile's measured crossover replaces the engine's compiled cap while we are active
-        // (0 = the profile found no size at which a copy kernel beats the copy engine: every transfer keeps it)
-        if (on) {
-            kernel_copy_cap_prev = kernel_copy_max_set(kernel_copy_cap_bytes);
-        } else {
-            kernel_copy_max_set(kernel_copy_cap_prev);
-        }
-    }
     epoch++;   // pooled-layer graph topology changes with this flag
     reset_slots();
     if (!on) {
         // the next graphs will not bind these; stale pointers would alias whatever
         // tensor the rebuilt graph places at the same address
         for (auto & L : layers) {
-            L.ids_router = L.ids_gpu = L.ids_gpu_bias = L.ids_cpu = L.ids_pred = nullptr;
+            L.ids_router = L.ids_gpu = L.ids_gpu_bias = L.ids_cpu = L.ids_pred = L.ids_host = nullptr;
+            L.ids_host_armed = false;
+            L.ids_host_n = 0;
         }
     }
     if (sched != nullptr) {
@@ -305,8 +285,7 @@ void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
     }
     ab_mode = ab;
     epoch++;   // stale view bindings must not survive a graph-reuse pass
-    // v1 relabel: cache contents do not survive the A/B overlay (the halves alias
-    // the slot arrays); drop the maps and refill lazily
+    // cache contents do not survive the whole-layer overlay (the halves alias the slot arrays): drop the maps and refill lazily
     reset_slots();
     if (sched != nullptr) {
         register_sched(sched);
@@ -364,7 +343,7 @@ void llama_expert_pool::bind_pred_ids(int32_t il, ggml_tensor * ids_pred) {
 }
 
 void llama_expert_pool::bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu,
-                                       ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu) {
+                                       ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu, ggml_tensor * ids_host) {
     if (!layer_pooled(il)) {
         return;
     }
@@ -373,6 +352,9 @@ void llama_expert_pool::bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggm
     L.ids_gpu      = ids_gpu;
     L.ids_gpu_bias = ids_gpu_bias;
     L.ids_cpu      = ids_cpu;
+    L.ids_host     = ids_host;
+    L.ids_host_n   = ids_host != nullptr ? (size_t) ggml_nelements(ids_host) : 0;
+    L.ids_host_armed = false;
     L.serve_gen    = 0;
     // ids_pred is NOT touched here: within build_moe_ffn(il) the predictor for
     // layer il+k binds BEFORE this call, and this layer's own prediction was bound
@@ -516,7 +498,8 @@ void llama_expert_pool::ensure_read_staging(ggml_backend_t backend) {
     }
     read_cap = 512 * 1024;           // ids or prediction download of a 2048-token ubatch x 16 routes x 4 B = 128 KB; headroom
     const size_t per_layer = 8192;   // per-layer id upload buffers: 1024 tokens x 8 routes; larger batches use the vectors
-    const size_t bytes = 2 * read_cap + layers.size() * 2 * per_layer * sizeof(int32_t);
+    const size_t landing   = layers.size() * per_layer * sizeof(int32_t);   // per-layer router-ids landing slices
+    const size_t bytes = 2 * read_cap + layers.size() * 2 * per_layer * sizeof(int32_t) + landing;
     read_staging = ggml_backend_buft_alloc_buffer(buft, bytes);
     if (read_staging == nullptr) {
         read_cap = 0;
@@ -530,8 +513,242 @@ void llama_expert_pool::ensure_read_staging(ggml_backend_t backend) {
         L.mapped_buf.pin = slice; L.mapped_buf.pin_cap = per_layer; slice += per_layer;
         L.bias_buf.pin   = slice; L.bias_buf.pin_cap   = per_layer; slice += per_layer;
     }
-    LLAMA_LOG_INFO("%s: expert pool: %.1f MiB page-locked staging in %s (kernel-copy downloads and id uploads)\n",
-        __func__, bytes / (1024.0 * 1024.0), ggml_backend_buft_name(buft));
+    // landing slices: a device alias lets the graph write the router ids into host memory; without the mapping
+    // the layers read the ids back with a stream drain
+    ids_host_base = (char *) slice;
+    lookup_backend_procs();
+    ids_host_buf = wrap_host_buffer != nullptr ? wrap_host_buffer(backend, ids_host_base, landing) : nullptr;
+    if (ids_host_buf != nullptr) {
+        std::fill(slice, slice + layers.size() * per_layer, -1);
+        for (auto & L : layers) {
+            L.ids_host_pin = slice; L.ids_host_cap = per_layer; slice += per_layer;
+        }
+    }
+    LLAMA_LOG_INFO("%s: expert pool: %.1f MiB page-locked staging in %s (kernel-copy downloads and id uploads%s)\n",
+        __func__, bytes / (1024.0 * 1024.0), ggml_backend_buft_name(buft),
+        ids_host_buf != nullptr ? ", router-ids landing mapped for the device" : "; router-ids landing NOT mappable");
+}
+
+ggml_tensor * llama_expert_pool::ids_host_tensor(int32_t il, ggml_context * ctx, const ggml_tensor * ids) {
+    if (!layer_pooled(il) || backend_router == nullptr || ids == nullptr) {
+        return nullptr;
+    }
+    ensure_read_staging(backend_router);
+    layer_state & L = layers[il];
+    if (ids_host_buf == nullptr || L.ids_host_pin == nullptr || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        ids->type != GGML_TYPE_I32 || (size_t) (ids->ne[0] * ids->ne[1]) > L.ids_host_cap) {
+        return nullptr;
+    }
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+    t->buffer = ids_host_buf;
+    t->data   = (char *) ggml_backend_buffer_get_base(ids_host_buf) + ((char *) L.ids_host_pin - ids_host_base);
+    return t;
+}
+
+void llama_expert_pool::arm_ids_host() {
+    if (ids_host_buf == nullptr) {
+        return;
+    }
+    if (ids_host_unconsumed > 0) {
+        // a previous pass left armed slices (aborted graph): let its copies land before re-arming
+        ggml_backend_synchronize(backend_router);
+        ids_host_unconsumed = 0;
+    }
+    for (auto & L : layers) {
+        if (L.ids_host == nullptr || L.ids_host_pin == nullptr) {
+            continue;
+        }
+        std::fill(L.ids_host_pin, L.ids_host_pin + L.ids_host_n, -1);
+        L.ids_host_armed = true;
+        ids_host_unconsumed++;
+    }
+}
+
+void llama_expert_pool::hoist_independent(ggml_cgraph * gf) {
+    hoisted_nodes = 0;
+    hoist_regions = 0;
+    if (!active || gf == nullptr) {
+        return;
+    }
+    const int n = ggml_graph_n_nodes(gf);
+    if (n == 0) {
+        return;
+    }
+    ggml_tensor ** nodes = ggml_graph_nodes(gf);
+
+    // late tensors: the pooled host weights (served at the split) and the ids leaves serve() writes; nodes
+    // reading them, and their dependents, keep their place
+    std::unordered_map<const ggml_tensor *, int32_t> late;   // late tensor -> its layer
+    for (const auto & L : layers) {
+        for (const auto & e : L.tensors) {
+            late[e.host] = L.il;
+        }
+        if (L.ids_gpu      != nullptr) { late[L.ids_gpu]      = L.il; }
+        if (L.ids_gpu_bias != nullptr) { late[L.ids_gpu_bias] = L.il; }
+        if (L.ids_cpu      != nullptr) { late[L.ids_cpu]      = L.il; }
+    }
+    if (late.empty()) {
+        return;
+    }
+
+    auto root = [](const ggml_tensor * t) {
+        while (t->view_src != nullptr) {
+            t = t->view_src;
+        }
+        return t;
+    };
+    auto is_view_op = [](ggml_op op) {
+        return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+    };
+
+    // one region per pooled layer's boundary: dependents of the boundary are held in order; nodes whose inputs
+    // are all available before it are hoisted ahead of the held ones
+    std::unordered_set<const ggml_tensor *> done;      // results already emitted in the new order (or leaves)
+    std::unordered_set<const ggml_tensor *> tainted;   // results downstream of this region's boundary
+    std::vector<ggml_tensor *> out;
+    std::vector<ggml_tensor *> held;
+    out.reserve(n);
+
+    // the layer whose late tensor this node reads directly (-1: none)
+    auto direct_late = [&](const ggml_tensor * t) -> int32_t {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = t->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            auto it = late.find(src);
+            if (it == late.end()) {
+                it = late.find(root(src));
+            }
+            if (it != late.end()) {
+                return it->second;
+            }
+        }
+        return -1;
+    };
+    // downstream of this region's boundary through a result, or an in-place op on such a tensor
+    auto reads_tainted = [&](const ggml_tensor * t) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = t->src[s];
+            if (src != nullptr && (tainted.count(src) || tainted.count(root(src)))) {
+                return true;
+            }
+        }
+        return t->view_src != nullptr && tainted.count(root(t)) > 0;
+    };
+    auto available = [&](const ggml_tensor * src) {
+        if (src->op == GGML_OP_NONE) {
+            return !late.count(src) && !late.count(root(src));   // a leaf that is not written by the service
+        }
+        return done.count(src) > 0;
+    };
+    auto hoistable = [&](const ggml_tensor * t) {
+        if (t->view_src != nullptr && !is_view_op(t->op)) {
+            return false;   // an in-place op: it writes into a tensor the held nodes may still read
+        }
+        if (t->view_src != nullptr) {
+            // a pure view moves only when its root is an emitted result
+            const ggml_tensor * r = root(t);
+            if (r->op == GGML_OP_NONE || !done.count(r)) {
+                return false;
+            }
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = t->src[s];
+            if (src != nullptr && !available(src)) {
+                return false;
+            }
+        }
+        // write-after-read: a held node that writes in place into a tensor this node reads must stay before it
+        for (const ggml_tensor * h : held) {
+            if (h->view_src == nullptr || is_view_op(h->op)) {
+                continue;
+            }
+            const ggml_tensor * w = root(h);
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                const ggml_tensor * src = t->src[s];
+                if (src != nullptr && root(src) == w) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    auto flush = [&]() {
+        for (ggml_tensor * h : held) {
+            out.push_back(h);
+            done.insert(h);
+        }
+        held.clear();
+        tainted.clear();
+    };
+
+    int32_t region_il = -1;   // the layer whose routed boundary opened the current region (-1: none open)
+    for (int i = 0; i < n; i++) {
+        ggml_tensor * t = nodes[i];
+        const int32_t il = direct_late(t);
+        if (il >= 0 && il != region_il) {
+            // a new layer's boundary: flush the previous region in its original order
+            flush();
+            region_il = il;
+            hoist_regions++;
+        }
+        if (il >= 0 || (region_il >= 0 && reads_tainted(t))) {
+            held.push_back(t);   // the routed chain and everything downstream of it
+            tainted.insert(t);
+            continue;
+        }
+        if (region_il < 0) {
+            out.push_back(t);    // before the first boundary: untouched
+            done.insert(t);
+            continue;
+        }
+        if (hoistable(t)) {
+            out.push_back(t);    // independent of the routed experts: runs while the host decides
+            done.insert(t);
+            hoisted_nodes++;
+        } else {
+            held.push_back(t);   // depends on a held node, or writes in place: keeps its order
+        }
+    }
+    flush();
+    GGML_ASSERT((int) out.size() == n);
+    for (int i = 0; i < n; i++) {
+        nodes[i] = out[i];
+    }
+    if (hoisted_nodes > 0) {
+        LLAMA_LOG_INFO("%s: expert pool: %u nodes hoisted ahead of %u routed boundaries\n",
+            __func__, hoisted_nodes, hoist_regions);
+    }
+}
+
+bool llama_expert_pool::wait_ids_host(layer_state & L, size_t n) {
+    // ids are >= 0, so -1 marks an entry the graph copy has not written yet
+    const volatile int32_t * p = L.ids_host_pin;
+    const int64_t t0 = ggml_time_us();
+    size_t i = 0;
+    bool drained = false;
+    for (;;) {
+        while (i < n && p[i] != -1) {
+            i++;
+        }
+        if (i == n) {
+            break;
+        }
+        if (!drained && ggml_time_us() - t0 > 50000) {
+            ggml_backend_synchronize(backend_router);   // large batches: the router is far down the queue
+            drained = true;
+            ids_host_drains++;
+            continue;
+        }
+        if (drained) {
+            ids_host_fallbacks++;
+            return false;
+        }
+    }
+    ids_host_polls++;
+    ids_host_wait_us += (uint64_t) (ggml_time_us() - t0);
+    return true;
 }
 
 bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_backend_t split_backend) {
@@ -570,14 +787,33 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
     const int64_t n_ids_1 = ids->ne[1]; // n_tokens
     ensure_read_staging(backend_router);
     char * idbuf = nullptr;
-    if (read_ids != nullptr && ggml_nbytes(ids) <= read_cap) {
-        idbuf = read_ids;
-    } else {
-        ids_read_buf.resize(ggml_nbytes(ids));
-        idbuf = ids_read_buf.data();
+    size_t nb0 = ids->nb[0];
+    size_t nb1 = ids->nb[1];
+    bool landed = false;
+    if (L.ids_host != nullptr && L.ids_host_armed && L.ids_host_pin != nullptr &&
+        (size_t) (n_ids_0 * n_ids_1) == L.ids_host_n) {
+        // the graph copied the ids into the pinned slice right after the router: poll instead of draining the stream
+        L.ids_host_armed = false;
+        landed = wait_ids_host(L, (size_t) (n_ids_0 * n_ids_1));
+        if (landed && ids_host_unconsumed > 0) {
+            ids_host_unconsumed--;   // an unlanded slice stays counted so the next arm drains first
+        }
+        if (landed) {
+            idbuf = (char *) L.ids_host_pin;
+            nb0 = sizeof(int32_t);
+            nb1 = (size_t) n_ids_0 * sizeof(int32_t);
+        }
     }
-    ggml_backend_tensor_get_async(backend_router, const_cast<ggml_tensor *>(ids), idbuf, 0, ggml_nbytes(ids));
-    ggml_backend_synchronize(backend_router);
+    if (!landed) {
+        if (read_ids != nullptr && ggml_nbytes(ids) <= read_cap) {
+            idbuf = read_ids;
+        } else {
+            ids_read_buf.resize(ggml_nbytes(ids));
+            idbuf = ids_read_buf.data();
+        }
+        ggml_backend_tensor_get_async(backend_router, const_cast<ggml_tensor *>(ids), idbuf, 0, ggml_nbytes(ids));
+        ggml_backend_synchronize(backend_router);
+    }
 
     // background admission: slots filled on the copy stream last pass must have
     // landed before any kernel of this pass reads them (one wait per pass, first
@@ -603,7 +839,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         }
         for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
             for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
-                const int32_t e = *(const int32_t *) (idbuf + i1*ids->nb[1] + i0*ids->nb[0]);
+                const int32_t e = *(const int32_t *) (idbuf + i1*nb1 + i0*nb0);
                 mapped[i1*n_ids_0 + i0] = e;
             }
         }
@@ -629,7 +865,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
             for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
                 const int32_t e = *(const int32_t *)
-                    (idbuf + i1*ids->nb[1] + i0*ids->nb[0]);
+                    (idbuf + i1*nb1 + i0*nb0);
                 GGML_ASSERT(e >= 0 && e < (int32_t) n_expert);
                 if (!L.use_count.empty()) {
                     L.use_count[e]++;   // routing workload histogram: every route, before the per-pass dedup
@@ -665,7 +901,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             const int64_t np1 = std::min<int64_t>(pt->ne[1], n_ids_1);
             for (int64_t i1 = 0; i1 < np1; i1++) {
                 for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
-                    const int32_t e = *(const int32_t *) (idbuf + i1*ids->nb[1] + i0*ids->nb[0]);
+                    const int32_t e = *(const int32_t *) (idbuf + i1*nb1 + i0*nb0);
                     bool in_pred = false;
                     for (int64_t j0 = 0; j0 < pt->ne[0] && !in_pred; j0++) {
                         in_pred = *(const int32_t *) (predbuf + i1*pt->nb[1] + j0*pt->nb[0]) == e;
@@ -809,7 +1045,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
             for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
                 const int32_t e = *(const int32_t *)
-                    (idbuf + i1*ids->nb[1] + i0*ids->nb[0]);
+                    (idbuf + i1*nb1 + i0*nb0);
                 const int32_t slot = L.expert_slot[e];
                 const size_t  k    = (size_t) (i1*n_ids_0 + i0);
                 L.expert_last_gen[e] = generation;
@@ -947,8 +1183,8 @@ void llama_expert_pool::reset_slots() {
 }
 
 void llama_expert_pool::log_counters() const {
-    // the three headline lines print at WARN: perf runs carry no -lv (user rule) and the
-    // grid calibrates the pricing model from them; per-layer detail stays at INFO
+    // the headline lines print at WARN so runs without -lv still report them (the pricing model is
+    // calibrated from these); per-layer detail stays at INFO
     uint64_t hits = 0, misses = 0, passes = 0;
     uint64_t hits_1 = 0, misses_1 = 0, passes_1 = 0, evicted = 0;
     std::string per_layer;
@@ -967,6 +1203,13 @@ void llama_expert_pool::log_counters() const {
         char buf[16];
         snprintf(buf, sizeof(buf), " %.2f", n > 0 ? (double) L.hits / (double) n : 0.0);
         per_layer += buf;
+    }
+    if (ids_host_polls + ids_host_fallbacks > 0) {
+        // before the cache-mode return: whole-stack passes have no hits/misses
+        LLAMA_LOG_WARN("%s: expert pool: router ids landed in host memory %llu times (mean poll %.1f us, %llu drained the stream first), %llu fell back to the stream drain; last graph: %u nodes hoisted ahead of %u routed boundaries\n",
+            __func__, (unsigned long long) ids_host_polls,
+            ids_host_polls > 0 ? (double) ids_host_wait_us / (double) ids_host_polls : 0.0,
+            (unsigned long long) ids_host_drains, (unsigned long long) ids_host_fallbacks, hoisted_nodes, hoist_regions);
     }
     if (hits + misses == 0) {
         return; // never served in cache mode (or pool never engaged)
@@ -1024,10 +1267,9 @@ void llama_expert_pool::log_counters() const {
             __func__, (unsigned long long) hits_1, (unsigned long long) misses_1, (unsigned long long) passes_1, h1, mpt1, n_slots);
     }
     // routing workload: this run's cache-mode route histogram goes into <model>.pshard_workload. Real runs
-    // ACCUMULATE (a 128-token run alone has ~4 routes per expert on a 256-expert model, too few on its own; the
-    // module's split-half fit is unbiased at small samples and the store grows with every run); a file holding
-    // only the plan-time calibration stand-in is replaced by the first real run. The 64-pass floor keeps trivial
-    // runs out. The fitted exponent is what the planner prices h(s) with.
+    // accumulate (one short run has too few routes per expert; the split-half fit is unbiased at small samples
+    // and the store grows with every run); a file holding only the plan-time calibration stand-in is replaced by
+    // the first real run. The 64-pass floor keeps trivial runs out. The planner prices h(s) with the fitted exponent.
     if (passes >= 64) {
         std::vector<std::pair<uint32_t, std::vector<uint64_t>>> mine;
         uint64_t mine_routes = 0;

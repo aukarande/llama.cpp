@@ -434,15 +434,21 @@ extern "C" {
     // "ggml_backend_copy_segments_async": one launch uploading many pinned host segments to the device
     //   on the backend's stream (false = not taken, the caller falls back to per-tensor set_async)
     // "ggml_backend_kernel_copy_set": run copies to/from device-accessible pinned host memory as kernels
-    //   (no copy-engine transitions - on WDDM each costs 35-55 us of GPU idle)
+    //   (no copy-engine transitions - under WDDM each one idles the GPU)
     struct ggml_backend_copy_segment { void * dst; const void * src; size_t size; };
     typedef bool (*ggml_backend_copy_segments_async_t)(ggml_backend_t backend,
             const struct ggml_backend_copy_segment * segs, int n);
     typedef bool (*ggml_backend_kernel_copy_set_t)(bool on);
     // "ggml_backend_kernel_copy_max_set": bytes above which a transfer keeps the copy engine even with kernel
-    //   copies on (bandwidth-bound bulk). The runtime sets the machine profile's measured crossover here.
+    //   copies on (bandwidth-bound bulk). The runtime sets the machine profile's copy crossover here.
     //   Returns the previous runtime value.
     typedef size_t (*ggml_backend_kernel_copy_max_set_t)(size_t bytes);
+    // "ggml_backend_wrap_host_buffer": device buffer aliasing a pinned host range through its device mapping,
+    //   so graph nodes can write host memory directly; freeing it frees nothing; nullptr if the range is not mapped
+    typedef ggml_backend_buffer_t (*ggml_backend_wrap_host_buffer_t)(ggml_backend_t backend, void * host_ptr, size_t size);
+    // "ggml_backend_kernel_copy_allow": whether this backend instance may run pinned transfers as copy kernels
+    //   (denied for copy-stream backends: a copy kernel there would compete with compute kernels for SMs)
+    typedef void (*ggml_backend_kernel_copy_allow_t)(ggml_backend_t backend, bool allow);
 
     // Per-split info snapshot for timing prediction.
     struct ggml_backend_sched_split_info {

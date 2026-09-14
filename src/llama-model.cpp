@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-expert-pool.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1540,10 +1541,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     } else {
         // every device reported 0 free bytes (a pshard target that took the whole card
-        // before its draft model loads, 2026-09-05: DSv4 + DSpark at ctx 8192): the
-        // division above would make the split points NaN, upper_bound would return the
-        // end iterator and devices.at() would throw "invalid vector subscript". Split
-        // evenly instead - the budget decides what fits, not the split.
+        // before its draft model loads): the split points would be NaN, upper_bound would
+        // return the end iterator and devices.at() would throw. Split evenly instead - the
+        // budget decides what fits, not the split.
         for (size_t i = 0; i < n_devices(); ++i) {
             splits[i] = float(i + 1) / float(n_devices());
         }
@@ -1986,16 +1986,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         const int64_t t0 = ggml_time_us();
                         const bool locked = register_fn(mapping->addr(), mapping->size());
                         if (!locked) {
-                            // pinned-memory ceiling (a 45 GB DeepSeek-V4 shard after a 47 GB one on 127 GB RAM)
+                            // pinned-memory ceiling: the host cannot page-lock this much more RAM
                             // - streamed copies from this region run pageable
                             LLAMA_LOG_WARN("%s: pshard: could not page-lock %.1f MiB mmap region - streamed copies from it will be pageable (slower)\n",
                                 __func__, mapping->size() / (1024.0 * 1024.0));
 #ifdef _WIN32
                             // Windows trims file-mapped pages out of the working set between passes, so every
-                            // upload pass soft-faults the whole region again (~6 GB/s memcpy into the staging
-                            // ring, ~4 GB/s on the driver's pageable path, measured on a 45 GB DeepSeek-V4
-                            // shard). VirtualLock keeps the pages resident and mapped: the CUDA DMA still has to
-                            // go through the staging ring, but the ring's memcpy runs at memory speed.
+                            // upload pass soft-faults the whole region again. VirtualLock keeps the pages
+                            // resident and mapped: the CUDA DMA still goes through the staging ring, but the
+                            // ring's memcpy then runs at memory speed.
                             {
                                 const int64_t t1 = ggml_time_us();
                                 SIZE_T ws_min = 0, ws_max = 0;
@@ -3635,6 +3634,11 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
     llm->res->set_outputs(params);
+
+    if (params.expert_pool != nullptr) {
+        // pooled layers: hoist nodes independent of the routed experts ahead of the split boundary
+        params.expert_pool->hoist_independent(llm->res->get_gf());
+    }
 
     return llm->res->get_gf();
 }

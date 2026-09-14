@@ -1163,6 +1163,8 @@ const ggml_cuda_device_info & ggml_cuda_info();
 
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
+// true for a buffer created by "ggml_backend_wrap_host_buffer" (device mapping of pinned host memory)
+bool ggml_cuda_buffer_is_host_alias(ggml_backend_buffer_t buffer);
 
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;

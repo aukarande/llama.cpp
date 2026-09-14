@@ -2196,16 +2196,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // args stay the host homes (the scheduler rebinds them to the pool views
     // through the input-copy override). Everything else - the probs get_rows,
     // the w_s scales, add_id biases, LoRA - keeps the original router ids.
-    // ids leaves for a pool-managed layer. fetch-only policies remap the four
+    // The ids leaves for a pool-managed layer: fetch-only policies remap the four
     // expert MUL_MAT_IDs to slot ids (one leaf); policies that admit CPU routes
     // (cpu_exec / hybrid / fetch_on_2nd_miss) run TWO expert-FFN chains - GPU over
     // the pool slots and CPU over the host homes - each seeing -1 for the other
-    // side's routes, merged by one ADD at the down output (the split-op, design
-    // 6e). Biases then need expert ids with -1 for the foreign routes too.
+    // side's routes, merged by one ADD at the down output (the split-op). Biases
+    // then need expert ids with -1 for the foreign routes too.
     ggml_tensor * pool_mm_ids   = nullptr; // GPU chain mm: slot id | -1
     ggml_tensor * pool_bias_ids = nullptr; // GPU chain add_id: expert id | -1
     ggml_tensor * pool_cpu_ids  = nullptr; // CPU chain mm + add_id: expert id | -1
-    // whole-stack (A/B) tiers have every expert resident: no CPU routes, single chain.
+    // whole-stack tiers (ab_mode) have every expert resident: no CPU routes, single chain.
     // Gate on the DOWN tensor, not the layer: GroveMoE builds its chunk experts
     // (ffn_*_chexps) through this same path on a pooled layer.
     const bool pool_layer = expert_pool != nullptr && expert_pool->active &&
@@ -2229,7 +2229,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             pool_cpu_ids = ids_leaf("ffn_moe_pool_cpu_ids");
         }
         ggml_set_output(selected_experts); // the pool service host-reads it
-        expert_pool->bind_layer_ids(il, selected_experts, pool_mm_ids, pool_bias_ids, pool_cpu_ids);
+        // router ids landing: a graph copy into the pool's pinned slice right after the router; the pool polls it
+        // at the routed split's boundary instead of draining the stream
+        ggml_tensor * ids_host = expert_pool->ids_host_tensor(il, ctx0, selected_experts);
+        if (ids_host != nullptr) {
+            ggml_tensor * landed = ggml_cpy(ctx0, selected_experts, ids_host);
+            cb(landed, "ffn_moe_pool_ids_host", il);
+            ggml_build_forward_expand(gf, landed);
+        }
+        expert_pool->bind_layer_ids(il, selected_experts, pool_mm_ids, pool_bias_ids, pool_cpu_ids, ids_host);
     }
 
     // one expert-FFN chain (gate/up [+bias] -> activation -> down [+bias]) over the

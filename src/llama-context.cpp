@@ -494,18 +494,23 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.pshard && !model.hparams.no_alloc) {
-            pshard_pack_cache_region();
-            pshard_setup_expert_pool();
-        }
+        try {
+            if (cparams.pshard && !model.hparams.no_alloc) {
+                pshard_pack_cache_region();
+                pshard_setup_expert_pool();
+            }
 
-        sched_reserve();
+            sched_reserve();
 
-        if (cparams.pshard && !model.hparams.no_alloc) {
-            pshard_warmup_plan_reserves();
-            const_cast<llama_model &>(model).sync_dev_preload();
-            pshard_apply_initial_plan();
-            pshard_runtime_ready = true;
+            if (cparams.pshard && !model.hparams.no_alloc) {
+                pshard_warmup_plan_reserves();
+                const_cast<llama_model &>(model).sync_dev_preload();
+                pshard_apply_initial_plan();
+                pshard_runtime_ready = true;
+            }
+        } catch (...) {
+            pshard_update_transfer_mode(nullptr);   // the destructor will not run: hand the process-wide mode back
+            throw;
         }
 
         if (!cparams.flash_attn) {
@@ -533,6 +538,7 @@ llama_context::~llama_context() {
     if (expert_pool) {
         expert_pool->log_counters();
     }
+    pshard_update_transfer_mode(nullptr);   // the kernel-copy flag and cap are process-wide: hand them back
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -924,14 +930,12 @@ bool llama_context::memory_update(bool optimize) {
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
     if (cparams.pshard && pshard_active_plan != nullptr && model.get_dev_preload_buf() != nullptr) {
-        // pshard: the active tier's warmup reserve IS its worst case and its saved allocation is the
+        // pshard: the active tier's warmup reserve is its worst case and its saved allocation is the
         // arena's layout. The stock worst-case reserve below would place a min(n_ctx, n_ubatch)-token
         // graph into the active tier's window through ggml_backend_sched_reserve, which grows
-        // overflow chunks outside the budget with no refusal - and a stale chunk it left behind
-        // would stay resident for the context's lifetime (review 2026-09-06; the K-shift path is
-        // the one llama_kv_cache::update marks "pshard + KV shift -- testing pending"). Restore the
-        // tier's layout instead: a runtime graph it does not fit re-reserves in alloc_splits under
-        // the overflow refusal.
+        // overflow chunks outside the budget with no refusal, and a stale chunk it left behind
+        // would stay resident for the context's lifetime. Restore the tier's layout instead: a
+        // runtime graph it does not fit re-reserves in alloc_splits under the overflow refusal.
         if (!pshard_restore_active_alloc()) {
             LLAMA_LOG_WARN("%s: could not restore the active tier's allocation after the memory update\n", __func__);
         }
@@ -1495,9 +1499,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             // the graph's tensors hold no (or stale) allocations: an equal-shape ubatch that came
-            // next would take the reuse branch above and compute on them (review 2026-09-06: the
-            // pshard arena's overflow refusal made this a recurring soft error, and callers such as
-            // speculative-simple keep decoding after -2). Same reset as graph_reserve / memory_update.
+            // next would take the reuse branch above and compute on them (the pshard arena's overflow
+            // refusal makes this a soft error and callers keep decoding after -2). Same reset as
+            // graph_reserve / memory_update.
             res->reset();
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1507,8 +1511,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             pshard_refresh_stream_views(memory.get());
             // the arena is the budget: a graph the scheduler could only place by growing overflow
             // chunks (ggml_backend_sched_alloc_splits' re-reserve) ran outside it. Name the ubatch
-            // so the shape mismatch against the tier's reserve can be traced (2026-09-06: DSv4 +
-            // DSpark at 8000 spilled 1088 MiB on its first decode graph, 10757 nodes).
+            // so the shape mismatch against the tier's reserve can be found.
             if (model.get_dev_preload_buf()) {
                 const int n_chunks = ggml_backend_sched_get_n_chunks(sched.get(), backends[pshard_layout.compute].get());
                 if (n_chunks == 1) {
@@ -1542,6 +1545,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         pshard_update_write_cells(mctx);
         if (expert_pool) {
             expert_pool->generation++;
+            expert_pool->arm_ids_host();
         }
     }
 
@@ -1897,8 +1901,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // switches are pairwise: TTFT depends on the plan that is active RIGHT NOW
             // (not necessarily the decode plan, e.g. bs=16 decode or back-to-back prompts)
             n_ubatch_eff = registry->find_optimal_ubatch(n_tokens_all, max_ubatch, pshard_active_plan);
-            // eval shape changes numerics on shape-sensitive models - log once so A/B
-            // baselines can match -ub to what pshard actually evaluates with
+            // eval shape changes numerics on shape-sensitive models - log once so a stock
+            // reference run can match -ub to what pshard actually evaluates with
             static uint32_t logged_ub = 0;
             if (n_ubatch_eff != cparams.n_ubatch && logged_ub != n_ubatch_eff) {
                 logged_ub = n_ubatch_eff;

@@ -93,13 +93,10 @@ void llama_pshard_generate_overrides(
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
 
         if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
-            // MTP head layers: pinned whole, experts included, exactly as the planner's copy
-            // prices them (the draft context is a stock sched with no pool and reads them every
-            // draft step). This branch lacked the special case until 2026-09-07: the load-time
-            // array then homed the MTP layer's experts on the shard bid, and the post-fit MTP
-            // probe over that array measured 193 MiB where the plan tool (planner array, layer
-            // pinned) measured 21 - the runtime refit to a budget with no saved variant and
-            // disabled pshard (grid 20260906-fixes, every q35 MTP pool cell at 8000/full).
+            // MTP head layers: pinned whole, experts included, the placement the planner's copy prices
+            // (the draft context is a stock sched with no pool and reads them every draft step). homing
+            // the head's experts on the shard bid instead makes the post-fit MTP probe overshoot the plan
+            // and the refit lands on a budget with no saved variant, which disables pshard
             if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
                 emit(patterns_layer[il].c_str(), host_buft, g_pshard_mtp_head_cpu ? layout.cpu : layout.compute);
                 continue;
@@ -123,11 +120,10 @@ void llama_pshard_generate_overrides(
         } else if (il >= il_pin_start && il < il_pin_end) {
             emit(patterns_layer[il].c_str(), host_buft, layout.compute);
         } else {
-            // MTP head layers: read every draft step by the stock-sched draft context.
-            // Never slot-streamed (concurrent reader); PIN-PRIORITY: whenever the plan
-            // pins anything at all, the head goes to the compute GPU first (the probes
-            // price it, so viability shrinks the trunk pins accordingly). Pinned is
-            // sound now that the draft ctx gets stock, backed KV (per-context gate).
+            // MTP head layers: read every draft step by the stock-sched draft context, so never
+            // slot-streamed (concurrent reader). whenever the plan pins anything at all the head goes
+            // to the compute GPU first (the probes price it, so viability shrinks the trunk pins);
+            // pinning needs the draft ctx on stock, backed KV (per-context gate)
             if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
                 const bool pin_head = !g_pshard_mtp_head_cpu && (n_pinned > 0 || n_attn_pinned > 0);
                 emit(patterns_layer[il].c_str(), host_buft, pin_head ? layout.compute : layout.cpu);
@@ -331,10 +327,9 @@ static bool llama_pshard_probe_model_only(
     g_pshard_unsupported_reason = llama_pshard_arch_unsupported(*model);
     g_pshard_extra_device_bytes = llama_pshard_extra_device_bytes(*model, cparams->n_seq_max, cparams->n_rs_seq);
 
-    // MTP: the nextn head is a full extra layer (attn + experts) WITHIN block_count.
-    // When it will actually be loaded, plan it like any other layer - leaving it out
-    // let blk.<nextn> fall to the loader's dev_layer default (wholesale on GPU,
-    // outside the budget) and crashed warmup reserves with plan-blind view sizes.
+    // MTP: the nextn head is a full extra layer (attn + experts) within block_count. when it will be
+    // loaded, plan it like any other layer; otherwise blk.<nextn> falls to the loader's dev_layer
+    // default (wholesale on GPU, outside the budget) and the warmup reserves see plan-blind view sizes
     if (mparams->load_mtp) {
         probe.n_layers += model->hparams.n_layer_nextn;
     }
@@ -511,23 +506,6 @@ void llama_params_fit_pshard(
     if (!registry->pshard_disabled) {
         LLAMA_LOG_INFO("%s: loaded %zu tier plans from cache (variant budget=%u MiB cache_ubatch=%u)\n",
             __func__, registry->tier_sizes.size(), registry->budget_mib, registry->cache_ubatch);
-    }
-
-    // EXPERT_POOL plans cannot execute yet (the pool runtime lands in a later
-    // stage): bail BEFORE any cparams mutation so the stock fallback keeps the
-    // user's batch geometry
-    for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
-        const llama_pshard_plan * p = registry->get_best(t);
-        if (p && p->is_viable && p->strategy == LLAMA_PSHARD_EXPERT_POOL) {
-            if (getenv("PSHARD_POOL_RUNTIME") == nullptr) {
-                LLAMA_LOG_WARN("%s: EXPERT_POOL plan in the registry but the pool runtime "
-                    "is experimental - set PSHARD_POOL_RUNTIME=1 to enable; disabling pshard\n", __func__);
-                mparams->pshard = false;
-                cparams->pshard = false;
-                return;
-            }
-            break;
-        }
     }
 
     // cached baseline fit for this budget

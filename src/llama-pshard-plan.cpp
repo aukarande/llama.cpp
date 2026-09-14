@@ -99,9 +99,8 @@ static void llama_pshard_generate_overrides(
         if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
             // MTP head layers: the draft context (a stock sched, no pool) reads them
             // on every draft step - a pooled head would stream its whole expert set
-            // per draft token (measured: 9.5 ms per draft on q35). Pin the head whole,
-            // experts included, like the legacy plans do; the pool region shrinks by
-            // one layer of experts (~6 of 82 slots on q35).
+            // per draft token. Pin the head whole, experts included, like the legacy
+            // plans do; the pool region shrinks by one layer of experts.
             if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
                 emit(patterns_layer[il].c_str(), g_pshard_mtp_head_cpu ? host_buft : gpu_buft,
                      g_pshard_mtp_head_cpu ? layout.cpu : layout.compute);
@@ -135,7 +134,7 @@ static void llama_pshard_generate_overrides(
             // Never slot-streamed (concurrent reader); PIN-PRIORITY: whenever the plan
             // pins anything at all, the head goes to the compute GPU first (the probes
             // price it, so viability shrinks the trunk pins accordingly). Pinned is
-            // sound now that the draft ctx gets stock, backed KV (per-context gate).
+            // sound because the draft ctx gets stock, backed KV (per-context gate).
             if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
                 const bool pin_head = !g_pshard_mtp_head_cpu && (n_pinned > 0 || n_attn_pinned > 0);
                 emit(patterns_layer[il].c_str(), host_buft, pin_head ? layout.compute : layout.cpu);
@@ -226,10 +225,10 @@ struct llama_pshard_search_ctx {
     uint32_t                                   n_expert_used = 0;
     int64_t                                    model_size    = 0;
 
-    // routed-expert bytes read from the gguf tensor table (0 = unknown -> the
-    // file-size heuristic): the largest layer's full expert set, one expert's rows
-    // summed over its tensors (up/gate/down or gate_up/down), and how many layers
-    // carry routed experts (DSv4-class models have dense lead layers)
+    // routed-expert bytes read from the gguf tensor table (0 = unknown: pool tiers are
+    // refused, the ids-cross decision is not priced): the largest layer's full expert
+    // set, one expert's rows summed over its tensors (up/gate/down or gate_up/down), and
+    // how many layers carry routed experts (DSv4-class models have dense lead layers)
     size_t                                     exps_layer_bytes = 0;   // largest layer (A/B pair floor)
     size_t                                     exps_row_bytes   = 0;   // largest per-expert row set
     size_t                                     exps_total_bytes = 0;   // all routed experts, all layers
@@ -364,8 +363,7 @@ static bool pshard_alternate_ids_cross_wins(const struct llama_pshard_search_ctx
     // the sliced path's ids round trip (readback, sync, decision, upload launch) plus the copy-engine
     // transition its DMA readback pays on this machine: the legacy sliced tiers keep the copy engine
     const double t_slice_ms = b_slice / 1e9 / pcie * 1000.0 + (st->pool_serve_us + st->engine_switch_us) / 1000.0;
-    // cover the full upload could hide behind: the paired CPU-FFN's DRAM-bound expert reads (the streamed
-    // layer's attention compute was a 0.1 ms constant here: unmeasured, no longer charged)
+    // cover the full upload could hide behind: the paired CPU-FFN's DRAM-bound expert reads
     const double cover_ms   = b_slice / 1e9 / dram * 1000.0;
     return t_slice_ms < std::max(0.0, t_full_ms - cover_ms);
 }
@@ -405,15 +403,14 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
     // probes must never take the canonical-preload path: once best_plans is
     // partially populated (fallbacks, demotion re-plans), a registry-carrying
     // probe load packs pinned KV into the external preload buffer and the
-    // measurement no longer attributes it to mb.context (measured cache = 0)
+    // probe no longer attributes it to mb.context (it reports cache = 0)
     llama_model_params mparams_probe_clean = mparams;
     mparams_probe_clean.pshard_registry = nullptr;
 
     const uint32_t probe_n_tokens  = std::max<uint32_t>(1, cparams.n_batch ? cparams.n_batch : cparams.n_ubatch);
     // the outputs the runtime reserve requests for this tier (pshard_reserve_and_save clamps them
     // to n_outputs_max; 0 = n_batch, llama_context's own rule). Probing every token as an output
-    // charged (bs - n_outputs_max) x n_vocab x 4 B of logits the runtime never reserves - ~1 GiB
-    // at DSv4 bs=2048 under a speculative target's cap of 4 (review 2026-09-06)
+    // would charge (bs - n_outputs_max) x n_vocab x 4 B of logits the runtime never reserves
     const uint32_t probe_n_outputs = std::max<uint32_t>(1, cparams.n_outputs_max
         ? std::min<uint32_t>(probe_n_tokens, cparams.n_outputs_max) : probe_n_tokens);
 
@@ -461,9 +458,8 @@ struct llama_pshard_tier_prune {
     }
 
     // an attn-pin bound proven at a larger batch is INVALID at bs=1: activation
-    // scratch shrinks ~350x between bs=8192 and bs=1, so far more attention fits.
-    // (q35-16k-mva2000: inherited hi_attn=11 hid the attn=40 STATIC winner, 12.1
-    // vs 29.6 predicted tps.) Search the decode tier with a fresh bound.
+    // scratch shrinks with the batch, so far more attention fits. Search the
+    // decode tier with a fresh bound.
     uint32_t attn_hint(uint32_t n_batch) const {
         return n_batch <= 1 ? UINT32_MAX : hi_attn;
     }
@@ -1485,8 +1481,8 @@ bool pshard_registry_load(
         }
     }
 
-    // deterministic variant selection (the accumulate + first-match era produced plans
-    // from mixed planning sessions - see the phantom q8d 2.84 t/s incident):
+    // deterministic variant selection (a first-match pick can mix plans from
+    // different planning sessions):
     //   1. a variant planned for EXACTLY this budget always wins
     //   2. otherwise the largest stored budget <= requested (safe: only leaves VRAM idle)
     //   3. NEVER a variant planned for a bigger budget, and no per-tier salvage from
@@ -1772,14 +1768,13 @@ static void pshard_enforce_union_budget(
                 size_t so = align_up(common_end);
                 for (const auto & [name, sz] : extras) { so = align_up(so + sz); }
 
-                // the tier's compute scratch (streaming slots + graph temporaries, probe-measured)
+                // the tier's compute scratch (streaming slots + graph temporaries, from the probe)
                 // must fit above the packed weights and the pinned cache too: otherwise the
                 // runtime reserve falls back to constrained packing and galloc spills into an
-                // overflow chunk OUTSIDE the arena (measured +496 MiB at a 3929 MiB budget)
+                // overflow chunk OUTSIDE the arena
                 // + margin: the runtime canonical packing (pshard_compute_scratch_off) rounds
-                // differently from this metadata pass by up to a few tens of MiB (seen +29.7 MiB
-                // at a 2024 MiB budget: a tier that passed here by 1.2 MiB was marked unviable at
-                // load, and every verify batch then ran in the 512-token streaming plan)
+                // differently from this metadata pass by up to a few tens of MiB, and a tier
+                // that passes here by less than that is marked unviable at load
                 const size_t need = so + plan.cache_measured + plan.scratch_measured + margin;
                 LLAMA_LOG_INFO("%s: [tier bs=%u] union scratch_off=%.2f MiB + pinned cache=%.2f MiB + compute=%.2f MiB + margin=%.0f MiB = %.2f / %.2f MiB budget %s\n",
                     __func__, plan.batch_size, so / (1024.0*1024.0), plan.cache_measured / (1024.0*1024.0),
@@ -1819,12 +1814,11 @@ static void pshard_enforce_union_budget(
 
         // trunk shaving did not converge: MTP head lever (once), then shave again
         if (g_pshard_n_layers_mtp > 0 && !g_pshard_mtp_head_cpu) {
-            // the MTP context's pre-fit reserve (common_pshard_draft_reserve_mb) was measured with
+            // the MTP context's pre-fit reserve (common_pshard_draft_reserve_mb) was taken with
             // the head pinned; with the head on the CPU its device compute grows by the logits
-            // scratch (+177.5 / +179.5 MiB on q35, 2026-09-04 grid). The one-budget fit
-            // (common_pshard_fit_one_budget) re-measures the context under the fitted placement and
-            // refits once with the larger reserve; the analytical arena charge that stood in for
-            // that (2026-09-05, n_vocab x 128 x 6 B, mtp_head_extra_mb) is retired (2026-09-06)
+            // scratch. The one-budget fit (common_pshard_fit_one_budget) re-measures the context
+            // under the fitted placement and refits once with the larger reserve, so nothing is
+            // charged for it here
             LLAMA_LOG_WARN("%s: union still overshoots after %d rounds with the MTP head pinned; re-planning all tiers with the head on CPU\n",
                 __func__, max_rounds);
             g_pshard_mtp_head_cpu  = true;
@@ -1955,8 +1949,7 @@ static llama_pshard_plan llama_pshard_attn_pin_fallback(
         uint32_t hi_pinned = UINT32_MAX) {
     llama_pshard_plan fallback = llama_pshard_search_attn_pin(ctx, LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS, hi_attn, hi_pinned);
     fallback.batch_size = ctx.cparams->n_batch;
-    // WARN: the grid runner labels rows by the forced arm; a silent substitution recorded three
-    // s1 cells and seven speculative pool cells as something they were not (audit 2026-09-05)
+    // WARN level: a caller that keys its results on the forced strategy must see the substitution
     LLAMA_LOG_WARN("llama_params_fit_pshard: [bs=%-4u %-10s] forced %s non-viable, STATIC_ATTNPRIO_ALLMODELS fallback: n_pinned=%2u/%2u, %s\n",
         ctx.cparams->n_batch, llama_pshard_strategy_name(LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS),
         llama_pshard_strategy_name((llama_pshard_strategy)force_strategy),
@@ -2007,9 +2000,8 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     }
 
     // output head ON the GPU: with it on the CPU every pass (target token AND draft
-    // step) pays the vocabulary projection at host rate - ~9 ms per pass on q35, the
-    // largest single term of a pool token; the head's bytes come out of the pool
-    // (~11 of 86 slots at 8000) and the probe prices the trade
+    // step) pays the vocabulary projection at host rate, the largest single term of
+    // a pool token; the head's bytes come out of the pool and the probe prices the trade
     llama_pshard_generate_overrides(0, n_layers, gpu_buft, host_buft,
         tensor_buft_overrides, LLAMA_LAYER_FRACTION_NONE, LLAMA_PSHARD_EXPERT_POOL,
         layout, false, /*output_on_gpu=*/true, n_layers, /*overlap=*/true, /*ids_cross=*/true);
@@ -2043,10 +2035,8 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     // the pool graph reads device-resident expert VIEWS and allocates no slot copies, so its scratch
     // is that of the same graph with the experts pinned: probe that shape too (no_alloc - nothing is
     // allocated) and take only its compute buffer. The streaming probe above priced the tier and
-    // measured its placement bytes, but its compute holds the transient per-layer expert copies; the
-    // old credit of "2 x b_layer" for them under-estimated the pool graph's scratch by 0.7-2.2 GiB
-    // and let the planner emit A/B tiers the runtime carve could not host (DSv4 @14500 bs=4096/8192,
-    // q35 @4000 bs>=1024: 2026-09-05 grid, design 11.C.19).
+    // gave its placement bytes, but its compute holds the transient per-layer expert copies, and
+    // crediting those analytically under-estimates the pool graph's scratch (design 11.C.19)
     size_t scratch_pool = 0;
     {
         std::vector<llama_model_tensor_buft_override> pinned;
@@ -2087,11 +2077,9 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     const bool ab_tier = (uint64_t) bs * ctx.n_expert_used * 2 >= ctx.n_expert; // whole-stack regime
     // fixed = the pool placement's pinned weights + KV (the streaming probe's total minus its
     // compute); scratch = the pool graph's own compute buffer. Mirror the runtime carve: it charges
-    // the measured chunk0 + 32 MiB. The extra 64 MiB stands in for what the pinned-expert probe does
-    // not see of the pool graph: the runtime's chunk0 measured 8.9% above this probe at every bs on
-    // DSv4 (+26 / +52 / +104 / +209 MiB at bs 512 / 1024 / 2048 / 4096, verify-three-20260906), a
-    // per-token term of ~50 KB whose source is not attributed yet. The verdicts agreed at both
-    // verified cells (DSv4 @14500, q35 @4000); a modelled residual is a proposed change (design 11.C.19 x).
+    // the probed chunk0 + 32 MiB. The extra 64 MiB stands in for what the pinned-expert probe does
+    // not see of the pool graph: the runtime's chunk0 is larger by a small per-token term whose
+    // source is not attributed yet (a modelled residual is a proposed change, design 11.C.19 x)
     const int64_t fixed_bytes = gpu_used - (int64_t) plan.scratch_measured;
     const int64_t pool_bytes  = (int64_t) vram_free - fixed_bytes - (int64_t) scratch_pool - (32ll << 20) - (64ll << 20);
     plan.scratch_measured = scratch_pool;   // the tier's real scratch (union enforcer, pool setup, carve)
@@ -2105,13 +2093,13 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         ? (uint32_t) ((double) pool_bytes / b_slot) : 0;
 
     // per-expert rates shared by the miss pricing and the hybrid q* share. Every machine number comes from
-    // the profile (schema 2, 2026-09-12); a pool tier is refused rather than priced with a built-in value.
+    // the profile (schema 2); a pool tier is refused rather than priced with a built-in value.
     //   t_fetch: expert bytes at the segment-batch kernel's gathered rate for the pool's own segment size
     //            (one expert row of one expert tensor): the IDLE curve for fetch (no CPU chain runs while it
     //            uploads), the LOADED curve for the CPU-route policies (the chain shares the memory bus).
     //   t_cpu:   the CPU chain's per-expert cost at small batch = expert bytes at the host DRAM rate (light
-    //            quants are DRAM-bound), or the dequant compute at the slowest measured matmul rate (DSv4
-    //            UD-Q2_K_XL is compute-bound): max of the two.
+    //            quants are DRAM-bound), or the dequant compute at the profile's slowest matmul rate (heavy
+    //            dequant formats are compute-bound): max of the two.
     //   t_serve: the pooled layer's host round trip (ids readback, sync, decision, upload, launch), paid per
     //            layer by every cache-tier policy (Pool_Serve_us).
     //   t_split: the CPU route's handoff (activation download, host graph, partial upload, join), paid per
@@ -2176,13 +2164,11 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         // weight-upload term (full expert stacks) is replaced by
         //   distinct(bs) * (1 - h(s)) * t_miss   per pooled layer,
         // distinct(bs) = min(E, bs*top_k) (token union), h(s) = Zipf(alpha) mass of
-        // the s most popular of E experts (the static optimum). alpha is MEASURED:
-        // the pool histograms every cache-mode route and refits it at exit into
-        // <model>.pshard_workload; a model without one is calibrated at plan time
-        // (sampled generation). The planner prices the long-run rate; short
-        // generations pay the fill (an 86-slot layer needs ~10 tokens of misses),
-        // which the 32-token QA gate reports as the cold one. (An LRU-shortfall
-        // factor and admission gating were both measured unnecessary and removed.)
+        // the s most popular of E experts (the static optimum). alpha comes from the
+        // routing workload: the pool histograms every cache-mode route and refits it
+        // at exit into <model>.pshard_workload; a model without one is calibrated at
+        // plan time (sampled generation). The planner prices the long-run rate; short
+        // generations pay the fill of the pool first.
         const double E = (double) ctx.n_expert;
         const double s = std::min<double>(plan.pool_slots, E);
         const double alpha = ctx.zipf_alpha;
@@ -2198,9 +2184,8 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         const double distinct = std::min<double>(E, (double) bs * ctx.n_expert_used);
         const double misses   = distinct * (1.0 - h);
         const double hits     = distinct - misses;
-        // the CPU chain runs concurrently with the GPU chain (scheduler lookahead); the
-        // serial variant is no longer priced (its switch was removed after the grid
-        // certified the overlap)
+        // the CPU chain runs concurrently with the GPU chain (scheduler lookahead);
+        // only the overlapped price is taken
         const bool cpu_chain_overlaps = true;
         auto miss_ms_layer = [&](int pol) -> double {
             switch (pol) {
@@ -2319,11 +2304,6 @@ static llama_pshard_plan llama_pshard_search_tier(
     for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
         if (force_strategy >= 0 && force_strategy != s) continue;
         if (prune.skip[s]) continue;
-        if (s == LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_EXPERT_POOL &&
-                getenv("PSHARD_POOL_AUTO") == nullptr) {
-            continue; // PSHARD_POOL_AUTO=1 lets the priced pool compete in auto (runtime needs PSHARD_POOL_RUNTIME=1)
-        }
-
         llama_pshard_strategy strategy = (llama_pshard_strategy)s;
         llama_pshard_plan plan;
 
@@ -2428,11 +2408,6 @@ static void llama_pshard_strategy_sweep(
         size_t first_tier) {
 
     if (force_strategy >= 0 && force_strategy != strategy) return;
-    if (strategy == LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_EXPERT_POOL &&
-            getenv("PSHARD_POOL_AUTO") == nullptr) {
-        return; // PSHARD_POOL_AUTO=1 lets the priced pool compete in auto
-    }
-
     llama_model_tensor_buft_override local_overrides[4096];
     llama_pshard_search_ctx ctx = ctx_template;
     ctx.overrides = local_overrides;
@@ -2664,9 +2639,8 @@ void llama_params_fit_pshard_plan(
     const pshard_dev_layout layout  = pshard_dev_layout::for_device(0, cpu_bid);
     // every variant starts with the MTP head pin-priority placement; the union-budget
     // enforcer flips this (and records it in the registry) only when the pinned head overshoots.
-    // The one-budget fit's second pass starts here too: a preset that kept pass 1's head home was
-    // tried and reverted on 2026-09-07 (design 11.C.19 xiii) - it rescued one arm and cost the
-    // others; the head home is a planner pricing decision, not a protocol rule.
+    // The one-budget fit's second pass starts here too: the head home is a planner pricing
+    // decision, not a protocol rule (design 11.C.19 xiii).
     g_pshard_mtp_head_cpu = false;
 
     std::unique_ptr<llama_benchmark_predictor> predictor;
@@ -2680,11 +2654,11 @@ void llama_params_fit_pshard_plan(
         auto p = std::make_unique<llama_benchmark_predictor>();
         const bool has_cpu = p->load_cpu(cpu_path, cparams->n_threads);
         const bool has_gpu = p->load_gpu(gpu_path);
-        // the profile must be THIS machine's, complete (schema 2) and measured at this thread count: nothing in
+        // the profile must be THIS machine's, complete (schema 2) and taken at this thread count: nothing in
         // the planner prices without it, and a profile from another box would price with that box's numbers.
         // There is no override.
         {
-            // the same device the profiler measured and the registry loader hashes: the first GPU-type device in
+            // the same device the profiler describes and the registry loader hashes: the first GPU-type device in
             // registry order (a plan for another GPU of a multi-GPU box needs a profile of that GPU, which the
             // profiler cannot yet select - the refusal then names both descriptions)
             const auto current = llama_benchmark_stats::machine_current(
@@ -2750,8 +2724,8 @@ void llama_params_fit_pshard_plan(
     // runtime registers whole mappings greedily in split order, all-or-nothing)
     // and reprice the predictor's weight-upload rate with the blended value.
     // Also compute the TOTAL file size: the main split of a sharded gguf can be
-    // tiny (DeepSeek-V4's is 6 MB); the byte counts the planner prices with come
-    // from the gguf tensor table (scan below), the total only feeds sanity checks.
+    // tiny; the byte counts the planner prices with come from the gguf tensor
+    // table (scan below), the total only feeds sanity checks.
     // NOTE: the registry fingerprint above stays on the MAIN split size - the
     // runtime computes it the same way, and changing it would strand every
     // cached registry into silent stock fallback.
@@ -2815,9 +2789,8 @@ void llama_params_fit_pshard_plan(
         if (predictor && predictor->stats.host_pin_ceiling_gb > 0.0 &&
                 predictor->stats.peak_system_bw > 0.0 && predictor->stats.peak_pcie_bw > 0.0) {
             const double pcie_r = predictor->stats.peak_pcie_bw;
-            // the staged rate is measured (PCIe_Staged: a pageable source through the staging ring). A
-            // profile without the line prices staged bytes at the pinned rate and says so; step 5 makes an
-            // incomplete profile a refusal.
+            // the staged rate comes from the profile (PCIe_Staged: a pageable source through the staging
+            // ring); a profile without the line prices staged bytes at the pinned rate and says so
             double staged_r = pcie_r;
             if (predictor->stats.staged_bw > 0.0) {
                 staged_r = std::min(pcie_r, predictor->stats.staged_bw);
@@ -2903,7 +2876,7 @@ void llama_params_fit_pshard_plan(
 
     // routing workload: the Zipf exponent the pool's hit-rate model h(s) uses. From <model>.pshard_workload
     // (pool runs accumulate their route histograms into it at exit), else calibrated now: a CPU-only sampled
-    // generation (256 tokens, seed 1234, temperature 1) whose router top-k ids are histogrammed - a measured
+    // generation (256 tokens, seed 1234, temperature 1) whose router top-k ids are histogrammed - a sampled
     // stand-in for the workload that the first real run replaces. Nothing is assumed: without either, pool
     // tiers are refused.
     if (hp_nex > 0) {

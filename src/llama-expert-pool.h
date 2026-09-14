@@ -41,7 +41,7 @@ struct llama_expert_pool {
 
     // int32 id buffer: lives in the pool's page-locked arena when it fits (the CUDA backend then uploads
     // it with a kernel copy instead of a copy-engine transfer), else in an owned vector. Same call surface
-    // as the vector it replaces; a copy gets its own vector storage.
+    // as std::vector; a copy gets its own vector storage.
     struct ids_buf {
         int32_t * pin     = nullptr;   // arena slice (may be null)
         size_t    pin_cap = 0;         // elements
@@ -106,6 +106,12 @@ struct llama_expert_pool {
         ggml_tensor * ids_gpu_bias = nullptr; // GPU chain add_id ids: expert id | -1 (dual only)
         ggml_tensor * ids_cpu      = nullptr; // CPU chain ids: expert id | -1 (dual only)
         ggml_tensor * ids_pred     = nullptr; // routing predicted predict_k layers earlier (output leaf)
+        // router ids landing: the graph copies selected_experts into this layer's pinned slice; serve() polls it
+        ggml_tensor * ids_host     = nullptr; // the graph's landing tensor (nullptr: the layer reads the ids back from the device)
+        int32_t *     ids_host_pin = nullptr; // host view of the slice
+        size_t        ids_host_cap = 0;       // elements
+        size_t        ids_host_n   = 0;       // elements the bound landing tensor holds (n_expert_used x n_tokens)
+        bool          ids_host_armed = false; // -1 sentinels written this pass and not consumed yet
 
         // this layer's router (for the predictor built in an earlier layer)
         const ggml_tensor * gate_inp    = nullptr;
@@ -124,8 +130,7 @@ struct llama_expert_pool {
         uint64_t pf_used   = 0;
         std::vector<uint64_t> slot_pf_gen;   // [n_slots] pass that prefetched the slot
 
-        // per-layer allocation: this layer's slot count (= the pool's uniform n_slots
-        // the same count in every layer)
+        // this layer's slot count (= the pool's uniform n_slots, the same in every layer)
         uint32_t n_slots_l = 0;
         ids_buf bias_buf;                     // persistent upload buffers (async-safe)
         std::vector<int32_t> cpu_buf;
@@ -138,7 +143,7 @@ struct llama_expert_pool {
 
     uint32_t n_expert      = 0;
     uint32_t n_expert_used = 0;
-    uint32_t n_slots       = 0;        // cache-mode slots per layer (the uniform baseline)
+    uint32_t n_slots       = 0;        // cache-mode slots per layer (the same count in every layer)
     std::string workload_path;         // <model>.pshard_workload: the routing skew refit written at exit (empty = not persisted)
     bool     ab_mode       = false;    // active tier is a whole-stack prefill tier
     bool     active        = false;    // the ACTIVE plan is EXPERT_POOL (legacy tiers
@@ -151,27 +156,21 @@ struct llama_expert_pool {
     bool     prefetch_on   = true;   // PSHARD_POOL_PREFETCH=0: predict and score only
     // dead CPU chains (every route of the pass resident or promoted): the sched skips the
     // chain's compute and zero-fills its merge input instead of the host join copy.
-    // (always on: measured a win on 2026-09-10; the A/B switch was removed 2026-09-13)
     uint64_t skipped_splits = 0;     // CPU chains the sched skipped on our word
     int32_t  prefetch_n    = 1;      // PSHARD_POOL_PREFETCH_N: at most this many of the predicted
                                      // experts per layer, highest predicted score first (0 = all).
-                                     // Mispredicted uploads share the PCIe link with the critical-
-                                     // path misses: DSv4 @12000 N=1 +6.5%, N=2 +3.7%, N=3 -2%
+                                     // Mispredicted uploads share the PCIe link with the critical-path misses.
     std::vector<char> pred_read_buf;
     // page-locked staging: the ids / prediction downloads and every layer's id upload buffers.
     // Device-accessible, so with kernel copies on the backend moves them with kernels instead
-    // of copy-engine transfers (a DMA ordered behind kernels costs 30-55 us of GPU idle on WDDM
-    // whether the host side is pinned or pageable - the pinned arena of 2026-09-10 regressed for
-    // that reason). Allocated while kernel copies are on; larger batches fall back to the vectors.
+    // of copy-engine transfers (a DMA ordered behind kernels idles the GPU under WDDM whether
+    // the host side is pinned or pageable). Allocated while kernel copies are on; larger batches
+    // fall back to the vectors. Also holds the per-layer router-ids landing slices (ids_host_pin),
+    // written by the graph via ids_host_buf
     ggml_backend_buffer_t read_staging = nullptr;
     bool   read_staging_tried = false;
-    bool   kernel_copies      = false;   // the backend runs pinned-memory copies as kernels while we are active
+    bool   kernel_copies      = false;   // pinned copies run as kernels (the context's transfer mode)
     ggml_backend_copy_segments_async_t copy_segments = nullptr;   // batched upload proc (CUDA), else per-tensor
-    ggml_backend_kernel_copy_set_t     kernel_copy_set = nullptr;
-    ggml_backend_kernel_copy_max_set_t kernel_copy_max_set = nullptr;
-    bool   kernel_copy_cap_set   = false; // the registry carried the machine profile's measured crossover (kernel_cap_mb)
-    size_t kernel_copy_cap_bytes = 0;    // that crossover in bytes; 0 is a valid measurement (kernel copies never win)
-    size_t kernel_copy_cap_prev  = 0;    // the engine's value before we set ours, restored on deactivation
     bool   procs_looked_up = false;
     void lookup_backend_procs();
     struct upload_seg { ggml_tensor * view; size_t off; const void * src; size_t size; };
@@ -180,6 +179,16 @@ struct llama_expert_pool {
     char * read_pred = nullptr;
     size_t read_cap  = 0;
     void ensure_read_staging(ggml_backend_t backend);
+    // router-ids landing: device alias of the pinned staging, its host base, counters
+    ggml_backend_wrap_host_buffer_t wrap_host_buffer = nullptr;
+    ggml_backend_buffer_t ids_host_buf  = nullptr;
+    char *                ids_host_base = nullptr;   // host address of ids_host_buf's base
+    uint32_t ids_host_unconsumed = 0;   // layers armed this pass whose serve() has not read them
+    uint64_t ids_host_polls      = 0;   // readbacks that went through the landing slice
+    uint64_t ids_host_drains     = 0;   // of those, polls that drained the stream before the slice filled
+    uint64_t ids_host_wait_us    = 0;   // host time spent polling for them
+    uint64_t ids_host_fallbacks  = 0;   // slices that never filled (stream drained, then the device readback)
+    bool wait_ids_host(layer_state & L, size_t n);
     uint64_t epoch         = 0;        // bumped on active/ab flips; joins graph reuse
     uint64_t generation    = 0;        // bumped once per decode call; dedupes serve()
 
@@ -213,8 +222,8 @@ struct llama_expert_pool {
     // at the ACTIVE view set, and install the serving callback
     void register_sched(ggml_backend_sched_t sched);
 
-    // tier switch: flip cache/AB mode and re-register; cache contents survive a
-    // mode round-trip only in the preserved span (v1: dropped - lazy refill)
+    // tier switch: flip cache/AB mode and re-register; cache contents do not survive
+    // a mode round-trip (the halves alias the slot arrays): maps dropped, lazy refill
     void set_ab_mode(bool ab, ggml_backend_sched_t sched);
 
     // the ACTIVE plan pools experts; when false the overrides are cleared and
@@ -237,7 +246,15 @@ struct llama_expert_pool {
     // the pool's copy backend + event (background admission, prefetch); no-op once created
     void ensure_admit_backend(ggml_backend_t split_backend);
     void bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu,
-                        ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu);
+                        ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu, ggml_tensor * ids_host);
+    // graph build: device tensor aliasing this layer's landing slice (nullptr: unmapped or too large)
+    ggml_tensor * ids_host_tensor(int32_t il, ggml_context * ctx, const ggml_tensor * ids);
+    // pass start: write the -1 sentinels the landing slices are polled against
+    void arm_ids_host();
+    // finished graph: move nodes independent of a pooled layer's routed split ahead of its boundary
+    void hoist_independent(ggml_cgraph * gf);
+    uint32_t hoisted_nodes = 0;   // last build: nodes moved ahead of a boundary
+    uint32_t hoist_regions = 0;   // last build: routed boundaries seen
     ggml_tensor * mm_view(int32_t il, const ggml_tensor * host) const;
     bool layer_pooled(int32_t il) const {
         return il >= 0 && il < (int32_t) layers.size() && !layers[il].tensors.empty();

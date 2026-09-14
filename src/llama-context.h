@@ -282,6 +282,8 @@ private:
     void pshard_pack_cache_region();
     void pshard_setup_expert_pool();
     void pshard_update_pool_mode(const llama_pshard_plan & plan);
+    // transfer mode of the active pshard tier: kernel copies, the profile's cap, async sched host paths (nullptr: off)
+    void pshard_update_transfer_mode(const llama_pshard_plan * plan);
     bool pshard_pool_resize(const llama_pshard_plan & plan);   // per-tier region: budget - weights - cache - this tier's scratch
     void pshard_assign_pool_tensors();
     void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true, bool force_upload = false);
@@ -384,11 +386,18 @@ private:
 
     const llama_pshard_plan * pshard_active_plan = nullptr;
     // EXPERT_POOL runtime (docs/expert-pool-design.md); non-null only when the
-    // registry's viable plans pool experts and PSHARD_POOL_RUNTIME is set
+    // registry's viable plans pool experts
     std::unique_ptr<struct llama_expert_pool> expert_pool;
     size_t expert_pool_bytes = 0;  // region carved below the pinned KV cache
-    // compute scratch (+ margin) each EXPERT_POOL tier's graph really needs, measured
-    // at its first reserve: the pool region is everything the graph leaves
+
+    // pshard transfer mode (pshard_update_transfer_mode)
+    bool   pshard_transfer_on      = false;
+    bool   pshard_kernel_cap_set   = false;   // the registry carried the profile's kernel_cap_mb
+    size_t pshard_kernel_cap_bytes = 0;
+    ggml_backend_kernel_copy_set_t     pshard_kernel_copy_set     = nullptr;
+    ggml_backend_kernel_copy_max_set_t pshard_kernel_copy_max_set = nullptr;
+    // compute scratch (+ margin) each EXPERT_POOL tier's graph needs, taken at its first reserve;
+    // the pool region is what the graph leaves
     std::map<uint32_t, size_t> pshard_pool_scratch;
     bool pshard_memory_dirty = false;
     // tiers reserved + initial plan landed; a later scheduler rebuild (sched_need_reserve
