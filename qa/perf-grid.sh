@@ -73,7 +73,8 @@ mva_of()      { case $1 in full) echo "$FULL" ;; *) echo "$1" ;; esac; }
 #   mva    MiB or "full"
 #   prompt 512 | 4k
 #   arm    stock | auto | s0..s4 (forced legacy) | pool:<policy> | pool:plan | poolauto
-#   warm   1 = PSHARD_POOL_WARM=8 PSHARD_POOL_ALLOC=1 (prompt-end LRU seeding + per-layer slots)
+#   warm   1 = RETIRED 2026-09-13: PSHARD_POOL_WARM / PSHARD_POOL_ALLOC were removed (measured no win);
+#              the arm now repeats the pred arm - drop it at the next rerun
 #   noovl  always 0 (column kept for ledger compatibility; the no-overlap switch was removed
 #          2026-09-09 after the 20260905/20260906 grids certified the overlap in all 16 pairs)
 CELLS=""
@@ -355,7 +356,7 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
     [ "$N" = "1" ] && { echo "noovl cells are gone: the no-overlap switch was removed 2026-09-09 ($NM)" >&2; exit 2; }
     ENVV=$ENVF
     [ "$P" = "1" ] && ENVV="$ENVV PSHARD_POOL_PREDICT=1"
-    [ "$W" = "1" ] && ENVV="$ENVV PSHARD_POOL_WARM=8 PSHARD_POOL_ALLOC=1"
+    # W=1 (warm start + per-layer slots) retired 2026-09-13: the knobs no longer exist; the arm repeats the pred arm
 
     # budget flag: stock -fitb, pshard -pshard -mva. DSv4 + DSpark stock only fits at 3000
     # (the stock fit ignores the 10.4 GB draft and OOMs otherwise) - recorded as mva 3000.

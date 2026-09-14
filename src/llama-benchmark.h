@@ -7,6 +7,9 @@
 #include <utility>
 #include <vector>
 
+struct ggml_backend_device;
+typedef struct ggml_backend_device * ggml_backend_dev_t;
+
 struct ggml_tensor;
 typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
@@ -110,6 +113,13 @@ struct llama_benchmark_stats {
         int         threads  = 0;
         int         schema   = 0;   // 0 = pre-fingerprint profile
     } machine;
+    // the machine this process runs on, in the profile's terms (gpu description, cpu brand string, os);
+    // threads come from the caller. The planner compares it with `machine` and refuses a foreign profile.
+    static machine_t   machine_current(ggml_backend_dev_t gpu_dev, int n_threads);
+    // FNV-1a over gpu|cpu|os: the plan registry records it so a registry planned on another machine is not reused
+    static uint64_t    machine_hash(const machine_t & m);
+    // "" when the profile's machine is the running one (gpu, cpu, os, threads), else what differs
+    static std::string machine_mismatch(const machine_t & profile, const machine_t & current);
 
     // kernel-copy era measurements (schema 2). 0 / -1 = not in the profile; there is no fallback value:
     // a planner term that needs one refuses to price without it (nothing machine-specific is a constant).

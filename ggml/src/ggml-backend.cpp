@@ -866,11 +866,6 @@ struct ggml_backend_sched {
     // redirected aliases, the CPU, and devices without events (those fall back to a stream synchronize).
     ggml_backend_event_t d2h_events[GGML_SCHED_MAX_BACKENDS];
 
-    // GGML_ASYNC_HANDOFF=1: pinned staging for device->host input handoffs, so the
-    // download is a stream-scoped async get instead of a device-wide sync memcpy
-    // (which also drains unrelated queued uploads). Keyed by the producing backend.
-    ggml_backend_buffer_t handoff_staging[GGML_SCHED_MAX_BACKENDS];
-    size_t                handoff_staging_size[GGML_SCHED_MAX_BACKENDS];
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1982,20 +1977,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
-    // host-side phase timing (GGML_SCHED_TIMING=1): totals per compute_splits call, in us
-    static const bool sched_timing = getenv("GGML_SCHED_TIMING") != nullptr;
     // pool tiers only (ggml_backend_sched_set_async_host_copies): the asynchronous input handling below.
     // Legacy tiers keep the synchronous paths - measured 2026-09-11 (q35 @8000, 3 pairs): with DMA copies the
     // asynchronous paths cost them 1% (58.3 -> 57.7 t/s), with the pool's kernel copies they are the win.
     const bool pshard_async = sched->async_host_copies;
-    int64_t tt_redirect = 0, tt_inputs = 0, tt_precomp = 0, tt_prefetch = 0, tt_launch = 0, tt_postcomp = 0;
-    // per-callsite host-blocking attribution (which exact sync eats the wall time)
-    int64_t tt_s_prev = 0, tt_s_flagin = 0, tt_s_wait = 0, tt_s_sliced = 0, tt_s_cpy = 0, tt_s_post = 0;
-    int64_t tt_c_flagin = 0, tt_c_fallback = 0, tt_c_setasync = 0, tt_c_slicedcp = 0, tt_c_d2h = 0;
-    int64_t tt_h_enq = 0, tt_h_sync = 0, tt_h_out = 0, tt_h_prev = 0;
-    #define SCHED_SYNC_TIMED(acc, stmt) do {         const int64_t ts_ = sched_timing ? ggml_time_us() : 0;         stmt;         if (sched_timing) (acc) += ggml_time_us() - ts_;     } while (0)
-    int nn_redirected = 0, nn_redirect_sync = 0, nn_prefetched = 0, nn_handoff = 0, nn_skipped = 0, nn_d2h = 0;
-    const int64_t tt_start = sched_timing ? ggml_time_us() : 0;
     // splits whose compute was skipped this graph (all-zero on the split_skip_cb's word): a later
     // split's input produced by one of them is zero-filled in place of the copy
     std::vector<int> skipped_splits;
@@ -2055,9 +2040,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // this split, the allocator may have reused buffer regions across splits
         if (stage != 2 && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                SCHED_SYNC_TIMED(tt_s_prev, ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]));
+                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
-                SCHED_SYNC_TIMED(tt_s_prev, ggml_backend_synchronize(sched->backends[prev_backend_id]));
+                ggml_backend_synchronize(sched->backends[prev_backend_id]);
                 backend_busy[prev_backend_id] = false;
             }
         }
@@ -2065,16 +2050,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // pshard: a redirected backend executes this split on its target
         if (sched->redirect_target[split_backend_id] >= 0) {
             if (stage != 2) {
-                nn_redirected++;
                 // the alias stream needs to drain only if something was issued on it since its last
                 // synchronize. Cache-tier decode issues nothing there (traced 2026-09-10: three idle
                 // synchronizes per pooled layer inside the 68 us GPU gap before the expert chains)
                 if (backend_busy[split_backend_id] || !pshard_async) {
-                    nn_redirect_sync++;
-                    const int64_t t0 = sched_timing ? ggml_time_us() : 0;
                     ggml_backend_synchronize(sched->backends[split_backend_id]);
                     backend_busy[split_backend_id] = false;
-                    if (sched_timing) tt_redirect += ggml_time_us() - t0;
                 }
             }
             split_backend_id = sched->redirect_target[split_backend_id];
@@ -2089,7 +2070,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             prefetched_split_id == split_id &&
             prefetched_backend_id == copy_backend_id;
         if (weights_prefetched) {
-            nn_prefetched++;
         }
 
         if (prefetched_split_id == split_id && !weights_prefetched) {
@@ -2203,7 +2183,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (stage != 2) {
         // copy the input tensors to the split backend
-        const int64_t t_in0 = sched_timing ? ggml_time_us() : 0;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             {
@@ -2236,7 +2215,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // shares the producer's backend). Replaces a host synchronize + host->device upload per
                 // dead expert chain (traced 2026-09-10: most of a 65 us GPU gap per pooled layer)
                 if (input_cpy->data != NULL) {
-                    SCHED_SYNC_TIMED(tt_c_setasync, ggml_backend_tensor_memset_async(split_backend, input_cpy, 0, 0, ggml_nbytes(input_cpy)));
+                    ggml_backend_tensor_memset_async(split_backend, input_cpy, 0, 0, ggml_nbytes(input_cpy));
                     if (input_cpy != input) {
                         ggml_backend_sched_zero_copy_padding(split_backend, input_cpy);
                     }
@@ -2255,24 +2234,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 if (host_upload_no_drain(input, input_cpy, input_buf, split_backend_id)) {
-                    SCHED_SYNC_TIMED(tt_c_flagin, ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input)));
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                     ggml_backend_sched_zero_copy_padding(split_backend, input_cpy);
                     flag_input_pending[split_backend_id] = true;
                     continue;
                 }
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    SCHED_SYNC_TIMED(tt_s_flagin, ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]));
+                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
-                    SCHED_SYNC_TIMED(tt_s_flagin, ggml_backend_synchronize(split_backend));
+                    ggml_backend_synchronize(split_backend);
                 }
-                SCHED_SYNC_TIMED(tt_c_flagin, ggml_backend_tensor_copy(input, input_cpy));
+                ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else if (!host_upload_no_drain(input, input_cpy, input_buf, split_backend_id)) {
-                    SCHED_SYNC_TIMED(tt_s_wait, ggml_backend_synchronize(split_backend));
+                    ggml_backend_synchronize(split_backend);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -2285,7 +2264,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    SCHED_SYNC_TIMED(tt_s_sliced, ggml_backend_synchronize(input_backend));
+                    ggml_backend_synchronize(input_backend);
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -2304,7 +2283,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        SCHED_SYNC_TIMED(tt_s_sliced, ggml_backend_synchronize(ids_backend));
+                        ggml_backend_synchronize(ids_backend);
 
                         // find the used experts
                         used_ids.clear();
@@ -2364,7 +2343,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         first_id = id;
                         last_id = id;
                     }
-                    SCHED_SYNC_TIMED(tt_c_slicedcp, copy_experts(first_id, last_id));
+                    copy_experts(first_id, last_id);
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -2376,12 +2355,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         input_cpy->data != NULL && input_cpy->buffer != NULL && ggml_backend_buffer_is_host(input_cpy->buffer) &&
                         ggml_backend_sched_backend_id(sched, input_backend) >= 0) {
                         // device -> CPU split input: an asynchronous download on the producer's stream (a kernel
-                        // copy into the pinned CPU buffer under GGML_CUDA_KERNEL_COPY, else a DMA) in place of a
+                        // copy into the pinned CPU buffer with kernel copies on, else a DMA) in place of a
                         // host synchronize followed by a synchronous copy; the producer is synchronized right
                         // before the CPU split computes. Traced 2026-09-10: the synchronous path left a 30 us
                         // copy-engine gap behind every pooled layer's router kernels (WDDM engine switch).
                         // Stock layouts (no redirects) keep the byte-identical synchronous path.
-                        SCHED_SYNC_TIMED(tt_c_d2h, ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input)));
+                        ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
                         const int d2h_bid = ggml_backend_sched_backend_id(sched, input_backend);
                         if (sched->d2h_events[d2h_bid] != NULL) {
                             // fence just this download: a stream synchronize before the CPU compute would wait
@@ -2390,78 +2369,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_event_record(sched->d2h_events[d2h_bid], input_backend);
                         }
                         pending_input_sync[d2h_bid] = true;
-                        nn_d2h++;
                         copied = true;
                     }
                     if (!copied) {
-                        SCHED_SYNC_TIMED(tt_s_cpy, ggml_backend_synchronize(input_backend));
+                        ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            SCHED_SYNC_TIMED(tt_s_cpy, ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]));
+                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         }
                         // no second synchronize of split_backend without events: the one at the top of this branch
                         // drained it and nothing was issued on it since (a cpy_tensor_async that returns false issues nothing)
                         if (sched->has_redirects && input->data != NULL && input_buf != NULL &&
                             ggml_backend_buffer_is_host(input_buf)) {
-                            SCHED_SYNC_TIMED(tt_c_setasync, ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input)));
+                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                             ggml_backend_sched_zero_copy_padding(split_backend, input_cpy);
                         } else {
-                            // device->host handoff. The plain tensor_copy is a synchronous memcpy =
-                            // device-wide barrier: it also drains unrelated queued uploads (~one
-                            // streamed-weight upload per call, measured ~5ms on q8d-s4). With
-                            // GGML_ASYNC_HANDOFF=1, download into pinned staging on the producer's
-                            // stream instead (pageable dst would degrade cudaMemcpyAsync back to
-                            // device-wide sync semantics), then sync just that stream and memcpy out.
-                            static const bool async_handoff = getenv("GGML_ASYNC_HANDOFF") != NULL;
-                            bool handoff_done = false;
-                            if (async_handoff && input->buffer != NULL &&
-                                !ggml_backend_buffer_is_host(input->buffer) &&
-                                ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                                input_cpy->buffer != NULL && input_cpy->data != NULL &&
-                                ggml_backend_buffer_is_host(input_cpy->buffer) &&
-                                input_backend->iface.get_tensor_async != NULL &&
-                                ggml_are_same_layout(input, input_cpy) && ggml_is_contiguous(input)) {
-                                const int    in_bid = ggml_backend_sched_backend_id(sched, input_backend);
-                                const size_t nbytes = ggml_nbytes(input);
-                                if (in_bid >= 0) {
-                                    if (sched->handoff_staging_size[in_bid] < nbytes) {
-                                        ggml_backend_buffer_type_t hbuft =
-                                            ggml_backend_dev_host_buffer_type(ggml_backend_get_device(input_backend));
-                                        if (hbuft != NULL) {
-                                            if (sched->handoff_staging[in_bid] != NULL) {
-                                                // previous use ended with a synchronize, safe to free
-                                                ggml_backend_buffer_free(sched->handoff_staging[in_bid]);
-                                                sched->handoff_staging[in_bid] = NULL;
-                                                sched->handoff_staging_size[in_bid] = 0;
-                                            }
-                                            ggml_backend_buffer_t hb = ggml_backend_buft_alloc_buffer(hbuft, nbytes);
-                                            if (hb != NULL) {
-                                                sched->handoff_staging[in_bid] = hb;
-                                                sched->handoff_staging_size[in_bid] = nbytes;
-                                            }
-                                        }
-                                    }
-                                    if (sched->handoff_staging_size[in_bid] >= nbytes) {
-                                        void * stage = ggml_backend_buffer_get_base(sched->handoff_staging[in_bid]);
-                                        SCHED_SYNC_TIMED(tt_h_enq,  ggml_backend_tensor_get_async(input_backend, input, stage, 0, nbytes));
-                                        SCHED_SYNC_TIMED(tt_h_sync, ggml_backend_synchronize(input_backend));
-                                        SCHED_SYNC_TIMED(tt_h_out,  memcpy(input_cpy->data, stage, nbytes));
-                                        tt_c_fallback += tt_h_enq + tt_h_sync + tt_h_out - tt_h_prev;
-                                        tt_h_prev = tt_h_enq + tt_h_sync + tt_h_out;
-                                        nn_handoff++;
-                                        handoff_done = true;
-                                    }
-                                }
-                            }
-                            if (!handoff_done) {
-                                SCHED_SYNC_TIMED(tt_c_fallback, ggml_backend_tensor_copy(input, input_cpy));
-                            }
+                            // device->host handoff: the pool tiers take the asynchronous path above; this
+                            // synchronous copy is the legacy tiers' (measured 2026-09-11: it costs them nothing)
+                            ggml_backend_tensor_copy(input, input_cpy);
                         }
                     }
                 }
             }
         }
 
-        if (sched_timing) tt_inputs += ggml_time_us() - t_in0;
         } // stage != 2
 
         if (stage == 1) {
@@ -2469,27 +2399,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // pre-compute: upload stateful cache (KV/RS) for WRITEBACK tensors in this split
-        const int64_t t_pc0 = sched_timing ? ggml_time_us() : 0;
         if (sched->split_pre_compute != NULL && split->n_writeback > 0) {
             for (int w = 0; w < split->n_writeback; w++) {
                 sched->split_pre_compute(split->writeback[w], split_backend, sched->split_cb_user_data);
             }
         }
-        if (sched_timing) tt_precomp += ggml_time_us() - t_pc0;
 
-        const int64_t t_pf0 = sched_timing ? ggml_time_us() : 0;
         prefetch_next_split();
-        if (sched_timing) tt_prefetch += ggml_time_us() - t_pf0;
 
-        const int64_t t_ln0 = sched_timing ? ggml_time_us() : 0;
         if (split_backend_id == sched->n_backends - 1) {
             // the CPU split reads inputs that may still be downloading (async device->host path above)
             for (int b = 0; b < sched->n_backends; b++) {
                 if (pending_input_sync[b]) {
                     if (sched->d2h_events[b] != NULL) {
-                        SCHED_SYNC_TIMED(tt_s_wait, ggml_backend_event_synchronize(sched->d2h_events[b]));
+                        ggml_backend_event_synchronize(sched->d2h_events[b]);
                     } else {
-                        SCHED_SYNC_TIMED(tt_s_wait, ggml_backend_synchronize(sched->backends[b]));
+                        ggml_backend_synchronize(sched->backends[b]);
                         backend_busy[b] = false;
                     }
                     pending_input_sync[b] = false;
@@ -2501,14 +2426,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->split_skip_cb(&split->graph, split_backend, sched->split_skip_ud)) {
                 // all-zero split: no compute; its consumers get zero-filled copies (input loop above)
                 skipped_splits.push_back(split_id);
-                nn_skipped++;
             } else {
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
             }
-            if (sched_timing) tt_launch += ggml_time_us() - t_ln0;
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
@@ -2544,14 +2467,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // post-compute: download stateful cache (KV/RS) for WRITEBACK tensors in this split
-        const int64_t t_wb0 = sched_timing ? ggml_time_us() : 0;
         if (sched->split_post_compute != NULL && split->n_writeback > 0) {
-            SCHED_SYNC_TIMED(tt_s_post, ggml_backend_synchronize(split_backend));
+            ggml_backend_synchronize(split_backend);
             for (int w = 0; w < split->n_writeback; w++) {
                 sched->split_post_compute(split->writeback[w], split_backend, sched->split_cb_user_data);
             }
         }
-        if (sched_timing) tt_postcomp += ggml_time_us() - t_wb0;
 
         // record compute done for copy stream sync
         if (sched->compute_events[split_backend_id] != NULL) {
@@ -2634,23 +2555,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // the user's inputs uploaded asynchronously above must be consumed before the caller can overwrite them
     for (int b = 0; b < sched->n_backends; b++) {
         if (flag_input_pending[b]) {
-            SCHED_SYNC_TIMED(tt_s_flagin, ggml_backend_synchronize(sched->backends[b]));
+            ggml_backend_synchronize(sched->backends[b]);
             flag_input_pending[b] = false;
         }
     }
 
-    if (sched_timing) {
-        GGML_LOG_INFO("sched_timing: n_splits=%d redirected=%d redirect_syncs=%d prefetched=%d skipped=%d total=%lld us | redirect_sync=%lld inputs=%lld precomp=%lld prefetch=%lld launch=%lld postcomp=%lld\n",
-            sched->n_splits, nn_redirected, nn_redirect_sync, nn_prefetched, nn_skipped, (long long)(ggml_time_us() - tt_start),
-            (long long)tt_redirect, (long long)tt_inputs, (long long)tt_precomp,
-            (long long)tt_prefetch, (long long)tt_launch, (long long)tt_postcomp);
-        GGML_LOG_INFO("sched_copy: flagin_cpy=%lld fallback_cpy=%lld set_async=%lld sliced_cpy=%lld d2h_async=%lld us (n=%d) handoff_n=%d (enq=%lld sync=%lld out=%lld)\n",
-            (long long)tt_c_flagin, (long long)tt_c_fallback, (long long)tt_c_setasync, (long long)tt_c_slicedcp, (long long)tt_c_d2h, nn_d2h, nn_handoff,
-            (long long)tt_h_enq, (long long)tt_h_sync, (long long)tt_h_out);
-        GGML_LOG_INFO("sched_sync: prev=%lld flag_in=%lld else_wait=%lld sliced=%lld cpy_fallback=%lld postcomp=%lld us\n",
-            (long long)tt_s_prev, (long long)tt_s_flagin, (long long)tt_s_wait,
-            (long long)tt_s_sliced, (long long)tt_s_cpy, (long long)tt_s_post);
-    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2731,8 +2640,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->copy_events[i] = NULL;
         sched->compute_events[i] = NULL;
         sched->d2h_events[i] = NULL;
-        sched->handoff_staging[i] = NULL;
-        sched->handoff_staging_size[i] = 0;
         ggml_backend_dev_t dev_i = ggml_backend_get_device(backends[i]);
         if (ggml_backend_dev_type(dev_i) == GGML_BACKEND_DEVICE_TYPE_CPU) {
             continue;
@@ -2777,9 +2684,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_backend_event_free(sched->copy_events[b]);
         ggml_backend_event_free(sched->compute_events[b]);
         ggml_backend_event_free(sched->d2h_events[b]);
-        if (sched->handoff_staging[b] != NULL) {
-            ggml_backend_buffer_free(sched->handoff_staging[b]);
-        }
         if (sched->copy_backends[b] != NULL) {
             ggml_backend_free(sched->copy_backends[b]);
         }

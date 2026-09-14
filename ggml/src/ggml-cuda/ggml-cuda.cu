@@ -2526,9 +2526,8 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
 // copies run ~40 GB/s on the same box). Stage such copies through a small pinned ring: worker
 // threads memcpy chunk k+1 into the ring while the GPU DMAs chunk k from it. The call stays
 // host-synchronous for the duration (exactly like the pageable copy it replaces) but at memcpy
-// speed (~30 GB/s with 8 threads) instead of the driver's pageable path.
-//   GGML_CUDA_STAGE_RING_MB   ring size in MiB (default 512 = 8 x 64 MiB chunks; 0 disables)
-//   GGML_CUDA_STAGE_THREADS   memcpy threads per chunk (default 8)
+// speed (~30 GB/s with 8 threads) instead of the driver's pageable path. Ring: 512 MiB = 8 x 64 MiB
+// chunks, 8 memcpy threads per chunk (measured 2026-09-02).
 // Pinned/registered/device sources, copies < 1 MiB, and copies issued during graph capture take
 // the direct path. One ring per PHYSICAL device: a CUDA event can only be recorded on a stream of
 // the device it was created on, so the slot events are created under that device (review finding
@@ -2557,15 +2556,7 @@ struct ggml_cuda_stage_ring {
         init_done = true;
         const int prev_device = ggml_cuda_get_device();
         ggml_cuda_set_device(device);
-        const char * e = getenv("GGML_CUDA_STAGE_RING_MB");
-        const size_t mb = e ? (size_t) atoll(e) : 512;
-        if (mb == 0) {
-            disabled = true;
-            return false;
-        }
-        if (const char * t = getenv("GGML_CUDA_STAGE_THREADS"); t && atoi(t) > 0) {
-            n_threads = atoi(t);
-        }
+        const size_t mb = 512;   // ring: 8 x 64 MiB chunks (the loader's chunking; measured 2026-09-02)
         n_chunks = std::max<int>(2, (int) ((mb << 20) / chunk));
         cudaError_t err = cudaHostAlloc((void **) &base, (size_t) n_chunks * chunk, cudaHostAllocPortable);
         if (err != cudaSuccess) {
@@ -2763,7 +2754,7 @@ static bool ggml_cuda_staged_h2d_now(int device, void * dst, const void * src, s
 //     layer's compute queued, so the block overlaps work instead of idling the device);
 //   - every other direct operation on a stream with pending staged copies (kernel launch, other
 //     copies, synchronize) drains that stream's jobs first.
-// GGML_CUDA_STAGE_ASYNC=0 falls back to the synchronous pipeline.
+// The synchronous pipeline (ggml_cuda_staged_h2d_now) is the worker's implementation.
 struct ggml_cuda_stage_worker {
     // COPY: staged pageable upload; RECORD: deferred event record; H2D/D2H/MEMSET: ordinary stream
     // operations the scheduler issued on a stream that still had staged copies queued - queued
@@ -2882,11 +2873,7 @@ static ggml_cuda_stage_worker * g_stage_workers[GGML_CUDA_MAX_DEVICES] = {};
 static std::atomic<bool> g_stage_any_worker{false};
 
 static bool ggml_cuda_stage_async_enabled() {
-    static const bool enabled = [] {
-        const char * e = getenv("GGML_CUDA_STAGE_ASYNC");
-        return e == nullptr || e[0] != '0';
-    }();
-    return enabled;
+    return true;   // the worker won its measurement 2026-09-02; the synchronous pipeline is its implementation
 }
 
 // worker of a device, created on first use; nullptr when async staging is off
@@ -3018,18 +3005,16 @@ static bool ggml_cuda_stage_queue_memset(int device, cudaStream_t stream, void *
 }
 #endif // !GGML_USE_HIP && !GGML_USE_MUSA
 
-// kernel copies (GGML_CUDA_KERNEL_COPY=1). On WDDM a copy-engine transfer ordered behind a kernel, or a
+// kernel copies (the expert pool turns them on while a pool tier is active). On WDDM a copy-engine transfer ordered behind a kernel, or a
 // kernel behind a transfer, costs 35-55 us of GPU idle: the OS scheduler fences the two engines. A copy
 // performed by a kernel through the device mapping of pinned host memory (cudaMallocHost, cudaHostRegister)
 // stays on the compute engine. Measured 2026-09-10 on an RTX 5070 Ti: kernel -> DMA D2H 8 KB -> sync 43 us
 // vs copy kernel 12 us; kernel -> DMA H2D 2 MB -> kernel 154 us vs copy kernel 58 us (~30 GB/s from host).
 // Transfers above the kernel-copy cap keep the copy engine (bandwidth-bound bulk): 16 MiB until the runtime sets
-// the machine profile's measured crossover through "ggml_backend_kernel_copy_max_set"; GGML_CUDA_KERNEL_COPY_MAX_MB
-// overrides both.
+// the machine profile's measured crossover through "ggml_backend_kernel_copy_max_set".
 static std::atomic<bool> ggml_cuda_kernel_copy_flag{false};   // runtime switch (the expert pool turns it on while active)
 static bool ggml_cuda_kernel_copy_enabled() {
-    static const int env_mode = [] { const char * e = getenv("GGML_CUDA_KERNEL_COPY"); return e != nullptr ? (atoi(e) != 0 ? 1 : 0) : -1; }();
-    return env_mode >= 0 ? env_mode != 0 : ggml_cuda_kernel_copy_flag.load(std::memory_order_relaxed);
+    return ggml_cuda_kernel_copy_flag.load(std::memory_order_relaxed);
 }
 bool ggml_backend_cuda_kernel_copy_set(bool on) {
     ggml_cuda_kernel_copy_flag.store(on, std::memory_order_relaxed);
@@ -3037,8 +3022,7 @@ bool ggml_backend_cuda_kernel_copy_set(bool on) {
 }
 static std::atomic<size_t> ggml_cuda_kernel_copy_max_flag{(size_t) 16 << 20};
 static size_t ggml_cuda_kernel_copy_max_bytes() {
-    static const long long env_mx = [] { const char * e = getenv("GGML_CUDA_KERNEL_COPY_MAX_MB"); return e != nullptr ? (long long) (atof(e) * 1024.0 * 1024.0) : -1LL; }();
-    return env_mx >= 0 ? (size_t) env_mx : ggml_cuda_kernel_copy_max_flag.load(std::memory_order_relaxed);
+    return ggml_cuda_kernel_copy_max_flag.load(std::memory_order_relaxed);
 }
 size_t ggml_backend_cuda_kernel_copy_max_set(size_t bytes) {
     return ggml_cuda_kernel_copy_max_flag.exchange(bytes, std::memory_order_relaxed);
@@ -3779,16 +3763,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
     // certified for pshard 2026-09-01: the corruption was the memory-range check
     // skipping op-NONE srcs (sched slot copies), letting the fused dst legally land
-    // in just-freed weight-copy bytes the kernel still reads. The check sees them
-    // now; this env remains as a manual disable lever only.
-    // value-based: "0" force-ENABLES the fusion under pshard (certification/debug lever)
-    static const bool disable_glu_fusion = [] {
-        const char * v = getenv("GGML_CUDA_DISABLE_FUSION_GLU");
-        return v != nullptr && v[0] != '0';
-    }();
-
-    if (!disable_glu_fusion &&
-        (is_equal(mul_mat_bias_glu_ops, ops) || is_equal(mul_mat_id_bias_glu_ops, ops)) &&
+    // in just-freed weight-copy bytes the kernel still reads. The check sees them now.
+    if ((is_equal(mul_mat_bias_glu_ops, ops) || is_equal(mul_mat_id_bias_glu_ops, ops)) &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 })) {
         const ggml_tensor * ffn_gate      = cgraph->nodes[node_idx];
         const ggml_tensor * ffn_gate_bias = cgraph->nodes[node_idx + 1];
@@ -3802,7 +3778,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
-    if (!disable_glu_fusion &&
+    if (
         (is_equal(mul_mat_id_glu_ops, ops) || is_equal(mul_mat_glu_ops, ops)) &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
         const ggml_tensor * ffn_gate = cgraph->nodes[node_idx];
@@ -4045,10 +4021,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     //topk-moe
-    // debug kill-switch (pshard split-graph triage)
-    static bool disable_topk_fusion = getenv("GGML_CUDA_DISABLE_FUSION_TOPK") != nullptr;
-    if (!disable_topk_fusion &&
-            (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+    if ((cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT)) {
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
@@ -5405,12 +5378,7 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
 }
 
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    // unset or "0": do not page-lock (GGML_CUDA_REGISTER_HOST=0 is the pageable-copies lever;
-    // note that pageable uploads >= 1 MiB then go through the staging ring - add
-    // GGML_CUDA_STAGE_RING_MB=0 to measure the driver's raw pageable path)
-    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr || getenv("GGML_CUDA_REGISTER_HOST")[0] == '0') {
-        return false;
-    }
+    // page-locks the caller's mapping (the pshard loader's mmap regions, the profiler's pin-ceiling probe)
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);

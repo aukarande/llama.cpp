@@ -9,6 +9,97 @@
 #include <cstdio>
 #include <cstring>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>
+#endif
+
+static std::string llama_benchmark_cpu_brand() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    char brand[49] = { 0 };
+    for (int i = 0; i < 3; i++) {
+        int r[4] = { 0, 0, 0, 0 };
+#if defined(_MSC_VER)
+        __cpuid(r, 0x80000002 + i);
+#else
+        __cpuid(0x80000002 + i, r[0], r[1], r[2], r[3]);
+#endif
+        memcpy(brand + 16 * i, r, 16);
+    }
+    std::string s;
+    for (const char * p = brand; *p; p++) {
+        if (*p == ' ' && (s.empty() || s.back() == ' ')) {
+            continue;
+        }
+        s += *p;
+    }
+    while (!s.empty() && s.back() == ' ') {
+        s.pop_back();
+    }
+    return s.empty() ? std::string("unknown") : s;
+#else
+    return "unknown";
+#endif
+}
+
+llama_benchmark_stats::machine_t llama_benchmark_stats::machine_current(ggml_backend_dev_t gpu_dev, int n_threads) {
+    machine_t m;
+    m.cpu     = llama_benchmark_cpu_brand();
+    m.threads = n_threads;
+    m.schema  = 2;
+#if defined(_WIN32)
+    m.os = "windows";
+#elif defined(__APPLE__)
+    m.os = "macos";
+#elif defined(__linux__)
+    m.os = "linux";
+#else
+    m.os = "unknown";
+#endif
+    m.gpu = "none";
+    if (gpu_dev != nullptr) {
+        const char * d = ggml_backend_dev_description(gpu_dev);
+        if (d != nullptr) {
+            m.gpu = d;
+        }
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(gpu_dev, &fr, &tot);
+        m.vram_mib = tot >> 20;
+    }
+    return m;
+}
+
+uint64_t llama_benchmark_stats::machine_hash(const machine_t & m) {
+    const std::string key = m.gpu + "|" + m.cpu + "|" + m.os;
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : key) {
+        h ^= c;
+        h *= 1099511628211ull;
+    }
+    return h == 0 ? 1 : h;   // 0 means "unknown" in the registry
+}
+
+std::string llama_benchmark_stats::machine_mismatch(const machine_t & profile, const machine_t & current) {
+    std::string why;
+    if (profile.gpu != current.gpu) {
+        why += "gpu \"" + profile.gpu + "\" vs \"" + current.gpu + "\"; ";
+    }
+    if (profile.cpu != current.cpu) {
+        why += "cpu \"" + profile.cpu + "\" vs \"" + current.cpu + "\"; ";
+    }
+    if (profile.os != current.os) {
+        why += "os " + profile.os + " vs " + current.os + "; ";
+    }
+    if (profile.threads != current.threads) {
+        why += "threads " + std::to_string(profile.threads) + " vs " + std::to_string(current.threads) + "; ";
+    }
+    if (!why.empty()) {
+        why = "profile measured on another machine or configuration: " + why.substr(0, why.size() - 2);
+    }
+    return why;
+}
+
 llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node) {
     llama_op_metrics m = {};
 

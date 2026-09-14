@@ -1332,16 +1332,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         LOG_INF("%s: pshard enabled, probing and loading plan cache\n", __func__);
         // fused-GLU is certified for pshard as of 2026-09-01: the fusion memory-range
         // check now sees scheduler input copies, so fusion self-disables exactly on
-        // layers where the fused dst would alias recycled slot bytes. The
-        // GGML_CUDA_DISABLE_FUSION_GLU env remains available as a manual lever.
-#ifdef _WIN32
-        // page-lock mmap'd weights so streamed copies run at full async PCIe rate
-        if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
-            _putenv_s("GGML_CUDA_REGISTER_HOST", "1");
-        }
-#else
-        setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
-#endif
+        // layers where the fused dst would alias recycled slot bytes.
         params.tensor_buft_overrides.resize(4096);
         // spec verify tier: the target context advertises n_draft+1 outputs per sequence
         const uint32_t n_draft_tier = cparams.n_outputs_max_per_seq > 1 ? cparams.n_outputs_max_per_seq - 1 : 0;
@@ -1378,15 +1369,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             common_pshard_draft_leftover(params, mparams.pshard_registry, mparams.max_vram_alloc);
         }
         if (!mparams.pshard) {
-            // this process continues on the STOCK path: undo the pshard-only env gates so the
-            // fallback run keeps stock fusion behavior
-#ifdef _WIN32
-            _putenv_s("GGML_CUDA_DISABLE_FUSION_GLU", "");
-            _putenv_s("GGML_CUDA_REGISTER_HOST", "");
-#else
-            unsetenv("GGML_CUDA_DISABLE_FUSION_GLU");
-            unsetenv("GGML_CUDA_REGISTER_HOST");
-#endif
+            // this process continues on the STOCK path
             LOG_WRN("%s: pshard not active for this configuration\n", __func__);
             llama_pshard_registry_free(mparams.pshard_registry);
             mparams.pshard_registry = nullptr;

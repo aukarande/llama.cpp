@@ -1188,13 +1188,13 @@ bool pshard_registry_save(
 
     // trailing fields after cache_ubatch are ignored by older parsers (sscanf assigns
     // the two %u before the literal ']' mismatch and still returns 2)
-    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu kernel_cap_mb=%.0f]\n",
+    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu kernel_cap_mb=%.0f machine=%016llx]\n",
         budget_mib, cache_ubatch,
         registry->switch_layer_mb, registry->switch_attn_frac,
         registry->switch_head_mb, registry->switch_pcie_gb_s,
         registry->mtp_head_cpu ? 1 : 0, registry->mtp_head_extra_mb,
         (size_t) ((registry->union_bytes + 1024 * 1024 - 1) / (1024 * 1024)),  // whole MiB, rounded up
-        registry->kernel_copy_cap_mb);
+        registry->kernel_copy_cap_mb, (unsigned long long) registry->machine_hash);
     if (registry->pshard_disabled) {
         fprintf(f, "pshard_disabled=1 baseline_vram=%.1f\n", registry->baseline_vram_req / (1024.0 * 1024.0));
     } else {
@@ -1277,6 +1277,7 @@ bool pshard_registry_load(
         float switch_head_mb = 0.0f;
         float switch_pcie_gb_s = 0.0f;
         float kernel_copy_cap_mb = -1.0f;
+        uint64_t machine_hash  = 0;
         bool  mtp_head_cpu     = false;
         uint32_t mtp_head_extra_mb = 0;
         size_t union_bytes     = 0;
@@ -1284,6 +1285,9 @@ bool pshard_registry_load(
     };
     std::vector<variant_data> variants;
     variant_data * cur_variant = nullptr;
+    // a variant records the machine it was planned on (gpu|cpu|os hash); one planned elsewhere is not reused
+    const uint64_t current_machine_hash = llama_benchmark_stats::machine_hash(
+        llama_benchmark_stats::machine_current(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU), 0));
 
     while (fgets(line, sizeof(line), f)) {
         std::string s = line;
@@ -1310,6 +1314,7 @@ bool pshard_registry_load(
             if ((p = strstr(s.c_str(), "head_mb="))   != NULL) cur_variant->switch_head_mb   = (float)atof(p + 8);
             if ((p = strstr(s.c_str(), "pcie="))      != NULL) cur_variant->switch_pcie_gb_s = (float)atof(p + 5);
             if ((p = strstr(s.c_str(), "kernel_cap_mb=")) != NULL) cur_variant->kernel_copy_cap_mb = (float)atof(p + 14);
+            if ((p = strstr(s.c_str(), "machine=")) != NULL) cur_variant->machine_hash = strtoull(p + 8, NULL, 16);
             if ((p = strstr(s.c_str(), "mtp_head_cpu=")) != NULL) cur_variant->mtp_head_cpu = atoi(p + 13) != 0;
             if ((p = strstr(s.c_str(), "mtp_head_extra_mb=")) != NULL) cur_variant->mtp_head_extra_mb = (uint32_t) atoi(p + 18);
             if ((p = strstr(s.c_str(), "union_mb="))    != NULL) cur_variant->union_bytes = (size_t)(atof(p + 9) * 1024.0 * 1024.0);
@@ -1463,6 +1468,7 @@ bool pshard_registry_load(
     };
 
     for (const auto & variant : variants) {
+        if (variant.machine_hash != 0 && variant.machine_hash != current_machine_hash) continue;   // planned elsewhere
         if (!variant.pshard_disabled) continue;
         if (!cache_ubatch_ok(variant)) continue;
         const size_t baseline_vram = pshard_mib_to_bytes(variant.baseline_vram_mib);
@@ -1490,6 +1496,11 @@ bool pshard_registry_load(
     bool best_is_exact = false;
     for (const auto & variant : variants) {
         if (variant.pshard_disabled || variant.tiers.empty()) continue;
+        if (variant.machine_hash != 0 && variant.machine_hash != current_machine_hash) {
+            LLAMA_LOG_WARN("%s: registry variant budget=%u was planned on another machine (%016llx, this machine %016llx) - ignored; re-plan here\n",
+                __func__, variant.budget_mib, (unsigned long long) variant.machine_hash, (unsigned long long) current_machine_hash);
+            continue;
+        }
         if (!cache_ubatch_ok(variant)) continue;
         const bool exact = variant.budget_mib == current_budget_mib;
         if (require_exact_budget && !exact) continue;
@@ -1566,6 +1577,7 @@ bool pshard_registry_load(
         registry->switch_head_mb   = best_whole->switch_head_mb;
         registry->switch_pcie_gb_s = best_whole->switch_pcie_gb_s;
         registry->kernel_copy_cap_mb = best_whole->kernel_copy_cap_mb;
+        registry->machine_hash     = best_whole->machine_hash;
         registry->mtp_head_cpu     = best_whole->mtp_head_cpu;
         registry->mtp_head_extra_mb = best_whole->mtp_head_extra_mb;
         registry->union_bytes      = best_whole->union_bytes;
@@ -2104,7 +2116,6 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     //            layer by every cache-tier policy (Pool_Serve_us).
     //   t_split: the CPU route's handoff (activation download, host graph, partial upload, join), paid per
     //            layer with CPU routes (Pool_Split_us); the CPU compute itself is t_cpu per expert.
-    //   PSHARD_POOL_CPU_GBS / PSHARD_POOL_CPU_GFLOPS override the two CPU rates for experiments.
     const llama_benchmark_stats * st = ctx.predictor ? &ctx.predictor->stats : nullptr;
     const double b_row = ctx.exps_tensors_per_layer > 0 ? b_expert / ctx.exps_tensors_per_layer : b_expert;
     {
@@ -2122,7 +2133,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         if (ctx.exps_total_weights == 0 || ctx.n_expert == 0) {
             missing += " expert-weight-count(gguf)";
         }
-        if (ctx.zipf_alpha < 0.0 && getenv("PSHARD_POOL_ZIPF") == nullptr) {
+        if (ctx.zipf_alpha < 0.0) {
             missing += " zipf_alpha(routing-workload)";
         }
         if (!missing.empty()) {
@@ -2133,14 +2144,8 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     }
     const double bp_idle   = st->slice_bw_kernel(b_row, false);
     const double bp_loaded = st->slice_bw_kernel(b_row, true);
-    double cpu_gbs = st->peak_system_bw;
-    if (const char * cg = getenv("PSHARD_POOL_CPU_GBS")) {
-        cpu_gbs = std::max(0.5, atof(cg));
-    }
-    double cpu_gflops = st->cpu_matmul_floor_gflops;
-    if (const char * cg = getenv("PSHARD_POOL_CPU_GFLOPS")) {
-        cpu_gflops = std::max(1.0, atof(cg));
-    }
+    const double cpu_gbs    = st->peak_system_bw;
+    const double cpu_gflops = st->cpu_matmul_floor_gflops;
     const double w_expert = (double) ctx.exps_total_weights / ((double) ctx.n_expert * n_layers_exp);
     const double t_fetch_idle   = b_expert / 1e9 / bp_idle   * 1000.0;   // ms per fetched expert, CPU idle
     const double t_fetch_loaded = b_expert / 1e9 / bp_loaded * 1000.0;   // ms per fetched expert beside the CPU chain
@@ -2178,13 +2183,9 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         // generations pay the fill (an 86-slot layer needs ~10 tokens of misses),
         // which the 32-token QA gate reports as the cold one. (An LRU-shortfall
         // factor and admission gating were both measured unnecessary and removed.)
-        // PSHARD_POOL_ZIPF overrides alpha for experiments.
         const double E = (double) ctx.n_expert;
         const double s = std::min<double>(plan.pool_slots, E);
-        double alpha = ctx.zipf_alpha;
-        if (const char * za = getenv("PSHARD_POOL_ZIPF")) {
-            alpha = atof(za);
-        }
+        const double alpha = ctx.zipf_alpha;
         auto zipf_mass = [alpha](double n) {
             double m = 0.0;
             for (int i = 1; i <= (int) n; i++) {
@@ -2669,6 +2670,7 @@ void llama_params_fit_pshard_plan(
     g_pshard_mtp_head_cpu = false;
 
     std::unique_ptr<llama_benchmark_predictor> predictor;
+    uint64_t machine_hash = 0;
     {
         const char * env_cpu  = getenv("PSHARD_CPU_PROFILE");
         const char * env_gpu  = getenv("PSHARD_GPU_PROFILE");
@@ -2678,6 +2680,38 @@ void llama_params_fit_pshard_plan(
         auto p = std::make_unique<llama_benchmark_predictor>();
         const bool has_cpu = p->load_cpu(cpu_path, cparams->n_threads);
         const bool has_gpu = p->load_gpu(gpu_path);
+        // the profile must be THIS machine's, complete (schema 2) and measured at this thread count: nothing in
+        // the planner prices without it, and a profile from another box would price with that box's numbers.
+        // There is no override.
+        {
+            // the same device the profiler measured and the registry loader hashes: the first GPU-type device in
+            // registry order (a plan for another GPU of a multi-GPU box needs a profile of that GPU, which the
+            // profiler cannot yet select - the refusal then names both descriptions)
+            const auto current = llama_benchmark_stats::machine_current(
+                ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU), cparams->n_threads);
+            std::string why;
+            if (!has_cpu) {
+                why = std::string("no CPU profile at ") + cpu_path + " for " + std::to_string(cparams->n_threads) + " threads";
+            } else if (p->stats.machine.schema < 2) {
+                why = "the CPU profile predates schema 2 (no machine line, no kernel-copy measurements)";
+            } else {
+                why = llama_benchmark_stats::machine_mismatch(p->stats.machine, current);
+            }
+            if (!why.empty()) {
+                LLAMA_LOG_ERROR("%s: pshard refused - %s. Run llama-profiler-cpu --splice %s (or a full profile) on this machine: "
+                    "gpu=\"%s\" cpu=\"%s\" os=%s threads=%d\n",
+                    __func__, why.c_str(), cpu_path, current.gpu.c_str(), current.cpu.c_str(), current.os.c_str(), cparams->n_threads);
+                mparams->pshard = false;
+                mparams->pshard_delegate_compute = false;
+                cparams->pshard = false;
+                return;
+            }
+            machine_hash = llama_benchmark_stats::machine_hash(current);
+            // every registry write from here on names this machine (the pshard_disabled global-fit save included)
+            if (mparams->pshard_registry != nullptr) {
+                mparams->pshard_registry->machine_hash = machine_hash;
+            }
+        }
         if (has_cpu || has_gpu) {
             predictor = std::move(p);
             LLAMA_LOG_INFO("%s: benchmark predictor loaded (cpu=%s gpu=%s)\n",
@@ -3131,6 +3165,7 @@ void llama_params_fit_pshard_plan(
         pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
             path_model, mparams);
         registry->kernel_copy_cap_mb = predictor ? (float) predictor->stats.kernel_copy_cap_mb : -1.0f;
+        registry->machine_hash = machine_hash;
         pshard_compute_switch_costs(registry, ctx, n_layers,
             predictor ? (predictor->stats.upload_bw > 0.0
                 ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 0.0);   // no profile: unpriced
@@ -3163,6 +3198,7 @@ void llama_params_fit_pshard_plan(
                     pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
                         path_model, mparams);
                     registry->kernel_copy_cap_mb = predictor ? (float) predictor->stats.kernel_copy_cap_mb : -1.0f;
+                    registry->machine_hash = machine_hash;
                     pshard_compute_switch_costs(registry, ctx, n_layers,
                         predictor ? (predictor->stats.upload_bw > 0.0
                             ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 0.0);   // no profile: unpriced

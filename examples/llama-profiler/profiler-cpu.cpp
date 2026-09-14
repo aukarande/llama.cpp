@@ -639,6 +639,10 @@ static bool splice_profile_header(const char * path, calib_results & cr, int thr
                    &tc, &a, &b, &c, &d) == 5) {
             if (cr.cpu_eff < 0.0) cr.cpu_eff = d;
             if (cr.pcie_concurrent <= 0.0) cr.pcie_concurrent = c;
+            if (tc != threads) {
+                printf("WARNING: the op tables in %s were measured at %d threads, this splice ran at %d: the planner matches the\n"
+                       "         thread count and will refuse the file - rerun with --threads %d\n", path, tc, threads, tc);
+            }
         }
         double pc = 0.0;
         if (sscanf(lines[i].c_str(), "#   Host_Pin_Ceiling: %lf GB", &pc) == 1 && cr.pin_ceiling_gb <= 0.0) {
@@ -677,13 +681,6 @@ static double calibrate_pin_ceiling(pcie_stress_ctx * pcie) {
         printf("  backend does not expose host registration - skipping\n\n");
         return 0.0;
     }
-    // the CUDA implementation is gated on this env (the runtime's pageable-copies
-    // measurement lever); the profiler measures the real machine
-#ifdef _WIN32
-    _putenv_s("GGML_CUDA_REGISTER_HOST", "1");
-#else
-    setenv("GGML_CUDA_REGISTER_HOST", "1", 1);
-#endif
     // stop short of AVAILABLE memory: past it the probe faults into swap and
     // measures the pager (or feeds the OOM killer), not the driver
     size_t avail = 0;
@@ -1190,11 +1187,6 @@ int main(int argc, char ** argv) {
         calibrate_pcie(&pcie);
         cr.pcie_standalone = pcie.calibrated_bw_gb_s;
         procs = lookup_gpu_procs(pcie.gpu_backend);
-        if (getenv("GGML_CUDA_KERNEL_COPY") != nullptr || getenv("GGML_CUDA_KERNEL_COPY_MAX_MB") != nullptr) {
-            printf("GGML_CUDA_KERNEL_COPY / GGML_CUDA_KERNEL_COPY_MAX_MB are set and override the switches the\n"
-                   "profiler drives: unset them to measure the kernel-copy paths (their lines are omitted)\n\n");
-            procs.kernel_copies = false;
-        }
         calibrate_pcie_sliced(&pcie, procs, threads, SLICED_DMA, true, cr.sliced_bw);
         if (procs.kernel_copies) {
             calibrate_pcie_sliced(&pcie, procs, threads, SLICED_KERNEL, true, cr.sliced_kernel_bw);

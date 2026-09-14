@@ -188,7 +188,9 @@ static std::map<uint32_t, uint32_t> bench_plan_context_tier_caps(const bench_pla
     return result;
 }
 
-static void plan_pshard_context(common_params & params, uint32_t n_ctx, uint32_t bench_tier_cap = 0, bool bench_plan = false) {
+// false when the planner refused pshard for this context (no or foreign machine profile, unsupported params):
+// nothing was written for it
+static bool plan_pshard_context(common_params & params, uint32_t n_ctx, uint32_t bench_tier_cap = 0, bool bench_plan = false) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -252,7 +254,9 @@ static void plan_pshard_context(common_params & params, uint32_t n_ctx, uint32_t
             return r;
         });
 
+    const bool planned = mparams.pshard;
     llama_pshard_registry_free(mparams.pshard_registry);
+    return planned;
 }
 
 int main(int argc, char ** argv) {
@@ -284,6 +288,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    bool ok = true;
     if (bench.enabled) {
         const std::map<uint32_t, uint32_t> ctx_caps = bench_plan_context_tier_caps(bench);
         if (ctx_caps.empty()) {
@@ -293,13 +298,17 @@ int main(int argc, char ** argv) {
 
         LOG_INF("%s: planning %zu unique llama-bench context(s)\n", __func__, ctx_caps.size());
         for (const auto & ctx_cap : ctx_caps) {
-            plan_pshard_context(params, ctx_cap.first, ctx_cap.second, true);
+            ok = plan_pshard_context(params, ctx_cap.first, ctx_cap.second, true) && ok;
         }
     } else {
         auto cparams = common_context_params_to_llama(params);
-        plan_pshard_context(params, cparams.n_ctx);
+        ok = plan_pshard_context(params, cparams.n_ctx);
     }
 
+    if (!ok) {
+        LOG_ERR("%s: planning REFUSED (see the error above) - nothing written for the refused context(s)\n", __func__);
+        return 2;
+    }
     LOG_INF("%s: planning complete, registry written next to model file\n", __func__);
 
     return 0;

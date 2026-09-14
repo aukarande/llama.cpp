@@ -434,15 +434,14 @@ extern "C" {
     // "ggml_backend_copy_segments_async": one launch uploading many pinned host segments to the device
     //   on the backend's stream (false = not taken, the caller falls back to per-tensor set_async)
     // "ggml_backend_kernel_copy_set": run copies to/from device-accessible pinned host memory as kernels
-    //   (no copy-engine transitions - on WDDM each costs 35-55 us of GPU idle); GGML_CUDA_KERNEL_COPY=0/1
-    //   overrides the switch
+    //   (no copy-engine transitions - on WDDM each costs 35-55 us of GPU idle)
     struct ggml_backend_copy_segment { void * dst; const void * src; size_t size; };
     typedef bool (*ggml_backend_copy_segments_async_t)(ggml_backend_t backend,
             const struct ggml_backend_copy_segment * segs, int n);
     typedef bool (*ggml_backend_kernel_copy_set_t)(bool on);
     // "ggml_backend_kernel_copy_max_set": bytes above which a transfer keeps the copy engine even with kernel
-    //   copies on (bandwidth-bound bulk). The runtime sets the machine profile's measured crossover here;
-    //   GGML_CUDA_KERNEL_COPY_MAX_MB overrides it. Returns the previous runtime value.
+    //   copies on (bandwidth-bound bulk). The runtime sets the machine profile's measured crossover here.
+    //   Returns the previous runtime value.
     typedef size_t (*ggml_backend_kernel_copy_max_set_t)(size_t bytes);
 
     // Per-split info snapshot for timing prediction.

@@ -175,11 +175,7 @@ inline thread_local size_t g_pshard_extra_device_bytes = 0;
 size_t llama_pshard_extra_device_bytes(const llama_model & model, uint32_t n_seq_max, uint32_t n_rs_seq);
 
 inline const char * llama_pshard_arch_unsupported(const llama_model & model) {
-    // PSHARD_ALLOW_UNSUPPORTED=1: development lever - run a refused architecture anyway
-    static const bool allow = getenv("PSHARD_ALLOW_UNSUPPORTED") != nullptr && getenv("PSHARD_ALLOW_UNSUPPORTED")[0] == '1';
-    if (allow) {
-        return nullptr;
-    }
+    // no architecture is refused today; the callers keep the hook
     (void) model;
     return nullptr;
 }
@@ -328,6 +324,9 @@ struct llama_pshard_plan_registry {
     // a copy-engine transfer ordered against kernels); the pool sets it as the engine's cap while active.
     // -1 = not in the profile -> the engine keeps its default
     float kernel_copy_cap_mb = -1.0f;
+    // hash of the machine (gpu description | cpu brand | os) the variant was planned on; the loader ignores a
+    // variant planned elsewhere. 0 = unknown (older registry)
+    uint64_t machine_hash = 0;
     bool  mtp_head_cpu     = false; // MTP head demoted to CPU by union-budget enforcement
     // RETIRED 2026-09-06 (kept so existing registry files still parse; never charged): the
     // analytical arena charge for the MTP context's larger device compute with the head on the

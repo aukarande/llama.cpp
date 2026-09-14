@@ -125,19 +125,8 @@ struct llama_expert_pool {
         std::vector<uint64_t> slot_pf_gen;   // [n_slots] pass that prefetched the slot
 
         // per-layer allocation: this layer's slot count (= the pool's uniform n_slots
-        // unless the last warm start redistributed the region by prompt demand)
+        // the same count in every layer)
         uint32_t n_slots_l = 0;
-        // prompt routing stats per expert (A/B mode counts them for free): the warm
-        // start seeds the cache and sizes the layers from them. Recency-weighted
-        // (user hypothesis 2026-09-04: the reply continues the prompt's TAIL, so the
-        // last tokens' experts matter most - the flat histogram measured no win):
-        // prompt_last[e] = position of the expert's most recent route, prompt_count[e]
-        // = plain count; the warm order is (last DESC, count DESC) - prompt-end LRU.
-        std::vector<uint32_t> prompt_count;
-        std::vector<uint32_t> prompt_last;
-        uint32_t              prompt_pos = 0;   // tokens of this prompt seen by this layer
-        ggml_backend_event_t  warm_event   = nullptr;   // this layer's seeds landed (copy stream)
-        bool                  warm_pending = false;
         ids_buf bias_buf;                     // persistent upload buffers (async-safe)
         std::vector<int32_t> cpu_buf;
         std::vector<uint64_t> expert_last_gen; // [n_expert] recency: last generation routed
@@ -162,8 +151,7 @@ struct llama_expert_pool {
     bool     prefetch_on   = true;   // PSHARD_POOL_PREFETCH=0: predict and score only
     // dead CPU chains (every route of the pass resident or promoted): the sched skips the
     // chain's compute and zero-fills its merge input instead of the host join copy.
-    // PSHARD_POOL_SKIP_DEAD=0 computes them anyway (A/B switch)
-    bool     skip_dead     = true;
+    // (always on: measured a win on 2026-09-10; the A/B switch was removed 2026-09-13)
     uint64_t skipped_splits = 0;     // CPU chains the sched skipped on our word
     int32_t  prefetch_n    = 1;      // PSHARD_POOL_PREFETCH_N: at most this many of the predicted
                                      // experts per layer, highest predicted score first (0 = all).
@@ -171,10 +159,10 @@ struct llama_expert_pool {
                                      // path misses: DSv4 @12000 N=1 +6.5%, N=2 +3.7%, N=3 -2%
     std::vector<char> pred_read_buf;
     // page-locked staging: the ids / prediction downloads and every layer's id upload buffers.
-    // Device-accessible, so with GGML_CUDA_KERNEL_COPY the backend moves them with kernels instead
+    // Device-accessible, so with kernel copies on the backend moves them with kernels instead
     // of copy-engine transfers (a DMA ordered behind kernels costs 30-55 us of GPU idle on WDDM
     // whether the host side is pinned or pageable - the pinned arena of 2026-09-10 regressed for
-    // that reason). Allocated only when that env is set; larger batches fall back to the vectors.
+    // that reason). Allocated while kernel copies are on; larger batches fall back to the vectors.
     ggml_backend_buffer_t read_staging = nullptr;
     bool   read_staging_tried = false;
     bool   kernel_copies      = false;   // the backend runs pinned-memory copies as kernels while we are active
@@ -198,19 +186,6 @@ struct llama_expert_pool {
     void *   region_base   = nullptr;
     size_t   region_bytes  = 0;
     ggml_backend_buffer_t region_arena = nullptr;
-    // warm start (A/B -> cache flip after a prefill): per-layer slot plan from the
-    // prompt histogram (valid for the uniform count it was derived from) and seeding
-    std::vector<uint32_t> layer_slots_plan;
-    uint32_t              layer_slots_plan_base = 0;
-    bool                  prompt_seen = false;
-    // both measured 2026-09-03 and left OFF by default: seeding costs link time the
-    // cache would have spent warming itself (q35 32 tok: h 0.70 -> 0.73 but 44.9 ->
-    // 43.0 t/s; DSv4 10.65 -> 10.39) and the per-layer redistribution moved h by
-    // <= 0.4 points; PSHARD_POOL_WARM=N / PSHARD_POOL_ALLOC=1 enable them
-    int32_t  warm_n        = 0;        // PSHARD_POOL_WARM: seeds per layer (0 = off)
-    bool     alloc_on      = false;    // PSHARD_POOL_ALLOC=1: slots per layer by prompt demand
-    uint64_t warm_seeded   = 0;
-    uint32_t warm_starts   = 0;
     size_t   layer_slot_bytes = 0;     // per-layer cache-mode footprint (all tensors)
     size_t   layer_full_bytes = 0;     // per-layer whole-expert-set footprint
     bool     ab_capable       = false; // the region holds the A/B pair (set_region)
@@ -261,9 +236,6 @@ struct llama_expert_pool {
     void bind_pred_ids(int32_t il, ggml_tensor * ids_pred);
     // the pool's copy backend + event (background admission, prefetch); no-op once created
     void ensure_admit_backend(ggml_backend_t split_backend);
-    // at the A/B -> cache flip: size the layers by prompt demand and seed the cache
-    // with each layer's most-used prompt experts (uploads on the copy stream)
-    void warm_start();
     void bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggml_tensor * ids_gpu,
                         ggml_tensor * ids_gpu_bias, ggml_tensor * ids_cpu);
     ggml_tensor * mm_view(int32_t il, const ggml_tensor * host) const;

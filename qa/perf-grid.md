@@ -61,7 +61,7 @@ overlap in all 16 pairs (identical counters, never slower). The noovl ledger col
 |---|---|---|---|
 | 1 | fetch | `PSHARD_MISS_POLICY=fetch` | the baseline policy |
 | 2 | fetch + pred | + `PSHARD_POOL_PREDICT=1` | predictor default |
-| 3 | fetch + pred + warm | + `PSHARD_POOL_WARM=8 PSHARD_POOL_ALLOC=1` | prompt-end LRU seeding + per-layer slots |
+| 3 | fetch + pred + warm | retired 2026-09-13: `PSHARD_POOL_WARM` / `PSHARD_POOL_ALLOC` were removed after measuring no win | drop the arm at the next rerun |
 | 4 | hybrid | `PSHARD_MISS_POLICY=hybrid` | the FreeToken q* split |
 | 5 | hybrid + pred | + `PSHARD_POOL_PREDICT=1` | whether prefetch hurts CPU-route policies everywhere |
 | 7 | cpu_admit | `PSHARD_MISS_POLICY=cpu_admit` | background admission |
