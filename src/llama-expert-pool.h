@@ -312,3 +312,11 @@ struct llama_expert_pool {
     // pass-local distinct-expert marker (union guard)
     std::vector<uint8_t> seen_gen;
 };
+
+// finished graph of a pshard context: nodes that follow a layer's first read of a host-resident weight (a CPU-computed
+// or streamed layer) or of a pool-served tensor, without depending on it, move ahead of that boundary; the pool's ids
+// leaves count as late when the pool is active (pool may be nullptr)
+// sched (may be nullptr): a region whose boundary computes on the CPU gets a split cut before its first hoisted
+// node, so the scheduler fetches the CPU split's inputs before the hoisted nodes launch
+void llama_pshard_hoist_independent(ggml_cgraph * gf, llama_expert_pool * pool, ggml_backend_sched_t sched,
+                                    uint32_t * hoisted, uint32_t * regions);

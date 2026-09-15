@@ -3635,9 +3635,12 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->res->set_outputs(params);
 
-    if (params.expert_pool != nullptr) {
-        // pooled layers: hoist nodes independent of the routed experts ahead of the split boundary
-        params.expert_pool->hoist_independent(llm->res->get_gf());
+    if (params.cparams.pshard) {
+        // hoist nodes independent of a layer's host-resident weights (CPU-computed, streamed or pooled experts)
+        // ahead of the split boundary
+        uint32_t * hoisted = params.expert_pool != nullptr ? &params.expert_pool->hoisted_nodes : nullptr;
+        uint32_t * regions = params.expert_pool != nullptr ? &params.expert_pool->hoist_regions : nullptr;
+        llama_pshard_hoist_independent(llm->res->get_gf(), params.expert_pool, params.sched, hoisted, regions);
     }
 
     return llm->res->get_gf();

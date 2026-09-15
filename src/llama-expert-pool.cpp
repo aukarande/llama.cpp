@@ -6,6 +6,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -565,9 +566,19 @@ void llama_expert_pool::arm_ids_host() {
 }
 
 void llama_expert_pool::hoist_independent(ggml_cgraph * gf) {
-    hoisted_nodes = 0;
-    hoist_regions = 0;
-    if (!active || gf == nullptr) {
+    llama_pshard_hoist_independent(gf, this, nullptr, &hoisted_nodes, &hoist_regions);
+}
+
+void llama_pshard_hoist_independent(ggml_cgraph * gf, llama_expert_pool * pool, ggml_backend_sched_t sched,
+                                    uint32_t * hoisted, uint32_t * regions) {
+    if (sched != nullptr) {
+        ggml_backend_sched_clear_split_before(sched);
+    }
+    uint32_t hoisted_nodes = 0;
+    uint32_t hoist_regions = 0;
+    if (hoisted) { *hoisted = 0; }
+    if (regions) { *regions = 0; }
+    if (gf == nullptr) {
         return;
     }
     const int n = ggml_graph_n_nodes(gf);
@@ -576,27 +587,51 @@ void llama_expert_pool::hoist_independent(ggml_cgraph * gf) {
     }
     ggml_tensor ** nodes = ggml_graph_nodes(gf);
 
-    // late tensors: the pooled host weights (served at the split) and the ids leaves serve() writes; nodes
-    // reading them, and their dependents, keep their place
-    std::unordered_map<const ggml_tensor *, int32_t> late;   // late tensor -> its layer
-    for (const auto & L : layers) {
-        for (const auto & e : L.tensors) {
-            late[e.host] = L.il;
-        }
-        if (L.ids_gpu      != nullptr) { late[L.ids_gpu]      = L.il; }
-        if (L.ids_gpu_bias != nullptr) { late[L.ids_gpu_bias] = L.il; }
-        if (L.ids_cpu      != nullptr) { late[L.ids_cpu]      = L.il; }
-    }
-    if (late.empty()) {
-        return;
-    }
-
     auto root = [](const ggml_tensor * t) {
         while (t->view_src != nullptr) {
             t = t->view_src;
         }
         return t;
     };
+
+    // late tensors: host-resident weights (a CPU-computed or streamed layer's first read of one is the boundary
+    // the scheduler cuts at), keyed by their layer, plus the pool-served weights and the ids leaves serve() writes
+    std::unordered_map<const ggml_tensor *, int32_t> late;   // late tensor -> its layer
+    for (int i = 0; i < n; i++) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = nodes[i]->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            const ggml_tensor * r = root(src);
+            if (r->op != GGML_OP_NONE || r->buffer == nullptr || late.count(r)) {
+                continue;
+            }
+            if (!ggml_backend_buffer_is_host(r->buffer) || ggml_backend_buffer_get_usage(r->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            int il = -1;
+            if (sscanf(r->name, "blk.%d.", &il) == 1 && il >= 0) {
+                late[r] = il;
+            }
+        }
+    }
+    std::unordered_set<const ggml_tensor *> pool_late;   // the pool's own late tensors: the pool service cuts there itself
+    if (pool != nullptr && pool->active) {
+        for (const auto & L : pool->layers) {
+            for (const auto & e : L.tensors) {
+                late[e.host] = L.il;
+                pool_late.insert(e.host);
+            }
+            if (L.ids_gpu      != nullptr) { late[L.ids_gpu]      = L.il; pool_late.insert(L.ids_gpu); }
+            if (L.ids_gpu_bias != nullptr) { late[L.ids_gpu_bias] = L.il; pool_late.insert(L.ids_gpu_bias); }
+            if (L.ids_cpu      != nullptr) { late[L.ids_cpu]      = L.il; pool_late.insert(L.ids_cpu); }
+        }
+    }
+    if (late.empty()) {
+        return;
+    }
+
     auto is_view_op = [](ggml_op op) {
         return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
     };
@@ -608,6 +643,9 @@ void llama_expert_pool::hoist_independent(ggml_cgraph * gf) {
     std::vector<ggml_tensor *> out;
     std::vector<ggml_tensor *> held;
     out.reserve(n);
+    ggml_tensor * region_first_hoisted = nullptr;   // first node hoisted in the open region
+    ggml_tensor * region_boundary      = nullptr;   // the node that opened it
+    bool          region_pool          = false;     // it opened on a pool-served tensor
 
     // the layer whose late tensor this node reads directly (-1: none)
     auto direct_late = [&](const ggml_tensor * t) -> int32_t {
@@ -681,6 +719,14 @@ void llama_expert_pool::hoist_independent(ggml_cgraph * gf) {
         }
         held.clear();
         tainted.clear();
+        // a region whose boundary computes on the CPU: cut a split before its first hoisted node, so the scheduler
+        // fetches the CPU split's inputs before the hoisted nodes launch and the CPU works while they run
+        if (sched != nullptr && region_first_hoisted != nullptr && region_boundary != nullptr && !region_pool) {
+            ggml_backend_sched_set_split_before(sched, region_first_hoisted, region_boundary);
+        }
+        region_first_hoisted = nullptr;
+        region_boundary      = nullptr;
+        region_pool          = false;
     };
 
     int32_t region_il = -1;   // the layer whose routed boundary opened the current region (-1: none open)
@@ -692,6 +738,11 @@ void llama_expert_pool::hoist_independent(ggml_cgraph * gf) {
             flush();
             region_il = il;
             hoist_regions++;
+            region_boundary = t;
+            for (int s = 0; s < GGML_MAX_SRC && !region_pool; s++) {
+                const ggml_tensor * src = t->src[s];
+                region_pool = src != nullptr && (pool_late.count(src) || pool_late.count(root(src)));
+            }
         }
         if (il >= 0 || (region_il >= 0 && reads_tainted(t))) {
             held.push_back(t);   // the routed chain and everything downstream of it
@@ -707,6 +758,9 @@ void llama_expert_pool::hoist_independent(ggml_cgraph * gf) {
             out.push_back(t);    // independent of the routed experts: runs while the host decides
             done.insert(t);
             hoisted_nodes++;
+            if (region_first_hoisted == nullptr) {
+                region_first_hoisted = t;
+            }
         } else {
             held.push_back(t);   // depends on a held node, or writes in place: keeps its order
         }
@@ -716,8 +770,10 @@ void llama_expert_pool::hoist_independent(ggml_cgraph * gf) {
     for (int i = 0; i < n; i++) {
         nodes[i] = out[i];
     }
+    if (hoisted) { *hoisted = hoisted_nodes; }
+    if (regions) { *regions = hoist_regions; }
     if (hoisted_nodes > 0) {
-        LLAMA_LOG_INFO("%s: expert pool: %u nodes hoisted ahead of %u routed boundaries\n",
+        LLAMA_LOG_INFO("%s: pshard: %u nodes hoisted ahead of %u host-weight boundaries\n",
             __func__, hoisted_nodes, hoist_regions);
     }
 }

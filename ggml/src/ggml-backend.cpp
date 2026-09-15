@@ -788,6 +788,8 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_split_mark { const struct ggml_tensor * node; const struct ggml_tensor * boundary; };
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -851,6 +853,10 @@ struct ggml_backend_sched {
     ggml_backend_sched_split_skip_cb split_skip_cb;
     void * split_skip_ud;
     bool async_host_copies;   // ggml_backend_sched_set_async_host_copies (pool tiers)
+    // nodes a new split starts at when their boundary node runs on the CPU (ggml_backend_sched_set_split_before)
+    struct ggml_backend_sched_split_mark * split_before;
+    int n_split_before;
+    int split_before_capacity;
 
     ggml_backend_sched_split_cb split_pre_compute;
     ggml_backend_sched_split_cb split_post_compute;
@@ -1513,6 +1519,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            if (i > split->i_start) {
+                for (int k = 0; k < sched->n_split_before; k++) {
+                    if (sched->split_before[k].node == node && tensor_backend_id((struct ggml_tensor *) sched->split_before[k].boundary) == sched->n_backends - 1) {
+                        need_new_split = true;
+                        break;
+                    }
+                }
+            }
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1671,6 +1685,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
     }
+
+    // the marks belonged to this graph
+    sched->n_split_before = 0;
 
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
@@ -2507,7 +2524,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // Split index order, galloc order and the prefetch bookkeeping are untouched; the
     // serial order remains correct by construction. Always on whenever the sched has copy
     // overrides and no eval callback.
-    const bool cpu_overlap = sched->n_copy_overrides > 0 && sched->callback_eval == NULL;
+    const bool cpu_overlap = (sched->n_copy_overrides > 0 || sched->async_host_copies) && sched->callback_eval == NULL;
     auto cpu_overlap_ok = [&](int k) -> bool {
         if (!cpu_overlap || k + 1 >= sched->n_splits) {
             return false;
@@ -2519,6 +2536,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         if (g->n_writeback > 0 || b->n_writeback > 0 || b->n_inputs == 0) {
             return false;
+        }
+        // the CPU split's input copies land before the device split's own uploads: a host activation the device
+        // split uploads could share its allocation with them
+        for (int i = 0; i < g->n_inputs; i++) {
+            ggml_backend_buffer_t buf = ggml_backend_sched_tensor_buffer(g->inputs[i]);
+            if (buf != NULL && ggml_backend_buffer_is_host(buf) && ggml_backend_buffer_get_usage(buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                return false;
+            }
         }
         for (int i = 0; i < b->n_inputs; i++) {
             for (const struct ggml_tensor * t = b->inputs[i]; t != NULL; t = t->view_src) {
@@ -2726,6 +2751,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_usr);
     free(sched->hv_tensor_writeback);
+    free(sched->split_before);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
@@ -2930,6 +2956,27 @@ void ggml_backend_sched_set_split_skip_cb(ggml_backend_sched_t sched,
         ggml_backend_sched_split_skip_cb cb, void * user_data) {
     sched->split_skip_cb = cb;
     sched->split_skip_ud = user_data;
+}
+
+void ggml_backend_sched_clear_split_before(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    sched->n_split_before = 0;
+}
+
+void ggml_backend_sched_set_split_before(ggml_backend_sched_t sched, const struct ggml_tensor * node, const struct ggml_tensor * boundary) {
+    GGML_ASSERT(sched);
+    if (node == NULL || boundary == NULL) {
+        return;
+    }
+    if (sched->n_split_before >= sched->split_before_capacity) {
+        sched->split_before_capacity = sched->split_before_capacity > 0 ? 2 * sched->split_before_capacity : 64;
+        sched->split_before = (struct ggml_backend_sched_split_mark *) realloc(sched->split_before,
+            sched->split_before_capacity * sizeof(struct ggml_backend_sched_split_mark));
+        GGML_ASSERT(sched->split_before != NULL);
+    }
+    sched->split_before[sched->n_split_before].node     = node;
+    sched->split_before[sched->n_split_before].boundary = boundary;
+    sched->n_split_before++;
 }
 
 void ggml_backend_sched_set_async_host_copies(ggml_backend_sched_t sched, bool on) {

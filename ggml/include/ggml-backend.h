@@ -429,6 +429,10 @@ extern "C" {
     // an alias stream is synchronized only when something was issued on it. Pays off with kernel copies
     // (the expert pool turns both on while a pool tier is active); legacy tiers keep the synchronous paths.
     GGML_API void ggml_backend_sched_set_async_host_copies(ggml_backend_sched_t sched, bool on);
+    // start a new split at `node` when `boundary` is assigned to the CPU backend; the marks are consumed by the next
+    // graph split (ggml_backend_sched_clear_split_before drops pending ones)
+    GGML_API void ggml_backend_sched_clear_split_before(ggml_backend_sched_t sched);
+    GGML_API void ggml_backend_sched_set_split_before(ggml_backend_sched_t sched, const struct ggml_tensor * node, const struct ggml_tensor * boundary);
 
     // optional backend procs (ggml_backend_reg_get_proc_address), implemented by the CUDA backend:
     // "ggml_backend_copy_segments_async": one launch uploading many pinned host segments to the device
