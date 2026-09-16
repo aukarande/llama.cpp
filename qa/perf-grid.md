@@ -181,3 +181,6 @@ run logs where the carve line was present (32 rows) and left empty elsewhere.
 > 2026-09-13: the expert pool is a first-class strategy - `PSHARD_POOL_RUNTIME` and `PSHARD_POOL_AUTO` no longer exist.
 > An "auto" cell now lets the pool compete with the legacy strategies on the profile's price; a legacy control needs
 > `PSHARD_STRATEGY=<legacy strategy>`. The pool arms' env settings are harmless leftovers until the next rerun.
+>
+> 2026-09-16: the default ladder is the legacy one again (s0-s4). `PSHARD_STRATEGY=ALL` lets the pool compete
+> (the `poolauto` arm); `PSHARD_STRATEGY=5` still forces it. An "auto" cell is therefore the legacy control.

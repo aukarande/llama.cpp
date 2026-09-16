@@ -351,7 +351,7 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
         s[0-4])   ENVF="PSHARD_STRATEGY=${A#s}" ;;   # forced legacy strategy (fingerprinted)
         pool:plan) ENVF="PSHARD_STRATEGY=5 PSHARD_POOL_RUNTIME=1" ;;
         pool:*)   ENVF="PSHARD_STRATEGY=5 PSHARD_MISS_POLICY=${A#pool:} PSHARD_POOL_RUNTIME=1" ;;
-        poolauto) ENVF="PSHARD_POOL_AUTO=1 PSHARD_POOL_RUNTIME=1" ;;
+        poolauto) ENVF="PSHARD_STRATEGY=ALL" ;;              # the ladder with the pool (the default ladder is s0-s4)
     esac
     [ "$N" = "1" ] && { echo "noovl cells are gone: the no-overlap switch was removed 2026-09-09 ($NM)" >&2; exit 2; }
     ENVV=$ENVF

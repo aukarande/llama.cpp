@@ -1172,7 +1172,7 @@ bool pshard_registry_save(
         fprintf(f, "# n_ctx=%u n_seq_max=%u n_threads=%d fa=%s type_k=%d type_v=%d strategy=%s\n",
             cparams->n_ctx, cparams->n_seq_max, cparams->n_threads,
             fa_str, (int)cparams->type_k, (int)cparams->type_v,
-            forced_strategy >= 0 ? llama_pshard_strategy_name((llama_pshard_strategy)forced_strategy) : "auto");
+            pshard_forced_strategy_name(forced_strategy));
     }
 
     for (const auto & variant : preserved_variants) {
@@ -2302,7 +2302,7 @@ static llama_pshard_plan llama_pshard_search_tier(
     llama_pshard_plan best;
 
     for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
-        if (force_strategy >= 0 && force_strategy != s) continue;
+        if (!pshard_strategy_allowed(force_strategy, s)) continue;
         if (prune.skip[s]) continue;
         llama_pshard_strategy strategy = (llama_pshard_strategy)s;
         llama_pshard_plan plan;
@@ -2407,7 +2407,7 @@ static void llama_pshard_strategy_sweep(
         size_t n_tiers,
         size_t first_tier) {
 
-    if (force_strategy >= 0 && force_strategy != strategy) return;
+    if (!pshard_strategy_allowed(force_strategy, strategy)) return;
     llama_model_tensor_buft_override local_overrides[4096];
     llama_pshard_search_ctx ctx = ctx_template;
     ctx.overrides = local_overrides;
@@ -2620,9 +2620,9 @@ void llama_params_fit_pshard_plan(
 
     // step 2: read forced strategy from env (PSHARD_STRATEGY)
     const int force_strategy = pshard_strategy_from_env();
-    if (force_strategy >= 0) {
+    if (force_strategy != -1) {
         LLAMA_LOG_INFO("%s: forcing strategy %s (PSHARD_STRATEGY=%s)\n",
-            __func__, llama_pshard_strategy_name((llama_pshard_strategy)force_strategy),
+            __func__, pshard_forced_strategy_name(force_strategy),
             getenv("PSHARD_STRATEGY"));
     } else if (getenv("PSHARD_STRATEGY")) {
         LLAMA_LOG_WARN("%s: invalid PSHARD_STRATEGY='%s', ignoring\n",

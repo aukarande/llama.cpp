@@ -45,10 +45,14 @@ inline bool llama_pshard_strategy_delegates_compute(llama_pshard_strategy s) {
     return s == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS;
 }
 
-// PSHARD_STRATEGY accepts a name or numeric id
+// PSHARD_STRATEGY=ALL: the auto search includes the expert pool; unset = the legacy ladder (s0-s4)
+constexpr int PSHARD_STRATEGY_ALL = -2;
+
+// PSHARD_STRATEGY accepts a name, a numeric id or ALL; -1 when unset or invalid
 inline int pshard_strategy_from_env() {
     const char * env = getenv("PSHARD_STRATEGY");
     if (!env || !*env) return -1;
+    if (strcmp(env, "ALL") == 0) return PSHARD_STRATEGY_ALL;
     for (int i = 0; i < LLAMA_PSHARD_COUNT; i++) {
         if (strcmp(env, llama_pshard_strategy_name((llama_pshard_strategy)i)) == 0) {
             return i;
@@ -60,6 +64,20 @@ inline int pshard_strategy_from_env() {
         return (int)v;
     }
     return -1;
+}
+
+// whether the search may consider strategy s under the PSHARD_STRATEGY setting:
+// a forced strategy alone, the expert pool only when forced or with ALL
+inline bool pshard_strategy_allowed(int force_strategy, int s) {
+    if (force_strategy >= 0) return force_strategy == s;
+    if (s == LLAMA_PSHARD_EXPERT_POOL) return force_strategy == PSHARD_STRATEGY_ALL;
+    return true;
+}
+
+// PSHARD_STRATEGY setting for logs and the registry header
+inline const char * pshard_forced_strategy_name(int force_strategy) {
+    if (force_strategy == PSHARD_STRATEGY_ALL) return "ALL";
+    return force_strategy >= 0 ? llama_pshard_strategy_name((llama_pshard_strategy) force_strategy) : "auto";
 }
 
 // EXPERT_POOL: what a cache miss does at decode / small batch (per-tier field,
