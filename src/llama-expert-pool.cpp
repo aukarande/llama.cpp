@@ -636,6 +636,18 @@ void llama_pshard_hoist_independent(ggml_cgraph * gf, llama_expert_pool * pool, 
         return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
     };
 
+    // results a later node writes in place (the destination of a SET_ROWS or CPY): the scheduler assigns the writer
+    // and its destination by neighbourhood, so the destination has to keep its place next to the writer
+    std::unordered_set<const ggml_tensor *> inplace_dst;
+    for (int i = 0; i < n; i++) {
+        if (nodes[i]->view_src != nullptr && !is_view_op(nodes[i]->op)) {
+            const ggml_tensor * r = root(nodes[i]);
+            if (r->op != GGML_OP_NONE) {
+                inplace_dst.insert(r);
+            }
+        }
+    }
+
     // one region per pooled layer's boundary: dependents of the boundary are held in order; nodes whose inputs
     // are all available before it are hoisted ahead of the held ones
     std::unordered_set<const ggml_tensor *> done;      // results already emitted in the new order (or leaves)
@@ -683,6 +695,9 @@ void llama_pshard_hoist_independent(ggml_cgraph * gf, llama_expert_pool * pool, 
     auto hoistable = [&](const ggml_tensor * t) {
         if (t->view_src != nullptr && !is_view_op(t->op)) {
             return false;   // an in-place op: it writes into a tensor the held nodes may still read
+        }
+        if (inplace_dst.count(t)) {
+            return false;   // written in place later: stays with its writer
         }
         if (t->view_src != nullptr) {
             // a pure view moves only when its root is an emitted result
