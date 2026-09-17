@@ -617,11 +617,23 @@ void llama_memory_pshard::download_for_switch(int32_t il, ggml_backend_t be) {
     }
 }
 
-void llama_memory_pshard::assign_tensors(
+bool llama_memory_pshard::assign_tensors(
         ggml_backend_sched_t sched,
         const std::unordered_map<int, int32_t> & layer_bids,
         const std::vector<ggml_backend_ptr> & backends,
         const pshard_dev_layout & layout) {
+    // every unpinned layer needs a placement before anything is touched: a plan that covers only
+    // part of the model cannot run (the unconfigured tensors have no buffer)
+    for (const auto & l : layers) {
+        if (l.is_pinned) {
+            continue;
+        }
+        auto it = layer_bids.find((int) l.il);
+        if (it == layer_bids.end() || it->second < 0 || it->second >= (int32_t) backends.size()) {
+            LLAMA_LOG_ERROR("%s: layer %u has no backend_id in plan (the registry does not match this load)\n", __func__, l.il);
+            return false;
+        }
+    }
     for (const auto & l : layers) {
         auto it = layer_bids.find((int)l.il);
         if (l.is_pinned) {
@@ -648,8 +660,7 @@ void llama_memory_pshard::assign_tensors(
                     ggml_backend_sched_add_writeback(sched, l.t2_gpu);
                 }
             }
-        } else if (!l.is_pinned) {
-            LLAMA_LOG_WARN("%s: layer %u has no backend_id in plan -- left unconfigured\n", __func__, l.il);
         }
     }
+    return true;
 }

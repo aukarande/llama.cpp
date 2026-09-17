@@ -69,6 +69,8 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    // what the last reserve asked of the compute GPU: streamed weights, activations, write-back staging, galloc chunks
+    void pshard_log_reserve_breakdown(const char * tag) const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -294,6 +296,8 @@ private:
     void pshard_reserve_and_save(const llama_pshard_plan & plan);
     void pshard_save_alloc_state(const llama_pshard_plan & plan);
     void pshard_warmup_plan_reserves();
+    // KV/RS bytes a plan pins on the compute GPU (from the plan's own layer map)
+    size_t pshard_plan_pinned_cache_size(const llama_pshard_plan & plan) const;
     void pshard_apply_initial_plan();
     void pshard_switch_plan(
             const llama_pshard_plan & old_plan,
@@ -468,7 +472,8 @@ llama_context * llama_init_from_model_internal(
 // pshard free functions (implemented in llama-context-pshard.cpp)
 struct llama_memory_i;
 
-void pshard_assign_tensors(
+// false when a pipe shard's plan leaves a layer without a placement
+bool pshard_assign_tensors(
         ggml_backend_sched_t                              sched,
         const llama_model                               & model,
         llama_memory_i                                  * memory,

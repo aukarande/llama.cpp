@@ -59,7 +59,8 @@ struct llama_memory_pipe_shard_i {
 
     virtual void refresh_stream_views(int32_t il) = 0;
 
-    virtual void assign_tensors(
+    // false when the plan leaves an unpinned layer without a placement (nothing is touched then)
+    virtual bool assign_tensors(
             ggml_backend_sched_t sched,
             const std::unordered_map<int, int32_t> & layer_bids,
             const std::vector<ggml_backend_ptr> & backends,

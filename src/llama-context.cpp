@@ -1492,7 +1492,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (cparams.pshard) {
-            pshard_assign_tensors(sched.get(), model, memory.get(), backends, pshard_layout);
+            if (!pshard_assign_tensors(sched.get(), model, memory.get(), backends, pshard_layout)) {
+                LLAMA_LOG_ERROR("%s: the pshard plan does not cover this load\n", __func__);
+                // the next equal-shape ubatch would otherwise reuse this unallocated graph
+                res->reset();
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
             pshard_assign_pool_tensors();
         }
 
@@ -2645,7 +2651,10 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_outputs = save_n_outputs;
 
     if (cparams.pshard) {
-        pshard_assign_tensors(sched.get(), model, memory.get(), backends, pshard_layout);
+        if (!pshard_assign_tensors(sched.get(), model, memory.get(), backends, pshard_layout)) {
+            LLAMA_LOG_ERROR("%s: the pshard plan does not cover this load\n", __func__);
+            return nullptr;
+        }
         pshard_assign_pool_tensors();
     }
 

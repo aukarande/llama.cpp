@@ -20,7 +20,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <functional>
+#include <map>
+#include <string>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -114,7 +117,7 @@ namespace {
 
 } // namespace
 
-void pshard_assign_tensors(
+bool pshard_assign_tensors(
         ggml_backend_sched_t                              sched,
         const llama_model                               & model,
         llama_memory_i                                  * memory,
@@ -131,9 +134,12 @@ void pshard_assign_tensors(
 
     if (memory) {
         for (auto * ps : memory->get_pipe_shards()) {
-            ps->assign_tensors(sched, lbids, backends, layout);
+            if (!ps->assign_tensors(sched, lbids, backends, layout)) {
+                return false;
+            }
         }
     }
+    return true;
 }
 
 void pshard_refresh_stream_views(llama_memory_i * memory) {
@@ -642,6 +648,14 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
 
     auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
 
+    if (gf) {
+        char tag[160];
+        snprintf(tag, sizeof(tag), "runtime tier bs=%u %s n_pinned=%u (n_tokens=%u n_seqs=%u n_outputs=%u scratch_off=%.1f MiB)",
+            plan.batch_size, llama_pshard_strategy_name(plan.strategy), plan.n_pinned,
+            n_tokens, n_seqs, n_outputs, scratch_off / (1024.0 * 1024.0));
+        pshard_log_reserve_breakdown(tag);
+    }
+
     if (gf && external_buf) {
         auto measure = [&]() -> size_t {
             const int    n_chunks   = ggml_backend_sched_get_n_chunks(sched.get(), gpu);
@@ -771,6 +785,63 @@ void llama_context::pshard_save_alloc_state(const llama_pshard_plan & plan) {
         sched_n_nodes, sched_n_leafs);
 }
 
+// the KV/RS this plan pins: read the plan's own layer map (cached when its backend maps were
+// last set), not the pin state of the tier that happens to be applied now
+size_t llama_context::pshard_plan_pinned_cache_size(const llama_pshard_plan & plan) const {
+    if (!plan.maps_cached) {
+        const_cast<llama_model &>(model).pshard_set_backend_maps(plan);
+    }
+    size_t total = 0;
+    for (auto * ps : memory->get_pipe_shards()) {
+        for (const auto & l : ps->get_layers()) {
+            const auto it = plan.cached_layer_bids.find((int) l.il);
+            if (it != plan.cached_layer_bids.end() && it->second == pshard_layout.compute) {
+                total += l.alloc_size;
+            }
+        }
+    }
+    return total;
+}
+
+void llama_context::pshard_log_reserve_breakdown(const char * tag) const {
+    const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
+    // per scheduler backend: 0 compute GPU, 1/2 shard lanes (streamed weights), 3 CPU
+    struct acc { int n = 0; size_t w_in = 0, w_pref = 0, w_sliced = 0, act = 0, wb_kv = 0, wb_rs = 0; };
+    std::map<int, acc> by_bid;
+    for (int i = 0; i < n_splits; i++) {
+        ggml_backend_sched_split_info si = {};
+        if (!ggml_backend_sched_get_split_info(sched.get(), i, &si)) continue;
+        auto & a = by_bid[si.backend_id];
+        a.n++;
+        a.w_in     += si.input_weight_bytes;
+        a.w_pref   += si.input_weight_prefetch_bytes;
+        a.w_sliced += si.input_weight_sliced_bytes;
+        a.act      += si.input_activ_bytes;
+        a.wb_kv    += si.writeback_kv_bytes;
+        a.wb_rs    += si.writeback_rs_bytes;
+    }
+    std::string per_bid;
+    for (const auto & [bid, a] : by_bid) {
+        char buf[200];
+        snprintf(buf, sizeof(buf), " | bid %d: %d splits, weights in %.1f (prefetch %.1f, sliced %.1f), activ %.1f, writeback kv %.1f rs %.1f MiB",
+            bid, a.n, a.w_in / (1024.0 * 1024.0), a.w_pref / (1024.0 * 1024.0), a.w_sliced / (1024.0 * 1024.0),
+            a.act / (1024.0 * 1024.0), a.wb_kv / (1024.0 * 1024.0), a.wb_rs / (1024.0 * 1024.0));
+        per_bid += buf;
+    }
+    std::string chunks;
+    for (size_t b = 0; b < backends.size(); b++) {
+        const int n_chunks = ggml_backend_sched_get_n_chunks(sched.get(), backends[b].get());
+        if (n_chunks <= 0) continue;
+        chunks += " bid " + std::to_string(b) + ":[";
+        for (int c = 0; c < n_chunks; c++) {
+            chunks += std::to_string(ggml_backend_sched_get_chunk_max_size(sched.get(), backends[b].get(), c) >> 20);
+            if (c + 1 < n_chunks) chunks += "+";
+        }
+        chunks += "]";
+    }
+    LLAMA_LOG_INFO("%s: %s:%s | galloc chunk max sizes (MiB):%s\n", __func__, tag, per_bid.c_str(), chunks.c_str());
+}
+
 void llama_context::pshard_warmup_plan_reserves() {
     auto * registry = model.get_plan_registry();
     if (!registry) return;
@@ -801,12 +872,13 @@ void llama_context::pshard_warmup_plan_reserves() {
             // no expert-pool charge here: the region is carved per tier from what
             // THIS tier leaves (legacy tiers run without it; a pool tier's region is
             // the remainder by construction, its floor is checked at apply)
-            const size_t pc        = total_pinned_cache_size(memory.get());
+            const size_t pc        = pshard_plan_pinned_cache_size(plan);
             if (plan.cached_scratch_off + pc > buf_total) {
-                LLAMA_LOG_WARN("%s: tier %zu (bs=%u, %s, n_pinned=%u) packing overshoots buffer by %.2f MiB; marking unviable\n",
+                LLAMA_LOG_WARN("%s: tier %zu (bs=%u, %s, n_pinned=%u) packing overshoots buffer by %.2f MiB (weights %.2f + pinned cache %.2f > %.2f); marking unviable\n",
                     __func__, t, registry->tier_sizes[t],
                     llama_pshard_strategy_name(plan.strategy), plan.n_pinned,
-                    (plan.cached_scratch_off + pc - buf_total) / (1024.0 * 1024.0));
+                    (plan.cached_scratch_off + pc - buf_total) / (1024.0 * 1024.0),
+                    plan.cached_scratch_off / (1024.0 * 1024.0), pc / (1024.0 * 1024.0), buf_total / (1024.0 * 1024.0));
                 plan.is_viable = false;
                 continue;
             }

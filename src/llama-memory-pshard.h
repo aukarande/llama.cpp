@@ -84,7 +84,7 @@ struct llama_memory_pshard : llama_memory_pipe_shard_i {
 
     void refresh_stream_views(int32_t il) override;
 
-    void assign_tensors(
+    bool assign_tensors(
             ggml_backend_sched_t sched,
             const std::unordered_map<int, int32_t> & layer_bids,
             const std::vector<ggml_backend_ptr> & backends,
