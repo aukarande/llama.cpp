@@ -383,10 +383,18 @@ static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
     auto * d = (llama_pshard_tps_hook_data *) user_data;
     if (!d || !d->predictor || !ctx) return;
 
-    double tps = d->predictor->predict_tps(ctx->get_sched(), d->cpu_backend_id, d->kv_size, d->batch_size, d->n_outputs, d->has_rs, d->out_bd);
+    // the probe reserves for n_seq_max sequences and graph_reserve rounds the token count up to a
+    // multiple of them; the tier itself steps batch_size tokens
+    const uint32_t n_seqs = std::max<uint32_t>(1, d->n_outputs);
+    const int32_t n_tokens_graph = (int32_t) (((d->batch_size + n_seqs - 1) / n_seqs) * n_seqs);
+    double tps = d->predictor->predict_tps(ctx->get_sched(), d->cpu_backend_id, d->kv_size, d->batch_size, n_tokens_graph,
+        d->n_outputs, d->has_rs, d->out_bd);
     if (d->out_tps) {
         *d->out_tps = (float)tps;
     }
+    char tag[96];
+    snprintf(tag, sizeof(tag), "probe bs=%d (n_tokens_graph=%d n_outputs=%u)", d->batch_size, n_tokens_graph, d->n_outputs);
+    ctx->pshard_log_reserve_breakdown(tag);
 }
 
 static std::vector<llama_device_memory_data> llama_pshard_probe_memory(

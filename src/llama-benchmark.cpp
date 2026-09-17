@@ -100,63 +100,70 @@ std::string llama_benchmark_stats::machine_mismatch(const machine_t & profile, c
     return why;
 }
 
-llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node) {
+llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node, double token_scale) {
     llama_op_metrics m = {};
+
+    // activation-sized quantities follow the step's token count, weights do not
+    const double ts = (token_scale > 0.0 && token_scale < 1.0) ? token_scale : 1.0;
+    auto tokens = [ts](int64_t n) { return std::max<int64_t>(1, (int64_t) std::llround((double) n * ts)); };
+    auto act    = [ts](const ggml_tensor * t) { return t ? (double) ggml_nbytes(t) * ts : 0.0; };
 
     switch (node->op) {
         case GGML_OP_MUL_MAT: {
             m.N    = node->ne[0];
-            m.M    = node->ne[1];
+            m.M    = tokens(node->ne[1]);
             m.K    = node->src[0]->ne[0];
             m.ops  = 2.0 * m.N * m.K * m.M;
-            m.bytes = ggml_nbytes(node->src[0]) + ggml_nbytes(node->src[1]) + ggml_nbytes(node);
+            m.bytes = (double) ggml_nbytes(node->src[0]) + act(node->src[1]) + act(node);
             m.quant_type = ggml_type_name(node->src[0]->type);
             break;
         }
         case GGML_OP_MUL_MAT_ID: {
             m.N              = node->ne[0];
             m.n_experts_used = node->ne[1];
-            m.M              = node->ne[2];
+            m.M              = tokens(node->ne[2]);
             m.K              = node->src[0]->ne[0];
             const int64_t total_experts = node->src[0]->ne[2];
             m.ops  = 2.0 * m.N * m.K * m.M * m.n_experts_used;
-            m.bytes = (ggml_nbytes(node->src[0]) * m.n_experts_used / total_experts)
-                    + ggml_nbytes(node->src[1]) + ggml_nbytes(node);
+            // a memory-bound step streams the distinct experts the M tokens route to,
+            // expected total * (1 - (1 - used/total)^M), not used/total per token
+            const double p_miss   = 1.0 - (double) m.n_experts_used / (double) total_experts;
+            const double distinct = (double) total_experts * (1.0 - std::pow(p_miss, (double) m.M));
+            m.bytes = (double) ggml_nbytes(node->src[0]) * distinct / (double) total_experts
+                    + act(node->src[1]) + act(node);
             m.quant_type = ggml_type_name(node->src[0]->type);
             break;
         }
         case GGML_OP_FLASH_ATTN_EXT: {
             m.head_dim  = node->ne[0];
             m.n_q_heads = node->ne[1];
-            m.n_tokens  = node->ne[2];
+            m.n_tokens  = tokens(node->ne[2]);
             m.ctx_len   = node->src[1]->ne[1];
             m.n_kv_heads = node->src[1]->ne[2];
             m.ops  = 2.0 * m.n_tokens * m.head_dim * m.ctx_len * m.n_q_heads * 2.0;
-            m.bytes = ggml_nbytes(node->src[0]) + ggml_nbytes(node->src[1])
-                    + ggml_nbytes(node->src[2]) + ggml_nbytes(node);
+            m.bytes = act(node->src[0]) + ggml_nbytes(node->src[1])
+                    + ggml_nbytes(node->src[2]) + act(node);
             break;
         }
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK: {
-            m.n_elements = ggml_nelements(node);
+            m.n_elements = tokens(ggml_nelements(node));
             m.ops  = 6.0 * m.n_elements;
-            m.bytes = ggml_nbytes(node->src[0]) + ggml_nbytes(node);
+            m.bytes = act(node->src[0]) + act(node);
             m.quant_type = ggml_type_name(node->type);
             break;
         }
         case GGML_OP_RMS_NORM: {
-            m.n_elements = ggml_nelements(node);
+            m.n_elements = tokens(ggml_nelements(node));
             m.ops  = 3.0 * m.n_elements;
-            m.bytes = ggml_nbytes(node->src[0]) + ggml_nbytes(node);
+            m.bytes = act(node->src[0]) + act(node);
             m.quant_type = ggml_type_name(node->type);
             break;
         }
         case GGML_OP_GLU: {
-            m.n_elements = ggml_nelements(node);
+            m.n_elements = tokens(ggml_nelements(node));
             m.ops  = 2.0 * m.n_elements;
-            m.bytes = ggml_nbytes(node->src[0]);
-            if (node->src[1]) { m.bytes += ggml_nbytes(node->src[1]); }
-            m.bytes += ggml_nbytes(node);
+            m.bytes = act(node->src[0]) + act(node->src[1]) + act(node);
             m.quant_type = ggml_type_name(node->type);
             break;
         }
@@ -164,24 +171,28 @@ llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node) {
         case GGML_OP_MUL:
         case GGML_OP_SUB:
         case GGML_OP_DIV: {
-            m.n_elements = ggml_nelements(node);
+            m.n_elements = tokens(ggml_nelements(node));
             m.ops  = m.n_elements;
-            m.bytes = ggml_nbytes(node->src[0]);
-            if (node->src[1]) { m.bytes += ggml_nbytes(node->src[1]); }
-            m.bytes += ggml_nbytes(node);
+            m.bytes = act(node->src[0]) + act(node->src[1]) + act(node);
             m.quant_type = ggml_type_name(node->type);
             break;
         }
         case GGML_OP_GET_ROWS: {
-            m.n_elements = ggml_nelements(node);
-            m.bytes = ggml_nbytes(node);
+            m.n_elements = tokens(ggml_nelements(node));
+            m.bytes = act(node);
             m.quant_type = ggml_type_name(node->src[0]->type);
             break;
         }
-        case GGML_OP_SET_ROWS:
+        case GGML_OP_SET_ROWS: {
+            // the node is a view of the whole destination (the cache); the work is the rows written
+            m.n_elements = tokens(ggml_nelements(node->src[0]));
+            m.bytes = 2.0 * act(node->src[0]);
+            m.quant_type = ggml_type_name(node->src[0]->type);
+            break;
+        }
         case GGML_OP_CPY: {
-            m.n_elements = ggml_nelements(node);
-            m.bytes = ggml_nbytes(node->src[0]) + ggml_nbytes(node);
+            m.n_elements = tokens(ggml_nelements(node));
+            m.bytes = act(node->src[0]) + act(node);
             m.quant_type = ggml_type_name(node->src[0]->type);
             break;
         }
@@ -192,9 +203,8 @@ llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node) {
         case GGML_OP_NONE:
             break;
         default: {
-            m.n_elements = ggml_nelements(node);
-            m.bytes = ggml_nbytes(node);
-            if (node->src[0]) { m.bytes += ggml_nbytes(node->src[0]); }
+            m.n_elements = tokens(ggml_nelements(node));
+            m.bytes = act(node) + act(node->src[0]);
             m.quant_type = ggml_type_name(node->type);
             break;
         }
@@ -489,7 +499,7 @@ std::string llama_benchmark_predictor::make_timing_key(
 llama_split_timing llama_benchmark_predictor::predict_split(
         struct ggml_tensor ** nodes, int n_nodes,
         bool is_gpu, int32_t batch_size, bool async_copy,
-        timing_cache_t * timing_cache) const {
+        timing_cache_t * timing_cache, double token_scale) const {
 
     llama_split_timing result = {};
     timing_cache_t local_timing_cache;
@@ -502,7 +512,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
 
     for (int i = 0; i < n_nodes; i++) {
         ggml_tensor * node = nodes[i];
-        llama_op_metrics m = llama_op_metrics_compute(node);
+        llama_op_metrics m = llama_op_metrics_compute(node, token_scale);
 
         if (m.ops == 0.0 && m.bytes == 0.0) continue;
 
@@ -772,6 +782,7 @@ double llama_benchmark_predictor::predict_tps(
         int cpu_backend_id,
         uint32_t kv_size,
         int32_t batch_size,
+        int32_t n_tokens_graph,
         uint32_t n_outputs,
         bool has_rs,
         breakdown * bd) const {
@@ -779,8 +790,12 @@ double llama_benchmark_predictor::predict_tps(
     const int n_splits = ggml_backend_sched_get_n_splits(sched);
     if (n_splits <= 0) return 0.0;
 
-    LLAMA_LOG_DEBUG("%s: n_splits=%d, bs=%d, kv_size=%u, n_outputs=%u, has_rs=%d\n",
-        __func__, n_splits, batch_size, kv_size, n_outputs, (int)has_rs);
+    // the graph may have been reserved for more tokens than the step carries
+    const double token_scale = (n_tokens_graph > 0 && batch_size > 0 && batch_size < n_tokens_graph)
+        ? (double) batch_size / (double) n_tokens_graph : 1.0;
+
+    LLAMA_LOG_DEBUG("%s: n_splits=%d, bs=%d, n_tokens_graph=%d, kv_size=%u, n_outputs=%u, has_rs=%d\n",
+        __func__, n_splits, batch_size, n_tokens_graph, kv_size, n_outputs, (int)has_rs);
 
     const double pcie_bw = stats.peak_pcie_bw;
     // weight uploads may be repriced by the planner's per-mapping page-lock model
@@ -858,7 +873,7 @@ double llama_benchmark_predictor::predict_tps(
         // compute cost (CPU splits use eff_gflops when async_copy due to PCIe contention)
         struct ggml_tensor ** nodes = ggml_graph_nodes(si.graph);
         int n_nodes = ggml_graph_n_nodes(si.graph);
-        llama_split_timing t = predict_split(nodes, n_nodes, is_gpu, batch_size, async_copy, &timing_cache);
+        llama_split_timing t = predict_split(nodes, n_nodes, is_gpu, batch_size, async_copy, &timing_cache, token_scale);
 
         // prefetch cost: use concurrent PCIe BW for CPU splits (bus shared with DRAM),
         // peak PCIe BW for GPU splits (GPU compute doesn't contend with PCIe DMA).
@@ -882,14 +897,16 @@ double llama_benchmark_predictor::predict_tps(
         // output scaling: use the output rows in the reserved graph, then scale to
         // the runtime number of logits. This keeps the memory-probe graph as the
         // source of truth and avoids double-scaling when it was already reduced.
+        // The output rows are not rounded with the tokens, so the head is re-priced
+        // at its real rows whenever a token scale was applied
         if (i == n_splits - 1 && n_outputs > 0) {
             for (int j = 0; j < n_nodes; j++) {
                 if (nodes[j]->name && strstr(nodes[j]->name, "result_output")) {
                     const llama_op_metrics out_m = llama_op_metrics_compute(nodes[j]);
                     const int32_t graph_outputs = (int32_t) std::max<int64_t>(1, out_m.M);
-                    if (graph_outputs != batch_size || n_outputs < (uint32_t) graph_outputs) {
-                        llama_split_timing out_included = predict_split(&nodes[j], 1, is_gpu, batch_size, async_copy, &timing_cache);
-                        llama_split_timing out_graph    = predict_split(&nodes[j], 1, is_gpu, graph_outputs, async_copy, &timing_cache);
+                    if (token_scale < 1.0 || graph_outputs != batch_size || n_outputs < (uint32_t) graph_outputs) {
+                        llama_split_timing out_included = predict_split(&nodes[j], 1, is_gpu, batch_size, async_copy, &timing_cache, token_scale);
+                        llama_split_timing out_graph    = predict_split(&nodes[j], 1, is_gpu, graph_outputs, async_copy, &timing_cache, /*token_scale=*/1.0);
                         if (out_included.time_ms > 0.0 || out_graph.time_ms > 0.0) {
                             const double scale = n_outputs < (uint32_t) graph_outputs
                                                ? (double)n_outputs / (double)graph_outputs

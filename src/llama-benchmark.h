@@ -32,7 +32,9 @@ struct llama_op_metrics {
 
 // Extract ops/bytes metrics from a compute graph node.
 // Zero-cost view ops (RESHAPE, VIEW, PERMUTE, TRANSPOSE, NONE) return {0,0}.
-llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node);
+// token_scale < 1 prices a graph reserved for more tokens than the step carries
+// (activation-sized terms shrink with it, weight bytes do not)
+llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node, double token_scale = 1.0);
 
 // One row from profiler output (CPU or GPU).
 // For FLASH_ATTN ops, n_heads stores n_kv_heads (written by profiler).
@@ -214,7 +216,7 @@ struct llama_benchmark_predictor {
     llama_split_timing predict_split(
             struct ggml_tensor ** nodes, int n_nodes,
             bool is_gpu, int32_t batch_size, bool async_copy = true,
-            timing_cache_t * timing_cache = nullptr) const;
+            timing_cache_t * timing_cache = nullptr, double token_scale = 1.0) const;
 
     // Nearest-neighbor search with weighted scoring (batch > dims > quant).
     // For FLASH_ATTN queries, pass op_name="FLASH_ATTN" -- matches all FLASH_ATTN_* entries.
@@ -254,11 +256,14 @@ struct llama_benchmark_predictor {
         double other_ms         = 0.0;
     };
 
+    // batch_size: tokens per step of the priced tier; n_tokens_graph: tokens the reserved
+    // graph was built for (graph_reserve rounds up to a multiple of n_seq_max)
     double predict_tps(
             ggml_backend_sched_t sched,
             int cpu_backend_id,
             uint32_t kv_size,
             int32_t batch_size,
+            int32_t n_tokens_graph,
             uint32_t n_outputs = 0,
             bool has_rs = false,
             breakdown * bd = nullptr) const;
