@@ -23,6 +23,55 @@
 #include <stdexcept>
 #include <vector>
 
+namespace {
+
+// a probe demotes its own thread's chatter below min_level to DEBUG. The demotion is
+// thread-local: strategies probe on parallel threads, and swapping the process logger
+// would silence every other thread (and an unordered restore could leave a filter behind)
+thread_local int            t_probe_depth     = 0;
+thread_local ggml_log_level t_probe_min_level = GGML_LOG_LEVEL_DEBUG;
+
+struct {
+    ggml_log_callback callback  = nullptr;
+    void *            user_data = nullptr;
+    std::mutex        mutex;
+} g_probe_logger;
+
+void probe_log_callback(ggml_log_level level, const char * text, void * /*user_data*/) {
+    const ggml_log_level level_eff = (t_probe_depth > 0 && level < t_probe_min_level) ? GGML_LOG_LEVEL_DEBUG : level;
+    g_probe_logger.callback(level_eff, text, g_probe_logger.user_data);
+}
+
+struct probe_log_scope {
+    int            saved_depth;
+    ggml_log_level saved_level;
+
+    explicit probe_log_scope(ggml_log_level min_level) {
+        {
+            // (re)install whenever the application has set its own callback since the last probe
+            std::lock_guard<std::mutex> lg(g_probe_logger.mutex);
+            ggml_log_callback cur = nullptr;
+            void * cur_ud = nullptr;
+            llama_log_get(&cur, &cur_ud);
+            if (cur != probe_log_callback) {
+                g_probe_logger.callback  = cur;
+                g_probe_logger.user_data = cur_ud;
+                llama_log_set(probe_log_callback, nullptr);
+            }
+        }
+        saved_depth       = t_probe_depth;
+        saved_level       = t_probe_min_level;
+        t_probe_min_level = min_level;
+        t_probe_depth++;
+    }
+    ~probe_log_scope() { t_probe_depth = saved_depth; t_probe_min_level = saved_level; }
+
+    void pause()  { t_probe_depth--; }
+    void resume() { t_probe_depth++; }
+};
+
+} // namespace
+
 std::vector<llama_device_memory_data> llama_get_device_memory_data(
         const char * path_model, const llama_model_params * mparams, const llama_context_params * cparams,
         std::vector<llama_device> & devs, uint32_t & hp_ngl, uint32_t & hp_n_ctx_train, uint32_t & hp_n_expert,
@@ -30,27 +79,7 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         enum ggml_log_level log_level,
         llama_probe_hook_t probe_hook, void * probe_hook_data,
         uint32_t probe_n_tokens, uint32_t probe_n_outputs) {
-    struct user_data_t {
-        struct {
-            ggml_log_callback callback;
-            void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
-    };
-    static std::mutex log_mutex;
-    std::unique_lock<std::mutex> log_lock(log_mutex);
-
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
-
-    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
-        const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
-    }, &ud);
-
-    log_lock.unlock();
+    probe_log_scope probe_log(log_level);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
@@ -58,7 +87,6 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
 
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");
     }
 
@@ -66,7 +94,6 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
     llama_context * ctx = llama_init_from_model_internal(model, *cparams, probe_reserve);
     if (ctx == nullptr) {
         llama_model_free(model);
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
     }
 
@@ -128,16 +155,20 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
     // (breakdown print lives in common/fit at ToT; skipped here)
 
     if (probe_hook) {
-        probe_hook(ctx, probe_hook_data);
+        probe_log.pause();   // the hook's own report is not probe chatter
+        try {
+            probe_hook(ctx, probe_hook_data);
+        } catch (...) {
+            probe_log.resume();
+            llama_free(ctx);
+            llama_model_free(model);
+            throw;
+        }
+        probe_log.resume();
     }
 
     llama_free(ctx);
     llama_model_free(model);
-
-    {
-        std::lock_guard<std::mutex> lg(log_mutex);
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-    }
 
     return ret;
 }

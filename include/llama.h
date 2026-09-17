@@ -618,6 +618,8 @@ extern "C" {
     LLAMA_API uint32_t llama_pshard_registry_tier_batch_size(const struct llama_pshard_plan_registry * registry, size_t tier);
     LLAMA_API size_t   llama_pshard_registry_tier_overrides(const struct llama_pshard_plan_registry * registry, size_t tier,
         struct llama_model_tensor_buft_override * out, size_t n_max);
+    // true when llama_params_fit_pshard found no plan for this configuration in the cache
+    LLAMA_API bool     llama_pshard_registry_cache_missed(const struct llama_pshard_plan_registry * registry);
 
     // true when the loaded model runs under pshard (false after a silent stock fallback)
     LLAMA_API bool llama_model_pshard_active(const struct llama_model * model);

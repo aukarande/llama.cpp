@@ -759,6 +759,7 @@ struct common_params {
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 
     bool     pshard           = false;
+    bool     pshard_plan_on_miss = true;   // plan in-process when the registry has no plan for this configuration
     size_t   max_vram_alloc   = 0;
     uint32_t pshard_tier_max  = 0;
 };
@@ -996,6 +997,12 @@ void common_pshard_fit_one_budget(common_params & params, struct llama_model_par
 // pshard one-budget v2: hand the budget left beyond the target arena's canonical union to a
 // spilled MoE draft's experts (leading layers first). Runtime-only; called after the fit.
 void common_pshard_draft_leftover(common_params & params, const struct llama_pshard_plan_registry * registry, size_t arena_budget_mb);
+
+// plan the pshard tiers for this configuration and write the registry next to the model
+// (the same passes as the runtime load); returns false when planning is refused. Used by
+// llama-pshard-plan-params and by common_init_from_params when the registry has no plan.
+// bench_plan: llama-bench context planning with a tier cap.
+bool common_pshard_plan(common_params & params, uint32_t n_ctx, uint32_t bench_tier_cap = 0, bool bench_plan = false);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

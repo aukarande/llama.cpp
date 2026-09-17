@@ -1723,7 +1723,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_unified = value;
         }
-    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
+    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
@@ -1986,6 +1986,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "max tier batch size for pshard planning (0 = auto, capped by n_ctx)",
         [](common_params & params, int value) {
             params.pshard_tier_max = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--pshard-no-plan-on-miss"},
+        "do not plan in-process when the registry has no plan for this configuration; fall back to the stock path",
+        [](common_params & params) {
+            params.pshard_plan_on_miss = false;
         }
     ));
     add_opt(common_arg(

@@ -241,6 +241,9 @@ uint64_t pshard_registry_fingerprint(
 
     mix(cparams->n_ctx);
     mix(cparams->n_seq_max);
+    // the attention scratch follows the KV stream size: one unified stream of n_ctx cells
+    // needs an n_ctx x n_tokens mask, n_seq_max streams need n_seq_max smaller ones
+    mix((uint64_t)(cparams->kv_unified ? 1 : 0));
     mix(cparams->n_threads);
     mix((uint64_t)cparams->flash_attn_type);
     mix((uint64_t)cparams->type_k);
@@ -490,14 +493,21 @@ void llama_params_fit_pshard(
         }
     }
 
+    // the planner resolves n_ctx 0 to the training length; fingerprint the same number, but leave
+    // the caller's 0 in place on every stock-fallback return (the stock fit treats 0 as auto)
+    llama_context_params cparams_fp = *cparams;
+    if (cparams_fp.n_ctx == 0) {
+        cparams_fp.n_ctx = n_ctx_plan;
+    }
     const uint64_t fp = pshard_registry_fingerprint(
-        mparams, cparams, model_file_size);
+        mparams, &cparams_fp, model_file_size);
 
     if (!pshard_registry_load(registry, fp, cache_path.c_str(), host_buft, vram_free, false)) {
         LLAMA_LOG_WARN("%s: no matching plan cache at %s (fingerprint=0x%016" PRIx64 "), disabling pshard\n",
             __func__, cache_path.c_str(), fp);
         LLAMA_LOG_WARN("%s: >>> pshard DISABLED: this run uses the STOCK path - benchmark numbers will not be pshard numbers <<<\n", __func__);
-        LLAMA_LOG_WARN("%s: fingerprint inputs (n_ctx, n_seq_max, n_threads, flash_attn, type_k/v, model file size, PSHARD_STRATEGY env) must match the planner invocation exactly\n", __func__);
+        LLAMA_LOG_WARN("%s: fingerprint inputs (n_ctx, n_seq_max, kv_unified, n_threads, flash_attn, type_k/v, model file size, PSHARD_STRATEGY env) must match the planner invocation exactly\n", __func__);
+        registry->cache_missed = true;
         mparams->pshard = false;
         cparams->pshard = false;
         return;
@@ -559,6 +569,11 @@ void llama_params_fit_pshard(
         mparams->pshard = false;
         cparams->pshard = false;
         return;
+    }
+
+    // the plan is accepted: the context runs at the length the plan was made for
+    if (cparams->n_ctx == 0) {
+        cparams->n_ctx = n_ctx_plan;
     }
 
     // mirror the plan path (llama_params_fit_pshard_plan step 8): the load-time

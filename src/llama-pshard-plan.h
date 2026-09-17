@@ -6,6 +6,7 @@
 #include "llama-cparams.h"
 #include "llama-model.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -426,6 +427,8 @@ struct llama_pshard_plan_registry {
     // variant marker for a baseline load that fits
     // runtime still checks baseline_vram_req against the current budget
     bool                                 pshard_disabled = false;
+    // the load found no plan for this fingerprint and budget
+    bool                                 cache_missed = false;
     size_t                               baseline_vram_req = 0;
 
     void init(uint32_t n_ubatch, uint32_t n_parallel = 1, uint32_t n_draft = 0) {
@@ -458,22 +461,30 @@ struct llama_pshard_plan_registry {
                 tier_sizes.push_back(verify_tier);
             }
         } else {
-            for (uint32_t t = 1; t <= 64 && t < 512; t *= 4) {
-                tier_sizes.push_back(t);
-                if (t == 16) {
-                    tier_sizes.push_back(32);
+            // multi-sequence decode: one sequence left, the steady-state step of n_parallel tokens,
+            // its speculative verify batch of n_parallel * (n_draft + 1), and one small tier for
+            // short mixed batches; every tier is a full search, so nothing else
+            tier_sizes.push_back(1);
+            const uint32_t verify_tier = n_draft > 0 ? n_parallel * (n_draft + 1) : 0;
+            const uint32_t small_tier  = n_parallel < 16 ? 16 : 0;
+            for (uint32_t t : { n_parallel, small_tier, verify_tier }) {
+                if (t > 1 && t < 512 && t <= n_ubatch && std::find(tier_sizes.begin(), tier_sizes.end(), t) == tier_sizes.end()) {
+                    tier_sizes.push_back(t);
                 }
             }
+            std::sort(tier_sizes.begin(), tier_sizes.end());
         }
 
-        // prefill tiers: x2 growth from 512
-        for (uint32_t t = 512; t < n_ubatch; t *= 2) {
+        // prefill tiers: 512 and the 2048..8192 doublings, capped at n_ubatch; a context too
+        // small for 8192 ends the ladder at its own n_ubatch
+        for (uint32_t t : { 512u, 2048u, 4096u, 8192u }) {
+            if (t > n_ubatch) break;
             if (tier_sizes.empty() || tier_sizes.back() < t) {
                 tier_sizes.push_back(t);
             }
         }
 
-        if (tier_sizes.empty() || tier_sizes.back() != n_ubatch) {
+        if (n_ubatch < 8192 && (tier_sizes.empty() || tier_sizes.back() != n_ubatch)) {
             tier_sizes.push_back(n_ubatch);
         }
 

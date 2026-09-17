@@ -3,7 +3,6 @@
 #include "arg.h"
 #include "common.h"
 #include "log.h"
-#include "speculative.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -190,73 +189,10 @@ static std::map<uint32_t, uint32_t> bench_plan_context_tier_caps(const bench_pla
 
 // false when the planner refused pshard for this context (no or foreign machine profile, unsupported params):
 // nothing was written for it
+// the planner lives in common (common_pshard_plan) so that the tools can plan in-process when the
+// registry has no plan; this tool is the explicit, plan-only entry point
 static bool plan_pshard_context(common_params & params, uint32_t n_ctx, uint32_t bench_tier_cap = 0, bool bench_plan = false) {
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
-
-    cparams.n_ctx = n_ctx;
-
-    params.tensor_buft_overrides.assign(4096, {});
-
-    const uint32_t tier_max_auto = bench_plan ?
-        std::max(bench_tier_cap, (uint32_t) 16) :
-        std::min(std::max(cparams.n_batch, (uint32_t) 16384), cparams.n_ctx);
-    const uint32_t tier_max_user = params.pshard_tier_max > 0 ? std::min(params.pshard_tier_max, tier_max_auto) : tier_max_auto;
-    const uint32_t tier_max      = bench_plan ? tier_max_user : std::min(tier_max_user, cparams.n_ctx);
-
-    // spec verify tier: mirror the runtime's output-limits derivation. n_outputs_max is what the
-    // runtime reserve and the planner's probes clamp a tier's outputs to: speculative tools set it
-    // to the output limits' total; completion/perplexity leave it 0 (= n_batch, every token may be
-    // an output), so a plain plan must too, or the probes would price the logits scratch at 1 output
-    // while the runtime reserves bs (types defaults to { NONE }, so "configured" means a draft model
-    // or a non-zero draft length)
-    const bool spec_cfg = params.speculative.has_dft() || common_speculative_n_max(&params.speculative) > 0;
-    const auto output_limits = common_speculative_get_output_limits(
-            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
-    params.n_outputs_max = spec_cfg ? output_limits.total : 0;
-    params.n_outputs_max_per_seq = output_limits.per_seq;
-    cparams.n_outputs_max = spec_cfg ? output_limits.total : 0;
-    cparams.n_outputs_max_per_seq = output_limits.per_seq;
-    const uint32_t n_draft_tier = output_limits.per_seq > 1 ? (uint32_t) output_limits.per_seq - 1 : 0;
-
-    mparams.pshard_registry        = llama_pshard_registry_create(tier_max, cparams.n_seq_max, n_draft_tier);
-    mparams.pshard_cache_skip_load = true;
-
-    const size_t fit_target_mb = params.fit_params_target.empty() ? 0 : params.fit_params_target[0] / (1024 * 1024);
-
-    if (bench_plan) {
-        LOG_INF("%s: planning pshard tensor overrides for n_ctx=%u tier_cap=%u tier_max=%u...\n",
-                __func__, n_ctx, bench_tier_cap, tier_max);
-    } else {
-        LOG_INF("%s: planning pshard tensor overrides for n_ctx=%u tier_max=%u...\n", __func__, n_ctx, tier_max);
-    }
-    // one-budget rule: mirror the runtime - a separate draft's device footprint comes out of the budget
-    size_t mva_eff = params.max_vram_alloc, fit_target_eff = fit_target_mb;
-    const uint32_t n_ctx_res = common_pshard_resolve_n_ctx(params, cparams.n_ctx);
-    if (const size_t dres = common_pshard_draft_reserve_mb(params, n_ctx_res); dres > 0) {
-        if (mva_eff > 0) {
-            if (mva_eff <= dres) {
-                LOG_WRN("%s: the spec context reserve (%zu MiB) leaves nothing of the %zu MiB pshard budget for the target; pshard will fall back to stock\n", __func__, dres, mva_eff);
-            }
-            mva_eff = mva_eff > dres ? mva_eff - dres : 1;  // 1 MiB: non-viable -> stock fallback, never free-VRAM mode
-            LOG_INF("%s: pshard target budget after draft reserve: %zu MiB\n", __func__, mva_eff);
-        } else {
-            fit_target_eff += dres;
-            LOG_INF("%s: pshard fit target after draft reserve: %zu MiB\n", __func__, fit_target_eff);
-        }
-    }
-    // same passes as the runtime (common_init_result): fit, re-measure the MTP context under the
-    // fitted placement, refit once with the reserve raised if it is short
-    common_pshard_fit_one_budget(params, mparams, cparams, mva_eff, fit_target_eff, n_ctx_res,
-        llama_params_fit_pshard_plan,
-        [&]() {
-            auto * r = llama_pshard_registry_create(tier_max, cparams.n_seq_max, n_draft_tier);
-            return r;
-        });
-
-    const bool planned = mparams.pshard;
-    llama_pshard_registry_free(mparams.pshard_registry);
-    return planned;
+    return common_pshard_plan(params, n_ctx, bench_tier_cap, bench_plan);
 }
 
 int main(int argc, char ** argv) {

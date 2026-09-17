@@ -2406,6 +2406,48 @@ int llama_bench(int argc, char ** argv) {
             llama_params_fit_pshard(inst.model.c_str(), &mparams, &cparams,
                 pshard_overrides.data(), inst.max_vram_alloc, inst.fit_target);
 
+            if (llama_pshard_registry_cache_missed(pending_pshard_registry)) {
+                // no plan for this configuration (or only a smaller budget's): plan it in-process the way
+                // the tools do, then load again
+                fprintf(stderr, "%s: no pshard plan for this configuration, planning it now\n", __func__);
+                common_params pp;
+                pp.model.path      = inst.model;
+                pp.pshard          = true;
+                pp.n_ctx           = (int32_t) cparams.n_ctx;
+                pp.n_batch         = (int32_t) cparams.n_batch;
+                pp.n_ubatch        = (int32_t) cparams.n_ubatch;
+                pp.n_parallel      = (int32_t) cparams.n_seq_max;
+                pp.kv_unified      = cparams.kv_unified;
+                pp.cpuparams.n_threads       = cparams.n_threads;
+                pp.cpuparams_batch.n_threads = cparams.n_threads_batch;
+                pp.flash_attn_type = cparams.flash_attn_type;
+                pp.cache_type_k    = cparams.type_k;
+                pp.cache_type_v    = cparams.type_v;
+                pp.n_gpu_layers    = mparams.n_gpu_layers;
+                pp.main_gpu        = mparams.main_gpu;
+                pp.no_host         = mparams.no_host;
+                pp.devices         = inst.devices;
+                pp.no_kv_offload   = !cparams.offload_kqv;
+                pp.no_op_offload   = !cparams.op_offload;
+                pp.embedding       = cparams.embeddings;
+                pp.max_vram_alloc  = inst.max_vram_alloc;
+                pp.fit_params_target.assign(llama_max_devices(), inst.fit_target * 1024 * 1024);
+                const bool planned = common_pshard_plan(pp, cparams.n_ctx);
+                // load again against whatever the planner wrote; a refusal wrote nothing and the
+                // second probe takes the stock fallback (both pshard flags cleared there)
+                llama_pshard_registry_free(pending_pshard_registry);
+                mparams = inst.to_llama_mparams();
+                cparams = inst.to_llama_cparams();
+                pending_pshard_registry = llama_pshard_registry_create(tier_max_auto, cparams.n_seq_max, /*n_draft=*/0);
+                mparams.pshard_registry = pending_pshard_registry;
+                std::fill(pshard_overrides.begin(), pshard_overrides.end(), llama_model_tensor_buft_override{ nullptr, nullptr, -1 });
+                llama_params_fit_pshard(inst.model.c_str(), &mparams, &cparams,
+                    pshard_overrides.data(), inst.max_vram_alloc, inst.fit_target);
+                if (!planned && !mparams.pshard) {
+                    fprintf(stderr, "%s: planning produced no pshard plan; continuing on the stock path\n", __func__);
+                }
+            }
+
             if (!mparams.pshard) {
                 llama_pshard_registry_free(pending_pshard_registry);
                 pending_pshard_registry = nullptr;
