@@ -1,5 +1,15 @@
 #define CPU_WARMUP_ITERS  2
-#define CPU_TIMED_ITERS   2
+// timed passes: at least CPU_TIMED_ITERS, more until the timed work spans CPU_TIMED_MIN_S
+// or CPU_TIMED_ITERS_MAX passes, so a sub-millisecond op is averaged over dozens of samples
+#define CPU_TIMED_ITERS      2
+#define CPU_TIMED_ITERS_MAX  32
+#define CPU_TIMED_MIN_S      0.010
+// cold cache by rotation: consecutive passes read different copies of the operand (or a
+// different expert set) until at least BENCH_COLD_BYTES of traffic (operands read, outputs
+// written) lie between two reads of the same bytes, more than any CPU cache holds; no pass
+// sees what the previous one left in cache
+#define BENCH_COLD_BYTES  (512ULL * 1024 * 1024)
+#define BENCH_COPY_MAX    4096
 
 #include "profiler-common.h"
 
@@ -38,31 +48,38 @@
 #include <cstdlib>
 #endif
 
-static std::vector<char> g_flush_buffer;
-
-static void flush_caches() {
-    if (g_flush_buffer.empty()) return;
-
-    volatile char sum = 0;
-    for (size_t i = 0; i < g_flush_buffer.size(); i += 64) {
-        sum += g_flush_buffer[i];
-        g_flush_buffer[i] = (char)(i & 0xFF);
+// copies a rotation needs so that BENCH_COLD_BYTES of traffic separate two reads of one
+// copy; bytes_per_pass = what one pass reads of its copy plus the output it writes
+static int bench_n_copies(size_t bytes_per_pass) {
+    if (bytes_per_pass == 0) {
+        return 1;
     }
-    g_flush_buffer[0] = sum;
-
-#if defined(_MSC_VER)
-    _mm_mfence();
-#elif defined(__GNUC__) || defined(__clang__)
-    __sync_synchronize();
-#endif
+    const size_t n = (BENCH_COLD_BYTES + bytes_per_pass - 1) / bytes_per_pass;
+    return (int) std::min<size_t>(BENCH_COPY_MAX, std::max<size_t>(1, n));
 }
 
-static void init_flush_buffer() {
-    const size_t flush_size = 256 * 1024 * 1024;
-    g_flush_buffer.resize(flush_size);
-    for (size_t i = 0; i < flush_size; i += 4096) {
-        g_flush_buffer[i] = (char)(i & 0xFF);
+// prepare(pass) points a pass at operands no recent pass has read (a weight copy, a KV
+// block, an expert set) and returns the graph to run; the first CPU_WARMUP_ITERS passes are
+// not timed, a small op then repeats until its samples span the minimum duration
+static double time_op(ggml_backend_t be, const std::function<ggml_cgraph *(int)> & prepare) {
+    int pass = 0;
+    for (; pass < CPU_WARMUP_ITERS; pass++) {
+        ggml_backend_graph_compute_async(be, prepare(pass));
     }
+    double total_time = 0.0;
+    std::vector<double> samples;
+    bench_timer t;
+    while (samples.size() < CPU_TIMED_ITERS || (total_time < CPU_TIMED_MIN_S && samples.size() < CPU_TIMED_ITERS_MAX)) {
+        ggml_cgraph * gf = prepare(pass++);
+        t.start();
+        ggml_backend_graph_compute_async(be, gf);
+        samples.push_back(t.stop());
+        total_time += samples.back();
+    }
+    // the median once there are enough samples: one stalled pass must not price a fast op
+    std::sort(samples.begin(), samples.end());
+    const size_t n = samples.size();
+    return n >= 3 ? 0.5 * (samples[(n - 1) / 2] + samples[n / 2]) : total_time / n;
 }
 
 static double benchmark_cpu_dram_bandwidth(int threads) {
@@ -85,17 +102,21 @@ static double benchmark_cpu_dram_bandwidth(int threads) {
         workers.emplace_back([&pool, &thread_bytes, tid, chunk_per_thread, iterations, pool_bytes]() {
             const size_t start = tid * chunk_per_thread;
             const size_t end_pos = (tid == (int)(pool_bytes / chunk_per_thread) - 1) ? pool_bytes : (start + chunk_per_thread);
-            volatile uint64_t local_sink = 0;
+            // four independent sums over every word: a streaming read, not one dependent
+            // load per line that waits on the previous one
+            uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
             double local_bytes = 0.0;
             for (int iter = 0; iter < iterations; ++iter) {
-                const size_t limit = end_pos - sizeof(uint64_t);
-                for (size_t offset = start; offset + 64 <= limit; offset += 64) {
-                    local_sink += *(const uint64_t *)(pool.data() + offset);
-                    local_bytes += 64.0;
+                const uint64_t * p   = (const uint64_t *) (pool.data() + start);
+                const uint64_t * end = (const uint64_t *) (pool.data() + (end_pos & ~(size_t) 31));
+                for (; p + 4 <= end; p += 4) {
+                    s0 += p[0]; s1 += p[1]; s2 += p[2]; s3 += p[3];
                 }
+                local_bytes += (double) ((const uint8_t *) end - (pool.data() + start));
             }
+            volatile uint64_t sink = s0 + s1 + s2 + s3;
+            (void) sink;
             thread_bytes[tid] = local_bytes;
-            (void)local_sink;
         });
     }
     for (auto & w : workers) w.join();
@@ -775,38 +796,37 @@ static double benchmark_mul_mat_raw(
     ggml_context * ctx = ggml_init(params);
     ggml_backend_cpu_set_n_threads(be, threads);
 
-    ggml_tensor * A = ggml_new_tensor_2d(ctx, quant, K, N);
     ggml_tensor * B_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, batch_size);
 
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_tensor * C = ggml_mul_mat(ctx, A, B_tensor);
-    ggml_build_forward_expand(gf, C);
+    // one weight copy per pass in rotation, each with its own graph
+    const int n_copies = bench_n_copies(ggml_row_size(quant, K) * N + (size_t) N * batch_size * sizeof(float));
+    std::vector<ggml_tensor *> A(n_copies);
+    std::vector<ggml_cgraph *> gf(n_copies);
+    ggml_tensor * C = nullptr;
+    for (int c = 0; c < n_copies; c++) {
+        A[c]  = ggml_new_tensor_2d(ctx, quant, K, N);
+        gf[c] = ggml_new_graph_custom(ctx, 8, false);
+        C = ggml_mul_mat(ctx, A[c], B_tensor);
+        ggml_build_forward_expand(gf[c], C);
+    }
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!buffer) {
         printf("SKIPPED: MUL_MAT N=%d K=%d B=%d %s (alloc failed)\n", N, K, batch_size, ggml_type_name(quant));
         ggml_free(ctx); return 0.0;
     }
+    ggml_backend_buffer_clear(buffer, 0);   // touch every page now, not inside a timed pass
 
     std::vector<uint8_t> A_data = create_quantized_data(quant, (int64_t)K * N);
     std::vector<float> B_data(K * batch_size, 1.0f);
-    ggml_backend_tensor_set(A, A_data.data(), 0, ggml_nbytes(A));
+    for (int c = 0; c < n_copies; c++) {
+        ggml_backend_tensor_set(A[c], A_data.data(), 0, ggml_nbytes(A[c]));
+    }
     ggml_backend_tensor_set(B_tensor, B_data.data(), 0, ggml_nbytes(B_tensor));
 
-    for (int i = 0; i < CPU_WARMUP_ITERS; ++i) { flush_caches(); ggml_backend_graph_compute_async(be, gf); }
-
-    double total_time = 0.0;
-    bench_timer t;
-    for (int i = 0; i < CPU_TIMED_ITERS; ++i) {
-        flush_caches();
-        t.start();
-        ggml_backend_graph_compute_async(be, gf);
-        total_time += t.stop();
-    }
-
-    double time_per_iter = total_time / CPU_TIMED_ITERS;
+    double time_per_iter = time_op(be, [&](int pass) { return gf[pass % n_copies]; });
     double ops_total = 2.0 * N * K * batch_size;
-    double bytes_total = (double)(ggml_nbytes(A) + ggml_nbytes(B_tensor) + ggml_nbytes(C));
+    double bytes_total = (double)(ggml_nbytes(A[0]) + ggml_nbytes(B_tensor) + ggml_nbytes(C));
 
     if (out_time_s) *out_time_s = time_per_iter;
     if (out_ops) *out_ops = ops_total;
@@ -826,41 +846,51 @@ static double benchmark_mul_mat_id_raw(
     ggml_context * ctx = ggml_init(params);
     ggml_backend_cpu_set_n_threads(be, threads);
 
-    ggml_tensor * A   = ggml_new_tensor_3d(ctx, quant, K, N, n_experts);
     ggml_tensor * B   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, batch_size);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts_used, batch_size);
 
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, ggml_mul_mat_id(ctx, A, B, ids));
+    // a small expert stack gets copies too: the rotation walks the copies and, once around,
+    // moves on to the next experts, so no pass rereads bytes a recent pass touched
+    const int n_copies = bench_n_copies(ggml_row_size(quant, (int64_t) K * N * n_experts)
+                                        + (size_t) N * batch_size * n_experts_used * sizeof(float));
+    std::vector<ggml_tensor *> A(n_copies);
+    std::vector<ggml_cgraph *> gf(n_copies);
+    for (int c = 0; c < n_copies; c++) {
+        A[c]  = ggml_new_tensor_3d(ctx, quant, K, N, n_experts);
+        gf[c] = ggml_new_graph_custom(ctx, 8, false);
+        ggml_build_forward_expand(gf[c], ggml_mul_mat_id(ctx, A[c], B, ids));
+    }
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!buffer) {
         printf("SKIPPED: MUL_MAT_ID N=%d K=%d B=%d (alloc failed)\n", N, K, batch_size);
         ggml_free(ctx); return 0.0;
     }
+    ggml_backend_buffer_clear(buffer, 0);   // touch every page now, not inside a timed pass
 
     std::vector<uint8_t> A_data = create_quantized_data(quant, (int64_t)K * N * n_experts);
-    ggml_backend_tensor_set(A, A_data.data(), 0, ggml_nbytes(A));
+    for (int c = 0; c < n_copies; c++) {
+        ggml_backend_tensor_set(A[c], A_data.data(), 0, ggml_nbytes(A[c]));
+    }
     std::vector<float> B_data(K * batch_size, 1.0f);
     ggml_backend_tensor_set(B, B_data.data(), 0, ggml_nbytes(B));
+    // every token routes to its own experts until the stack is exhausted: the batch streams
+    // min(B * used, E) distinct experts, the independent-token routing the planner prices
     std::vector<int32_t> ids_data(n_experts_used * batch_size);
-    for (int i = 0; i < n_experts_used * batch_size; i++) ids_data[i] = i % n_experts;
-    ggml_backend_tensor_set(ids, ids_data.data(), 0, ggml_nbytes(ids));
+    const int n_distinct = std::min(n_experts_used * batch_size, n_experts);
+    auto prepare = [&](int pass) {
+        const int copy  = pass % n_copies;
+        const int shift = (int) ((((int64_t) pass / n_copies) * n_distinct) % n_experts);
+        for (int i = 0; i < n_experts_used * batch_size; i++) {
+            ids_data[i] = (i + shift) % n_experts;
+        }
+        ggml_backend_tensor_set(ids, ids_data.data(), 0, ggml_nbytes(ids));
+        return gf[copy];
+    };
 
-    for (int i = 0; i < CPU_WARMUP_ITERS; ++i) { flush_caches(); ggml_backend_graph_compute_async(be, gf); }
-
-    double total_time = 0.0;
-    bench_timer t;
-    for (int i = 0; i < CPU_TIMED_ITERS; ++i) {
-        flush_caches();
-        t.start();
-        ggml_backend_graph_compute_async(be, gf);
-        total_time += t.stop();
-    }
-
-    double time_per_iter = total_time / CPU_TIMED_ITERS;
+    double time_per_iter = time_op(be, prepare);
     double ops_total = 2.0 * N * K * batch_size * n_experts_used;
-    double bytes_total = (double)(ggml_nbytes(A) * n_experts_used / n_experts) + ggml_nbytes(B) + (double)(N * batch_size * n_experts_used * 4);
+    double bytes_total = (double) ggml_nbytes(A[0]) * n_distinct / n_experts + ggml_nbytes(B) + (double)(N * batch_size * n_experts_used * 4);
 
     if (out_time_s) *out_time_s = time_per_iter;
     if (out_ops) *out_ops = ops_total;
@@ -882,39 +912,39 @@ static double benchmark_flash_attn_raw(
     ggml_backend_cpu_set_n_threads(be, threads);
 
     ggml_tensor * Q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_tokens, n_q_heads, 1);
-    ggml_tensor * K = ggml_new_tensor_4d(ctx, kv_quant, head_dim, ctx_len, n_kv_heads, 1);
-    ggml_tensor * V = ggml_new_tensor_4d(ctx, kv_quant, head_dim, ctx_len, n_kv_heads, 1);
 
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_tensor * out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
-    ggml_build_forward_expand(gf, out);
+    // one KV block per pass in rotation, each with its own graph
+    const int n_copies = bench_n_copies(2 * ggml_row_size(kv_quant, (int64_t) head_dim * ctx_len * n_kv_heads)
+                                        + (size_t) head_dim * n_tokens * n_q_heads * sizeof(float));
+    std::vector<ggml_tensor *> K(n_copies), V(n_copies);
+    std::vector<ggml_cgraph *> gf(n_copies);
+    ggml_tensor * out = nullptr;
+    for (int c = 0; c < n_copies; c++) {
+        K[c]  = ggml_new_tensor_4d(ctx, kv_quant, head_dim, ctx_len, n_kv_heads, 1);
+        V[c]  = ggml_new_tensor_4d(ctx, kv_quant, head_dim, ctx_len, n_kv_heads, 1);
+        gf[c] = ggml_new_graph_custom(ctx, 8, false);
+        out = ggml_flash_attn_ext(ctx, Q, K[c], V[c], nullptr, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+        ggml_build_forward_expand(gf[c], out);
+    }
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!buffer) {
         printf("SKIPPED: FLASH_ATTN (alloc failed)\n");
         ggml_free(ctx); return 0.0;
     }
+    ggml_backend_buffer_clear(buffer, 0);   // touch every page now, not inside a timed pass
 
     std::vector<float> Q_data(ggml_nelements(Q), 1.0f);
     ggml_backend_tensor_set(Q, Q_data.data(), 0, ggml_nbytes(Q));
-    std::vector<uint8_t> KV_data = create_quantized_data(kv_quant, ggml_nelements(K));
-    ggml_backend_tensor_set(K, KV_data.data(), 0, ggml_nbytes(K));
-    ggml_backend_tensor_set(V, KV_data.data(), 0, ggml_nbytes(V));
-
-    for (int i = 0; i < CPU_WARMUP_ITERS; ++i) { flush_caches(); ggml_backend_graph_compute_async(be, gf); }
-
-    double total_time = 0.0;
-    bench_timer t;
-    for (int i = 0; i < CPU_TIMED_ITERS; ++i) {
-        flush_caches();
-        t.start();
-        ggml_backend_graph_compute_async(be, gf);
-        total_time += t.stop();
+    std::vector<uint8_t> KV_data = create_quantized_data(kv_quant, ggml_nelements(K[0]));
+    for (int c = 0; c < n_copies; c++) {
+        ggml_backend_tensor_set(K[c], KV_data.data(), 0, ggml_nbytes(K[c]));
+        ggml_backend_tensor_set(V[c], KV_data.data(), 0, ggml_nbytes(V[c]));
     }
 
-    double time_per_iter = total_time / CPU_TIMED_ITERS;
+    double time_per_iter = time_op(be, [&](int pass) { return gf[pass % n_copies]; });
     double ops_total = 2.0 * n_tokens * head_dim * ctx_len * n_q_heads * 2;
-    double bytes_total = (double)(ggml_nbytes(Q) + ggml_nbytes(K) + ggml_nbytes(V) + ggml_nbytes(out));
+    double bytes_total = (double)(ggml_nbytes(Q) + ggml_nbytes(K[0]) + ggml_nbytes(V[0]) + ggml_nbytes(out));
 
     if (out_time_s) *out_time_s = time_per_iter;
     if (out_ops) *out_ops = ops_total;
@@ -1129,13 +1159,13 @@ int main(int argc, char ** argv) {
 
     int32_t default_threads = common_cpu_get_num_math();
     int threads = (fixed_threads > 0) ? fixed_threads : default_threads;
-    std::vector<int32_t> batch_sizes = { 1, 64, 512 };
+    // 4 and 16 are the decode tiers of a multi-sequence server: between the memory-bound
+    // single token and the compute-bound prefill batches, priced from an entry in their own regime
+    std::vector<int32_t> batch_sizes = { 1, 4, 16, 64, 512 };
 
     printf("=== CPU Profiler (cold-cache) ===\n");
     printf("Threads: %d%s\n", threads, fixed_threads > 0 ? " (user)" : " (auto)");
     printf("Mode:    %s\n\n", fast_mode ? "FAST" : "FULL");
-
-    init_flush_buffer();
 
     ggml_backend_t cpu_be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!cpu_be) { fprintf(stderr, "Failed to initialize CPU backend\n"); return 1; }
