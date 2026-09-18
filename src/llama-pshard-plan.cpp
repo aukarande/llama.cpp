@@ -1265,10 +1265,11 @@ bool pshard_registry_save(
             case LLAMA_FLASH_ATTN_TYPE_AUTO:     fa_str = "auto"; break;
         }
         const int forced_strategy = pshard_strategy_from_env();
-        fprintf(f, "# n_ctx=%u n_seq_max=%u kv_unified=%d n_threads=%d fa=%s type_k=%d type_v=%d strategy=%s\n",
+        fprintf(f, "# n_ctx=%u n_seq_max=%u kv_unified=%d n_threads=%d fa=%s type_k=%d type_v=%d strategy=%s predictor=%u profile=%016llx\n",
             cparams->n_ctx, cparams->n_seq_max, cparams->kv_unified ? 1 : 0, cparams->n_threads,
             fa_str, (int)cparams->type_k, (int)cparams->type_v,
-            pshard_forced_strategy_name(forced_strategy));
+            pshard_forced_strategy_name(forced_strategy),
+            LLAMA_BENCHMARK_PREDICTOR_VERSION, (unsigned long long) llama_benchmark_profile_hash());
     }
 
     for (const auto & variant : preserved_variants) {
@@ -1290,10 +1291,22 @@ bool pshard_registry_save(
     if (registry->pshard_disabled) {
         fprintf(f, "pshard_disabled=1 baseline_vram=%.1f\n", registry->baseline_vram_req / (1024.0 * 1024.0));
     } else {
+        // the sweep's candidates follow each tier (audit only; older parsers skip the lines)
+        auto write_candidates = [&](size_t t) {
+            if (t >= registry->candidates.size()) {
+                return;
+            }
+            for (const auto & c : registry->candidates[t]) {
+                fprintf(f, "cand strategy=%s viable=%d tps=%.2f n_pinned=%u n_attn_pinned=%u slots=%u vram=%.1f\n",
+                    llama_pshard_strategy_name(c.strategy), c.is_viable ? 1 : 0, c.tps,
+                    c.n_pinned, c.n_attn_pinned, c.pool_slots, c.total_vram_req / (1024.0 * 1024.0));
+            }
+        };
         for (size_t t = 0; t < registry->tier_sizes.size(); t++) {
             const auto & plan = registry->best_plans[t];
             if (!plan.is_viable) {
                 fprintf(f, "[tier %zu bs=%u] not_viable\n", t, registry->tier_sizes[t]);
+                write_candidates(t);
                 continue;
             }
             fprintf(f, "[tier %zu bs=%u]\n", t, registry->tier_sizes[t]);
@@ -1314,6 +1327,7 @@ bool pshard_registry_save(
             }
             fprintf(f, "\n");
             fprintf(f, "ot=%s\n", pshard_plan_to_ot(plan, host_buft).c_str());
+            write_candidates(t);
         }
     }
 
@@ -1358,6 +1372,7 @@ bool pshard_registry_load(
         int pool_prefill = 0;
         float pool_hybrid_frac = 0.0f;
         std::string ot_line;
+        std::vector<llama_pshard_candidate> cands;
     };
     struct variant_data {
         uint32_t budget_mib = 0;
@@ -1493,6 +1508,30 @@ bool pshard_registry_load(
             }
         } else if (s.compare(0, 3, "ot=") == 0 && !cur_variant->tiers.empty()) {
             cur_variant->tiers.back().ot_line = s.substr(3);
+        } else if (s.compare(0, 5, "cand ") == 0 && !cur_variant->tiers.empty()) {
+            llama_pshard_candidate c;
+            char strat_name[64] = {};
+            int viable = 0;
+            double vram_mib = 0.0;
+            if (sscanf(s.c_str(), "cand strategy=%63s viable=%d tps=%f n_pinned=%u n_attn_pinned=%u slots=%u vram=%lf",
+                   strat_name, &viable, &c.tps, &c.n_pinned, &c.n_attn_pinned, &c.pool_slots, &vram_mib) != 7) {
+                LLAMA_LOG_WARN("%s: malformed candidate line ignored: %s\n", __func__, s.c_str());
+                continue;
+            }
+            int strat = -1;
+            for (int i = 0; i < LLAMA_PSHARD_COUNT; i++) {
+                if (strcmp(strat_name, llama_pshard_strategy_name((llama_pshard_strategy)i)) == 0) {
+                    strat = i;
+                    break;
+                }
+            }
+            if (strat < 0) {
+                continue;   // a strategy this build does not know: not a plan, nothing to invalidate
+            }
+            c.strategy       = (llama_pshard_strategy) strat;
+            c.is_viable      = viable != 0;
+            c.total_vram_req = pshard_mib_to_bytes(vram_mib);
+            cur_variant->tiers.back().cands.push_back(c);
         }
     }
     fclose(f);
@@ -1567,6 +1606,7 @@ bool pshard_registry_load(
         if (baseline_vram <= current_budget) {
             registry->tier_sizes.clear();
             registry->best_plans.clear();
+            registry->candidates.clear();
             registry->pshard_disabled = true;
             registry->baseline_vram_req = baseline_vram;
             registry->budget_mib = variant.budget_mib;
@@ -1618,16 +1658,22 @@ bool pshard_registry_load(
         best_whole = &variant; // all keys equal: later in file = newer wins
     }
 
-    std::vector<std::pair<uint32_t, llama_pshard_plan>> selected;
+    struct selected_tier {
+        uint32_t          bs;
+        llama_pshard_plan plan;
+        std::vector<llama_pshard_candidate> cands;
+    };
+    std::vector<selected_tier> selected;
     if (best_whole) {
         for (const auto & td : best_whole->tiers) {
             llama_pshard_plan plan = make_plan(td);
             auto it = std::find_if(selected.begin(), selected.end(),
-                [&](const auto & p) { return p.first == td.bs; });
+                [&](const auto & p) { return p.bs == td.bs; });
             if (it == selected.end()) {
-                selected.push_back({td.bs, std::move(plan)});
+                selected.push_back({td.bs, std::move(plan), td.cands});
             } else {
-                it->second = std::move(plan);
+                it->plan  = std::move(plan);
+                it->cands = td.cands;
             }
         }
         if (!best_is_exact) {
@@ -1642,8 +1688,8 @@ bool pshard_registry_load(
     const uint32_t selected_cache_ubatch = best_whole ? variant_cache_ubatch(*best_whole) : requested_cache_ubatch;
     selected.erase(std::remove_if(selected.begin(), selected.end(),
         [&](const auto & p) {
-            if (p.first == 0) return true;
-            return selected_cache_ubatch > 0 && p.first > selected_cache_ubatch;
+            if (p.bs == 0) return true;
+            return selected_cache_ubatch > 0 && p.bs > selected_cache_ubatch;
         }), selected.end());
     if (selected.empty()) {
         if (require_exact_budget && !variants.empty()) {
@@ -1658,10 +1704,11 @@ bool pshard_registry_load(
     }
 
     std::sort(selected.begin(), selected.end(),
-        [](const auto & a, const auto & b) { return a.first < b.first; });
+        [](const auto & a, const auto & b) { return a.bs < b.bs; });
 
     registry->tier_sizes.clear();
     registry->best_plans.clear();
+    registry->candidates.clear();
     registry->pshard_disabled = false;
     registry->baseline_vram_req = 0;
     registry->budget_mib = best_whole ? best_whole->budget_mib : 0;
@@ -1679,15 +1726,17 @@ bool pshard_registry_load(
     }
 
     for (auto & item : selected) {
-        const auto & p = item.second;
+        const auto & p = item.plan;
         if (p.is_viable && p.overrides.empty()) {
-            LLAMA_LOG_WARN("%s: plan cache corrupt: tier bs=%u viable but has no overrides\n", __func__, item.first);
+            LLAMA_LOG_WARN("%s: plan cache corrupt: tier bs=%u viable but has no overrides\n", __func__, item.bs);
             registry->tier_sizes.clear();
             registry->best_plans.clear();
+            registry->candidates.clear();
             return false;
         }
-        registry->tier_sizes.push_back(item.first);
-        registry->best_plans.push_back(std::move(item.second));
+        registry->tier_sizes.push_back(item.bs);
+        registry->best_plans.push_back(std::move(item.plan));
+        registry->candidates.push_back(std::move(item.cands));
     }
 
     LLAMA_LOG_INFO("%s: loaded %zu tier plans from %s budget=%u MiB cache_ubatch=%u variant (current budget=%u MiB) in %s\n",
@@ -2753,10 +2802,8 @@ void llama_params_fit_pshard_plan(
     std::unique_ptr<llama_benchmark_predictor> predictor;
     uint64_t machine_hash = 0;
     {
-        const char * env_cpu  = getenv("PSHARD_CPU_PROFILE");
-        const char * env_gpu  = getenv("PSHARD_GPU_PROFILE");
-        const char * cpu_path = env_cpu ? env_cpu : "cpu_profile.txt";
-        const char * gpu_path = env_gpu ? env_gpu : "gpu_profile.txt";
+        const char * cpu_path = llama_benchmark_profile_path(false);
+        const char * gpu_path = llama_benchmark_profile_path(true);
 
         auto p = std::make_unique<llama_benchmark_predictor>();
         const bool has_cpu = p->load_cpu(cpu_path, cparams->n_threads);
@@ -3043,6 +3090,7 @@ void llama_params_fit_pshard_plan(
 
             registry->tier_sizes = requested_tiers;
             registry->best_plans.resize(requested_tiers.size());
+            registry->candidates.assign(requested_tiers.size(), {});
             registry->pshard_disabled = cached.pshard_disabled;
             registry->baseline_vram_req = cached.baseline_vram_req;
             registry->budget_mib = cached.budget_mib;
@@ -3152,6 +3200,7 @@ void llama_params_fit_pshard_plan(
                     registry->cache_ubatch = global_cache_ubatch;
                     registry->tier_sizes.clear();
                     registry->best_plans.clear();
+                    registry->candidates.clear();
                     pshard_registry_save(registry, fp, cache_path.c_str(), host_buft, cparams);
 
                     mparams->pshard = false;
@@ -3226,10 +3275,17 @@ void llama_params_fit_pshard_plan(
                 }
                 registry->best_plans[t] = best;
 
-                // every candidate the sweep priced for this tier, so the pick can be audited from the log
+                // every candidate the sweep priced for this tier: logged, and kept in the registry
+                // so the pick can be audited against its runner-ups later
+                if (registry->candidates.size() < n_tiers) {
+                    registry->candidates.resize(n_tiers);
+                }
+                auto & cands = registry->candidates[t];
+                cands.clear();
                 for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
                     if (!pshard_strategy_allowed(force_strategy, s)) continue;
                     const auto & p = all_plans[s * n_tiers + t];
+                    cands.push_back({ (llama_pshard_strategy) s, p.is_viable, p.tps, p.n_pinned, p.n_attn_pinned, p.pool_slots, p.total_vram_req });
                     const bool picked = best.is_viable && p.is_viable && best.strategy == (llama_pshard_strategy) s;
                     LLAMA_LOG_INFO("%s: [tier %zu bs=%-5u] %-28s %s n_pinned=%2u n_attn=%2u slots=%3u tps=%7.1f vram=%7.1f MiB%s\n",
                         __func__, t, registry->tier_sizes[t], llama_pshard_strategy_name((llama_pshard_strategy) s),

@@ -304,8 +304,10 @@ void llama_params_fit_impl(
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level);
 
-// plan cache serialization. fingerprint covers only runtime plan-compatibility params
-// so the planner binary and the runtime binary can share the same cache file.
+// plan cache serialization. fingerprint covers the runtime plan-compatibility params, the
+// predictor version and the profile files' hash, so the planner binary and the runtime binary
+// share the same cache file when they see the same profile files (working directory or
+// PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE).
 // keep this in sync with planner save
 uint64_t pshard_registry_fingerprint(
         const struct llama_model_params * mparams,
@@ -322,9 +324,22 @@ bool pshard_registry_load(
         const char * cache_path, ggml_backend_buffer_type_t host_buft,
         size_t current_budget, bool require_exact_budget = false);
 
+// one strategy's result in a tier's sweep: the pick and its runner-ups, kept so a pick can be
+// audited against the prices it beat; never executed
+struct llama_pshard_candidate {
+    llama_pshard_strategy strategy       = LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS;
+    bool                  is_viable      = false;
+    float                 tps            = 0.0f;
+    uint32_t              n_pinned       = 0;
+    uint32_t              n_attn_pinned  = 0;
+    uint32_t              pool_slots     = 0;
+    size_t                total_vram_req = 0;
+};
+
 struct llama_pshard_plan_registry {
     std::vector<uint32_t>                tier_sizes;
     std::vector<llama_pshard_plan>       best_plans;  // one best plan per tier
+    std::vector<std::vector<llama_pshard_candidate>> candidates;  // per tier, every strategy the sweep priced
     llama_pshard_plan *                  active_plan = nullptr;
     uint32_t                             budget_mib = 0;
     uint32_t                             cache_ubatch = 0;
@@ -434,12 +449,7 @@ struct llama_pshard_plan_registry {
     void init(uint32_t n_ubatch, uint32_t n_parallel = 1, uint32_t n_draft = 0) {
         tier_sizes.clear();
         best_plans.clear();
-
-        if (n_ubatch == 0) {
-            cache_ubatch = 0;
-            return;
-        }
-        best_plans.clear();
+        candidates.clear();
 
         if (n_ubatch == 0) {
             cache_ubatch = 0;
@@ -490,6 +500,7 @@ struct llama_pshard_plan_registry {
 
         cache_ubatch = tier_sizes.empty() ? 0 : tier_sizes.back();
         best_plans.resize(tier_sizes.size());
+        candidates.resize(tier_sizes.size());
     }
 
     size_t tier_index(uint32_t batch_size) const {

@@ -254,6 +254,35 @@ void llama_benchmark_predictor::build_maps() {
     build_entry_map(gpu_map, gpu_entries);
 }
 
+const char * llama_benchmark_profile_path(bool gpu) {
+    const char * env = getenv(gpu ? "PSHARD_GPU_PROFILE" : "PSHARD_CPU_PROFILE");
+    return env ? env : (gpu ? "gpu_profile.txt" : "cpu_profile.txt");
+}
+
+uint64_t llama_benchmark_profile_hash() {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    bool any = false;
+    for (bool gpu : { false, true }) {
+        const char * path = llama_benchmark_profile_path(gpu);
+        FILE * f = fopen(path, "rb");
+        if (!f) {
+            LLAMA_LOG_WARN("%s: profile %s is not readable here - a plan priced from it will not match\n", __func__, path);
+            continue;
+        }
+        any = true;
+        unsigned char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            for (size_t i = 0; i < n; i++) {
+                h ^= buf[i];
+                h *= 0x100000001b3ULL;
+            }
+        }
+        fclose(f);
+    }
+    return any ? h : 0;
+}
+
 bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
     cpu_entries.clear();
     cpu_map.clear();

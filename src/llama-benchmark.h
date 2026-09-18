@@ -13,6 +13,18 @@ typedef struct ggml_backend_device * ggml_backend_dev_t;
 struct ggml_tensor;
 typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+// pricing model version. Bump it when a pricing formula changes: the plan registry
+// fingerprints it, so plans priced by an older predictor are re-planned, not reused
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 1;
+
+// the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
+// override the defaults in the working directory
+const char * llama_benchmark_profile_path(bool gpu);
+
+// FNV-1a over the bytes of both profile files, 0 when neither is readable. The plan
+// registry fingerprints it: a plan priced from another profile is re-planned, not reused
+uint64_t llama_benchmark_profile_hash();
+
 // Per-op FLOPS/bytes metrics extracted from a ggml tensor node.
 // Used by roofline prediction to classify ops as compute-bound or memory-bound.
 struct llama_op_metrics {

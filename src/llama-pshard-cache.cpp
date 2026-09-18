@@ -1,5 +1,6 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-pshard-plan.h"
+#include "llama-benchmark.h"
 #include "llama-impl.h"
 
 #include "ggml-backend.h"
@@ -249,6 +250,10 @@ uint64_t pshard_registry_fingerprint(
     mix((uint64_t)cparams->type_k);
     mix((uint64_t)cparams->type_v);
     mix((uint64_t)model_file_size);
+    // the pricing model and the profile files the plans were priced with: a plan priced by an
+    // older predictor or from another profile is re-planned, not reused
+    mix((uint64_t)LLAMA_BENCHMARK_PREDICTOR_VERSION);
+    mix(llama_benchmark_profile_hash());
     mix((uint64_t)pshard_strategy_from_env());
     // forced miss policy (QA override) plans differently; mixed only when set so
     // existing registries keep their fingerprints
@@ -506,7 +511,7 @@ void llama_params_fit_pshard(
         LLAMA_LOG_WARN("%s: no matching plan cache at %s (fingerprint=0x%016" PRIx64 "), disabling pshard\n",
             __func__, cache_path.c_str(), fp);
         LLAMA_LOG_WARN("%s: >>> pshard DISABLED: this run uses the STOCK path - benchmark numbers will not be pshard numbers <<<\n", __func__);
-        LLAMA_LOG_WARN("%s: fingerprint inputs (n_ctx, n_seq_max, kv_unified, n_threads, flash_attn, type_k/v, model file size, PSHARD_STRATEGY env) must match the planner invocation exactly\n", __func__);
+        LLAMA_LOG_WARN("%s: fingerprint inputs (n_ctx, n_seq_max, kv_unified, n_threads, flash_attn, type_k/v, model file size, PSHARD_STRATEGY env, predictor version, the profile files' bytes) must match the planner invocation exactly\n", __func__);
         registry->cache_missed = true;
         mparams->pshard = false;
         cparams->pshard = false;

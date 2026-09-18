@@ -44,12 +44,15 @@ Example registry output:
 # Generated file. Edit at your own risk.
 
 [fingerprint=0x9041bb5b253cf89f]
-# n_ctx=8192 n_seq_max=1 n_threads=8 fa=on type_k=1 type_v=1 strategy=auto
+# n_ctx=8192 n_seq_max=1 kv_unified=0 n_threads=8 fa=on type_k=1 type_v=1 strategy=auto predictor=1 profile=3f0c2a9e7b1d4c55
 
 [variant budget=12000 cache_ubatch=8192]
 [tier 0 bs=1]
 strategy=DYNAMIC_FFNCPU_ATTNSTREAM n_pinned=54 n_attn_pinned=0 overflow=NONE tps=12.85   vram=11975.7 output_on_gpu=0 pin_from_back=0
 ot=^output=CUDA_Host:3,^token_embd=CUDA_Host:3,blk\.0\..*=CUDA_Host:0, ... ,blk\.53\..*=CUDA_Host:0,blk\.54\.ffn_(up|gate|down).*=CUDA_Host:3,blk\.54\..*=CUDA_Host:1,blk\.55\.ffn_(up|gate|down).*=CUDA_Host:3,blk\.55\..*=CUDA_Host:2, ... ,blk\.63\.ffn_(up|gate|down).*=CUDA_Host:3,blk\.63\..*=CUDA_Host:2
+cand strategy=STATIC_ATTNPRIO_ALLMODELS viable=1 tps=9.10 n_pinned=40 n_attn_pinned=64 slots=0 vram=11980.2
+cand strategy=DYNAMIC_FFNCPU_ATTNSTREAM viable=1 tps=12.85 n_pinned=54 n_attn_pinned=0 slots=0 vram=11975.7
+cand strategy=GPUONLY_LAYERPIN_LAYERSTREAM viable=1 tps=4.20 n_pinned=52 n_attn_pinned=0 slots=0 vram=11973.3
 [tier 1 bs=16]
 strategy=GPUONLY_ATTNPIN_FFNSTREAM n_pinned=48 n_attn_pinned=0 overflow=NONE tps=208.27  vram=11964.1 output_on_gpu=0 pin_from_back=0
 ot=...
@@ -114,7 +117,8 @@ GPU-only schedules execute repeating-layer compute on GPU. Weights that do not f
 
 - `--max-vram-alloc` / `-mva <MiB>` sets the absolute planning budget. If it is `0` or omitted, the planner uses the free VRAM available at planning time minus `--fit-target` / `-fitt` (default 1024 MiB). When `-mva` is non-zero, `-fitt` is ignored for pshard.
 - `--pshard-tier-max <N>` caps the largest batch size the planner probes. The default is `min(max(n_batch, 16384), n_ctx)`.
-- The `[fingerprint=...]` line invalidates the registry when plan-compatible inputs change (`n_ctx`, `n_seq_max`, threads, FA mode, KV cache types, GGUF file size, or forced `PSHARD_STRATEGY`). The comment below the fingerprint lists those same inputs.
+- The `[fingerprint=...]` line invalidates the registry when plan-compatible inputs change (`n_ctx`, `n_seq_max`, `kv_unified`, threads, FA mode, KV cache types, GGUF file size, or forced `PSHARD_STRATEGY`), when the predictor's pricing model version changes (`predictor=`), or when the profile files change (`profile=` is a hash of `cpu_profile.txt` and `gpu_profile.txt` as found in the working directory or `PSHARD_CPU_PROFILE` / `PSHARD_GPU_PROFILE`). The runtime must see the same profile files as the planner to match a plan. The comment below the fingerprint lists those same inputs.
+- `cand ...` lines after a tier's `ot=` line record every strategy the sweep priced for that tier (the pick and its runner-ups: viability, predicted tokens/s, pin counts, pool slots, device bytes). They are an audit trail only; the runtime never executes them, and older parsers skip them.
 - A fingerprint can contain multiple `[variant budget=... cache_ubatch=...]` blocks. Re-running the planner with a new budget or cache ubatch replaces only that variant and keeps the others.
 - `cache_ubatch` records the runtime ubatch used for context/KV/SWA cache sizing. Tier compute scratch is still measured with the tier batch size.
 - `pshard_disabled=1 baseline_vram=<MiB>` is variant-scoped. Runtime skips pshard only when the measured baseline VRAM fits the current budget.
