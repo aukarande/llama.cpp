@@ -555,8 +555,10 @@ struct llama_pshard_plan_registry {
             const auto & plan = best_plans[t];
             if (!plan.is_viable || plan.tps <= 0.0f) continue;
 
-            double per_iter = (double)ts / (double)plan.tps;
-            uint32_t n_iters = (n_prompt + ts - 1) / ts;
+            // the prompt's own tokens at this tier's rate (the rate already amortizes one
+            // weight stream per ubatch of this size); a partly filled last ubatch is not
+            // charged as a full one, which favoured small tiers whenever the ladder was flat
+            const double prefill_s = (double) n_prompt / (double) plan.tps;
             // TTFT includes switching INTO this tier's plan from the active one and back
             // to the decode plan after prefill; a tier sharing that residency wins ties
             // against one that swaps pinned weights around the prompt
@@ -567,7 +569,7 @@ struct llama_pshard_plan_registry {
             if (decode_plan != nullptr) {
                 switch_total_ms += (double)switch_cost_ms(plan, *decode_plan);
             }
-            double total = n_iters * per_iter + switch_total_ms / 1000.0;
+            double total = prefill_s + switch_total_ms / 1000.0;
 
             if (total < best_time) {
                 best_time = total;
