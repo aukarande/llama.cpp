@@ -2346,23 +2346,20 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         const double distinct = std::min<double>(E, (double) bs * ctx.n_expert_used);
         const double misses   = distinct * (1.0 - h);
         const double hits     = distinct - misses;
-        // the CPU chain runs concurrently with the GPU chain (scheduler lookahead);
-        // only the overlapped price is taken
-        const bool cpu_chain_overlaps = true;
+        // the CPU chain and the GPU chain of a layer do not overlap on the critical path: the
+        // layer's join waits for both, and the fetched experts' upload holds the GPU chain
+        // while the CPU chain runs, so a layer pays its upload and its CPU compute in sequence
         auto miss_ms_layer = [&](int pol) -> double {
             switch (pol) {
                 case LLAMA_PSHARD_MISS_CPU_EXEC:
                     // never admits: the pool stays empty, every route is a CPU route
-                    // (h = 0, independent of s); nothing on the GPU side to overlap
+                    // (h = 0, independent of s)
                     return distinct * t_cpu + t_split;
                 case LLAMA_PSHARD_MISS_HYBRID: {
-                    // q* fetched, capped by the free slots (hits + q resident at once).
-                    // With the scheduler overlap the CPU chain runs while the GPU split
-                    // uploads its q experts and computes: max(); serial otherwise
+                    // q* fetched, capped by the free slots (hits + q resident at once);
+                    // the rest run on the CPU chain, serial with the upload
                     const double q = std::min(std::round(plan.pool_hybrid_frac * misses), std::max(0.0, s - hits));
-                    const double up_ms  = q * t_fetch_loaded;
-                    const double cpu_ms = (misses - q) * t_cpu;
-                    return (cpu_chain_overlaps ? std::max(up_ms, cpu_ms) : up_ms + cpu_ms) + t_split;
+                    return q * t_fetch_loaded + (misses - q) * t_cpu + t_split;
                 }
                 case LLAMA_PSHARD_MISS_FETCH_ON_2ND:
                     return 0.5 * misses * t_cpu + 0.5 * misses * t_fetch_loaded + t_split; // half admitted (TBD: counters)
@@ -2419,11 +2416,11 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
                 plan.tps = best_tps;
                 LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u priced: probe %.1f t/s (compute %.1f + upload %.1f + other %.1f ms) -> "
                     "pool %.1f t/s (h(%u)=%.2f, %.1f misses/layer, %.2f ms/layer, %s; t_fetch %.3f idle / %.3f loaded, t_cpu %.3f ms/expert, "
-                    "serve %.3f, split %.3f ms/layer%s)\n",
+                    "serve %.3f, split %.3f ms/layer)\n",
                     __func__, bs, probe_tps, bd.compute_ms, bd.weight_upload_ms, bd.other_ms, plan.tps,
                     plan.pool_slots, h, misses, miss_ms_layer(best),
                     llama_pshard_miss_policy_name((llama_pshard_miss_policy) best), t_fetch_idle, t_fetch_loaded, t_cpu,
-                    t_serve, t_split, cpu_chain_overlaps ? ", overlap" : ", serial");
+                    t_serve, t_split);
             }
         }
     }
