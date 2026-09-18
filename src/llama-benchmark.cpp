@@ -779,8 +779,11 @@ const llama_benchmark_entry * llama_benchmark_predictor::find_nearest(
             dim_score = elem_diff;
         }
 
-        if (target_batch > 0 && b.B > 0) {
-            batch_score = std::abs((double)b.B - target_batch) / std::max(target_batch, (int64_t)1);
+        // attention entries carry their token count in n_tokens, not B: without it a
+        // prefill attention op matches a decode-shaped entry and its bandwidth-bound rate
+        const int64_t entry_batch = attn_query ? b.n_tokens : b.B;
+        if (target_batch > 0 && entry_batch > 0) {
+            batch_score = std::abs((double)entry_batch - target_batch) / std::max(target_batch, (int64_t)1);
         }
 
         if (target_bpw > 0) {
