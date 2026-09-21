@@ -407,9 +407,10 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
     for (const auto & e : cpu_entries) {
         if (e.op_name != "MUL_MAT" && e.op_name != "MUL_MAT_ID") continue;
         if (e.peak_gflops <= 0.0) continue;
-        // only batch entries: a bs=1 matvec runs memory-bound and its observed GFLOPS
-        // is an artifact of bandwidth, not a compute measurement
-        if (e.B < 32) continue;
+        // only compute-bound entries: a memory-bound one (small batch, or a batch that streams
+        // a whole expert stack) reports bytes/time as GFLOPS, an artifact of bandwidth, and a
+        // floor taken from it would charge every expert its bandwidth time twice
+        if (e.B < 32 || e.ai < e.ridge) continue;
         if (stats.cpu_matmul_floor_gflops == 0.0 || e.peak_gflops < stats.cpu_matmul_floor_gflops) {
             stats.cpu_matmul_floor_gflops = e.peak_gflops;
         }

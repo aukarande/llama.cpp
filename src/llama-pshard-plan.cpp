@@ -2346,20 +2346,21 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         const double distinct = std::min<double>(E, (double) bs * ctx.n_expert_used);
         const double misses   = distinct * (1.0 - h);
         const double hits     = distinct - misses;
-        // the CPU chain and the GPU chain of a layer do not overlap on the critical path: the
-        // layer's join waits for both, and the fetched experts' upload holds the GPU chain
-        // while the CPU chain runs, so a layer pays its upload and its CPU compute in sequence
+        // the CPU chain of a layer runs while the GPU chain uploads and computes the fetched
+        // experts (the scheduler overlaps the CPU split; the fetched rows arrive by kernel
+        // copies on the GPU's own stream), so a hybrid layer pays the longer of the two chains
+        // plus the handoff, not their sum
         auto miss_ms_layer = [&](int pol) -> double {
             switch (pol) {
                 case LLAMA_PSHARD_MISS_CPU_EXEC:
                     // never admits: the pool stays empty, every route is a CPU route
-                    // (h = 0, independent of s)
+                    // (h = 0, independent of s); nothing on the GPU side to overlap
                     return distinct * t_cpu + t_split;
                 case LLAMA_PSHARD_MISS_HYBRID: {
                     // q* fetched, capped by the free slots (hits + q resident at once);
-                    // the rest run on the CPU chain, serial with the upload
+                    // the rest run on the CPU chain, overlapped with the upload
                     const double q = std::min(std::round(plan.pool_hybrid_frac * misses), std::max(0.0, s - hits));
-                    return q * t_fetch_loaded + (misses - q) * t_cpu + t_split;
+                    return std::max(q * t_fetch_loaded, (misses - q) * t_cpu) + t_split;
                 }
                 case LLAMA_PSHARD_MISS_FETCH_ON_2ND:
                     return 0.5 * misses * t_cpu + 0.5 * misses * t_fetch_loaded + t_split; // half admitted (TBD: counters)
