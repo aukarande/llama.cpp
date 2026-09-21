@@ -1562,6 +1562,9 @@ size_t common_pshard_mtp_need_mb(common_params & params, uint32_t n_ctx,
         return 0;   // a separate draft has its own placement: the pre-fit probe priced it
     }
     ggml_backend_dev_t gpu = params.devices.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : params.devices[0];
+    if (gpu == nullptr && params.devices.empty()) {
+        gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);   // unified-memory machines
+    }
     if (gpu == nullptr) {
         return 0;
     }

@@ -13,6 +13,16 @@
 #include <string>
 #include <vector>
 
+// the GPU to profile: a discrete device, else an integrated one (unified-memory machines
+// report GGML_BACKEND_DEVICE_TYPE_IGPU); nullptr without either
+static inline ggml_backend_t profiler_gpu_backend_init() {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (dev == nullptr) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+    }
+    return dev != nullptr ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+}
+
 struct bench_timer {
     using clk = std::chrono::high_resolution_clock;
     clk::time_point t0;

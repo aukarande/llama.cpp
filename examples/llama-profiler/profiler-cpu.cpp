@@ -1178,7 +1178,7 @@ int main(int argc, char ** argv) {
     ggml_quantize_init(GGML_TYPE_MXFP4);
 
     pcie_stress_ctx pcie;
-    pcie.gpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    pcie.gpu_backend = profiler_gpu_backend_init();
     bool has_gpu = (pcie.gpu_backend != nullptr);
 
     if (has_gpu) {

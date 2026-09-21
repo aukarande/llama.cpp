@@ -244,7 +244,7 @@ void llama_expert_pool::lookup_backend_procs() {
     }
     procs_looked_up = true;
     ggml_backend_dev_t dev = backend_router != nullptr ? ggml_backend_get_device(backend_router)
-                                                       : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+                                                       : pshard_gpu_dev();
     ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
     if (reg == nullptr) {
         return;

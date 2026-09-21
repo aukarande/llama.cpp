@@ -72,6 +72,13 @@ struct llama_cparams {
 
 inline constexpr int32_t PSHARD_BACKENDS_PER_DEV = 3;
 
+// the compute GPU: a discrete device, else an integrated one (unified-memory machines report
+// their GPU as GGML_BACKEND_DEVICE_TYPE_IGPU); nullptr without either
+inline ggml_backend_dev_t pshard_gpu_dev() {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    return dev != nullptr ? dev : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+}
+
 struct pshard_dev_layout {
     int32_t compute;
     int32_t shard_a;

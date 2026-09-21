@@ -310,7 +310,7 @@ static size_t     g_pshard_transfer_cap_prev = 0;
 void llama_context::pshard_update_transfer_mode(const llama_pshard_plan * plan) {
     const bool on = cparams.pshard && plan != nullptr && plan->is_viable;
     if (on && pshard_kernel_copy_set == nullptr) {
-        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_dev_t dev = pshard_gpu_dev();
         ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
         if (reg != nullptr) {
             pshard_kernel_copy_set     = (ggml_backend_kernel_copy_set_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_kernel_copy_set");

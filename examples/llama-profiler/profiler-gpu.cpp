@@ -384,7 +384,7 @@ int main(int argc, char ** argv) {
     printf("=== GPU Profiler ===\n");
     printf("Mode: %s\n\n", fast_mode ? "FAST" : "FULL");
 
-    ggml_backend_t gpu_be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    ggml_backend_t gpu_be = profiler_gpu_backend_init();
     if (!gpu_be) {
         fprintf(stderr, "No GPU backend available. Cannot run GPU profiler.\n");
         return 1;

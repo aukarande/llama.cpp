@@ -1419,7 +1419,7 @@ bool pshard_registry_load(
     variant_data * cur_variant = nullptr;
     // a variant records the machine it was planned on (gpu|cpu|os hash); one planned elsewhere is not reused
     const uint64_t current_machine_hash = llama_benchmark_stats::machine_hash(
-        llama_benchmark_stats::machine_current(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU), 0));
+        llama_benchmark_stats::machine_current(pshard_gpu_dev(), 0));
 
     while (fgets(line, sizeof(line), f)) {
         std::string s = line;
@@ -2839,7 +2839,7 @@ void llama_params_fit_pshard_plan(
             // registry order (a plan for another GPU of a multi-GPU box needs a profile of that GPU, which the
             // profiler cannot yet select - the refusal then names both descriptions)
             const auto current = llama_benchmark_stats::machine_current(
-                ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU), cparams->n_threads);
+                pshard_gpu_dev(), cparams->n_threads);
             std::string why;
             if (!has_cpu) {
                 why = std::string("no CPU profile at ") + cpu_path + " for " + std::to_string(cparams->n_threads) + " threads";

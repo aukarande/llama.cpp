@@ -1239,7 +1239,7 @@ llama_model::~llama_model() {
     }
     // release pshard's page-locks BEFORE the mappings themselves are torn down
     if (!pimpl->pshard_host_registered.empty()) {
-        auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        auto * gpu_dev = pshard_gpu_dev();
         if (gpu_dev) {
             auto * reg = ggml_backend_dev_backend_reg(gpu_dev);
 #ifdef _WIN32
@@ -1983,7 +1983,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // live on the device in every tier or compute on the CPU. A whole mapping past the
         // ceiling would otherwise stay pageable entirely.
         {
-            auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            auto * gpu_dev = pshard_gpu_dev();
             if (gpu_dev) {
                 auto * reg = ggml_backend_dev_backend_reg(gpu_dev);
                 auto register_fn = (bool (*)(void *, size_t))

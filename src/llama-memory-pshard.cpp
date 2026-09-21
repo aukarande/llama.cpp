@@ -26,7 +26,7 @@ bool llama_memory_pshard::init(
 
     if (specs.empty()) return true;
 
-    auto * main_gpu_dev  = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    auto * main_gpu_dev  = pshard_gpu_dev();
     auto * buft_gpu      = ggml_backend_dev_buffer_type(main_gpu_dev);
     auto * buft_cpu_host = ggml_backend_dev_host_buffer_type(main_gpu_dev);
 

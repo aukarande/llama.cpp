@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "llama-cparams.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -1919,7 +1920,7 @@ bool llama_model_loader::preload_common_weights_to_device(
         return false;
     }
 
-    auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    auto * gpu_dev = pshard_gpu_dev();
     if (!gpu_dev) {
         return false;
     }
@@ -2014,7 +2015,7 @@ bool llama_model_loader::preload_weights_to_device(
         size_t * out_preloaded_size,
         const std::vector<ggml_tensor *> * preload_order) {
 
-    auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    auto * gpu_dev = pshard_gpu_dev();
     if (!gpu_dev) {
         return false;
     }
