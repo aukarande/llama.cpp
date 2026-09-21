@@ -25,6 +25,11 @@ const char * llama_benchmark_profile_path(bool gpu);
 // registry fingerprints it: a plan priced from another profile is re-planned, not reused
 uint64_t llama_benchmark_profile_hash();
 
+// Host_Pin_Ceiling of the CPU profile in GB (the most host memory the driver page-locks
+// on this machine), 0 when the profile or the line is missing. The loader budgets its
+// page-locks from it
+double llama_benchmark_host_pin_ceiling_gb();
+
 // Per-op FLOPS/bytes metrics extracted from a ggml tensor node.
 // Used by roofline prediction to classify ops as compute-bound or memory-bound.
 struct llama_op_metrics {

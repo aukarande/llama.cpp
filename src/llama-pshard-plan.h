@@ -49,6 +49,12 @@ inline bool llama_pshard_strategy_delegates_compute(llama_pshard_strategy s) {
 // PSHARD_STRATEGY=ALL: the auto search includes the expert pool; unset = the legacy ladder (s0-s4)
 constexpr int PSHARD_STRATEGY_ALL = -2;
 
+// host memory the runtime pins outside the loader's page-lock loop (load staging, the
+// staging ring, the pinned KV shadow, the CPU chain's landing buffers). The loader stops
+// this far short of the driver's ceiling and the planner prices the staged share with the
+// same budget
+constexpr double LLAMA_PSHARD_HOST_PIN_RESERVE_GB = 2.0;
+
 // PSHARD_STRATEGY accepts a name, a numeric id or ALL; -1 when unset or invalid
 inline int pshard_strategy_from_env() {
     const char * env = getenv("PSHARD_STRATEGY");
@@ -309,8 +315,8 @@ struct llama_pshard_workload;
 // share of a layer's routes that a pool of pool_slots slots misses: 1 minus the mass of its
 // pool_slots most routed experts in the workload histogram. 1.0 for a layer without a
 // histogram, or without a pool (every routed expert of a streamed layer is uploaded). The
-// loader page-locks the streamed weights in this order and the planner prices the page-lock
-// ceiling with it, so the two agree on which bytes stay pageable
+// loader ranks the expert stacks it page-locks by it (copies per token) and the planner
+// prices the page-lock ceiling with it, so the two agree on which bytes stay pageable
 std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * wl, uint32_t n_layers, uint32_t pool_slots);
 
 // plan cache serialization. fingerprint covers the runtime plan-compatibility params, the

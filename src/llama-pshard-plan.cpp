@@ -2976,11 +2976,14 @@ void llama_params_fit_pshard_plan(
             }
             // pinned allocations made outside the page-lock loop (load staging,
             // the ring itself, the pinned KV shadow) share the driver's ceiling.
-            // The loader locks the streamed weights per layer range, routed-expert stacks
-            // first (ordered by the workload's miss share once a pool is planned), then the
-            // other layer weights, then the head: the same byte budget, so the staged share
-            // priced here is the share the runtime will see
-            double ceiling_b = (predictor->stats.host_pin_ceiling_gb - 2.0) * 1e9;
+            // The loader locks the streamed weights per layer range, hottest first (copies per
+            // token per byte under the tiers it will run). The plans are not known yet here, so
+            // the mirror assumes the decode placement every sweep so far has picked: attention
+            // resident, the expert stacks the only per-token traffic, so they take the budget
+            // first, then the other layer weights, then the head. A decode tier that streams
+            // attention would lock the attention bytes ahead of the stacks; the staged share
+            // priced here is then low by at most those bytes
+            double ceiling_b = (predictor->stats.host_pin_ceiling_gb - LLAMA_PSHARD_HOST_PIN_RESERVE_GB) * 1e9;
             double pinned_b = 0.0, staged_b = 0.0;
             auto lock_bytes = [&](double b) {
                 const double take = std::min(b, std::max(0.0, ceiling_b));

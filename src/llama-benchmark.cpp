@@ -283,6 +283,25 @@ uint64_t llama_benchmark_profile_hash() {
     return any ? h : 0;
 }
 
+double llama_benchmark_host_pin_ceiling_gb() {
+    FILE * f = fopen(llama_benchmark_profile_path(false), "r");
+    if (!f) {
+        return 0.0;
+    }
+    double pc = 0.0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] != '#') {
+            break;   // the header ends at the first entry
+        }
+        if (sscanf(line, "#   Host_Pin_Ceiling: %lf GB", &pc) == 1) {
+            break;
+        }
+    }
+    fclose(f);
+    return pc;
+}
+
 bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
     cpu_entries.clear();
     cpu_map.clear();

@@ -9,6 +9,7 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 #include "llama-pshard-plan.h"
+#include "llama-benchmark.h"
 #include "llama-pshard-workload.h"
 #ifdef _WIN32
 #   define WIN32_LEAN_AND_MEAN
@@ -1977,9 +1978,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // page-lock the streamed weights: their sources are mmap-backed (pageable), and a
         // cudaMemcpyAsync from pageable memory host-blocks at a fraction of the PCIe rate.
         // The driver's page-lock ceiling is finite, so the lock goes per layer range, not per
-        // mapping: the layers whose routed experts a pool misses most often first, the other
-        // layer weights next, the rest last, and never the weights that live on the device in
-        // every tier. A whole mapping past the ceiling would otherwise stay pageable entirely.
+        // mapping, hottest first: the ranges the plans copy most often per token (streamed
+        // attention every token, a pooled expert stack on its misses), never the weights that
+        // live on the device in every tier or compute on the CPU. A whole mapping past the
+        // ceiling would otherwise stay pageable entirely.
         {
             auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
             if (gpu_dev) {
@@ -1992,10 +1994,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         const char * end;
                         size_t       map_idx;
                         int          il;       // -1: not a layer tensor
-                        bool         exps;     // holds a routed-expert stack
-                        double       prio;
+                        int          cls;      // placement class, see pin_class
+                        const char * rep;      // name of the run's largest tensor: stands for the run in the plans' placement
+                        size_t       rep_bytes;
+                        double       prio;     // copies per token per byte, the most a viable tier makes
                         const char * reg_beg;  // page-aligned registration bounds
                         const char * reg_end;
+                    };
+                    // the classes the plans' placement patterns tell apart (llama_pshard_generate_overrides):
+                    // routed-expert stacks, dense FFN weights, the router, the rest of the layer
+                    enum { PIN_REST = 0, PIN_FFN = 1, PIN_EXPS = 2, PIN_ROUTER = 3 };
+                    auto pin_class = [](const std::string & name) {
+                        if (name.find("exps") != std::string::npos) {
+                            return (int) PIN_EXPS;
+                        }
+                        if (name.find("ffn_gate_inp") != std::string::npos) {
+                            return (int) PIN_ROUTER;
+                        }
+                        if (name.find(".ffn_up.") != std::string::npos || name.find(".ffn_gate.") != std::string::npos ||
+                                name.find(".ffn_down.") != std::string::npos) {
+                            return (int) PIN_FFN;
+                        }
+                        return (int) PIN_REST;
                     };
                     std::vector<pin_range> ranges;
                     size_t n_skip_data = 0, n_skip_idx = 0, n_skip_device = 0, n_skip_outside = 0;
@@ -2025,23 +2045,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         if (name.compare(0, 4, "blk.") == 0) {
                             il = atoi(name.c_str() + 4);
                         }
-                        ranges.push_back({ beg, end, w->idx, il, name.find("_exps") != std::string::npos, 0.0, nullptr, nullptr });
+                        ranges.push_back({ beg, end, w->idx, il, pin_class(name), name.c_str(), ggml_nbytes(t), 0.0, nullptr, nullptr });
                     }
-                    // one range per address-contiguous run of a layer's tensors (the file stores a
-                    // layer's tensors back to back). Consecutive runs share a boundary page, which
-                    // stays with the earlier run so no page is registered twice; the later run's
-                    // first tensor then spans two registrations and its copies take the DMA path
-                    // (pinned, no copy kernel) - one small tensor per layer
+                    // one range per address-contiguous run of a layer's tensors of one placement class
+                    // (the file stores a layer's tensors back to back). Consecutive runs share a
+                    // boundary page, which stays with the earlier run so no page is registered twice;
+                    // the later run's first tensor then spans two registrations and its copies take
+                    // the DMA path (pinned, no copy kernel) - one small tensor per run
                     const size_t page = 4096;
                     auto page_floor = [&](const char * p) { return (const char *) ((uintptr_t) p & ~(uintptr_t) (page - 1)); };
                     auto page_ceil  = [&](const char * p) { return (const char *) (((uintptr_t) p + page - 1) & ~(uintptr_t) (page - 1)); };
                     std::sort(ranges.begin(), ranges.end(), [](const pin_range & a, const pin_range & b) { return a.beg < b.beg; });
                     std::vector<pin_range> merged;
                     for (const auto & r : ranges) {
-                        if (!merged.empty() && merged.back().map_idx == r.map_idx && merged.back().il == r.il) {
+                        if (!merged.empty() && merged.back().map_idx == r.map_idx && merged.back().il == r.il && merged.back().cls == r.cls) {
                             auto & m = merged.back();
-                            m.end  = std::max(m.end, r.end);
-                            m.exps = m.exps || r.exps;
+                            m.end = std::max(m.end, r.end);
+                            if (r.rep_bytes > m.rep_bytes) {
+                                m.rep       = r.rep;
+                                m.rep_bytes = r.rep_bytes;
+                            }
                         } else {
                             merged.push_back(r);
                         }
@@ -2053,55 +2076,128 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                             merged[i].reg_beg = merged[i - 1].reg_end;
                         }
                     }
-                    // priority: routed-expert ranges by the share of routes a pool of the plan's
-                    // slots misses (workload histogram; file order without one), then the other
-                    // layer ranges, then everything else
-                    uint32_t pool_slots = 0;
+                    // priority: copies per token per byte, the most any viable tier makes of the run.
+                    // A weight a tier streams from host is uploaded once per pass: 1/batch per token
+                    // for attention and dense weights; for a routed-expert stack the share of the
+                    // stack a pass touches (a pool's misses among the batch's routes, every route
+                    // without a pool). Weights a tier computes on the CPU or keeps on the device are
+                    // not copied. The placement is read off the plan's own override patterns, the
+                    // ones the loader applies, so the two cannot drift
                     if (pimpl->plan_registry != nullptr) {
+                        llama_pshard_workload wl;
+                        const bool have_wl = !pimpl->path_model.empty() && wl.load(llama_pshard_workload::path_for(pimpl->path_model));
+                        std::map<uint32_t, std::vector<double>> miss_share_by_slots;
+                        const pshard_dev_layout layout = { 0, 1, 2, 3 };   // ids only: compute, shard a/b, cpu
+                        std::vector<llama_model_tensor_buft_override> ovs(4 * (size_t) hparams.n_layer_all + 8);
+                        const double n_exp  = std::max(1u, hparams.n_expert);
+                        const double n_used = std::max(1u, hparams.n_expert_used);
                         for (const auto & plan : pimpl->plan_registry->best_plans) {
-                            if (plan.is_viable) {
-                                pool_slots = std::max(pool_slots, plan.pool_slots);
+                            if (!plan.is_viable) {
+                                continue;
                             }
-                        }
-                    }
-                    llama_pshard_workload wl;
-                    const bool have_wl = pool_slots > 0 && !pimpl->path_model.empty() && wl.load(llama_pshard_workload::path_for(pimpl->path_model));
-                    const std::vector<double> miss_share = llama_pshard_layer_miss_share(have_wl ? &wl : nullptr, hparams.n_layer_all, pool_slots);
-                    for (auto & m : merged) {
-                        if (m.exps && m.il >= 0 && (uint32_t) m.il < miss_share.size()) {
-                            m.prio = 2.0 + miss_share[m.il];
-                        } else if (m.il >= 0) {
-                            m.prio = 1.0;
-                        } else {
-                            m.prio = 0.0;
+                            llama_pshard_generate_overrides(plan.n_pinned, hparams.n_layer_all, nullptr, nullptr, ovs.data(),
+                                (llama_layer_fraction) plan.overflow, plan.strategy, layout, plan.pin_from_back,
+                                plan.output_on_gpu, plan.n_attn_pinned, plan.overlap, plan.ids_cross);
+                            std::vector<std::regex> res;
+                            for (const auto * ov = ovs.data(); ov->pattern; ++ov) {
+                                res.emplace_back(ov->pattern);
+                            }
+                            auto & miss_share = miss_share_by_slots[plan.pool_slots];
+                            if (miss_share.empty()) {
+                                miss_share = llama_pshard_layer_miss_share(have_wl ? &wl : nullptr, hparams.n_layer_all, plan.pool_slots);
+                            }
+                            const double bs = std::max(1u, plan.batch_size);
+                            for (auto & m : merged) {
+                                int32_t bid = -1;
+                                for (size_t k = 0; k < res.size(); k++) {
+                                    if (ovs[k].backend_id >= 0 && std::regex_search(m.rep, res[k])) {
+                                        bid = ovs[k].backend_id;
+                                        break;
+                                    }
+                                }
+                                if (bid != layout.shard_a && bid != layout.shard_b) {
+                                    continue;   // resident or CPU-computed in this tier: never copied
+                                }
+                                double copies = 1.0 / bs;
+                                if (m.cls == PIN_EXPS && m.il >= 0) {
+                                    const double miss = (uint32_t) m.il < miss_share.size() ? miss_share[m.il] : 1.0;
+                                    copies = std::min(bs * n_used * miss, n_exp) / (n_exp * bs);
+                                }
+                                m.prio = std::max(m.prio, copies);
+                            }
                         }
                     }
                     std::stable_sort(merged.begin(), merged.end(), [](const pin_range & a, const pin_range & b) {
                         if (a.prio != b.prio) return a.prio > b.prio;
                         return a.il < b.il;
                     });
+                    // the runtime's own pinned allocations (load staging, the staging ring, the pinned
+                    // KV shadow, the CPU chain's landing buffers) share the driver's ceiling and come
+                    // after this loop, so it stops LLAMA_PSHARD_HOST_PIN_RESERVE_GB short of the
+                    // profile's ceiling. A refused registration is the ceiling too (whatever was pinned
+                    // before the loop counts against it): the loop stops there and hands its coldest
+                    // locks back until the reserve is free again
+                    const double ceiling_gb = llama_benchmark_host_pin_ceiling_gb();
+                    const size_t reserve_b  = (size_t) (LLAMA_PSHARD_HOST_PIN_RESERVE_GB * 1e9);
+                    const size_t budget_b   = ceiling_gb > 0.0 ? (size_t) std::max(0.0, ceiling_gb * 1e9 - (double) reserve_b) : SIZE_MAX;
+                    auto unregister_fn = (void (*)(void *))
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
                     size_t pinned_b = 0, pageable_b = 0;
+                    double hottest_pageable = 0.0;
                     std::vector<size_t> pageable_per_map(pimpl->mappings.size(), 0);
                     std::vector<std::pair<void *, size_t>> pageable_ranges;
+                    std::vector<std::pair<size_t, size_t>> locks;   // (merged index, bytes) in lock order
+                    bool refused = false;
                     const int64_t t0 = ggml_time_us();
-                    for (const auto & m : merged) {
+                    for (size_t i = 0; i < merged.size(); i++) {
+                        const auto & m = merged[i];
                         if (m.reg_end <= m.reg_beg) {
                             continue;   // swallowed by the previous run's boundary page
                         }
                         const size_t bytes = (size_t) (m.reg_end - m.reg_beg);
-                        if (register_fn((void *) m.reg_beg, bytes)) {
+                        bool locked = false;
+                        if (!refused && pinned_b + bytes <= budget_b) {
+                            locked  = register_fn((void *) m.reg_beg, bytes);
+                            refused = !locked;
+                        }
+                        if (locked) {
                             pimpl->pshard_host_registered.push_back((void *) m.reg_beg);
+                            locks.push_back({ i, bytes });
                             pinned_b += bytes;
                         } else {
                             pageable_b += bytes;
                             pageable_per_map[m.map_idx] += bytes;
                             pageable_ranges.push_back({ (void *) m.reg_beg, bytes });
+                            hottest_pageable = std::max(hottest_pageable, m.prio);
+                        }
+                        LLAMA_LOG_DEBUG("%s: pshard: %s %s (blk.%d class %d) %.1f MiB, %.4f copies/token\n",
+                            __func__, locked ? "page-locked" : "pageable   ", m.rep, m.il, m.cls, bytes / (1024.0 * 1024.0), m.prio);
+                    }
+                    size_t handed_back_b = 0;
+                    if (refused && unregister_fn) {
+                        while (handed_back_b < reserve_b && !locks.empty()) {
+                            const auto & m    = merged[locks.back().first];
+                            const size_t bytes = locks.back().second;
+                            unregister_fn((void *) m.reg_beg);
+                            auto it = std::find(pimpl->pshard_host_registered.begin(), pimpl->pshard_host_registered.end(), (void *) m.reg_beg);
+                            if (it != pimpl->pshard_host_registered.end()) {
+                                pimpl->pshard_host_registered.erase(it);
+                            }
+                            handed_back_b += bytes;
+                            pinned_b      -= bytes;
+                            pageable_b    += bytes;
+                            pageable_per_map[m.map_idx] += bytes;
+                            pageable_ranges.push_back({ (void *) m.reg_beg, bytes });
+                            hottest_pageable = std::max(hottest_pageable, m.prio);
+                            LLAMA_LOG_DEBUG("%s: pshard: handed back %s (blk.%d class %d) %.1f MiB, %.4f copies/token: the driver refused a lock, the runtime's pinned reserve comes first\n",
+                                __func__, m.rep, m.il, m.cls, bytes / (1024.0 * 1024.0), m.prio);
+                            locks.pop_back();
                         }
                     }
-                    LLAMA_LOG_INFO("%s: pshard: page-locked %.1f MiB of streamed weights in %zu ranges (%.1f MiB stay pageable) in %.1f ms%s\n",
+                    LLAMA_LOG_INFO("%s: pshard: page-locked %.1f MiB of streamed weights in %zu ranges (%.1f MiB stay pageable, hottest %.4f copies/token; ceiling %.1f GB, %.1f GB reserved%s) in %.1f ms\n",
                         __func__, pinned_b / (1024.0 * 1024.0), pimpl->pshard_host_registered.size(),
-                        pageable_b / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0,
-                        have_wl ? ", expert stacks ordered by the workload's miss share" : "");
+                        pageable_b / (1024.0 * 1024.0), hottest_pageable, ceiling_gb, LLAMA_PSHARD_HOST_PIN_RESERVE_GB,
+                        refused ? ", driver refused: coldest locks handed back" : "", (ggml_time_us() - t0) / 1000.0);
                     LLAMA_LOG_DEBUG("%s: pshard: page-lock candidates: %zu tensors in %zu ranges; skipped %zu without data, %zu outside the mappings' index range, %zu device-only, %zu not mmap-backed\n",
                         __func__, ranges.size(), merged.size(), n_skip_data, n_skip_idx, n_skip_device, n_skip_outside);
                     for (size_t mi = 0; mi < pimpl->mappings.size(); mi++) {
