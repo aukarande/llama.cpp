@@ -324,6 +324,31 @@ struct llama_pshard_search_ctx {
 // (the layer minus its FFN pattern set patterns_layer_ffn: attention, norms, routers,
 // anything that is not ffn_(up|gate|down). or an expert tensor: per_layer_attn), the
 // output head (output*) and the token embeddings (the head when the embeddings are tied)
+std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * wl, uint32_t n_layers, uint32_t pool_slots) {
+    std::vector<double> share(n_layers, 1.0);
+    if (wl == nullptr || pool_slots == 0) {
+        return share;
+    }
+    for (const auto & [il, counts] : wl->counts) {
+        if (il >= n_layers || counts.empty()) {
+            continue;
+        }
+        std::vector<uint64_t> sorted(counts);
+        std::sort(sorted.begin(), sorted.end(), std::greater<uint64_t>());
+        uint64_t total = 0, top = 0;
+        for (size_t i = 0; i < sorted.size(); i++) {
+            total += sorted[i];
+            if (i < pool_slots) {
+                top += sorted[i];
+            }
+        }
+        if (total > 0) {
+            share[il] = 1.0 - (double) top / (double) total;
+        }
+    }
+    return share;
+}
+
 static void pshard_scan_tensor_bytes(const struct gguf_context * g, uint32_t n_expert,
         std::vector<size_t> & per_layer, size_t & per_expert, size_t & total_weights, uint32_t & tensors_per_layer,
         std::vector<size_t> & per_layer_all, std::vector<size_t> & per_layer_attn, size_t & head_bytes, size_t & tok_embd_bytes,
@@ -2950,17 +2975,26 @@ void llama_params_fit_pshard_plan(
                 LLAMA_LOG_WARN("%s: profile has no PCIe_Staged line - staged mappings priced at the pinned rate (run llama-profiler-cpu --splice cpu_profile.txt)\n", __func__);
             }
             // pinned allocations made outside the page-lock loop (load staging,
-            // the ring itself, the pinned KV shadow) share the driver's ceiling
+            // the ring itself, the pinned KV shadow) share the driver's ceiling.
+            // The loader locks the streamed weights per layer range, routed-expert stacks
+            // first (ordered by the workload's miss share once a pool is planned), then the
+            // other layer weights, then the head: the same byte budget, so the staged share
+            // priced here is the share the runtime will see
             double ceiling_b = (predictor->stats.host_pin_ceiling_gb - 2.0) * 1e9;
             double pinned_b = 0.0, staged_b = 0.0;
-            for (int64_t s : map_sizes) {
-                if ((double) s <= ceiling_b) {   // greedy in split order, all-or-nothing
-                    ceiling_b -= (double) s;
-                    pinned_b  += (double) s;
-                } else {
-                    staged_b  += (double) s;
-                }
+            auto lock_bytes = [&](double b) {
+                const double take = std::min(b, std::max(0.0, ceiling_b));
+                ceiling_b -= take;
+                pinned_b  += take;
+                staged_b  += b - take;
+            };
+            for (uint32_t il = 0; il < n_layers; il++) {
+                lock_bytes((double) exps_per_layer[il]);
             }
+            for (uint32_t il = 0; il < n_layers; il++) {
+                lock_bytes((double) (all_per_layer[il] - std::min(all_per_layer[il], exps_per_layer[il])));
+            }
+            lock_bytes((double) head_bytes);
             if (staged_b > 0.0) {
                 const double blended = (pinned_b + staged_b) / (pinned_b / pcie_r + staged_b / staged_r);
                 predictor->stats.upload_bw          = blended;

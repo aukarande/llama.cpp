@@ -304,6 +304,15 @@ void llama_params_fit_impl(
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level);
 
+struct llama_pshard_workload;
+
+// share of a layer's routes that a pool of pool_slots slots misses: 1 minus the mass of its
+// pool_slots most routed experts in the workload histogram. 1.0 for a layer without a
+// histogram, or without a pool (every routed expert of a streamed layer is uploaded). The
+// loader page-locks the streamed weights in this order and the planner prices the page-lock
+// ceiling with it, so the two agree on which bytes stay pageable
+std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * wl, uint32_t n_layers, uint32_t pool_slots);
+
 // plan cache serialization. fingerprint covers the runtime plan-compatibility params, the
 // predictor version and the profile files' hash, so the planner binary and the runtime binary
 // share the same cache file when they see the same profile files (working directory or

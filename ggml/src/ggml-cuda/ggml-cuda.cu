@@ -120,11 +120,26 @@ static void ggml_cuda_host_region_del(const void * base) {
         }
     }
 }
-// device-side address of a host pointer when it lies in a device-accessible pinned region, else nullptr
-static void * ggml_cuda_host_device_ptr(const void * p) {
+// a host range whose first byte lies in a registered region but which runs past its end
+static bool ggml_cuda_host_range_straddles(const void * p, size_t size) {
     std::lock_guard<std::mutex> lock(ggml_cuda_host_regions_mutex);
     for (const auto & r : ggml_cuda_host_regions) {
         if ((const char *) p >= r.base && (const char *) p < r.base + r.size) {
+            return size > (size_t) (r.base + r.size - (const char *) p);
+        }
+    }
+    return false;
+}
+// device-side address of a host range when it lies whole inside one device-accessible pinned
+// region, else nullptr. Whole, not just its first byte: the model's mappings are registered per
+// layer range, and a transfer straddling two registrations has no single device alias
+static void * ggml_cuda_host_device_ptr(const void * p, size_t size = 1) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_host_regions_mutex);
+    for (const auto & r : ggml_cuda_host_regions) {
+        if ((const char *) p >= r.base && (const char *) p < r.base + r.size) {
+            if (size > (size_t) (r.base + r.size - (const char *) p)) {
+                return nullptr;   // runs past this registration
+            }
             return r.dev != nullptr ? r.dev + ((const char *) p - r.base) : nullptr;
         }
     }
@@ -2723,7 +2738,11 @@ static void ggml_cuda_parallel_memcpy(void * dst, const void * src, size_t n, in
 // is this copy one the ring should take: >= 1 MiB from unregistered (pageable) host memory, not
 // inside a CUDA graph capture
 static bool ggml_cuda_stage_candidate(const void * src, size_t size, cudaStream_t stream) {
-    if (size < (1ull << 20)) {
+    // a range that begins in a registered region but runs past it (the model's mappings are
+    // registered per layer range) has no single pinned allocation behind it: a direct
+    // cudaMemcpyAsync rejects it, so the ring carries it whatever its size
+    const bool straddles = ggml_cuda_host_range_straddles(src, size);
+    if (!straddles && size < (1ull << 20)) {
         return false;
     }
     cudaPointerAttributes attr;
@@ -2731,7 +2750,7 @@ static bool ggml_cuda_stage_candidate(const void * src, size_t size, cudaStream_
         (void) cudaGetLastError();
         return false;
     }
-    if (attr.type != cudaMemoryTypeUnregistered) {
+    if (!straddles && attr.type != cudaMemoryTypeUnregistered) {
         return false;   // pinned, registered or device memory: the direct async copy is already fast
     }
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
@@ -3070,12 +3089,8 @@ ggml_backend_buffer_t ggml_backend_cuda_wrap_host_buffer(ggml_backend_t backend,
     if (!ggml_backend_is_cuda(backend) || host_ptr == nullptr || size == 0) {
         return nullptr;
     }
-    char * dev = (char *) ggml_cuda_host_device_ptr(host_ptr);
+    char * dev = (char *) ggml_cuda_host_device_ptr(host_ptr, size);   // the whole range in one mapped region
     if (dev == nullptr) {
-        return nullptr;
-    }
-    // the whole range must lie in one mapped region
-    if ((char *) ggml_cuda_host_device_ptr((const char *) host_ptr + size - 1) != dev + size - 1) {
         return nullptr;
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -3092,7 +3107,7 @@ bool ggml_backend_cuda_copy_segments_async(ggml_backend_t backend, const ggml_ba
     std::vector<ggml_cuda_copy_seg> v((size_t) n);
     size_t max_n16 = 0;
     for (int i = 0; i < n; i++) {
-        const void * src_dev = ggml_cuda_host_device_ptr(segs[i].src);
+        const void * src_dev = ggml_cuda_host_device_ptr(segs[i].src, segs[i].size);
         if (src_dev == nullptr || segs[i].dst == nullptr ||
             (((uintptr_t) src_dev | (uintptr_t) segs[i].dst | (uintptr_t) segs[i].size) & 15) != 0 ||
             segs[i].size > ggml_cuda_kernel_copy_max_bytes()) {
@@ -3161,7 +3176,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     if (ggml_cuda_kernel_copies_for(backend) && size <= ggml_cuda_kernel_copy_max_bytes()) {
-        if (const void * src_dev = ggml_cuda_host_device_ptr(data)) {
+        if (const void * src_dev = ggml_cuda_host_device_ptr(data, size)) {
             ggml_cuda_set_device(cuda_ctx->device);
             ggml_cuda_kernel_copy((char *) tensor->data + offset, src_dev, size, cuda_ctx->stream());
             return;
@@ -3182,7 +3197,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     if (ggml_cuda_kernel_copies_for(backend) && size <= ggml_cuda_kernel_copy_max_bytes()) {
-        if (void * dst_dev = ggml_cuda_host_device_ptr(data)) {
+        if (void * dst_dev = ggml_cuda_host_device_ptr(data, size)) {
             ggml_cuda_set_device(cuda_ctx->device);
             ggml_cuda_kernel_copy(dst_dev, (const char *) tensor->data + offset, size, cuda_ctx->stream());
             return;

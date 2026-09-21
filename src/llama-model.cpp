@@ -9,6 +9,7 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 #include "llama-pshard-plan.h"
+#include "llama-pshard-workload.h"
 #ifdef _WIN32
 #   define WIN32_LEAN_AND_MEAN
 #   define NOMINMAX
@@ -1973,8 +1974,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (params.pshard && params.max_vram_alloc > 0) {
-        // page-lock the mmap regions: streamed weight sources are mmap-backed (pageable), and
-        // cudaMemcpyAsync from pageable memory host-blocks at a fraction of the PCIe rate
+        // page-lock the streamed weights: their sources are mmap-backed (pageable), and a
+        // cudaMemcpyAsync from pageable memory host-blocks at a fraction of the PCIe rate.
+        // The driver's page-lock ceiling is finite, so the lock goes per layer range, not per
+        // mapping: the layers whose routed experts a pool misses most often first, the other
+        // layer weights next, the rest last, and never the weights that live on the device in
+        // every tier. A whole mapping past the ceiling would otherwise stay pageable entirely.
         {
             auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
             if (gpu_dev) {
@@ -1982,51 +1987,171 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 auto register_fn = (bool (*)(void *, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
                 if (register_fn) {
-                    for (const auto & mapping : pimpl->mappings) {
-                        const int64_t t0 = ggml_time_us();
-                        const bool locked = register_fn(mapping->addr(), mapping->size());
-                        if (!locked) {
-                            // pinned-memory ceiling: the host cannot page-lock this much more RAM
-                            // - streamed copies from this region run pageable
-                            LLAMA_LOG_WARN("%s: pshard: could not page-lock %.1f MiB mmap region - streamed copies from it will be pageable (slower)\n",
-                                __func__, mapping->size() / (1024.0 * 1024.0));
-#ifdef _WIN32
-                            // Windows trims file-mapped pages out of the working set between passes, so every
-                            // upload pass soft-faults the whole region again. VirtualLock keeps the pages
-                            // resident and mapped: the CUDA DMA still goes through the staging ring, but the
-                            // ring's memcpy then runs at memory speed.
-                            {
-                                const int64_t t1 = ggml_time_us();
-                                SIZE_T ws_min = 0, ws_max = 0;
-                                DWORD  ws_flags = 0;
-                                HANDLE proc = GetCurrentProcess();
-                                bool ok = false;
-                                if (GetProcessWorkingSetSizeEx(proc, &ws_min, &ws_max, &ws_flags)) {
-                                    const SIZE_T extra = (SIZE_T) mapping->size() + (64ULL << 20);
-                                    ok = SetProcessWorkingSetSizeEx(proc, ws_min + extra, ws_max + extra,
-                                            QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
-                                }
-                                if (ok) {
-                                    ok = VirtualLock(mapping->addr(), (SIZE_T) mapping->size()) != 0;
-                                }
-                                if (ok) {
-                                    pimpl->pshard_virtual_locked.push_back({ mapping->addr(), (size_t) mapping->size() });
-                                    LLAMA_LOG_INFO("%s: pshard: VirtualLock'd the %.1f MiB mmap region in %.1f ms (resident for the staging ring; not DMA-pinned)\n",
-                                        __func__, mapping->size() / (1024.0 * 1024.0), (ggml_time_us() - t1) / 1000.0);
-                                } else {
-                                    LLAMA_LOG_WARN("%s: pshard: VirtualLock of the %.1f MiB mmap region failed (error %lu) - staying pageable\n",
-                                        __func__, mapping->size() / (1024.0 * 1024.0), (unsigned long) GetLastError());
-                                }
-                            }
-#endif
+                    struct pin_range {
+                        const char * beg;
+                        const char * end;
+                        size_t       map_idx;
+                        int          il;       // -1: not a layer tensor
+                        bool         exps;     // holds a routed-expert stack
+                        double       prio;
+                        const char * reg_beg;  // page-aligned registration bounds
+                        const char * reg_end;
+                    };
+                    std::vector<pin_range> ranges;
+                    size_t n_skip_data = 0, n_skip_idx = 0, n_skip_device = 0, n_skip_outside = 0;
+                    for (const auto & [name, t] : tensors_by_name) {
+                        const auto * w = ml.get_weight(name.c_str());
+                        if (t == nullptr || t->data == nullptr || w == nullptr) {
+                            n_skip_data++;
+                            continue;
                         }
-                        if (locked) {
-                            pimpl->pshard_host_registered.push_back(mapping->addr());
-                            LLAMA_LOG_INFO("%s: pshard: page-locked %.1f MiB mmap region in %.1f ms\n",
-                                __func__, mapping->size() / (1024.0 * 1024.0),
-                                (ggml_time_us() - t0) / 1000.0);
+                        if (w->idx >= pimpl->mappings.size()) {
+                            n_skip_idx++;
+                            continue;
+                        }
+                        if (pshard_device_only_tensors.count(t) > 0) {
+                            n_skip_device++;
+                            continue;   // resident in every tier: never streamed
+                        }
+                        const auto & mp = pimpl->mappings[w->idx];
+                        const char * base = (const char *) mp->addr();
+                        const char * beg  = (const char *) t->data;
+                        const char * end  = beg + ggml_nbytes(t);
+                        if (beg < base || end > base + mp->size()) {
+                            n_skip_outside++;
+                            continue;   // not mmap-backed
+                        }
+                        int il = -1;
+                        if (name.compare(0, 4, "blk.") == 0) {
+                            il = atoi(name.c_str() + 4);
+                        }
+                        ranges.push_back({ beg, end, w->idx, il, name.find("_exps") != std::string::npos, 0.0, nullptr, nullptr });
+                    }
+                    // one range per address-contiguous run of a layer's tensors (the file stores a
+                    // layer's tensors back to back). Consecutive runs share a boundary page, which
+                    // stays with the earlier run so no page is registered twice; the later run's
+                    // first tensor then spans two registrations and its copies take the DMA path
+                    // (pinned, no copy kernel) - one small tensor per layer
+                    const size_t page = 4096;
+                    auto page_floor = [&](const char * p) { return (const char *) ((uintptr_t) p & ~(uintptr_t) (page - 1)); };
+                    auto page_ceil  = [&](const char * p) { return (const char *) (((uintptr_t) p + page - 1) & ~(uintptr_t) (page - 1)); };
+                    std::sort(ranges.begin(), ranges.end(), [](const pin_range & a, const pin_range & b) { return a.beg < b.beg; });
+                    std::vector<pin_range> merged;
+                    for (const auto & r : ranges) {
+                        if (!merged.empty() && merged.back().map_idx == r.map_idx && merged.back().il == r.il) {
+                            auto & m = merged.back();
+                            m.end  = std::max(m.end, r.end);
+                            m.exps = m.exps || r.exps;
+                        } else {
+                            merged.push_back(r);
                         }
                     }
+                    for (size_t i = 0; i < merged.size(); i++) {
+                        merged[i].reg_beg = page_floor(merged[i].beg);
+                        merged[i].reg_end = page_ceil(merged[i].end);
+                        if (i > 0 && merged[i - 1].map_idx == merged[i].map_idx && merged[i].reg_beg < merged[i - 1].reg_end) {
+                            merged[i].reg_beg = merged[i - 1].reg_end;
+                        }
+                    }
+                    // priority: routed-expert ranges by the share of routes a pool of the plan's
+                    // slots misses (workload histogram; file order without one), then the other
+                    // layer ranges, then everything else
+                    uint32_t pool_slots = 0;
+                    if (pimpl->plan_registry != nullptr) {
+                        for (const auto & plan : pimpl->plan_registry->best_plans) {
+                            if (plan.is_viable) {
+                                pool_slots = std::max(pool_slots, plan.pool_slots);
+                            }
+                        }
+                    }
+                    llama_pshard_workload wl;
+                    const bool have_wl = pool_slots > 0 && !pimpl->path_model.empty() && wl.load(llama_pshard_workload::path_for(pimpl->path_model));
+                    const std::vector<double> miss_share = llama_pshard_layer_miss_share(have_wl ? &wl : nullptr, hparams.n_layer_all, pool_slots);
+                    for (auto & m : merged) {
+                        if (m.exps && m.il >= 0 && (uint32_t) m.il < miss_share.size()) {
+                            m.prio = 2.0 + miss_share[m.il];
+                        } else if (m.il >= 0) {
+                            m.prio = 1.0;
+                        } else {
+                            m.prio = 0.0;
+                        }
+                    }
+                    std::stable_sort(merged.begin(), merged.end(), [](const pin_range & a, const pin_range & b) {
+                        if (a.prio != b.prio) return a.prio > b.prio;
+                        return a.il < b.il;
+                    });
+                    size_t pinned_b = 0, pageable_b = 0;
+                    std::vector<size_t> pageable_per_map(pimpl->mappings.size(), 0);
+                    std::vector<std::pair<void *, size_t>> pageable_ranges;
+                    const int64_t t0 = ggml_time_us();
+                    for (const auto & m : merged) {
+                        if (m.reg_end <= m.reg_beg) {
+                            continue;   // swallowed by the previous run's boundary page
+                        }
+                        const size_t bytes = (size_t) (m.reg_end - m.reg_beg);
+                        if (register_fn((void *) m.reg_beg, bytes)) {
+                            pimpl->pshard_host_registered.push_back((void *) m.reg_beg);
+                            pinned_b += bytes;
+                        } else {
+                            pageable_b += bytes;
+                            pageable_per_map[m.map_idx] += bytes;
+                            pageable_ranges.push_back({ (void *) m.reg_beg, bytes });
+                        }
+                    }
+                    LLAMA_LOG_INFO("%s: pshard: page-locked %.1f MiB of streamed weights in %zu ranges (%.1f MiB stay pageable) in %.1f ms%s\n",
+                        __func__, pinned_b / (1024.0 * 1024.0), pimpl->pshard_host_registered.size(),
+                        pageable_b / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0,
+                        have_wl ? ", expert stacks ordered by the workload's miss share" : "");
+                    LLAMA_LOG_DEBUG("%s: pshard: page-lock candidates: %zu tensors in %zu ranges; skipped %zu without data, %zu outside the mappings' index range, %zu device-only, %zu not mmap-backed\n",
+                        __func__, ranges.size(), merged.size(), n_skip_data, n_skip_idx, n_skip_device, n_skip_outside);
+                    for (size_t mi = 0; mi < pimpl->mappings.size(); mi++) {
+                        if (pageable_per_map[mi] > 0) {
+                            // pinned-memory ceiling: the host cannot page-lock this much more RAM
+                            // - the remaining streamed copies from this region run pageable
+                            LLAMA_LOG_WARN("%s: pshard: %.1f MiB of the %.1f MiB mmap region stay pageable - streamed copies from them go through the staging ring (slower)\n",
+                                __func__, pageable_per_map[mi] / (1024.0 * 1024.0), pimpl->mappings[mi]->size() / (1024.0 * 1024.0));
+                        }
+                    }
+#ifdef _WIN32
+                    // Windows trims file-mapped pages out of the working set between passes, so every
+                    // upload pass soft-faults the pageable ranges again. VirtualLock keeps them resident
+                    // and mapped: the CUDA DMA still goes through the staging ring, but the ring's memcpy
+                    // then runs at memory speed. Only the ranges that did not page-lock, not whole
+                    // mappings: the working set the lock needs is what the ceiling left out
+                    if (!pageable_ranges.empty()) {
+                        const int64_t t1 = ggml_time_us();
+                        SIZE_T ws_min = 0, ws_max = 0;
+                        DWORD  ws_flags = 0;
+                        HANDLE proc = GetCurrentProcess();
+                        bool ok = false;
+                        if (GetProcessWorkingSetSizeEx(proc, &ws_min, &ws_max, &ws_flags)) {
+                            const SIZE_T extra = (SIZE_T) pageable_b + (64ULL << 20);
+                            ok = SetProcessWorkingSetSizeEx(proc, ws_min + extra, ws_max + extra,
+                                    QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
+                        }
+                        size_t locked_b = 0;
+                        DWORD  last_err = 0;
+                        if (ok) {
+                            for (const auto & [addr, size] : pageable_ranges) {
+                                if (VirtualLock(addr, (SIZE_T) size) != 0) {
+                                    pimpl->pshard_virtual_locked.push_back({ addr, size });
+                                    locked_b += size;
+                                } else {
+                                    last_err = GetLastError();
+                                }
+                            }
+                        } else {
+                            last_err = GetLastError();
+                        }
+                        if (locked_b == pageable_b) {
+                            LLAMA_LOG_INFO("%s: pshard: VirtualLock'd the %.1f MiB of pageable ranges in %.1f ms (resident for the staging ring; not DMA-pinned)\n",
+                                __func__, locked_b / (1024.0 * 1024.0), (ggml_time_us() - t1) / 1000.0);
+                        } else {
+                            LLAMA_LOG_WARN("%s: pshard: VirtualLock kept %.1f of %.1f MiB pageable ranges resident (last error %lu) - the rest stay pageable\n",
+                                __func__, locked_b / (1024.0 * 1024.0), pageable_b / (1024.0 * 1024.0), (unsigned long) last_err);
+                        }
+                    }
+#endif
                 }
             }
         }
