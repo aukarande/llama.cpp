@@ -1192,6 +1192,9 @@ int main(int argc, char ** argv) {
                     pcie.transfer_size >> 20, pcie.host_buf == nullptr ? "pinned host" : "device");
                 has_gpu = false;
             }
+            if (has_gpu && ggml_backend_buffer_get_type(pcie.host_buf) != host_buft) {
+                fprintf(stderr, "PCIe calibration: the pinned host allocation fell back to a pageable buffer - the copies below take the staging path\n");
+            }
             if (has_gpu) {
                 ggml_init_params p = { pcie.transfer_size + 8 * 1024 * 1024, NULL, true };
                 pcie.ctx = ggml_init(p);

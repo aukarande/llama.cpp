@@ -1381,7 +1381,8 @@ static void * ggml_cuda_host_malloc(size_t size) {
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
-        GGML_LOG_DEBUG("%s: failed to allocate %.2f MiB of pinned memory: %s\n", __func__,
+        // a pageable buffer stands in: pshard streams from host memory, so the caller must see this
+        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s - a pageable buffer stands in\n", __func__,
                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return nullptr;
     }
