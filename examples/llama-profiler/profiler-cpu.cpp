@@ -1187,15 +1187,22 @@ int main(int argc, char ** argv) {
         if (host_buft) {
             pcie.host_buf = ggml_backend_buft_alloc_buffer(host_buft, pcie.transfer_size);
             pcie.dev_buf  = ggml_backend_alloc_buffer(pcie.gpu_backend, pcie.transfer_size);
-            ggml_init_params p = { pcie.transfer_size + 8 * 1024 * 1024, NULL, true };
-            pcie.ctx = ggml_init(p);
-            pcie.h_tensor = ggml_new_tensor_1d(pcie.ctx, GGML_TYPE_F32, pcie.transfer_size / 4);
-            pcie.d_tensor = ggml_new_tensor_1d(pcie.ctx, GGML_TYPE_F32, pcie.transfer_size / 4);
-            ggml_backend_tensor_alloc(pcie.host_buf, pcie.h_tensor, ggml_backend_buffer_get_base(pcie.host_buf));
-            ggml_backend_tensor_alloc(pcie.dev_buf,  pcie.d_tensor, ggml_backend_buffer_get_base(pcie.dev_buf));
-            std::vector<float> init_data(pcie.transfer_size / 4, 1.0f);
-            ggml_backend_tensor_set(pcie.h_tensor, init_data.data(), 0, pcie.transfer_size);
-            printf("GPU: %s\n", ggml_backend_name(pcie.gpu_backend));
+            if (pcie.host_buf == nullptr || pcie.dev_buf == nullptr) {
+                fprintf(stderr, "PCIe calibration: could not allocate the %zu MiB %s buffer - GPU lines omitted\n",
+                    pcie.transfer_size >> 20, pcie.host_buf == nullptr ? "pinned host" : "device");
+                has_gpu = false;
+            }
+            if (has_gpu) {
+                ggml_init_params p = { pcie.transfer_size + 8 * 1024 * 1024, NULL, true };
+                pcie.ctx = ggml_init(p);
+                pcie.h_tensor = ggml_new_tensor_1d(pcie.ctx, GGML_TYPE_F32, pcie.transfer_size / 4);
+                pcie.d_tensor = ggml_new_tensor_1d(pcie.ctx, GGML_TYPE_F32, pcie.transfer_size / 4);
+                ggml_backend_tensor_alloc(pcie.host_buf, pcie.h_tensor, ggml_backend_buffer_get_base(pcie.host_buf));
+                ggml_backend_tensor_alloc(pcie.dev_buf,  pcie.d_tensor, ggml_backend_buffer_get_base(pcie.dev_buf));
+                std::vector<float> init_data(pcie.transfer_size / 4, 1.0f);
+                ggml_backend_tensor_set(pcie.h_tensor, init_data.data(), 0, pcie.transfer_size);
+                printf("GPU: %s\n", ggml_backend_name(pcie.gpu_backend));
+            }
         } else {
             has_gpu = false;
         }
