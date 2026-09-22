@@ -145,6 +145,41 @@ static void * ggml_cuda_host_device_ptr(const void * p, size_t size = 1) {
     }
     return nullptr;
 }
+
+// the pointer-attribute and stream-capture queries fill a caller-owned struct. Some runtimes write
+// past the size their own header declares (CUDA 13.1 on Windows-on-ARM does, and the stack cookie
+// of the caller trips). Query into a padded, sentinel-filled buffer, copy the declared struct out,
+// and say once how far the runtime wrote
+template <typename T>
+static void ggml_cuda_padded_query_report(const unsigned char * buf, size_t cap, const char * what) {
+    size_t n = cap;
+    while (n > sizeof(T) && buf[n - 1] == 0xA5) {
+        n--;
+    }
+    if (n > sizeof(T)) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            GGML_LOG_WARN("%s: the CUDA runtime wrote %zu bytes into a %zu-byte %s - padded here, report it to the runtime\n",
+                __func__, n, sizeof(T), what);
+        });
+    }
+}
+static cudaError_t ggml_cuda_pointer_attributes(cudaPointerAttributes & out, const void * p) {
+    alignas(64) unsigned char buf[512];
+    memset(buf, 0xA5, sizeof(buf));
+    const cudaError_t err = cudaPointerGetAttributes((cudaPointerAttributes *) buf, p);
+    memcpy(&out, buf, sizeof(out));
+    ggml_cuda_padded_query_report<cudaPointerAttributes>(buf, sizeof(buf), "cudaPointerAttributes");
+    return err;
+}
+static cudaError_t ggml_cuda_stream_capture_status(cudaStream_t stream, cudaStreamCaptureStatus & out) {
+    alignas(64) unsigned char buf[128];
+    memset(buf, 0xA5, sizeof(buf));
+    const cudaError_t err = cudaStreamIsCapturing(stream, (cudaStreamCaptureStatus *) buf);
+    memcpy(&out, buf, sizeof(out));
+    ggml_cuda_padded_query_report<cudaStreamCaptureStatus>(buf, sizeof(buf), "cudaStreamCaptureStatus");
+    return err;
+}
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -2747,7 +2782,7 @@ static bool ggml_cuda_stage_candidate(const void * src, size_t size, cudaStream_
         return false;
     }
     cudaPointerAttributes attr;
-    if (cudaPointerGetAttributes(&attr, src) != cudaSuccess) {
+    if (ggml_cuda_pointer_attributes(attr, src) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
@@ -2755,7 +2790,7 @@ static bool ggml_cuda_stage_candidate(const void * src, size_t size, cudaStream_
         return false;   // pinned, registered or device memory: the direct async copy is already fast
     }
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+    if (ggml_cuda_stream_capture_status(stream, cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
         return false;
     }
     (void) cudaGetLastError();
