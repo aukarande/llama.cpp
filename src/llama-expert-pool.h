@@ -188,6 +188,8 @@ struct llama_expert_pool {
     uint64_t ids_host_drains     = 0;   // of those, polls that drained the stream before the slice filled
     uint64_t ids_host_wait_us    = 0;   // host time spent polling for them
     uint64_t ids_host_fallbacks  = 0;   // slices that never filled (stream drained, then the device readback)
+    uint32_t ids_host_drain_streak = 0;     // consecutive decode-sized polls that filled only after a drain
+    bool     ids_host_sync_first   = false; // this device's writes reach the landing slice only after a drain
     bool wait_ids_host(layer_state & L, size_t n);
     uint64_t epoch         = 0;        // bumped on active/ab flips; joins graph reuse
     uint64_t generation    = 0;        // bumped once per decode call; dedupes serve()

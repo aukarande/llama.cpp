@@ -865,7 +865,22 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         (size_t) (n_ids_0 * n_ids_1) == L.ids_host_n) {
         // the graph copied the ids into the pinned slice right after the router: poll instead of draining the stream
         L.ids_host_armed = false;
+        if (ids_host_sync_first) {
+            ggml_backend_synchronize(backend_router);
+        }
+        const uint64_t drains_before = ids_host_drains;
         landed = wait_ids_host(L, (size_t) (n_ids_0 * n_ids_1));
+        // a decode-sized pass reaches its router within a few ms; when such passes keep needing the drain,
+        // the device's writes only become visible after it (seen on an integrated GPU): drain first from
+        // now on instead of polling out the timeout on every layer
+        if (!ids_host_sync_first && n_ids_1 <= 32) {
+            ids_host_drain_streak = ids_host_drains > drains_before ? ids_host_drain_streak + 1 : 0;
+            if (ids_host_drain_streak >= 3) {
+                ids_host_sync_first = true;
+                LLAMA_LOG_WARN("%s: expert pool: router ids reach host memory only after a stream drain on this device - "
+                    "draining first from now on\n", __func__);
+            }
+        }
         if (landed && ids_host_unconsumed > 0) {
             ids_host_unconsumed--;   // an unlanded slice stays counted so the next arm drains first
         }
