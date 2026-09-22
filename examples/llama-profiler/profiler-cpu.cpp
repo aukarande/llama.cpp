@@ -693,6 +693,12 @@ static bool splice_profile_header(const char * path, calib_results & cr, int thr
 static double calibrate_pin_ceiling(pcie_stress_ctx * pcie) {
     printf("Probing host pin ceiling (cudaHostRegister until refusal)...\n");
     ggml_backend_dev_t dev = ggml_backend_get_device(pcie->gpu_backend);
+    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        // the GPU shares host memory: nothing to page-lock, and a refused registration can leave
+        // the runtime failing later copies
+        printf("  integrated GPU shares host memory - no pin ceiling to probe\n\n");
+        return 0.0;
+    }
     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     auto register_fn = reg ? (bool (*)(void *, size_t))
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;

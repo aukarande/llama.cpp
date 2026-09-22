@@ -1984,6 +1984,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // ceiling would otherwise stay pageable entirely.
         {
             auto * gpu_dev = pshard_gpu_dev();
+            // an integrated GPU reads host memory in place: there is no upload to speed up and no
+            // ceiling to budget, and a refused registration can leave the runtime failing later copies
+            if (gpu_dev && ggml_backend_dev_type(gpu_dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                LLAMA_LOG_INFO("%s: pshard: integrated GPU shares host memory - streamed weights are not page-locked\n", __func__);
+                gpu_dev = nullptr;
+            }
             if (gpu_dev) {
                 auto * reg = ggml_backend_dev_backend_reg(gpu_dev);
                 auto register_fn = (bool (*)(void *, size_t))
