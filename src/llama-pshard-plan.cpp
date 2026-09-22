@@ -2261,7 +2261,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     const double   b_slot       = (double) ctx.exps_total_bytes / ctx.n_expert;   // one slot in every layer
     const double   b_expert     = b_slot / n_layers_exp;                                      // average expert (per miss)
     const uint32_t bs = cparams->n_batch;
-    const bool ab_tier = (uint64_t) bs * ctx.n_expert_used * 2 >= ctx.n_expert; // whole-stack regime
+    const bool ab_tier = (uint64_t) bs * ctx.n_expert_used >= ctx.n_expert; // whole-stack regime: the batch could touch every expert
     // fixed = the pool placement's pinned weights + KV (the streaming probe's total minus its
     // compute); scratch = the pool graph's own compute buffer. Mirror the runtime carve: it charges
     // the probed chunk0 + 32 MiB. The extra 64 MiB stands in for what the pinned-expert probe does

@@ -15,7 +15,7 @@ typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 3;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 4;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory

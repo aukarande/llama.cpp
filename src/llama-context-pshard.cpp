@@ -389,7 +389,7 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
 
     // whole-stack tiers need the two-layer double-buffer pair (ab) in the region; cache tiers only
     // their slots (the pair is not reserved for them: tight budgets turn it into slots)
-    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
+    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used >= expert_pool->n_expert;
     // slots = what the window holds (the plan's count estimates the same quantity
     // from the probe; the reserved scratch here is the authority - the log shows both)
     const size_t per_slot = expert_pool->region_bytes_needed(1, /*with_ab=*/false);
@@ -452,7 +452,7 @@ void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
     }
     expert_pool->set_active(on, sched.get());
     expert_pool->set_policy(plan.pool_miss, plan.pool_hybrid_frac, sched.get());
-    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used * 2 >= expert_pool->n_expert;
+    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used >= expert_pool->n_expert;
     expert_pool->set_ab_mode(on && ab, sched.get());
 }
 
