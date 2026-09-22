@@ -2302,6 +2302,71 @@ int llama_bench(int argc, char ** argv) {
         return 1;
     }
 
+    std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
+
+    // pshard: plan a test's configuration in-process the way the tools do
+    auto pshard_plan_instance = [&](const cmd_params_instance & inst, const llama_model_params & mparams,
+                                    const llama_context_params & cparams) -> bool {
+        common_params pp;
+        pp.model.path      = inst.model;
+        pp.pshard          = true;
+        pp.n_ctx           = (int32_t) cparams.n_ctx;
+        pp.n_batch         = (int32_t) cparams.n_batch;
+        pp.n_ubatch        = (int32_t) cparams.n_ubatch;
+        pp.n_parallel      = (int32_t) cparams.n_seq_max;
+        pp.kv_unified      = cparams.kv_unified;
+        pp.cpuparams.n_threads       = cparams.n_threads;
+        pp.cpuparams_batch.n_threads = cparams.n_threads_batch;
+        pp.flash_attn_type = cparams.flash_attn_type;
+        pp.cache_type_k    = cparams.type_k;
+        pp.cache_type_v    = cparams.type_v;
+        pp.n_gpu_layers    = mparams.n_gpu_layers;
+        pp.main_gpu        = mparams.main_gpu;
+        pp.no_host         = mparams.no_host;
+        pp.devices         = inst.devices;
+        pp.no_kv_offload   = !cparams.offload_kqv;
+        pp.no_op_offload   = !cparams.op_offload;
+        pp.embedding       = cparams.embeddings;
+        pp.max_vram_alloc  = inst.max_vram_alloc;
+        pp.fit_params_target.assign(llama_max_devices(), inst.fit_target * 1024 * 1024);
+        return common_pshard_plan(pp, cparams.n_ctx);
+    };
+
+    // pshard: plan every configuration the run needs before the first test, so planning never lands
+    // between timed tests. Each test keeps its own context, as the stock path does; tests that share a
+    // configuration share one plan (the second finds the first in the registry)
+    std::unordered_set<size_t> pshard_preplanned;
+    for (size_t i = 0; i < params_instances.size(); i++) {
+        const auto & inst = params_instances[i];
+        if (!inst.pshard || inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0]) {
+            continue;
+        }
+        auto mparams = inst.to_llama_mparams();
+        auto cparams = inst.to_llama_cparams();
+        if (!params.n_gpu_layers_user) {
+            mparams.n_gpu_layers = llama_model_default_params().n_gpu_layers;
+        }
+        std::vector<llama_model_tensor_buft_override> overrides(4096, { nullptr, nullptr, -1 });
+        const uint32_t tier_max_auto = std::min(std::max(cparams.n_batch, (uint32_t) 16384), cparams.n_ctx);
+        auto * reg = llama_pshard_registry_create(tier_max_auto, cparams.n_seq_max, /*n_draft=*/0);
+        mparams.pshard_registry = reg;
+        llama_params_fit_pshard(inst.model.c_str(), &mparams, &cparams,
+            overrides.data(), inst.max_vram_alloc, inst.fit_target);
+        const bool missed = llama_pshard_registry_cache_missed(reg);
+        llama_pshard_registry_free(reg);
+        if (!missed) {
+            continue;
+        }
+        fprintf(stderr, "%s: planning pshard for test %zu/%zu (n_ctx=%u) before the first test\n",
+            __func__, i + 1, params_instances.size(), cparams.n_ctx);
+        const bool planned = pshard_plan_instance(inst, mparams, cparams);
+        if (!planned) {
+            fprintf(stderr, "%s: test %zu/%zu runs on the stock path: the whole model fits the budget, or the planner "
+                "refused (-v shows which)\n", __func__, i + 1, params_instances.size());
+        }
+        pshard_preplanned.insert(i);
+    }
+
     // initialize printer
     std::unique_ptr<printer> p     = create_printer(params.output_format);
     std::unique_ptr<printer> p_err = create_printer(params.output_format_stderr);
@@ -2315,8 +2380,6 @@ int llama_bench(int argc, char ** argv) {
         p_err->fout = stderr;
         p_err->print_header(params);
     }
-
-    std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
 
     llama_model *                 lmodel                  = nullptr;
     llama_pshard_plan_registry *  active_pshard_registry  = nullptr;
@@ -2406,33 +2469,14 @@ int llama_bench(int argc, char ** argv) {
             llama_params_fit_pshard(inst.model.c_str(), &mparams, &cparams,
                 pshard_overrides.data(), inst.max_vram_alloc, inst.fit_target);
 
-            if (llama_pshard_registry_cache_missed(pending_pshard_registry)) {
-                // no plan for this configuration (or only a smaller budget's): plan it in-process the way
-                // the tools do, then load again
+            const bool pshard_missed = llama_pshard_registry_cache_missed(pending_pshard_registry);
+            if (pshard_missed && pshard_preplanned.count((size_t) params_idx - 1) > 0) {
+                // planned before the first test and refused there: the stock fallback stands
+                fprintf(stderr, "%s: the planner produced no pshard plan for this configuration; continuing on the stock path\n", __func__);
+            } else if (pshard_missed) {
+                // no plan for this configuration (or only a smaller budget's): plan it in-process, then load again
                 fprintf(stderr, "%s: no pshard plan for this configuration, planning it now\n", __func__);
-                common_params pp;
-                pp.model.path      = inst.model;
-                pp.pshard          = true;
-                pp.n_ctx           = (int32_t) cparams.n_ctx;
-                pp.n_batch         = (int32_t) cparams.n_batch;
-                pp.n_ubatch        = (int32_t) cparams.n_ubatch;
-                pp.n_parallel      = (int32_t) cparams.n_seq_max;
-                pp.kv_unified      = cparams.kv_unified;
-                pp.cpuparams.n_threads       = cparams.n_threads;
-                pp.cpuparams_batch.n_threads = cparams.n_threads_batch;
-                pp.flash_attn_type = cparams.flash_attn_type;
-                pp.cache_type_k    = cparams.type_k;
-                pp.cache_type_v    = cparams.type_v;
-                pp.n_gpu_layers    = mparams.n_gpu_layers;
-                pp.main_gpu        = mparams.main_gpu;
-                pp.no_host         = mparams.no_host;
-                pp.devices         = inst.devices;
-                pp.no_kv_offload   = !cparams.offload_kqv;
-                pp.no_op_offload   = !cparams.op_offload;
-                pp.embedding       = cparams.embeddings;
-                pp.max_vram_alloc  = inst.max_vram_alloc;
-                pp.fit_params_target.assign(llama_max_devices(), inst.fit_target * 1024 * 1024);
-                const bool planned = common_pshard_plan(pp, cparams.n_ctx);
+                const bool planned = pshard_plan_instance(inst, mparams, cparams);
                 // load again against whatever the planner wrote; a refusal wrote nothing and the
                 // second probe takes the stock fallback (both pshard flags cleared there)
                 llama_pshard_registry_free(pending_pshard_registry);
