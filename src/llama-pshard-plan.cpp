@@ -3186,6 +3186,11 @@ void llama_params_fit_pshard_plan(
                     break;
                 }
             }
+            if (min_global_tier == n_tiers && n_tiers > 0) {
+                // a context shorter than GLOBAL_FIT_MIN_BATCH never runs a larger batch: its largest
+                // tier is the whole-model fit to check, or a model that fits is planned anyway
+                min_global_tier = n_tiers - 1;
+            }
 
             if (min_global_tier < n_tiers && ctx.model_size > 0 && (size_t) ctx.model_size > ctx.vram_free) {
                 // the weights alone exceed the budget: no tier can hold the whole model
@@ -3255,7 +3260,7 @@ void llama_params_fit_pshard_plan(
             }
 
             LLAMA_LOG_INFO("%s: no full-fit global plan found down to bs=%u\n",
-                __func__, GLOBAL_FIT_MIN_BATCH);
+                __func__, min_global_tier < n_tiers ? registry->tier_sizes[min_global_tier] : GLOBAL_FIT_MIN_BATCH);
         } else {
             LLAMA_LOG_INFO("%s: skipping baseline global-fit check for forced strategy %s\n",
                 __func__, llama_pshard_strategy_name((llama_pshard_strategy) force_strategy));
