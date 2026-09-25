@@ -138,7 +138,9 @@ static void pshard_plan_generate_overrides(
             // sound because the draft ctx gets stock, backed KV (per-context gate).
             if (g_pshard_n_layers_mtp > 0 && il >= n_layers - g_pshard_n_layers_mtp) {
                 const bool pin_head = !g_pshard_mtp_head_cpu && (n_pinned > 0 || n_attn_pinned > 0);
-                emit(patterns_layer[il].c_str(), host_buft, pin_head ? layout.compute : layout.cpu);
+                // a pinned head is device memory: under the GPU buft so the probe counts it, as the
+                // pool branch does; under the host buft the union check found it only after the plan
+                emit(patterns_layer[il].c_str(), pin_head ? gpu_buft : host_buft, pin_head ? layout.compute : layout.cpu);
                 continue;
             }
             // overlap=1: alternating shard slots (double-buffering). overlap=0: one slot,
