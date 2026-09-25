@@ -358,11 +358,11 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
     [ "$P" = "1" ] && ENVV="$ENVV PSHARD_POOL_PREDICT=1"
     # W=1 (warm start + per-layer slots) retired 2026-09-13: the knobs no longer exist; the arm repeats the pred arm
 
-    # budget flag: stock -fitb, pshard -pshard -mva. DSv4 + DSpark stock only fits at 3000
-    # (the stock fit ignores the 10.4 GB draft and OOMs otherwise) - recorded as mva 3000.
+    # budget flag: stock -fitb, pshard -pshard -mva. The stock fit counts the draft (dflash-class
+    # drafts are measured against a no-alloc target context); a draft larger than the budget still
+    # lands on the device and the cell is recorded as NOFIT
     BUDGET=$MVA
     if [ "$A" = "stock" ]; then
-        [ "$M" = "dsv4" ] && [ "$S" = "dspark" ] && BUDGET=3000
         BUDF="-fitb $BUDGET"
     else
         BUDF="-pshard -mva $MVA"
@@ -422,6 +422,7 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
     case $A in pool:*|poolauto) set -- $(pool_counters "$LOG"); H=${1:-}; MPT=${2:-} ;; esac
     [ "$RC" != "0" ] && STATUS=FAIL
     [ "$A" != "stock" ] && fallback "$LOG" && STATUS=FALLBACK
+    [ "$STATUS" = OK ] && [ "$A" = "stock" ] && strip < "$LOG" | grep -aq "cannot meet the target" && STATUS=NOFIT
     if [ "$STATUS" = OK ] && [ "$A" != "stock" ]; then
         # the planner substitutes the attn-pin legacy plan for a forced strategy or a pool
         # policy that does not fit the tier (three s1 cells and seven speculative pool cells

@@ -1,5 +1,6 @@
 #include "fit.h"
 
+#include "llama-cpp.h"
 #include "log.h"
 
 #include "../src/llama-ext.h"
@@ -24,6 +25,24 @@ enum common_layer_fraction_t {
 
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+// while in scope, llama prints below min_level go to the debug log
+struct common_fit_log_scope {
+    ggml_log_callback callback;
+    void *            user_data;
+    ggml_log_level    min_level;
+
+    explicit common_fit_log_scope(ggml_log_level min_level) : min_level(min_level) {
+        llama_log_get(&callback, &user_data);
+        llama_log_set([](ggml_log_level level, const char * text, void * ud) {
+            const common_fit_log_scope * self = (const common_fit_log_scope *) ud;
+            self->callback(level >= self->min_level ? level : GGML_LOG_LEVEL_DEBUG, text, self->user_data);
+        }, this);
+    }
+    ~common_fit_log_scope() {
+        llama_log_set(callback, user_data);
+    }
 };
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
@@ -200,6 +219,44 @@ static void common_params_fit_impl(
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context size dmds_extra was evaluated at
 
+    // drafts that borrow the token embeddings or the output head of the main model (dflash, eagle3)
+    // cannot build a context alone: they are measured against a no-alloc context of the main model
+    llama_model_ptr   model_host;
+    llama_context_ptr ctx_host;
+    auto measure_extra = [&](std::vector<ggml_backend_dev_t> & devs_extra, uint32_t & ngl_extra, uint32_t & nct_extra, uint32_t & nex_extra) {
+        try {
+            return common_get_device_memory_data_impl(
+                extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+        } catch (const std::runtime_error &) {
+            if (extra->shares_model || extra->cparams->ctx_other != nullptr) {
+                throw;
+            }
+        }
+        if (!ctx_host) {
+            common_fit_log_scope log_scope(log_level);
+            llama_model_params mparams_host = *mparams;
+            mparams_host.no_alloc  = true;
+            mparams_host.load_mode = LLAMA_LOAD_MODE_NONE;
+            model_host.reset(llama_model_load_from_file(path_model, mparams_host));
+            if (model_host) {
+                ctx_host.reset(llama_init_from_model(model_host.get(), *cparams));
+            }
+            if (!ctx_host) {
+                throw std::runtime_error("failed to create a context of the main model for the extra model");
+            }
+        }
+        extra->cparams->ctx_other = ctx_host.get();
+        try {
+            dmds_t measured = common_get_device_memory_data_impl(
+                extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+            extra->cparams->ctx_other = nullptr;
+            return measured;
+        } catch (...) {
+            extra->cparams->ctx_other = nullptr;
+            throw;
+        }
+    };
+
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is re-evaluated whenever the context it follows changes
     auto add_extra_memory = [&](dmds_t & dmds) {
@@ -220,8 +277,7 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                measured = measure_extra(devs_extra, ngl_extra, nct_extra, nex_extra);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
@@ -742,6 +798,11 @@ static void common_params_fit_impl(
         LOG_TRC(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
+        // only the main model's layers move: an extra model that alone exceeds the target still lands on the device
+        if (mem[id] > targets[id]) {
+            LOG_WRN("%s: %s: cannot meet the target of %" PRId64 " MiB, %" PRId64 " MiB are used with %" PRIu32 " layers offloaded\n",
+                __func__, dev_names[id].c_str(), targets[id]/MiB, mem[id]/MiB, ngl_per_device[id].n_layer);
+        }
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
