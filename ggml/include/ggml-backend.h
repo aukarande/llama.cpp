@@ -423,6 +423,11 @@ extern "C" {
             ggml_backend_t backend, void * user_data);
     GGML_API void ggml_backend_sched_set_split_skip_cb(ggml_backend_sched_t sched,
             ggml_backend_sched_split_skip_cb cb, void * user_data);
+    // optional: called when an expert copy is sliced by used ids for a multi-row evaluation (ids->ne[1] > 1),
+    // once per consumer ids tensor, with the number of distinct experts its rows route to
+    typedef void (*ggml_backend_sched_ids_observe_cb)(const struct ggml_tensor * ids, int64_t n_distinct, void * user_data);
+    GGML_API void ggml_backend_sched_set_ids_observe_cb(ggml_backend_sched_t sched,
+            ggml_backend_sched_ids_observe_cb cb, void * user_data);
     // asynchronous host<->device input handling on pshard layouts (off by default): a CPU split's device
     // inputs download asynchronously behind an event, host-sourced inputs of device splits upload on the
     // split stream without a drain, the user's inputs upload asynchronously and drain once per graph, and
@@ -468,6 +473,14 @@ extern "C" {
         size_t               writeback_kv_bytes;          // attention KV cache: runtime moves only newly written cells
         size_t               writeback_rs_bytes;          // recurrent state: runtime moves the full tensor every eval
         bool                 can_prefetch_weights;
+        // expert tensors the prefetch pass moves in full; a split that was not prefetched copies them sliced by
+        // used ids instead (their MUL_MAT_ID reads ids an earlier split computed)
+        size_t               input_expert_bytes;          // full size of those tensors (part of input_weight_copy_bytes)
+        size_t               input_expert_size;           // one expert's bytes (min across those tensors)
+        int64_t              input_expert_n_expert;       // experts per tensor
+        int64_t              input_expert_n_rows;         // token rows of the consumer's ids
+        int64_t              input_expert_n_used;         // experts per row
+        bool                 input_expert_segments;       // the split's device takes the sliced copy as one segment-batch launch
     };
 
     GGML_API bool ggml_backend_sched_get_split_info(

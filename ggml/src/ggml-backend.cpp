@@ -852,6 +852,8 @@ struct ggml_backend_sched {
     ggml_backend_sched_pool_prefetch_cb pool_prefetch_cb;
     ggml_backend_sched_split_skip_cb split_skip_cb;
     void * split_skip_ud;
+    ggml_backend_sched_ids_observe_cb ids_observe_cb;
+    void * ids_observe_ud;
     bool async_host_copies;   // ggml_backend_sched_set_async_host_copies (pool tiers)
     // nodes a new split starts at when their boundary node runs on the CPU (ggml_backend_sched_set_split_before)
     struct ggml_backend_sched_split_mark * split_before;
@@ -1986,6 +1988,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
+    const ggml_tensor * prev_observed_ids = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
     int prefetched_split_id = -1;
@@ -2304,6 +2307,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 GGML_ASSERT(id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
                             }
+                        }
+                        // keyed on the consumer's ids: the swap above can re-read one layer's ids for its next tensor
+                        if (sched->ids_observe_cb != NULL && ids_tensor->ne[1] > 1 && node->src[2] != prev_observed_ids) {
+                            int64_t n_distinct = 0;
+                            for (int64_t e = 0; e < n_expert; e++) {
+                                n_distinct += ggml_bitset_get(used_ids.data(), e) ? 1 : 0;
+                            }
+                            sched->ids_observe_cb(ids_tensor, n_distinct, sched->ids_observe_ud);
+                            prev_observed_ids = node->src[2];
                         }
 
                         prev_ids_tensor = ids_tensor;
@@ -2958,6 +2970,12 @@ void ggml_backend_sched_set_split_skip_cb(ggml_backend_sched_t sched,
     sched->split_skip_ud = user_data;
 }
 
+void ggml_backend_sched_set_ids_observe_cb(ggml_backend_sched_t sched,
+        ggml_backend_sched_ids_observe_cb cb, void * user_data) {
+    sched->ids_observe_cb = cb;
+    sched->ids_observe_ud = user_data;
+}
+
 void ggml_backend_sched_clear_split_before(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     sched->n_split_before = 0;
@@ -3102,6 +3120,14 @@ bool ggml_backend_sched_get_split_info(
     out->input_weight_sliced_chunk_bytes = 0;
     out->input_weight_prefetch_bytes = 0;
     out->input_activ_bytes           = 0;
+    out->input_expert_bytes          = 0;
+    out->input_expert_size           = 0;
+    out->input_expert_n_expert       = 0;
+    out->input_expert_n_rows         = 0;
+    out->input_expert_n_used         = 0;
+    // the consume path batches sliced copies on the device the split runs on
+    const int seg_bid = sched->redirect_target[s->backend_id] >= 0 ? sched->redirect_target[s->backend_id] : s->backend_id;
+    out->input_expert_segments = sched->copy_segments_fn[seg_bid] != NULL;
     for (int j = 0; j < s->n_inputs; j++) {
         struct ggml_tensor * inp = s->inputs[j];
         if (inp->buffer != NULL &&
@@ -3126,6 +3152,17 @@ bool ggml_backend_sched_get_split_info(
             } else {
                 out->input_weight_copy_bytes     += full;
                 out->input_weight_prefetch_bytes += full;
+                // the consume path slices it by used ids when the prefetch pass did not move it first
+                const struct ggml_tensor * moe = inp_cpy != NULL ? ggml_backend_sched_split_find_moe_consumer(&s->graph, inp_cpy) : NULL;
+                if (moe != NULL) {
+                    out->input_expert_bytes   += full;
+                    out->input_expert_n_expert = inp->ne[2];
+                    out->input_expert_n_rows   = moe->src[2]->ne[1];
+                    out->input_expert_n_used   = moe->src[2]->ne[0];
+                    if (out->input_expert_size == 0 || inp->nb[2] < out->input_expert_size) {
+                        out->input_expert_size = inp->nb[2];
+                    }
+                }
             }
         } else {
             out->input_activ_bytes += ggml_nbytes(inp);
