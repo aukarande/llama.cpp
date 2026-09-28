@@ -437,7 +437,7 @@ static bool pshard_alternate_ids_cross_wins(const struct llama_pshard_search_ctx
     // decision cannot be priced and the full-upload prefetch (the default placement) stands
     const llama_benchmark_stats * st = ctx.predictor ? &ctx.predictor->stats : nullptr;
     if (st == nullptr || st->eff_pcie_bw <= 0.0 || st->peak_system_bw <= 0.0 ||
-            st->pool_serve_us <= 0.0 || st->engine_switch_us < 0.0 || ctx.exps_layer_bytes == 0) {
+            st->pool_serve_us <= 0.0 || st->engine_switch_us < 0.0 || ctx.exps_layer_bytes == 0 || ctx.exps_row_bytes == 0) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -454,12 +454,15 @@ static bool pshard_alternate_ids_cross_wins(const struct llama_pshard_search_ctx
     }
     const double dram    = st->peak_system_bw;
     const double b_full  = (double) ctx.exps_layer_bytes;   // full expert set of the largest layer (gguf table)
-    const double frac    = std::min(1.0, (double) bs * ctx.n_expert_used / ctx.n_expert);
-    const double b_slice = b_full * frac;
+    const double share   = llama_expert_distinct_share(ctx.predictor->workload, bs, ctx.n_expert_used, ctx.n_expert);
+    const double b_slice = b_full * share;
+    const double b_expert = (double) ctx.exps_row_bytes / std::max<uint32_t>(1, ctx.exps_tensors_per_layer);   // one expert of one tensor
     const double t_full_ms  = b_full  / 1e9 / pcie * 1000.0;
-    // the sliced path's ids round trip (readback, sync, decision, upload launch) plus the copy-engine
-    // transition its DMA readback pays on this machine: the legacy sliced tiers keep the copy engine
-    const double t_slice_ms = b_slice / 1e9 / pcie * 1000.0 + (st->pool_serve_us + st->engine_switch_us) / 1000.0;
+    // the sliced copy on the runtime's path (the profile has the segment-batch curve only where the device takes it),
+    // plus the ids round trip (readback, sync, decision, upload launch) and the copy-engine transition its DMA
+    // readback pays on this machine
+    const double t_slice_ms = ctx.predictor->sliced_expert_copy_ms(b_slice, share, ctx.n_expert, b_expert, true)
+                            + (st->pool_serve_us + st->engine_switch_us) / 1000.0;
     // cover the full upload could hide behind: the paired CPU-FFN's DRAM-bound expert reads
     const double cover_ms   = b_slice / 1e9 / dram * 1000.0;
     return t_slice_ms < std::max(0.0, t_full_ms - cover_ms);
@@ -2351,14 +2354,20 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
 
         // price (design 3b.2): compute + other + per-layer miss cost. The probe's
         // weight-upload term (full expert stacks) is replaced by
-        //   distinct(bs) * (1 - h(s)) * t_miss   per pooled layer,
-        // distinct(bs) = min(E, bs*top_k) (token union), h(s) = Zipf(alpha) mass of
-        // the s most popular of E experts (the static optimum). alpha comes from the
+        //   misses(bs, s) * t_miss   per pooled layer.
+        // One row routes to top_k experts, h(s) of them resident: h(s) = Zipf(alpha) mass
+        // of the s most popular of E experts (the static optimum). alpha comes from the
         // routing workload: the pool histograms every cache-mode route and refits it
         // at exit into <model>.pshard_workload; a model without one is calibrated at
         // plan time (sampled generation). The planner prices the long-run rate; short
         // generations pay the fill of the pool first.
+        // A pass of bs rows repeats experts, mostly the popular ones the pool keeps: the
+        // misses of one row grow by their ratio on the workload's pool table (the
+        // distinct-expert curve with each layer's s most routed experts resident), the
+        // pass's other distinct experts are hits, at most one per slot. Without the table
+        // every route of the pass is a distinct expert.
         const double E = (double) ctx.n_expert;
+        const double k = (double) ctx.n_expert_used;
         const double s = std::min<double>(plan.pool_slots, E);
         const double alpha = ctx.zipf_alpha;
         auto zipf_mass = [alpha](double n) {
@@ -2370,9 +2379,17 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         };
         const double h        = s >= E ? 1.0
             : (s >= 1.0 ? zipf_mass(s) / zipf_mass(E) : 0.0);
-        const double distinct = std::min<double>(E, (double) bs * ctx.n_expert_used);
-        const double misses   = distinct * (1.0 - h);
-        const double hits     = distinct - misses;
+        double distinct = std::min<double>(E, (double) bs * k);   // distinct experts with an empty pool
+        double misses   = distinct * (1.0 - h);
+        double hits     = distinct - misses;
+        const llama_pshard_workload * wl = ctx.predictor ? ctx.predictor->workload : nullptr;
+        double miss_growth = 0.0;
+        if (bs > 1 && wl != nullptr && wl->share_n_expert == ctx.n_expert && wl->share_n_used == ctx.n_expert_used &&
+                wl->pool_miss_growth(bs, (uint32_t) s, miss_growth)) {
+            distinct = E * wl->distinct_share(bs);
+            hits     = std::min(s, std::max(0.0, distinct - k * (1.0 - h) * miss_growth));
+            misses   = distinct - hits;
+        }
         // the CPU chain of a layer runs while the GPU chain uploads and computes the fetched
         // experts (the scheduler overlaps the CPU split; the fetched rows arrive by kernel
         // copies on the GPU's own stream), so a hybrid layer pays the longer of the two chains
@@ -2443,10 +2460,10 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             if (priced) {
                 plan.tps = best_tps;
                 LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u priced: probe %.1f t/s (compute %.1f + upload %.1f + other %.1f ms) -> "
-                    "pool %.1f t/s (h(%u)=%.2f, %.1f misses/layer, %.2f ms/layer, %s; t_fetch %.3f idle / %.3f loaded, t_cpu %.3f ms/expert, "
-                    "serve %.3f, split %.3f ms/layer)\n",
+                    "pool %.1f t/s (h(%u)=%.2f, %.1f misses + %.1f hits/layer, %.2f ms/layer, %s; t_fetch %.3f idle / %.3f loaded, "
+                    "t_cpu %.3f ms/expert, serve %.3f, split %.3f ms/layer)\n",
                     __func__, bs, probe_tps, bd.compute_ms, bd.weight_upload_ms, bd.other_ms, plan.tps,
-                    plan.pool_slots, h, misses, miss_ms_layer(best),
+                    plan.pool_slots, h, misses, hits, miss_ms_layer(best),
                     llama_pshard_miss_policy_name((llama_pshard_miss_policy) best), t_fetch_idle, t_fetch_loaded, t_cpu,
                     t_serve, t_split);
             }
@@ -3070,7 +3087,8 @@ void llama_params_fit_pshard_plan(
     // generation (256 tokens, seed 1234, temperature 1) whose router top-k ids are histogrammed - a sampled
     // stand-in for the workload that the first real run replaces. Nothing is assumed: without either, pool
     // tiers are refused. The distinct experts per pass (recorded by pshard runs in <model>.pshard_workload_rows,
-    // else modelled from the route histogram) price the expert copies a split that was not prefetched slices.
+    // else modelled from the route histogram) price the sliced expert copies, the MUL_MAT_ID expert reads, the
+    // ids-cross decision and the EXPERT_POOL hits and misses of multi-row passes.
     llama_pshard_workload wl;   // outlives the sweep: the predictor reads its share table
     if (hp_nex > 0) {
         const std::string wl_path = llama_pshard_workload::path_for(path_model);
@@ -3092,7 +3110,9 @@ void llama_params_fit_pshard_plan(
         ctx.zipf_alpha  = wl.zipf_alpha;
         ctx.zipf_source = wl.source;
         wl.load_distinct(llama_pshard_workload::distinct_path_for(path_model), hp_nex);
-        wl.build_share_table(hp_nex, ctx.n_expert_used, n_ctx_plan);
+        // the pool table covers the EXPERT_POOL cache tiers (bs * top_k < n_expert); whole-stack tiers price streaming
+        const uint32_t pool_rows = ctx.n_expert_used > 0 ? (hp_nex + ctx.n_expert_used - 1) / ctx.n_expert_used : 0;
+        wl.build_share_table(hp_nex, ctx.n_expert_used, n_ctx_plan, pool_rows);
         if (predictor && !wl.share_table.empty()) {
             predictor->workload = &wl;
         }

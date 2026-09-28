@@ -3084,41 +3084,8 @@ bool ggml_backend_sched_get_split_info(
     out->graph      = &s->graph;
     out->backend_id = s->backend_id;
 
-    // sliced estimate for one expert weight tensor, mirroring the runtime's
-    // by-used-ids copy: find the MUL_MAT_ID consumer anywhere in the split (the
-    // runtime scans the whole split - gate/up/down each have their own consumer)
-    // and charge only the experts one evaluation actually gathers
-    auto sliced_weight_copy_bytes = [&](struct ggml_tensor * inp, struct ggml_tensor * inp_cpy) {
-        const size_t full_size = ggml_nbytes(inp);
-
-        const struct ggml_tensor * node = ggml_backend_sched_split_find_moe_consumer(&s->graph, inp_cpy);
-        if (node == NULL || node->src[2] == NULL) {
-            return full_size;
-        }
-
-        const int64_t n_expert = inp->ne[2];
-        if (n_expert <= 0) {
-            return full_size;
-        }
-
-        const size_t expert_size = inp->nb[2];
-        const int64_t n_routes = ggml_nelements(node->src[2]);
-        int64_t n_used = std::min<int64_t>(n_expert, std::max<int64_t>(1, n_routes));
-        const int64_t n_expert_used = node->src[2]->ne[0];
-        // ids contains one route per token/top-k slot, not unique experts.
-        // For larger batches, estimate unique experts instead of charging every route.
-        if (n_used > n_expert_used) {
-            n_used = std::min<int64_t>(n_expert, std::max<int64_t>(n_expert_used, (n_expert + 3) / 4));
-        }
-        const size_t padding = std::min<size_t>(expert_size, 512);
-
-        return std::min(full_size, (size_t) n_used * (expert_size + padding));
-    };
-
     out->input_weight_bytes          = 0;
-    out->input_weight_copy_bytes     = 0;
     out->input_weight_sliced_bytes   = 0;
-    out->input_weight_sliced_chunk_bytes = 0;
     out->input_weight_prefetch_bytes = 0;
     out->input_activ_bytes           = 0;
     out->input_expert_bytes          = 0;
@@ -3129,6 +3096,7 @@ bool ggml_backend_sched_get_split_info(
     // the consume path batches sliced copies on the device the split runs on
     const int seg_bid = sched->redirect_target[s->backend_id] >= 0 ? sched->redirect_target[s->backend_id] : s->backend_id;
     out->input_expert_segments = sched->copy_segments_fn[seg_bid] != NULL;
+    size_t n_expert_tensors = 0;
     for (int j = 0; j < s->n_inputs; j++) {
         struct ggml_tensor * inp = s->inputs[j];
         if (inp->buffer != NULL &&
@@ -3137,37 +3105,31 @@ bool ggml_backend_sched_get_split_info(
             const size_t full = ggml_nbytes(inp);
             out->input_weight_bytes += full;
             struct ggml_tensor * inp_cpy = tensor_copy(inp, s->backend_id, sched->cur_copy);
-            if (inp_cpy != NULL && ggml_backend_sched_prefer_sliced_expert_copy(&s->graph, inp, inp_cpy)) {
+            // an expert tensor whose MUL_MAT_ID reads ids an earlier split computed: the consume path slices it by
+            // used ids unless the prefetch pass moved it first
+            const struct ggml_tensor * moe = inp_cpy != NULL ? ggml_backend_sched_split_find_moe_consumer(&s->graph, inp_cpy) : NULL;
+            if (moe != NULL) {
+                out->input_expert_n_expert = inp->ne[2];
+                out->input_expert_n_rows   = moe->src[2]->ne[1];
+                out->input_expert_n_used   = moe->src[2]->ne[0];
+                out->input_expert_size    += inp->nb[2];
+                n_expert_tensors++;
+            }
+            if (moe != NULL && ggml_backend_sched_prefer_sliced_expert_copy(&s->graph, inp, inp_cpy)) {
                 // runtime prefetch SKIPS this tensor; the consume-time sliced copy pays instead
-                const size_t sliced = sliced_weight_copy_bytes(inp, inp_cpy);
-                out->input_weight_copy_bytes   += sliced;
-                out->input_weight_sliced_bytes += sliced;
-                // per-expert granularity: the runtime uploads one contiguous run of
-                // used experts per copy; consecutive hits are rare at low top-k, so
-                // one expert per transfer is the representative chunk size
-                const size_t chunk = inp->ne[2] > 0 ? inp->nb[2] : sliced;
-                if (chunk > 0 && (out->input_weight_sliced_chunk_bytes == 0 ||
-                                  chunk < out->input_weight_sliced_chunk_bytes)) {
-                    out->input_weight_sliced_chunk_bytes = chunk;
-                }
+                out->input_weight_sliced_bytes += full;
             } else {
-                out->input_weight_copy_bytes     += full;
                 out->input_weight_prefetch_bytes += full;
-                // the consume path slices it by used ids when the prefetch pass did not move it first
-                const struct ggml_tensor * moe = inp_cpy != NULL ? ggml_backend_sched_split_find_moe_consumer(&s->graph, inp_cpy) : NULL;
                 if (moe != NULL) {
-                    out->input_expert_bytes   += full;
-                    out->input_expert_n_expert = inp->ne[2];
-                    out->input_expert_n_rows   = moe->src[2]->ne[1];
-                    out->input_expert_n_used   = moe->src[2]->ne[0];
-                    if (out->input_expert_size == 0 || inp->nb[2] < out->input_expert_size) {
-                        out->input_expert_size = inp->nb[2];
-                    }
+                    out->input_expert_bytes += full;
                 }
             }
         } else {
             out->input_activ_bytes += ggml_nbytes(inp);
         }
+    }
+    if (n_expert_tensors > 0) {
+        out->input_expert_size /= n_expert_tensors;
     }
 
     // classify writebacks: the runtime delta-syncs attention KV (write-cells) but

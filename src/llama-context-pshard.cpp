@@ -854,7 +854,7 @@ void llama_context::pshard_log_reserve_breakdown(const char * tag) const {
     std::string per_bid;
     for (const auto & [bid, a] : by_bid) {
         char buf[200];
-        snprintf(buf, sizeof(buf), " | bid %d: %d splits, weights in %.1f (prefetch %.1f, sliced %.1f), activ %.1f, writeback kv %.1f rs %.1f MiB",
+        snprintf(buf, sizeof(buf), " | bid %d: %d splits, weights in %.1f (prefetch %.1f, sliced-eligible %.1f), activ %.1f, writeback kv %.1f rs %.1f MiB",
             bid, a.n, a.w_in / (1024.0 * 1024.0), a.w_pref / (1024.0 * 1024.0), a.w_sliced / (1024.0 * 1024.0),
             a.act / (1024.0 * 1024.0), a.wb_kv / (1024.0 * 1024.0), a.wb_rs / (1024.0 * 1024.0));
         per_bid += buf;

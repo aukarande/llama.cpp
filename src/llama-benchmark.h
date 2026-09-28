@@ -17,7 +17,7 @@ struct llama_pshard_workload;
 
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 5;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 6;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory
@@ -49,11 +49,17 @@ struct llama_op_metrics {
     int64_t n_tokens        = 0;
 };
 
+// distinct experts one pass of `rows` token rows routes to, as a share of n_expert: the routing workload's curve,
+// else independent uniform draws of n_used experts per row (wl == nullptr, no table, or a table built for another
+// n_expert / n_used)
+double llama_expert_distinct_share(const llama_pshard_workload * wl, double rows, double n_used, double n_expert);
+
 // Extract ops/bytes metrics from a compute graph node.
 // Zero-cost view ops (RESHAPE, VIEW, PERMUTE, TRANSPOSE, NONE) return {0,0}.
 // token_scale < 1 prices a graph reserved for more tokens than the step carries
 // (activation-sized terms shrink with it, weight bytes do not)
-llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node, double token_scale = 1.0);
+// wl: routing workload for the distinct experts a MUL_MAT_ID reads (see llama_expert_distinct_share)
+llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node, double token_scale = 1.0, const llama_pshard_workload * wl = nullptr);
 
 // One row from profiler output (CPU or GPU).
 // For FLASH_ATTN ops, n_heads stores n_kv_heads (written by profiler).
@@ -210,7 +216,7 @@ struct llama_benchmark_predictor {
     std::vector<llama_benchmark_entry> gpu_entries;
     llama_benchmark_stats stats = {};
     // routing workload of the planned model, set by the planner (nullptr = none): the distinct experts per
-    // pass that sliced expert copies are priced with
+    // pass that sliced expert copies and MUL_MAT_ID expert reads are priced with
     const llama_pshard_workload * workload = nullptr;
 
     std::unordered_map<std::string, const llama_benchmark_entry *> cpu_map;
@@ -289,6 +295,11 @@ struct llama_benchmark_predictor {
             uint32_t n_outputs = 0,
             bool has_rs = false,
             breakdown * bd = nullptr) const;
+
+    // ms of a copy sliced by used ids: `bytes` are the `share` of tensors of n_expert experts of expert_size bytes
+    // the rows route to. segments: the device takes the copy as one segment-batch launch
+    double sliced_expert_copy_ms(double bytes, double share, double n_expert, double expert_size,
+            bool segments) const;
 
 private:
     void build_maps();

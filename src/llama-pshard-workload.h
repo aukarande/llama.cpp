@@ -12,7 +12,8 @@ struct llama_model_params;
 // <model>.pshard_workload at exit (runs accumulate); a model without a file is calibrated at plan time
 // (llama_pshard_workload_calibrate below), and the first real run replaces that calibration.
 // Every pshard run also adds the distinct experts of its multi-row MoE passes whose expert copies the scheduler
-// sliced by used ids to <model>.pshard_workload_rows at exit; the predictor prices those copies from them.
+// sliced by used ids to <model>.pshard_workload_rows at exit; the planner prices sliced expert copies, MUL_MAT_ID
+// expert reads and the EXPERT_POOL hits and misses of multi-row passes from them.
 struct llama_pshard_workload {
     double      zipf_alpha = -1.0;   // -1 = unknown
     double      fit_rms    = 0.0;    // RMS of h_obs(s) - h_zipf(s; alpha) over s = 1..n_expert
@@ -34,6 +35,12 @@ struct llama_pshard_workload {
     // distinct share of the experts per pass at share_steps points per octave of rows from 1 row (build_share_table)
     static constexpr int share_steps = 4;
     std::vector<double>  share_table;
+    uint32_t             share_n_expert = 0;   // the routing the table was built for
+    uint32_t             share_n_used   = 0;
+    // the same model with each layer's s most routed experts resident: expected distinct experts outside them per
+    // layer pass, pool_table[j * (n_expert + 1) + s] at the share points j up to pool_rows, and the model's rows there
+    std::vector<double>  pool_table;
+    std::vector<double>  pool_rows_scaled;
 
     static std::string path_for(const std::string & path_model);
     bool load(const std::string & path);        // header + counts; refits alpha from the counts
@@ -58,9 +65,13 @@ struct llama_pshard_workload {
     // histogram, sum_i 1 - (1 - q_i)^rows (q_i = routes of expert i per counted token, averaged over layers), or
     // uniform routing (q_i = n_expert_used/n_expert) without a histogram or when the histogram cannot reach a
     // measured share. The model runs at scaled rows: exact at one row (the top-k share), through every measured
-    // bucket, the scale linear in log2(rows) between them and held past the last. No table with neither
-    void   build_share_table(uint32_t n_expert, uint32_t n_expert_used, uint32_t max_rows);
+    // bucket, the scale linear in log2(rows) between them and held past the last. No table with neither.
+    // pool_rows > 0 also builds the pool table up to pool_rows rows, at the same scaled rows
+    void   build_share_table(uint32_t n_expert, uint32_t n_expert_used, uint32_t max_rows, uint32_t pool_rows = 0);
     double distinct_share(double rows) const;   // -1 = no table
+    // growth of a pass's misses from one row to `rows` rows with each layer's s most routed experts resident, at most
+    // rows (a pass routes to at most rows times the experts of one row). false = no pool table
+    bool   pool_miss_growth(double rows, uint32_t s, double & growth) const;
 
     // fit alpha from per-layer expert use counts. h_obs(s) is a split-half top-s mass: each expert's routes are
     // split into two folds (deterministic binomial split), the experts are ranked on one fold and the cumulative

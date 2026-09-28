@@ -464,9 +464,7 @@ extern "C" {
         struct ggml_cgraph * graph;
         int                  backend_id;
         size_t               input_weight_bytes;          // full size of all host-weight inputs
-        size_t               input_weight_copy_bytes;     // consume-time copy estimate (sliced experts + full others)
-        size_t               input_weight_sliced_bytes;   // consume-time sliced-expert copies only (still paid when prefetched)
-        size_t               input_weight_sliced_chunk_bytes; // per-expert slice granularity (min across sliced tensors; 0 = none)
+        size_t               input_weight_sliced_bytes;   // full size of the expert tensors the prefetch pass skips: the consume path slices them (still paid when prefetched)
         size_t               input_weight_prefetch_bytes; // what the prefetch pass would move (excludes sliced-eligible experts)
         size_t               input_activ_bytes;
         size_t               writeback_bytes;             // total (kv + rs)
@@ -475,8 +473,10 @@ extern "C" {
         bool                 can_prefetch_weights;
         // expert tensors the prefetch pass moves in full; a split that was not prefetched copies them sliced by
         // used ids instead (their MUL_MAT_ID reads ids an earlier split computed)
-        size_t               input_expert_bytes;          // full size of those tensors (part of input_weight_copy_bytes)
-        size_t               input_expert_size;           // one expert's bytes (min across those tensors)
+        size_t               input_expert_bytes;          // full size of those tensors (part of input_weight_prefetch_bytes)
+        // shape of the sliced copies of both kinds: they move only the distinct experts the rows route to, a share
+        // of the full size the caller prices
+        size_t               input_expert_size;           // one expert's bytes (mean over the split's expert tensors)
         int64_t              input_expert_n_expert;       // experts per tensor
         int64_t              input_expert_n_rows;         // token rows of the consumer's ids
         int64_t              input_expert_n_used;         // experts per row

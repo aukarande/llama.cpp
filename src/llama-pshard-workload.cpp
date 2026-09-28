@@ -255,8 +255,12 @@ uint64_t llama_pshard_workload::distinct_passes() const {
     return n;
 }
 
-void llama_pshard_workload::build_share_table(uint32_t ne, uint32_t n_expert_used, uint32_t max_rows) {
+void llama_pshard_workload::build_share_table(uint32_t ne, uint32_t n_expert_used, uint32_t max_rows, uint32_t pool_rows) {
     share_table.clear();
+    pool_table.clear();
+    pool_rows_scaled.clear();
+    share_n_expert = ne;
+    share_n_used   = n_expert_used;
     if (ne == 0 || n_expert_used == 0 || max_rows == 0) {
         return;
     }
@@ -342,6 +346,7 @@ void llama_pshard_workload::build_share_table(uint32_t ne, uint32_t n_expert_use
     }
     const size_t n = (size_t) std::ceil(std::log2((double) max_rows) * share_steps) + 1;
     share_table.resize(n);
+    std::vector<double> rows_scaled(n);
     size_t i = 1;
     for (size_t j = 0; j < n; j++) {
         const double x = (double) j / share_steps;
@@ -354,9 +359,53 @@ void llama_pshard_workload::build_share_table(uint32_t ne, uint32_t n_expert_use
             const auto & b = anc[i];
             y = a.second + (x - a.first) / (b.first - a.first) * (b.second - a.second);
         }
+        rows_scaled[j] = std::exp2(y);
         // a pass of r rows routes to at most r * n_expert_used experts
-        share_table[j] = std::min(model(std::exp2(y)), std::exp2(x) * n_expert_used / ne);
+        share_table[j] = std::min(model(rows_scaled[j]), std::exp2(x) * n_expert_used / ne);
     }
+    if (pool_rows == 0) {
+        return;
+    }
+    // pool table: the same draws outside each layer's s most routed experts (l1q holds whole layers of ne experts,
+    // one layer when uniform), summed over a layer's experts from the least routed up and averaged over the layers
+    const size_t np    = std::min(n, (size_t) std::ceil(std::log2((double) pool_rows) * share_steps) + 1);
+    const size_t n_lay = l1q.size() / ne;
+    for (size_t l = 0; l < n_lay; l++) {
+        std::sort(l1q.begin() + l * ne, l1q.begin() + (l + 1) * ne);   // most routed first: log(1 - q) ascending
+    }
+    pool_table.assign(np * (ne + 1), 0.0);
+    pool_rows_scaled.assign(rows_scaled.begin(), rows_scaled.begin() + np);
+    for (size_t j = 0; j < np; j++) {
+        double * row = pool_table.data() + j * (ne + 1);
+        for (size_t l = 0; l < n_lay; l++) {
+            double miss = 0.0;
+            for (uint32_t s = ne; s-- > 0; ) {
+                miss   += 1.0 - std::exp(rows_scaled[j] * l1q[l * ne + s]);
+                row[s] += miss / (double) n_lay;
+            }
+        }
+    }
+}
+
+bool llama_pshard_workload::pool_miss_growth(double rows, uint32_t s, double & growth) const {
+    const size_t w = (size_t) share_n_expert + 1;
+    if (pool_table.empty()) {
+        return false;
+    }
+    rows = std::max(1.0, rows);
+    s    = std::min(s, share_n_expert);
+    const size_t n  = pool_table.size() / w;
+    const double x  = std::log2(rows) * share_steps;
+    const size_t j  = std::min((size_t) x, n - 1);   // held past the last point
+    const size_t j1 = std::min(j + 1, n - 1);
+    const double t  = j1 > j ? x - (double) j : 0.0;
+    auto at = [&](const double * v, size_t stride) {
+        return v[j * stride] + t * (v[j1 * stride] - v[j * stride]);
+    };
+    // no expert outside the s most routed at one row: rarely routed experts are drawn in proportion to the rows (q -> 0)
+    const double one = pool_table[s];
+    growth = std::min(rows, one > 0.0 ? at(pool_table.data() + s, w) / one : at(pool_rows_scaled.data(), 1));
+    return true;
 }
 
 double llama_pshard_workload::distinct_share(double rows) const {
