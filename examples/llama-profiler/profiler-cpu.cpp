@@ -1,6 +1,7 @@
 #define CPU_WARMUP_ITERS  2
 // timed passes: at least CPU_TIMED_ITERS, more until the timed work spans CPU_TIMED_MIN_S
-// or CPU_TIMED_ITERS_MAX passes, so a sub-millisecond op is averaged over dozens of samples
+// or CPU_TIMED_ITERS_MAX passes, so a sub-millisecond op is averaged over dozens of samples;
+// under the PCIe stress loop the pass cap is lifted so the window holds whole stress transfers
 #define CPU_TIMED_ITERS      2
 #define CPU_TIMED_ITERS_MAX  32
 #define CPU_TIMED_MIN_S      0.010
@@ -10,6 +11,9 @@
 // sees what the previous one left in cache
 #define BENCH_COLD_BYTES  (512ULL * 1024 * 1024)
 #define BENCH_COPY_MAX    4096
+// PCIe stress transfer: small enough that many whole transfers fit in one timed window,
+// large enough that the per-transfer launch and sync stay small against the copy
+#define PCIE_STRESS_CHUNK (32ULL * 1024 * 1024)
 
 #include "profiler-common.h"
 
@@ -58,6 +62,10 @@ static int bench_n_copies(size_t bytes_per_pass) {
     return (int) std::min<size_t>(BENCH_COPY_MAX, std::max<size_t>(1, n));
 }
 
+// accounting window of the PCIe stress loop, set while a concurrent pass runs its op under
+// the loop: the epoch is odd while the timed passes run (see pcie_stress_loop)
+static std::atomic<uint32_t> * g_stress_window = nullptr;
+
 // prepare(pass) points a pass at operands no recent pass has read (a weight copy, a KV
 // block, an expert set) and returns the graph to run; the first CPU_WARMUP_ITERS passes are
 // not timed, a small op then repeats until its samples span the minimum duration
@@ -66,16 +74,20 @@ static double time_op(ggml_backend_t be, const std::function<ggml_cgraph *(int)>
     for (; pass < CPU_WARMUP_ITERS; pass++) {
         ggml_backend_graph_compute_async(be, prepare(pass));
     }
+    std::atomic<uint32_t> * win = g_stress_window;
     double total_time = 0.0;
     std::vector<double> samples;
     bench_timer t;
-    while (samples.size() < CPU_TIMED_ITERS || (total_time < CPU_TIMED_MIN_S && samples.size() < CPU_TIMED_ITERS_MAX)) {
+    if (win) win->fetch_add(1);   // open
+    while (samples.size() < CPU_TIMED_ITERS ||
+           (total_time < CPU_TIMED_MIN_S && (win != nullptr || samples.size() < CPU_TIMED_ITERS_MAX))) {
         ggml_cgraph * gf = prepare(pass++);
         t.start();
         ggml_backend_graph_compute_async(be, gf);
         samples.push_back(t.stop());
         total_time += samples.back();
     }
+    if (win) win->fetch_add(1);   // closed
     // the median once there are enough samples: one stalled pass must not price a fast op
     std::sort(samples.begin(), samples.end());
     const size_t n = samples.size();
@@ -139,27 +151,47 @@ struct pcie_stress_ctx {
     ggml_context * ctx = nullptr;
     size_t transfer_size = 256 * 1024 * 1024;
     double calibrated_bw_gb_s = 0.0;
-    // bytes the stress loop moved and the time it ran: the concurrent PCIe rate is computed from these
+    // bytes the stress loop moved inside accounting windows and the time they took: the concurrent PCIe
+    // rate is computed from these
     std::atomic<uint64_t> stress_bytes{0};
     std::atomic<uint64_t> stress_ns{0};
+    // accounting window epoch, odd while open: the op's timed passes, or the DRAM-load calibration
+    std::atomic<uint32_t> window{0};
 };
 
+// uploads and readbacks of PCIE_STRESS_CHUNK in turn, walking the buffer. The load runs from before the
+// operands are set up until after they are freed; a transfer counts only when it ran entirely inside one
+// open window, so setup, teardown and the transfer in flight at stop do not enter the rate
 static void pcie_stress_loop(pcie_stress_ctx * pcie) {
-    bench_timer t;
-    t.start();
-    uint64_t bytes = 0;
+    const size_t chunk = std::min<size_t>(PCIE_STRESS_CHUNK, pcie->transfer_size);
+    uint64_t bytes = 0, ns = 0;
+    size_t   off   = 0;
+    bool     up    = true;
     pcie->active.store(true, std::memory_order_release);
     while (!pcie->stop.load(std::memory_order_acquire)) {
-        ggml_backend_tensor_set_async(pcie->gpu_backend, pcie->d_tensor,
-            pcie->h_tensor->data, 0, pcie->transfer_size);
+        const uint32_t w = pcie->window.load(std::memory_order_acquire);
+        bench_timer t;
+        t.start();
+        if (up) {
+            ggml_backend_tensor_set_async(pcie->gpu_backend, pcie->d_tensor,
+                (const char *) pcie->h_tensor->data + off, off, chunk);
+        } else {
+            ggml_backend_tensor_get_async(pcie->gpu_backend, pcie->d_tensor,
+                (char *) pcie->h_tensor->data + off, off, chunk);
+        }
         ggml_backend_synchronize(pcie->gpu_backend);
-        ggml_backend_tensor_get_async(pcie->gpu_backend, pcie->d_tensor,
-            pcie->h_tensor->data, 0, pcie->transfer_size);
-        ggml_backend_synchronize(pcie->gpu_backend);
-        bytes += 2 * (uint64_t) pcie->transfer_size;
+        const double dt = t.stop();
+        if ((w & 1) && pcie->window.load(std::memory_order_acquire) == w) {
+            bytes += chunk;
+            ns    += (uint64_t) (dt * 1e9);
+        }
+        if (!up) {
+            off = off + 2 * chunk <= pcie->transfer_size ? off + chunk : 0;
+        }
+        up = !up;
     }
     pcie->stress_bytes.fetch_add(bytes, std::memory_order_relaxed);
-    pcie->stress_ns.fetch_add((uint64_t)(t.stop() * 1e9), std::memory_order_relaxed);
+    pcie->stress_ns.fetch_add(ns, std::memory_order_relaxed);
     pcie->active.store(false, std::memory_order_release);
 }
 
@@ -368,8 +400,8 @@ static void calibrate_pcie_sliced(pcie_stress_ctx * pcie, const gpu_procs & proc
     printf("\n");
 }
 
-// PCIe rate while the CPU streams DRAM. A full run measures it per op while the tables run; the
-// calibration-only modes measure it against the same DRAM readers the sliced curves use.
+// PCIe rate while the CPU streams DRAM, against the same DRAM readers the sliced curves use: the
+// header's PCIe_Concurrent. The op tables carry the per-op rates.
 static double calibrate_pcie_concurrent(pcie_stress_ctx * pcie, int threads) {
     printf("Calibrating concurrent PCIe bandwidth (CPU DRAM load)...\n");
     dram_stress stress;
@@ -378,7 +410,9 @@ static double calibrate_pcie_concurrent(pcie_stress_ctx * pcie, int threads) {
     pcie->stop.store(false, std::memory_order_release);
     std::thread th(pcie_stress_loop, pcie);
     while (!pcie->active.load(std::memory_order_acquire)) std::this_thread::yield();
+    pcie->window.fetch_add(1);
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    pcie->window.fetch_add(1);
     pcie->stop.store(true, std::memory_order_release);
     th.join();
     stress.finish();
@@ -982,7 +1016,10 @@ static bench_result_cpu run_concurrent(
         std::thread pcie_thread(pcie_stress_loop, pcie);
         while (!pcie->active.load(std::memory_order_acquire)) std::this_thread::yield();
 
+        // the op's timed passes are the loop's accounting window
+        g_stress_window = &pcie->window;
         result.concurrent_gflops = (float)bench_fn(nullptr, nullptr, nullptr);
+        g_stress_window = nullptr;
 
         pcie->stop.store(true, std::memory_order_release);
         pcie_thread.join();
@@ -1246,9 +1283,7 @@ int main(int argc, char ** argv) {
             printf("Kernel copies not available on this backend - kernel-copy lines omitted\n\n");
         }
         cr.staged_bw = calibrate_staged_upload(&pcie);
-        if (calibrate_only || splice_path) {
-            cr.pcie_concurrent = calibrate_pcie_concurrent(&pcie, threads);
-        }
+        cr.pcie_concurrent = calibrate_pcie_concurrent(&pcie, threads);
         if (!no_pin_ceiling) cr.pin_ceiling_gb = calibrate_pin_ceiling(&pcie);
     }
 
@@ -1285,9 +1320,6 @@ int main(int argc, char ** argv) {
         double sum_s = 0.0, sum_c = 0.0;
         for (const auto & r : all_results) { sum_s += r.standalone_gflops; sum_c += r.concurrent_gflops; }
         cr.cpu_eff = (sum_s > 0) ? 100.0 * sum_c / sum_s : 100.0;
-        // PCIe rate over every concurrent phase: bytes the stress loop moved while the op tables ran
-        const uint64_t ns = pcie.stress_ns.load();
-        cr.pcie_concurrent = ns > 0 ? (double)pcie.stress_bytes.load() / ((double)ns / 1e9) / 1e9 : 0.0;
     }
 
     printf("\nTotal time: %.1f s, %zu benchmarks\n", overall.stop(), all_results.size());
