@@ -120,15 +120,19 @@ static void ggml_cuda_host_region_del(const void * base) {
         }
     }
 }
-// a host range whose first byte lies in a registered region but which runs past its end
-static bool ggml_cuda_host_range_straddles(const void * p, size_t size) {
+// bytes of [p, p + size) that lie in the registered region holding p (all of them when p is in none)
+static size_t ggml_cuda_host_region_part(const void * p, size_t size) {
     std::lock_guard<std::mutex> lock(ggml_cuda_host_regions_mutex);
     for (const auto & r : ggml_cuda_host_regions) {
         if ((const char *) p >= r.base && (const char *) p < r.base + r.size) {
-            return size > (size_t) (r.base + r.size - (const char *) p);
+            return std::min(size, (size_t) (r.base + r.size - (const char *) p));
         }
     }
-    return false;
+    return size;
+}
+// a host range whose first byte lies in a registered region but which runs past its end
+static bool ggml_cuda_host_range_straddles(const void * p, size_t size) {
+    return ggml_cuda_host_region_part(p, size) < size;
 }
 // device-side address of a host range when it lies whole inside one device-accessible pinned
 // region, else nullptr. Whole, not just its first byte: the model's mappings are registered per
@@ -912,7 +916,12 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_cuda_stage_drain_device(ctx->device);
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    // a source that runs past its host registration is rejected by a single copy: copy it one registration at a time
+    for (size_t off = 0; off < size; ) {
+        const size_t n = ggml_cuda_host_region_part((const char *) data + off, size - off);
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + off, (const char *) data + off, n, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        off += n;
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
