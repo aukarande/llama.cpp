@@ -1172,13 +1172,14 @@ static struct ggml_tensor * ggml_backend_sched_split_find_moe_consumer(
 static bool ggml_backend_sched_prefer_sliced_expert_copy(
         const struct ggml_cgraph * g, const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
     const struct ggml_tensor * node = ggml_backend_sched_split_find_moe_consumer(g, input_cpy);
-    if (node == NULL || node->src[1] == NULL) {
+    if (node == NULL) {
         return false;
     }
     const int64_t n_expert = input->ne[2];
-    // expert-token pairs this evaluation will actually gather
-    const int64_t n_pairs  = ggml_nelements(node->src[1]) / std::max<int64_t>(node->src[1]->ne[0], 1);
-    return n_pairs * 2 < n_expert;
+    // tokens this evaluation routes, counted on the ids so every expert tensor of a layer takes the same mode
+    // (src[1] holds one row per token for up/gate but one per expert-token pair for down)
+    const int64_t n_tokens = node->src[2]->ne[1];
+    return n_tokens * 2 < n_expert;
 }
 
 // true if the split has at least one host-weight input the prefetch pass would actually copy
