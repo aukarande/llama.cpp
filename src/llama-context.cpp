@@ -538,6 +538,7 @@ llama_context::~llama_context() {
     if (expert_pool) {
         expert_pool->log_counters();
     }
+    pshard_fold_workload();
     pshard_update_transfer_mode(nullptr);   // the kernel-copy flag and cap are process-wide: hand them back
 
     if (!model.hparams.no_alloc) {

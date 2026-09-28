@@ -13,9 +13,11 @@ typedef struct ggml_backend_device * ggml_backend_dev_t;
 struct ggml_tensor;
 typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+struct llama_pshard_workload;
+
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 4;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 5;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory
@@ -207,6 +209,9 @@ struct llama_benchmark_predictor {
     std::vector<llama_benchmark_entry> cpu_entries;
     std::vector<llama_benchmark_entry> gpu_entries;
     llama_benchmark_stats stats = {};
+    // routing workload of the planned model, set by the planner (nullptr = none): the distinct experts per
+    // pass that sliced expert copies are priced with
+    const llama_pshard_workload * workload = nullptr;
 
     std::unordered_map<std::string, const llama_benchmark_entry *> cpu_map;
     std::unordered_map<std::string, const llama_benchmark_entry *> gpu_map;

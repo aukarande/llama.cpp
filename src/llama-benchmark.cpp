@@ -1,5 +1,6 @@
 #include "llama-benchmark.h"
 #include "llama-impl.h"
+#include "llama-pshard-workload.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -866,9 +867,82 @@ double llama_benchmark_predictor::predict_tps(
     bool copy_prefetched = false;
     timing_cache_t timing_cache;
 
+    std::vector<ggml_backend_sched_split_info> infos(n_splits);
+    std::vector<bool> have_info(n_splits);
+    // a CPU expert chain in the pass loads DRAM under the GPU's sliced expert copies
+    bool cpu_chain = false;
     for (int i = 0; i < n_splits; i++) {
-        struct ggml_backend_sched_split_info si = {};
-        if (!ggml_backend_sched_get_split_info(sched, i, &si)) continue;
+        have_info[i] = ggml_backend_sched_get_split_info(sched, i, &infos[i]);
+        if (have_info[i] && infos[i].backend_id == cpu_backend_id) {
+            struct ggml_tensor ** nodes = ggml_graph_nodes(infos[i].graph);
+            for (int j = 0; j < ggml_graph_n_nodes(infos[i].graph) && !cpu_chain; j++) {
+                cpu_chain = nodes[j]->op == GGML_OP_MUL_MAT_ID;
+            }
+        }
+    }
+
+    // distinct experts one pass of the step's rows routes to, as a share of the experts: the routing workload's
+    // curve, else independent uniform draws (as llama_op_metrics_compute)
+    auto expert_share = [&](const ggml_backend_sched_split_info & s) {
+        const double rows = std::max(1.0, std::round((double) s.input_expert_n_rows * token_scale));
+        const double m    = workload != nullptr ? workload->distinct_share(rows) : -1.0;
+        if (m >= 0.0) {
+            return m;
+        }
+        return 1.0 - std::pow(1.0 - std::min(1.0, (double) s.input_expert_n_used / (double) s.input_expert_n_expert), rows);
+    };
+    // the consume path copies the runs of consecutive used experts as one segment-batch launch when the device
+    // offers it, else run by run on the copy engine; staged mappings cannot take the kernel path
+    auto expert_copy_ms = [&](const ggml_backend_sched_split_info & s, double share, double bytes) {
+        const double e  = (double) s.input_expert_n_expert;
+        const double es = (double) s.input_expert_size;
+        // runs of consecutive used experts are 1/(1 - share) experts long on average
+        const double run = share < 1.0 ? std::min(share * e, 1.0 / (1.0 - share)) : e;
+        double chunk  = es * std::max(1.0, run);
+        double f_long = 0.0;   // share of the bytes in runs above the kernel-copy cap
+        double bw     = 0.0;
+        if (s.input_expert_segments) {
+            // the device refuses a segment batch holding a run above the kernel-copy cap: the runs then go one by one,
+            // the long ones by DMA. With experts used independently at rate p, the used experts in runs longer than
+            // c experts are p^c (1 + c (1 - p)) of them
+            double cap = INFINITY;
+            if (stats.kernel_copy_cap_mb >= 0.0) {
+                cap = stats.kernel_copy_cap_mb * 1024.0 * 1024.0;
+                const double c = std::floor(cap / es);
+                if (c < e) {
+                    f_long = share < 1.0 ? std::pow(share, c) * (1.0 + c * (1.0 - share)) : 1.0;
+                    chunk  = es * std::max(1.0, std::min(run, c));
+                }
+            }
+            // curve points above the cap are never reached: the last one below it holds
+            double top = 0.0;
+            for (double mb : llama_benchmark_stats::sliced_bw_chunk_mb) {
+                if (mb * 1024.0 * 1024.0 <= cap) {
+                    top = mb * 1024.0 * 1024.0;
+                }
+            }
+            if (top > 0.0) {
+                chunk = std::min(chunk, top);
+            }
+            bw = stats.slice_bw_kernel(chunk, cpu_chain);
+        }
+        if (bw <= 0.0) {
+            f_long = 0.0;
+            bw     = stats.slice_bw(chunk);
+        }
+        // long runs move as the full copy of a tensor does
+        double ms = bytes / 1e6 * ((1.0 - f_long) / bw + (f_long > 0.0 ? f_long / pcie_bw : 0.0));
+        if (stats.upload_staged_frac > 0.0 && stats.upload_staged_bw > 0.0) {
+            // mixture over mapping classes (see llama_benchmark_stats::upload_staged_frac)
+            const double f = std::min(1.0, stats.upload_staged_frac);
+            ms = f * bytes / 1e6 / stats.upload_staged_bw + (1.0 - f) * ms;
+        }
+        return ms;
+    };
+
+    for (int i = 0; i < n_splits; i++) {
+        if (!have_info[i]) continue;
+        const ggml_backend_sched_split_info & si = infos[i];
 
         const bool is_gpu = (si.backend_id != cpu_backend_id);
 
@@ -882,14 +956,19 @@ double llama_benchmark_predictor::predict_tps(
             // below peak PCIe, so pricing them at peak over-predicts sliced strategies;
             // price the sliced share at the profiled chunk-size rate, the contiguous rest at peak.
             const double sliced_bytes = (double)si.input_weight_sliced_bytes;
+            // a split that was not prefetched also slices the expert tensors the prefetch pass would have moved
+            // in full: only the distinct experts the step's rows route to move
+            const double expert_bytes = copy_prefetched ? 0.0 : (double) si.input_expert_bytes;
+            const double expert_share_v = expert_bytes > 0.0 ? expert_share(si) : 0.0;
+            const double expert_copy_bytes = expert_bytes * expert_share_v;
             const double rest_weight_bytes = copy_prefetched
                 ? 0.0
-                : std::max(0.0, (double)si.input_weight_copy_bytes - sliced_bytes);
+                : std::max(0.0, (double)si.input_weight_copy_bytes - sliced_bytes - expert_bytes);
             const double rest_wb_bytes = copy_prefetched
                 ? 0.0
                 : (double)si.writeback_kv_bytes * kv_ratio
                     + (double)si.writeback_rs_bytes;
-            input_copy_bytes = sliced_bytes + rest_weight_bytes + rest_wb_bytes;
+            input_copy_bytes = sliced_bytes + expert_copy_bytes + rest_weight_bytes + rest_wb_bytes;
             // sliced expert gathers source from the same mappings: a staged mapping
             // gates them at the blended rate even when the chunk curve is faster
             const double sliced_bw = sliced_bytes > 0.0
@@ -898,7 +977,8 @@ double llama_benchmark_predictor::predict_tps(
                     : stats.slice_bw((double)si.input_weight_sliced_chunk_bytes))
                 : pcie_bw;
             input_copy_weight_ms = (rest_weight_bytes / 1e9 / weight_bw) * 1000.0
-                                 + (sliced_bw > 0.0 ? (sliced_bytes / 1e9 / sliced_bw) * 1000.0 : 0.0);
+                                 + (sliced_bw > 0.0 ? (sliced_bytes / 1e9 / sliced_bw) * 1000.0 : 0.0)
+                                 + (expert_copy_bytes > 0.0 ? expert_copy_ms(si, expert_share_v, expert_copy_bytes) : 0.0);
             input_copy_ms = input_copy_weight_ms + (rest_wb_bytes / 1e9 / pcie_bw) * 1000.0;
         }
 
@@ -908,9 +988,8 @@ double llama_benchmark_predictor::predict_tps(
         double prefetch_wb_bytes = 0.0;
         bool next_copy_prefetched = false;
         if (i + 1 < n_splits) {
-            struct ggml_backend_sched_split_info next_si = {};
-            if (ggml_backend_sched_get_split_info(sched, i + 1, &next_si) &&
-                next_si.can_prefetch_weights) {
+            const ggml_backend_sched_split_info & next_si = infos[i + 1];
+            if (have_info[i + 1] && next_si.can_prefetch_weights) {
                 // the prefetch pass moves non-sliceable weights + writebacks only
                 prefetch_weight_bytes = (double)next_si.input_weight_prefetch_bytes;
                 prefetch_wb_bytes     = (double)next_si.writeback_kv_bytes * kv_ratio

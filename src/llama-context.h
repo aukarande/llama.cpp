@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-pshard-workload.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -286,6 +287,9 @@ private:
     void pshard_update_pool_mode(const llama_pshard_plan & plan);
     // transfer mode of the active pshard tier: kernel copies, the profile's cap, async sched host paths (nullptr: off)
     void pshard_update_transfer_mode(const llama_pshard_plan * plan);
+    // scheduler observer: the distinct experts of a multi-row pass whose expert copies were sliced (pshard_seen)
+    static void pshard_ids_observe(const ggml_tensor * ids, int64_t n_distinct, void * user_data);
+    void pshard_fold_workload();   // adds pshard_seen to <model>.pshard_workload_rows
     bool pshard_pool_resize(const llama_pshard_plan & plan);   // per-tier region: budget - weights - cache - this tier's scratch
     void pshard_assign_pool_tensors();
     void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true, bool force_upload = false);
@@ -393,6 +397,8 @@ private:
     // registry's viable plans pool experts
     std::unique_ptr<struct llama_expert_pool> expert_pool;
     size_t expert_pool_bytes = 0;  // region carved below the pinned KV cache
+    // this run's distinct experts per multi-row pass (sliced expert copies), folded into the ledger at exit
+    llama_pshard_workload pshard_seen;
 
     // pshard transfer mode (pshard_update_transfer_mode)
     bool   pshard_transfer_on      = false;

@@ -3069,9 +3069,10 @@ void llama_params_fit_pshard_plan(
     // (pool runs accumulate their route histograms into it at exit), else calibrated now: a CPU-only sampled
     // generation (256 tokens, seed 1234, temperature 1) whose router top-k ids are histogrammed - a sampled
     // stand-in for the workload that the first real run replaces. Nothing is assumed: without either, pool
-    // tiers are refused.
+    // tiers are refused. The distinct experts per pass (recorded by pshard runs in <model>.pshard_workload_rows,
+    // else modelled from the route histogram) price the expert copies a split that was not prefetched slices.
+    llama_pshard_workload wl;   // outlives the sweep: the predictor reads its share table
     if (hp_nex > 0) {
-        llama_pshard_workload wl;
         const std::string wl_path = llama_pshard_workload::path_for(path_model);
         if (wl.load(wl_path)) {
             LLAMA_LOG_INFO("%s: routing workload: zipf_alpha=%.3f (rms %.4f, %llu routes over %u layers, %s) from %s\n",
@@ -3090,6 +3091,11 @@ void llama_params_fit_pshard_plan(
         }
         ctx.zipf_alpha  = wl.zipf_alpha;
         ctx.zipf_source = wl.source;
+        wl.load_distinct(llama_pshard_workload::distinct_path_for(path_model), hp_nex);
+        wl.build_share_table(hp_nex, ctx.n_expert_used, n_ctx_plan);
+        if (predictor && !wl.share_table.empty()) {
+            predictor->workload = &wl;
+        }
     }
 
     llama_pshard_plan_registry * registry  = mparams->pshard_registry;
@@ -3175,6 +3181,21 @@ void llama_params_fit_pshard_plan(
     // step 5: probe tiers largest first and skip pshard when baseline already fits
     if (registry && needs_probe) {
         const size_t n_tiers = registry->tier_sizes.size();
+
+        if (predictor && predictor->workload != nullptr) {
+            size_t n_meas = 0;
+            for (const auto & d : wl.rows_distinct) {
+                n_meas += d.passes > 0 ? 1 : 0;
+            }
+            std::string at;
+            for (uint32_t bs : registry->tier_sizes) {
+                char buf[48];
+                snprintf(buf, sizeof(buf), " %u:%.1f", bs, wl.distinct_share(bs) * hp_nex);
+                at += buf;
+            }
+            LLAMA_LOG_INFO("%s: distinct experts of %u per pass at the tier sizes (%zu measured row buckets):%s\n",
+                __func__, hp_nex, n_meas, at.c_str());
+        }
 
         // step 5a: baseline off-ramp only for global tiers
         static constexpr uint32_t GLOBAL_FIT_MIN_BATCH = 512;

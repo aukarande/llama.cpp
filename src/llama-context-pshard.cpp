@@ -351,6 +351,36 @@ void llama_context::pshard_update_transfer_mode(const llama_pshard_plan * plan) 
     }
 }
 
+void llama_context::pshard_ids_observe(const ggml_tensor * ids, int64_t n_distinct, void * user_data) {
+    llama_context * lctx = (llama_context *) user_data;
+    if (!lctx->cparams.warmup) {   // llama_set_warmup batches are not the workload
+        lctx->pshard_seen.add_distinct((uint64_t) ids->ne[1], (uint64_t) n_distinct);
+    }
+}
+
+void llama_context::pshard_fold_workload() {
+    // every recorded pass is a sample: the bucket means weigh them by count, a single prompt included
+    const uint64_t passes = pshard_seen.distinct_passes();
+    if (passes == 0 || model.get_path_model().empty()) {
+        return;
+    }
+    const std::string path = llama_pshard_workload::distinct_path_for(model.get_path_model());
+    llama_pshard_workload wl;
+    if (!wl.load_distinct(path, model.hparams.n_expert)) {
+        if (FILE * f = fopen(path.c_str(), "r")) {
+            fclose(f);
+            LLAMA_LOG_WARN("%s: %s is unreadable or holds another expert count - not updated\n", __func__, path.c_str());
+            return;
+        }
+    }
+    wl.merge_distinct(pshard_seen.rows_distinct);
+    if (wl.save_distinct(path, model.hparams.n_expert)) {
+        LLAMA_LOG_INFO("%s: %llu multi-row expert passes -> %s\n", __func__, (unsigned long long) passes, path.c_str());
+    } else {
+        LLAMA_LOG_WARN("%s: could not write %s\n", __func__, path.c_str());
+    }
+}
+
 // size the region for ONE tier: everything between the weights + this tier's
 // scratch and the pinned KV cache. Slots = min(plan, what fits), floor-checked
 // for cache-mode tiers. Returns false (pool left unsized/disengaged) when the
@@ -482,6 +512,7 @@ void llama_context::pshard_assign_pool_tensors() {
 
 void llama_context::pshard_setup_sched() {
     ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap);
+    ggml_backend_sched_set_ids_observe_cb(sched.get(), pshard_ids_observe, this);
 
     g_split_ctx = {};
     g_split_ctx.pipe_shards = memory->get_pipe_shards();

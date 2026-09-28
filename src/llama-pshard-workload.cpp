@@ -170,6 +170,207 @@ bool llama_pshard_workload::merge_counts(const std::vector<std::pair<uint32_t, s
     return refit();
 }
 
+std::string llama_pshard_workload::distinct_path_for(const std::string & path_model) {
+    return path_model + ".pshard_workload_rows";
+}
+
+bool llama_pshard_workload::save_distinct(const std::string & path, uint32_t ne) const {
+    FILE * f = fopen(path.c_str(), "w");
+    if (!f) {
+        return false;
+    }
+    fprintf(f, "# pshard distinct experts per multi-row MoE layer pass whose expert copies were sliced by used ids;\n");
+    fprintf(f, "# rows_distinct <floor(log2 rows)>: passes, token rows, distinct experts (sums); pshard runs accumulate into it\n");
+    fprintf(f, "n_expert=%u\n", ne);
+    for (size_t b = 0; b < rows_distinct.size(); b++) {
+        const distinct_bucket & d = rows_distinct[b];
+        if (d.passes > 0) {
+            fprintf(f, "rows_distinct %u: %llu %llu %llu\n", (unsigned) b,
+                (unsigned long long) d.passes, (unsigned long long) d.rows, (unsigned long long) d.distinct);
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+bool llama_pshard_workload::load_distinct(const std::string & path, uint32_t ne) {
+    rows_distinct.clear();
+    FILE * f = fopen(path.c_str(), "r");
+    if (!f) {
+        return false;
+    }
+    char line[256];
+    bool ok = false;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned n = 0, b = 0;
+        unsigned long long np = 0, nr = 0, nd = 0;
+        if (sscanf(line, "n_expert=%u", &n) == 1) {
+            ok = n == ne;
+        } else if (sscanf(line, "rows_distinct %u: %llu %llu %llu", &b, &np, &nr, &nd) == 4 && b < 64) {
+            if (rows_distinct.size() <= b) {
+                rows_distinct.resize(b + 1);
+            }
+            rows_distinct[b] = { (uint64_t) np, (uint64_t) nr, (uint64_t) nd };
+        }
+    }
+    fclose(f);
+    if (!ok) {
+        rows_distinct.clear();
+    }
+    return ok;
+}
+
+void llama_pshard_workload::add_distinct(uint64_t rows, uint64_t n_distinct) {
+    if (rows < 2) {
+        return;
+    }
+    size_t b = 0;
+    for (uint64_t r = rows; r > 1; r >>= 1) {
+        b++;
+    }
+    if (rows_distinct.size() <= b) {
+        rows_distinct.resize(b + 1);
+    }
+    rows_distinct[b].passes   += 1;
+    rows_distinct[b].rows     += rows;
+    rows_distinct[b].distinct += n_distinct;
+}
+
+void llama_pshard_workload::merge_distinct(const std::vector<distinct_bucket> & d) {
+    if (rows_distinct.size() < d.size()) {
+        rows_distinct.resize(d.size());
+    }
+    for (size_t b = 0; b < d.size(); b++) {
+        rows_distinct[b].passes   += d[b].passes;
+        rows_distinct[b].rows     += d[b].rows;
+        rows_distinct[b].distinct += d[b].distinct;
+    }
+}
+
+uint64_t llama_pshard_workload::distinct_passes() const {
+    uint64_t n = 0;
+    for (const auto & d : rows_distinct) {
+        n += d.passes;
+    }
+    return n;
+}
+
+void llama_pshard_workload::build_share_table(uint32_t ne, uint32_t n_expert_used, uint32_t max_rows) {
+    share_table.clear();
+    if (ne == 0 || n_expert_used == 0 || max_rows == 0) {
+        return;
+    }
+    // measured: (log2 of a bucket's mean rows, its mean distinct share)
+    std::vector<std::pair<double, double>> meas;
+    for (const auto & d : rows_distinct) {
+        if (d.passes > 0 && d.rows > 0) {
+            meas.push_back({ std::log2((double) d.rows / d.passes), (double) d.distinct / d.passes / ne });
+        }
+    }
+    // model: log(1 - q_i) over every counted layer's experts
+    std::vector<double> l1q;
+    for (const auto & p : counts) {
+        uint64_t total = 0;
+        for (uint64_t v : p.second) {
+            total += v;
+        }
+        if (total == 0 || p.second.size() != ne) {
+            continue;
+        }
+        const double tokens = (double) total / n_expert_used;
+        for (uint64_t v : p.second) {
+            l1q.push_back((double) v < tokens ? std::log1p(-(double) v / tokens) : -INFINITY);
+        }
+    }
+    auto set_uniform = [&]() {
+        l1q.assign(ne, n_expert_used < ne ? std::log1p(-(double) n_expert_used / ne) : -INFINITY);
+    };
+    if (l1q.empty()) {
+        if (meas.empty()) {
+            return;
+        }
+        set_uniform();
+    }
+    auto model = [&](double rows) {
+        double sum = 0.0;
+        for (double l : l1q) {
+            sum += 1.0 - std::exp(rows * l);
+        }
+        return sum / (double) l1q.size();
+    };
+    // rows at which the model reaches share s (it rises with rows), searched from 2^x0; 0 = never (the
+    // histogram lacks experts the measured passes used)
+    auto model_rows = [&](double s, double x0) {
+        double lo = x0;
+        double hi = x0;
+        while (model(std::exp2(lo)) > s && std::exp2(lo - 1.0) > 0.0) {
+            lo -= 1.0;
+        }
+        while (model(std::exp2(hi)) < s) {
+            const double m = model(std::exp2(hi));
+            hi += 1.0;
+            if (model(std::exp2(hi)) <= m) {
+                return 0.0;
+            }
+        }
+        for (;;) {
+            const double mid = 0.5 * (lo + hi);
+            if (mid <= lo || mid >= hi) {
+                break;
+            }
+            (model(std::exp2(mid)) < s ? lo : hi) = mid;
+        }
+        return std::exp2(hi);
+    };
+    // anchors (log2 rows, log2 of the rows the model needs for the share there): one row is exact, a pass routes to
+    // its top-k experts. Expected distinct experts do not fall as rows grow: the model rows do not either
+    std::vector<std::pair<double, double>> anc;
+    auto set_anchors = [&]() {
+        anc.assign(1, { 0.0, 0.0 });
+        for (const auto & m : meas) {
+            const double r = model_rows(m.second, m.first);
+            if (r <= 0.0) {
+                return false;
+            }
+            anc.push_back({ m.first, std::max(anc.back().second, std::log2(r)) });
+        }
+        return true;
+    };
+    if (!set_anchors()) {
+        set_uniform();
+        set_anchors();
+    }
+    const size_t n = (size_t) std::ceil(std::log2((double) max_rows) * share_steps) + 1;
+    share_table.resize(n);
+    size_t i = 1;
+    for (size_t j = 0; j < n; j++) {
+        const double x = (double) j / share_steps;
+        while (i < anc.size() && anc[i].first < x) {
+            i++;
+        }
+        double y = x + anc.back().second - anc.back().first;
+        if (i < anc.size()) {
+            const auto & a = anc[i - 1];
+            const auto & b = anc[i];
+            y = a.second + (x - a.first) / (b.first - a.first) * (b.second - a.second);
+        }
+        // a pass of r rows routes to at most r * n_expert_used experts
+        share_table[j] = std::min(model(std::exp2(y)), std::exp2(x) * n_expert_used / ne);
+    }
+}
+
+double llama_pshard_workload::distinct_share(double rows) const {
+    if (share_table.empty()) {
+        return -1.0;
+    }
+    const double x = std::log2(std::max(1.0, rows)) * share_steps;
+    const size_t j = (size_t) x;
+    if (j + 1 >= share_table.size()) {
+        return share_table.back();
+    }
+    return share_table[j] + (x - (double) j) * (share_table[j + 1] - share_table[j]);
+}
+
 bool llama_pshard_workload::save(const std::string & path) const {
     FILE * f = fopen(path.c_str(), "w");
     if (!f) {
