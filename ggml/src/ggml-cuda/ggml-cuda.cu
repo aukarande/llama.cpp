@@ -3220,6 +3220,17 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    // a source that runs past its host registration: one copy per registration, so the page-locked
+    // parts keep the direct path instead of all of it moving through the staging ring
+    if (ggml_cuda_host_region_part(data, size) < size) {
+        for (size_t off = 0; off < size; ) {
+            const size_t n = ggml_cuda_host_region_part((const char *) data + off, size - off);
+            ggml_backend_cuda_set_tensor_async(backend, tensor, (const char *) data + off, offset + off, n);
+            off += n;
+        }
+        return;
+    }
+
     if (ggml_cuda_kernel_copies_for(backend) && size <= ggml_cuda_kernel_copy_max_bytes()) {
         if (const void * src_dev = ggml_cuda_host_device_ptr(data, size)) {
             ggml_cuda_set_device(cuda_ctx->device);
