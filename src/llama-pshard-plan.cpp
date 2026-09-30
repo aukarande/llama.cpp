@@ -318,6 +318,8 @@ struct llama_pshard_search_ctx {
     // pool runs, else the plan-time calibration); -1 = unknown -> pool tiers cannot be priced
     double                                     zipf_alpha  = -1.0;
     std::string                                zipf_source;
+    // the next smaller tier's batch: the tier searched runs every ubatch above it up to its own (0 = none)
+    uint32_t                                   tier_from = 0;
 };
 
 // accumulate tensor bytes from a gguf tensor table: routed experts per layer
@@ -1164,7 +1166,7 @@ static bool pshard_parse_variant_header(const std::string & line, uint32_t & bud
     return sscanf(line.c_str(), "[variant budget=%u]", &budget_mib) == 1;
 }
 
-static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current);
+static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current, uint32_t from);
 
 // publish the switch-cost inputs and estimate, for every tier plan, the cost of switching into
 // it from the decode (tier 0) plan. Byte counts are the gguf table's per-layer averages (the
@@ -1991,6 +1993,7 @@ static void pshard_enforce_union_budget(
         cp_tier.n_batch  = registry->tier_sizes[t];
         cp_tier.n_ubatch = cp_tier.n_batch;
         ctx_t.cparams = &cp_tier;
+        ctx_t.tier_from = t > 0 ? registry->tier_sizes[t - 1] : 0;
         llama_pshard_tier_prune prune;
         prune.init();
         // a repair step: keep the tier's strategy and re-place it within the reduced budget; when
@@ -2125,10 +2128,32 @@ static void pshard_enforce_union_budget(
         __func__, max_rounds);
 }
 
-static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current) {
+// the mean predicted ms of a tier's ubatches above `from` tokens: one per doubling from its piece curve, and the
+// full batch. A tier runs every ubatch between the next smaller tier and its own batch, not only full ones
+static double pshard_tier_cost_ms(const llama_pshard_plan & p, uint32_t from) {
+    double sum = (double) p.batch_size * 1000.0 / (double) p.tps;
+    int    n   = 1;
+    for (size_t i = 0; i < p.piece_n.size() && i < p.piece_ms.size(); i++) {
+        if (p.piece_n[i] > from) {
+            sum += p.piece_ms[i];
+            n++;
+        }
+    }
+    return sum / n;
+}
+
+// from: the next smaller tier's batch (0 = none); with it and priced piece curves on both sides, plans are ranked
+// by their mean ubatch time over the sizes the tier runs, else by the full batch rate
+static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current, uint32_t from) {
     if (!current.is_viable) return true;
     const bool candidate_has_tps = candidate.tps > 0.0f;
     const bool current_has_tps   = current.tps   > 0.0f;
+    if (from > 0 && candidate_has_tps && current_has_tps && !candidate.piece_n.empty() && !current.piece_n.empty() &&
+            candidate.batch_size == current.batch_size) {
+        const double c_ms = pshard_tier_cost_ms(candidate, from);
+        const double b_ms = pshard_tier_cost_ms(current, from);
+        if (c_ms != b_ms) return c_ms < b_ms;
+    }
     if (candidate_has_tps || current_has_tps) {
         if (candidate_has_tps != current_has_tps) return candidate_has_tps;
         if (candidate.tps != current.tps) return candidate.tps > current.tps;
@@ -2698,7 +2723,7 @@ static llama_pshard_plan llama_pshard_search_tier(
             }
         }
 
-        if (plan.is_viable && pshard_plan_is_better(plan, best)) {
+        if (plan.is_viable && pshard_plan_is_better(plan, best, ctx.tier_from)) {
             best = plan;
         }
     }
@@ -3489,7 +3514,7 @@ void llama_params_fit_pshard_plan(
                 llama_pshard_plan best;
                 for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
                     auto & p = all_plans[s * n_tiers + t];
-                    if (p.is_viable && pshard_plan_is_better(p, best)) {
+                    if (p.is_viable && pshard_plan_is_better(p, best, t > 0 ? registry->tier_sizes[t - 1] : 0)) {
                         best = p;
                     }
                 }
