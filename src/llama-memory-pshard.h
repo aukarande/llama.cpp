@@ -74,6 +74,8 @@ struct llama_memory_pshard : llama_memory_pipe_shard_i {
 
     void upload_for_switch(int32_t il, ggml_backend_t be) override;
     void download_for_switch(int32_t il, ggml_backend_t be) override;
+    size_t switch_bytes(int32_t il) const override;
+    size_t switch_row_bytes(int32_t il) const override;
 
     void activate_gpu(int32_t il) override;
     void activate_cpu(int32_t il) override;

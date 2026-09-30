@@ -377,6 +377,10 @@ extern "C" {
     // Enable async weight prefetching to overlap CPU->GPU transfers with compute
     GGML_API void                 ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool enabled);
 
+    // expert tensors whose ids an earlier split computed are copied sliced by used ids when the ubatch has fewer than
+    // n_tokens tokens, else prefetched whole; -1 (default) = sliced below n_expert / 2 tokens
+    GGML_API void                 ggml_backend_sched_set_expert_slice_tokens(ggml_backend_sched_t sched, int n_tokens);
+
     // Per-split callbacks for stateful tensors (e.g. KV cache, recurrent state).
     typedef void (*ggml_backend_sched_split_cb)(struct ggml_tensor * tensor, ggml_backend_t backend, void * user_data);
 

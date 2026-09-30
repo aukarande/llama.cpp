@@ -1901,21 +1901,49 @@ int llama_context::decode(const llama_batch & batch_inp) {
     output_swaps.clear();
 
     uint32_t n_ubatch_eff = cparams.n_ubatch;
-    if (cparams.pshard && n_tokens_all >= 512) {
-        auto * registry = model.get_plan_registry();
-        if (registry && !registry->tier_sizes.empty()) {
-            const uint32_t max_ubatch = std::min(cparams.n_ubatch, registry->tier_sizes.back());
-            // switches are pairwise: TTFT depends on the plan that is active RIGHT NOW
-            // (not necessarily the decode plan, e.g. bs=16 decode or back-to-back prompts)
-            n_ubatch_eff = registry->find_optimal_ubatch(n_tokens_all, max_ubatch, pshard_active_plan);
-            // eval shape changes numerics on shape-sensitive models - log once so a stock
-            // reference run can match -ub to what pshard actually evaluates with
-            static uint32_t logged_ub = 0;
-            if (n_ubatch_eff != cparams.n_ubatch && logged_ub != n_ubatch_eff) {
-                logged_ub = n_ubatch_eff;
-                LLAMA_LOG_INFO("%s: pshard_prefill_ubatch_eff=%u (n_ubatch=%u, predicted-ttft optimum)\n",
-                    __func__, n_ubatch_eff, cparams.n_ubatch);
+    // pshard: the tiers the decode's cut runs on, whole ubatches and the last partial one (SIZE_MAX: none chosen)
+    size_t pshard_cut_tier = SIZE_MAX;
+    size_t pshard_cut_tail = SIZE_MAX;
+    auto * pshard_registry = cparams.pshard ? model.get_plan_registry() : nullptr;
+    if (pshard_registry && !pshard_registry->tier_sizes.empty() && cparams.causal_attn &&
+            n_tokens_all > pshard_registry->tier_sizes.front()) {
+        const uint32_t max_ubatch = std::min(cparams.n_ubatch, pshard_registry->tier_sizes.back());
+        // the splitter keeps the last 1 + n_rs_seq tokens of a sequence in one ubatch and needs a larger one
+        const uint32_t min_ubatch = cparams.n_rs_seq > 0 ? cparams.n_rs_seq + 2 : 1;
+        // the state a switch moves per layer: the KV cells in use and the rows this decode adds, the recurrent state
+        llama_pshard_switch_state switch_state;
+        switch_state.mb.assign(pshard_registry->n_layers, 0.0);
+        switch_state.row_mb.assign(pshard_registry->n_layers, 0.0);
+        if (memory) {
+            for (auto * ps : memory->get_pipe_shards()) {
+                for (const auto & l : ps->get_layers()) {
+                    if (l.il < switch_state.mb.size()) {
+                        switch_state.mb[l.il]     += (double) ps->switch_bytes((int32_t) l.il) / 1e6;
+                        switch_state.row_mb[l.il] += (double) ps->switch_row_bytes((int32_t) l.il) / 1e6;
+                    }
+                }
             }
+        }
+        // switches are pairwise: the price depends on the plan that is active RIGHT NOW
+        // (not necessarily the decode plan, e.g. bs=16 decode or back-to-back prompts)
+        const auto cut = pshard_registry->find_cut(n_tokens_all, max_ubatch, min_ubatch, pshard_active_plan, &switch_state);
+        if (cut.tier < pshard_registry->tier_sizes.size()) {
+            pshard_cut_tier = cut.tier;
+            pshard_cut_tail = cut.tail;
+            // a decode the tier holds whole stays one ubatch of any size the splitter accepts
+            if (n_tokens_all > pshard_registry->tier_sizes[cut.tier]) {
+                n_ubatch_eff = pshard_registry->tier_sizes[cut.tier];
+            }
+            // eval shape changes numerics on shape-sensitive models - log the cut so a stock reference
+            // run can match -ub to what pshard actually evaluates with
+            const uint32_t tier_bs = pshard_registry->tier_sizes[cut.tier];
+            const uint32_t n_whole = n_tokens_all > tier_bs ? n_tokens_all / tier_bs : 0;
+            const uint32_t n_rest  = n_tokens_all - n_whole * tier_bs;
+            LLAMA_LOG_INFO("%s: pshard cut: %u tokens = %u x bs=%u + %u on bs=%u, priced %.1f ms\n",
+                __func__, n_tokens_all, n_whole, tier_bs, n_rest,
+                n_whole > 0 && n_rest > 0 ? pshard_registry->tier_sizes[cut.tail] : tier_bs, cut.ms);
+        } else if (n_tokens_all >= 512) {
+            n_ubatch_eff = pshard_registry->largest_viable_ubatch(max_ubatch);
         }
     }
 
@@ -1924,7 +1952,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // n_ubatch_eff ubatches, so keying the tier off n_tokens_all would apply the
         // top tier's plan (e.g. an unviable-streaming fallback) to smaller ubatches
         // that were chosen precisely because their tier predicts far better tps
-        const uint32_t landed = pshard_maybe_switch(std::min(n_tokens_all, n_ubatch_eff));
+        const uint32_t landed = pshard_maybe_switch(std::min(n_tokens_all, n_ubatch_eff), pshard_cut_tier);
+        if (pshard_cut_tier < SIZE_MAX && landed != pshard_registry->tier_sizes[pshard_cut_tier]) {
+            pshard_cut_tail = SIZE_MAX;   // the cut's tier did not land: no tail switch
+        }
         if (landed >= 16 && landed < n_ubatch_eff && n_tokens_all > landed) {
             // the tier for this ubatch is not viable (or its runtime reserve failed): run the
             // prompt in ubatches the landed tier's reserve covers (a batch that already fits
@@ -1945,6 +1976,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_WARN("%s: prefill ubatch %u -> %u after the scheduler rebuild landed tier bs=%u\n",
             __func__, n_ubatch_eff, pshard_active_plan->batch_size, pshard_active_plan->batch_size);
         n_ubatch_eff = pshard_active_plan->batch_size;
+        pshard_cut_tail = SIZE_MAX;
     }
 
     bool did_optimize = false;
@@ -2013,6 +2045,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        if (pshard_cut_tail < SIZE_MAX && pshard_cut_tail != pshard_cut_tier) {
+            // the cut's remainder runs on its own tier, whole ubatches on the cut's tier
+            const bool   tail = ubatch.n_tokens < n_ubatch_eff && ubatch.n_tokens <= pshard_registry->tier_sizes[pshard_cut_tail];
+            const size_t want = tail ? pshard_cut_tail : pshard_cut_tier;
+            if (&pshard_registry->best_plans[want] != pshard_active_plan) {
+                // the switch moves weights and KV rows the queued ubatches still use
+                ggml_backend_sched_synchronize(sched.get());
+                if (pshard_maybe_switch(ubatch.n_tokens, want) < ubatch.n_tokens) {
+                    // the tail tier did not land: the cut's tier holds any ubatch of this decode
+                    LLAMA_LOG_WARN("%s: remainder tier bs=%u did not land; running the remainder on bs=%u\n",
+                        __func__, pshard_registry->tier_sizes[pshard_cut_tail], n_ubatch_eff);
+                    pshard_maybe_switch(ubatch.n_tokens, pshard_cut_tier);
+                    pshard_cut_tail = SIZE_MAX;
+                }
+            }
+        }
 
         // count the outputs in this ubatch
         {

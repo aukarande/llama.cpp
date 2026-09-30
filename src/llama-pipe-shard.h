@@ -45,6 +45,9 @@ struct llama_memory_pipe_shard_i {
     // plan switch
     virtual void upload_for_switch(int32_t il, ggml_backend_t be) = 0;
     virtual void download_for_switch(int32_t il, ggml_backend_t be) = 0;
+    // bytes either of the two moves for layer il now, and per row the next decode writes
+    virtual size_t switch_bytes(int32_t il) const = 0;
+    virtual size_t switch_row_bytes(int32_t il) const = 0;
 
     virtual void activate_gpu(int32_t il) = 0;
     virtual void activate_cpu(int32_t il) = 0;

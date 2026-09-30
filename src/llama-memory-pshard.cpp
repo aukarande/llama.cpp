@@ -617,6 +617,39 @@ void llama_memory_pshard::download_for_switch(int32_t il, ggml_backend_t be) {
     }
 }
 
+size_t llama_memory_pshard::switch_bytes(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return 0;
+    const auto & l = layers[it->second];
+    size_t n = 0;
+    for (const ggml_tensor * t : { l.t1_gpu, l.t2_gpu }) {
+        if (t == nullptr) continue;
+        if (mode == FULL) {
+            n += ggml_nbytes(t);
+        } else if (on_cells_used) {
+            // the cells in use of every stream, as upload_cells / download_cells move them
+            const size_t t_row = t->ne[0] * ggml_element_size(t);
+            for (uint32_t s = 0; s < (uint32_t) t->ne[2]; s++) {
+                n += (size_t) on_cells_used(s) * t_row;
+            }
+        }
+    }
+    return n;
+}
+
+size_t llama_memory_pshard::switch_row_bytes(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end() || mode == FULL) return 0;
+    const auto & l = layers[it->second];
+    size_t n = 0;
+    for (const ggml_tensor * t : { l.t1_gpu, l.t2_gpu }) {
+        if (t != nullptr) {
+            n += t->ne[0] * ggml_element_size(t);
+        }
+    }
+    return n;
+}
+
 bool llama_memory_pshard::assign_tensors(
         ggml_backend_sched_t sched,
         const std::unordered_map<int, int32_t> & layer_bids,

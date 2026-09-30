@@ -246,9 +246,46 @@ struct llama_pshard_plan {
     size_t scratch_measured = 0;
     size_t cache_measured   = 0;
     float  tps              = 0.0f;  // predicted tokens/sec (0 = no benchmark data)
-    float  switch_ms        = 0.0f;  // est. one-way cost of switching into this plan from
-                                     // the decode (tier 0) plan: pinned-residency delta / PCIe
+    float  switch_ms        = 0.0f;  // est. cost of switching into this plan from the decode
+                                     // (tier 0) plan, see llama_pshard_plan_registry::switch_cost_ms
+    float  cold_ms          = 0.0f;  // EXPERT_POOL cache tier: est. decode ms its misses cost above the
+                                     // warm rate after it lands with empty slots (0 = not a cache tier)
     bool   is_viable        = false;
+
+    // ubatches below this many tokens copy only the used experts of a layer whose ids an earlier split computed,
+    // larger ones prefetch the whole tensors (ggml_backend_sched_set_expert_slice_tokens); -1 = the scheduler's rule
+    int32_t expert_slice_tokens = -1;
+
+    // predicted ms of one ubatch of piece_n[i] tokens on this plan (ascending, below batch_size)
+    std::vector<uint32_t> piece_n;
+    std::vector<float>    piece_ms;
+
+    // predicted ms of one ubatch of n tokens: the piece curve, ending at batch_size tokens at the tier's rate
+    // (linear between points); without a curve, n tokens at the tier's rate
+    double ubatch_ms(uint32_t n) const {
+        if (tps <= 0.0f) {
+            return 0.0;
+        }
+        const double full_ms = (double) batch_size * 1000.0 / (double) tps;
+        if (piece_n.empty() || n >= batch_size) {
+            return n == batch_size ? full_ms : (double) n * 1000.0 / (double) tps;
+        }
+        uint32_t x0 = piece_n[0];
+        double   y0 = piece_ms[0];
+        if (n <= x0) {
+            return y0;
+        }
+        for (size_t i = 1; i <= piece_n.size(); i++) {
+            const uint32_t x1 = i < piece_n.size() ? piece_n[i]  : batch_size;
+            const double   y1 = i < piece_n.size() ? piece_ms[i] : full_ms;
+            if (n <= x1) {
+                return y0 + (y1 - y0) * (double) (n - x0) / (double) (x1 - x0);
+            }
+            x0 = x1;
+            y0 = y1;
+        }
+        return full_ms;
+    }
 
     // cached maps and offsets from first apply
     mutable std::unordered_map<std::string, int32_t> cached_tensor_bids;
@@ -302,7 +339,8 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         llama_probe_hook_t probe_hook = nullptr,
         void * probe_hook_data = nullptr,
         uint32_t probe_n_tokens = 0,
-        uint32_t probe_n_outputs = 0);
+        uint32_t probe_n_outputs = 0,
+        int32_t  probe_expert_slice_tokens = -1);
 
 // fit params entry point used by pshard planning; upstream's generic fit lives in common/fit
 void llama_params_fit_impl(
@@ -349,6 +387,12 @@ struct llama_pshard_candidate {
     uint32_t              n_attn_pinned  = 0;
     uint32_t              pool_slots     = 0;
     size_t                total_vram_req = 0;
+};
+
+// the state a plan switch moves per layer: MB before the decode, and MB per row the decode writes
+struct llama_pshard_switch_state {
+    std::vector<double> mb;
+    std::vector<double> row_mb;
 };
 
 struct llama_pshard_plan_registry {
@@ -415,43 +459,55 @@ struct llama_pshard_plan_registry {
         return want >= budget ? budget : want;
     }
 
-    // layers whose ATTENTION is device-resident under a plan. n_attn_pinned is the
-    // ATTNPRIO/ALTERNATE budget knob and stays 0 for strategies that pin attention
-    // structurally: ATTNPIN_FFNSTREAM keeps every layer's attention resident, the
-    // LAYERSTREAM/FFNCPU_ATTNSTREAM strategies only the fully pinned layers'. Pricing a
-    // switch from the raw field would charge an ATTNPIN <-> ATTNPRIO swap for structurally
-    // resident attention that never moves.
-    uint32_t attn_resident(const llama_pshard_plan & p) const {
-        uint32_t r = p.n_attn_pinned > p.n_pinned ? p.n_attn_pinned : p.n_pinned;
-        if (p.strategy == LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM && n_layers > 0) {
-            r = n_layers > r ? n_layers : r;
-        }
-        return r;
+    // whether a plan keeps layer il whole on the device
+    bool full_resident(const llama_pshard_plan & p, uint32_t il) const {
+        return p.pin_from_back ? il + p.n_pinned >= n_layers : il < p.n_pinned;
     }
 
-    // one-way cost of switching pinned residency between two plans, in ms.
-    // Falls back to the tier0-anchored per-plan estimate for legacy caches.
-    float switch_cost_ms(const llama_pshard_plan & from, const llama_pshard_plan & to) const {
-        if (switch_layer_mb <= 0.0f || switch_pcie_gb_s <= 0.0f) {
+    // whether a plan keeps layer il's non-FFN tensors (attention, norms, router) and its KV / recurrent state
+    // on the device: its whole layers, the attention pins (from the front), or every layer under
+    // ATTNPIN_FFNSTREAM, whose n_attn_pinned stays 0
+    bool attn_resident(const llama_pshard_plan & p, uint32_t il) const {
+        return full_resident(p, il) || il < p.n_attn_pinned || p.strategy == LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM;
+    }
+
+    // cost of switching from one plan to another, in ms. Weights move one way only: what `to` keeps on the device
+    // and `from` does not is uploaded, what `from` keeps and `to` does not is dropped in place. The state of a
+    // layer whose attention changes residency moves either way: st->mb[il] MB before the decode plus
+    // st->row_mb[il] per row the decode has written (n_rows). An expert pool cache tier that lands on slots
+    // another plan used starts empty and pays its refill (cold_ms); a pool cache tier with the same slot count
+    // keeps them. Legacy caches fall back to the tier0-anchored per-plan estimate
+    float switch_cost_ms(const llama_pshard_plan & from, const llama_pshard_plan & to,
+                         const llama_pshard_switch_state * st = nullptr, double n_rows = 0.0) const {
+        if (switch_layer_mb <= 0.0f || switch_pcie_gb_s <= 0.0f || n_layers == 0) {
             return to.switch_ms;
         }
+        const double attn_mb = (double) switch_layer_mb * (double) switch_attn_frac;
+        const double ffn_mb  = (double) switch_layer_mb - attn_mb;
         double mb = 0.0;
-        // fully pinned layers: nested sets when pinned from the same end, disjoint otherwise
-        if (from.pin_from_back == to.pin_from_back) {
-            mb += (to.n_pinned > from.n_pinned ? to.n_pinned - from.n_pinned
-                                               : from.n_pinned - to.n_pinned) * (double)switch_layer_mb;
-        } else {
-            mb += ((double)to.n_pinned + (double)from.n_pinned) * (double)switch_layer_mb;
+        for (uint32_t il = 0; il < n_layers; il++) {
+            if (full_resident(to, il) && !full_resident(from, il)) {
+                mb += ffn_mb;
+            }
+            const bool attn_from = attn_resident(from, il);
+            const bool attn_to   = attn_resident(to, il);
+            if (attn_to && !attn_from) {
+                mb += attn_mb;
+            }
+            if (attn_to != attn_from && st != nullptr && il < st->mb.size()) {
+                mb += st->mb[il] + n_rows * (il < st->row_mb.size() ? st->row_mb[il] : 0.0);
+            }
         }
-        // attention-only pins: resident attention beyond the fully pinned layers (structural
-        // pins included, see attn_resident)
-        const double fa = (double)(attn_resident(from) - from.n_pinned);
-        const double ta = (double)(attn_resident(to)   - to.n_pinned);
-        mb += (ta > fa ? ta - fa : fa - ta) * (double)switch_layer_mb * (double)switch_attn_frac;
-        if (from.output_on_gpu != to.output_on_gpu) {
-            mb += (double)switch_head_mb;
+        if (to.output_on_gpu && !from.output_on_gpu) {
+            mb += (double) switch_head_mb;
         }
-        return (float)(mb / (double)switch_pcie_gb_s);  // MB / (GB/s) == ms
+        double ms = mb / (double) switch_pcie_gb_s;  // MB / (GB/s) == ms
+        const bool same_slots = from.strategy == LLAMA_PSHARD_EXPERT_POOL && from.cold_ms > 0.0f &&
+                                from.pool_slots == to.pool_slots;
+        if (to.cold_ms > 0.0f && !same_slots) {
+            ms += (double) to.cold_ms;
+        }
+        return (float) ms;
     }
 
     // variant marker for a baseline load that fits
@@ -543,55 +599,81 @@ struct llama_pshard_plan_registry {
         return tier_sizes.size();
     }
 
-    // pick the prefill ubatch with the lowest predicted ttft. Without TPS data the default
-    // is the LARGEST VIABLE tier <= max_ubatch, never max_ubatch itself: the top tier can be
-    // unviable by design (a pool tier whose scratch leaves no room for its region)
-    // and a ubatch routed to it would run on the decode plan and spill past its window.
-    uint32_t find_optimal_ubatch(uint32_t n_prompt, uint32_t max_ubatch,
-                                 const llama_pshard_plan * from_plan = nullptr) const {
-        uint32_t best_ub  = max_ubatch;
+    // the largest viable tier <= max_ubatch, never max_ubatch itself: the top tier can be unviable by design (a
+    // pool tier whose scratch leaves no room for its region) and a ubatch routed to it would run on the decode
+    // plan and spill past its window
+    uint32_t largest_viable_ubatch(uint32_t max_ubatch) const {
         for (size_t t = tier_sizes.size(); t-- > 0;) {
-            if (tier_sizes[t] <= max_ubatch && best_plans[t].is_viable) { best_ub = tier_sizes[t]; break; }
+            if (tier_sizes[t] <= max_ubatch && best_plans[t].is_viable) {
+                return tier_sizes[t];
+            }
         }
-        double   best_time = 1e30;
+        return max_ubatch;
+    }
 
-        // switches are pairwise: prefill leaves whatever plan is CURRENTLY active
-        // (usually - but not always - the decode plan) and returns to the decode plan
+    // how a decode runs: ubatches of tier_sizes[tier] tokens on `tier`, the last partial ubatch on `tail`
+    struct cut {
+        size_t tier = SIZE_MAX;   // SIZE_MAX = no priced tier
+        size_t tail = SIZE_MAX;
+        double ms   = 0.0;
+    };
+
+    // the cheapest cut of a decode of n_tokens: one ubatch on a tier that holds it, or whole ubatches of one tier
+    // and the remainder on that tier or on a smaller viable tier that holds it. Each ubatch is priced from its
+    // tier's piece curve; the switches are pairwise: from the active plan, between the two tiers, and back to the
+    // decode plan. min_ubatch: the smallest ubatch size the memory's splitter accepts when it cuts. st: the state
+    // each layer's switch moves (see switch_cost_ms)
+    cut find_cut(uint32_t n_tokens, uint32_t max_ubatch, uint32_t min_ubatch, const llama_pshard_plan * from_plan,
+                 const llama_pshard_switch_state * st = nullptr) const {
+        cut best;
         const llama_pshard_plan * decode_plan =
             (!best_plans.empty() && best_plans[0].is_viable) ? &best_plans[0] : nullptr;
         if (from_plan == nullptr) {
             from_plan = decode_plan;
         }
+        // n_rows: the rows of this decode written before the switch
+        auto sw = [&](const llama_pshard_plan * a, const llama_pshard_plan * b, double n_rows) -> double {
+            return a != nullptr && b != nullptr ? (double) switch_cost_ms(*a, *b, st, n_rows) : 0.0;
+        };
+        auto priced = [&](size_t t) {
+            return best_plans[t].is_viable && best_plans[t].tps > 0.0f;
+        };
+        auto consider = [&](size_t t, size_t u, double ms) {
+            if (best.tier == SIZE_MAX || ms < best.ms) {
+                best.tier = t;
+                best.tail = u;
+                best.ms   = ms;
+            }
+        };
 
         for (size_t t = 0; t < tier_sizes.size(); t++) {
-            uint32_t ts = tier_sizes[t];
-            if (ts < 512 || ts > max_ubatch) continue;
-
-            const auto & plan = best_plans[t];
-            if (!plan.is_viable || plan.tps <= 0.0f) continue;
-
-            // the prompt's own tokens at this tier's rate (the rate already amortizes one
-            // weight stream per ubatch of this size); a partly filled last ubatch is not
-            // charged as a full one, which favoured small tiers whenever the ladder was flat
-            const double prefill_s = (double) n_prompt / (double) plan.tps;
-            // TTFT includes switching INTO this tier's plan from the active one and back
-            // to the decode plan after prefill; a tier sharing that residency wins ties
-            // against one that swaps pinned weights around the prompt
-            double switch_total_ms = 0.0;
-            if (from_plan != nullptr) {
-                switch_total_ms += (double)switch_cost_ms(*from_plan, plan);
+            const uint32_t ts = tier_sizes[t];
+            if (ts > max_ubatch || !priced(t)) {
+                continue;
             }
-            if (decode_plan != nullptr) {
-                switch_total_ms += (double)switch_cost_ms(plan, *decode_plan);
+            const llama_pshard_plan * plan = &best_plans[t];
+            if (n_tokens <= ts) {
+                consider(t, t, sw(from_plan, plan, 0) + plan->ubatch_ms(n_tokens) + sw(plan, decode_plan, n_tokens));
+                continue;
             }
-            double total = prefill_s + switch_total_ms / 1000.0;
-
-            if (total < best_time) {
-                best_time = total;
-                best_ub   = ts;
+            if (ts < min_ubatch) {
+                continue;
+            }
+            const uint32_t k = n_tokens / ts;
+            const uint32_t r = n_tokens % ts;
+            const double head_ms = sw(from_plan, plan, 0) + (double) k * plan->ubatch_ms(ts);
+            if (r == 0) {
+                consider(t, t, head_ms + sw(plan, decode_plan, n_tokens));
+                continue;
+            }
+            for (size_t u = 0; u <= t; u++) {
+                if (tier_sizes[u] < r || !priced(u)) {
+                    continue;
+                }
+                const llama_pshard_plan * tail = &best_plans[u];
+                consider(t, u, head_ms + sw(plan, tail, (double) k * ts) + tail->ubatch_ms(r) + sw(tail, decode_plan, n_tokens));
             }
         }
-
-        return best_ub;
+        return best;
     }
 };

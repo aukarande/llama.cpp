@@ -512,6 +512,9 @@ void llama_context::pshard_assign_pool_tensors() {
 
 void llama_context::pshard_setup_sched() {
     ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap);
+    // the active tier's slice crossover; a planner probe reserves under the one it measures
+    ggml_backend_sched_set_expert_slice_tokens(sched.get(),
+        pshard_active_plan ? pshard_active_plan->expert_slice_tokens : probe_reserve.expert_slice_tokens);
     ggml_backend_sched_set_ids_observe_cb(sched.get(), pshard_ids_observe, this);
 
     g_split_ctx = {};
@@ -567,6 +570,7 @@ void llama_context::pshard_setup_sched() {
 void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload, bool force_upload) {
     // per-tier transport mode: governs split_graph keepalives and the runtime prefetch scan
     ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
+    ggml_backend_sched_set_expert_slice_tokens(sched.get(), plan.expert_slice_tokens);
     ggml_backend_t gpu = backends[pshard_layout.compute].get();
     size_t scratch_off = const_cast<llama_model &>(model).pshard_apply_plan(plan, with_upload ? gpu : nullptr, force_upload);
 
@@ -887,6 +891,7 @@ void llama_context::pshard_warmup_plan_reserves() {
 
         // the reserve must see the same prefetch/keepalive mode this tier will run with
         ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
+        ggml_backend_sched_set_expert_slice_tokens(sched.get(), plan.expert_slice_tokens);
 
         const_cast<llama_model &>(model).pshard_compute_scratch_off(plan); // see pshard_apply_plan
 
@@ -1149,6 +1154,10 @@ uint32_t llama_context::pshard_land_tier(size_t tier, uint32_t n_tokens) {
                 }
                 // the device holds this plan's placement now, whatever its reserve did
                 pshard_active_plan = best;
+                // a graph built under the previous placement must not be reused for an equal-shape ubatch
+                if (gf_res_prev) {
+                    gf_res_prev->reset();
+                }
                 if (best->alloc_state.valid) {
                     return best->batch_size;
                 }
@@ -1196,7 +1205,7 @@ void llama_context::pshard_restore_after_host_access() {
     pshard_memory_dirty = false;
 }
 
-uint32_t llama_context::pshard_maybe_switch(uint32_t n_tokens) {
+uint32_t llama_context::pshard_maybe_switch(uint32_t n_tokens, size_t tier_want) {
     if (pshard_memory_dirty) {
         pshard_restore_after_host_access();
     }
@@ -1204,10 +1213,11 @@ uint32_t llama_context::pshard_maybe_switch(uint32_t n_tokens) {
     auto * registry = model.get_plan_registry();
     if (!registry) return n_tokens;
 
-    // the tier that executes this ubatch: the smallest viable tier at or above it, else the
-    // largest viable tier below (the caller clamps the ubatch to what we return). tier_index
-    // alone would hand an unviable top tier's batch to the decode plan.
-    const size_t tier = registry->viable_tier_for(n_tokens);
+    // the tier that executes this ubatch: the one the decode's cut chose, else the smallest viable
+    // tier at or above it, else the largest viable tier below (the caller clamps the ubatch to what
+    // we return). tier_index alone would hand an unviable top tier's batch to the decode plan.
+    const size_t tier = tier_want < registry->tier_sizes.size() && registry->best_plans[tier_want].is_viable
+        ? tier_want : registry->viable_tier_for(n_tokens);
     if (tier >= registry->tier_sizes.size()) {
         static bool warned = false;
         if (!warned) {

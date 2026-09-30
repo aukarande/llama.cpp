@@ -9,6 +9,7 @@
 
 #include <cassert>
 #include <climits>
+#include <functional>
 #include <stdexcept>
 
 static double benchmark_mul_mat_raw(
@@ -316,6 +317,167 @@ static void run_attention_benchmarks(
     }
 }
 
+// bytes and elements of a small op as the planner's predictor counts them (llama_op_metrics_compute), so a row's
+// rate prices a model node from the node's own bytes
+static void small_op_size(const ggml_tensor * t, double & bytes, int64_t & n_elements) {
+    auto nb = [](const ggml_tensor * x) { return x ? (double) ggml_nbytes(x) : 0.0; };
+    n_elements = ggml_nelements(t);
+    switch (t->op) {
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_SUB:
+        case GGML_OP_DIV:
+        case GGML_OP_GLU:
+            bytes = nb(t->src[0]) + nb(t->src[1]) + nb(t);
+            break;
+        case GGML_OP_GET_ROWS:
+            bytes = nb(t);
+            break;
+        default:
+            bytes = nb(t->src[0]) + nb(t);
+            break;
+    }
+}
+
+// the small ops a model graph is made of (elementwise, norms, activations, routing, copies, the short convolution
+// and the gated delta-net recurrence), at prompt and decode token counts. A graph holds several independent
+// copies of the op, so a row's time includes a node's share of the launch cost as it runs inside a model graph
+static void run_small_op_benchmarks(
+        ggml_backend_t be, const std::vector<int32_t> & batch_sizes, int32_t filter_batch,
+        std::vector<bench_result> & results) {
+    const int64_t W    = 4096;   // activation width
+    const int64_t NE   = 256;    // router width
+    const int64_t S    = 128;    // delta-net head size
+    const int64_t HK   = 16;     // delta-net key heads
+    const int64_t HV   = 32;     // delta-net value heads
+    const int64_t CONV = 4;      // short convolution width
+    const int     REPS = 8;
+    const int32_t max_tokens = 2048;
+
+    struct op_case {
+        const char * name;
+        // builds REPS nodes from shared inputs; returns the inputs that take integer data (row ids)
+        std::function<void(ggml_context *, int64_t, std::vector<ggml_tensor *> &, std::vector<ggml_tensor *> &)> build;
+    };
+    auto f32 = [](ggml_context * c, int64_t a, int64_t b) { return ggml_new_tensor_2d(c, GGML_TYPE_F32, a, b); };
+    const std::vector<op_case> cases = {
+        { "ADD", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, W, T), * b = f32(c, W, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_add(c, a, b)); } },
+        { "MUL", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, W, T), * b = f32(c, W, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_mul(c, a, b)); } },
+        { "RMS_NORM", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, W, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_rms_norm(c, a, 1e-6f)); } },
+        { "L2_NORM", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, S, HV * T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_l2_norm(c, a, 1e-6f)); } },
+        { "SCALE", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, W, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_scale(c, a, 0.5f)); } },
+        { "UNARY", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, W, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_silu(c, a)); } },
+        { "GLU", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, W, T), * b = f32(c, W, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_swiglu_split(c, a, b)); } },
+        { "SOFT_MAX", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, NE, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_soft_max(c, a)); } },
+        { "ARGSORT", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, NE, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_argsort(c, a, GGML_SORT_ORDER_DESC)); } },
+        { "CONCAT", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, W, T), * b = f32(c, W, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_concat(c, a, b, 0)); } },
+        { "CPY", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, W, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_cpy(c, a, ggml_new_tensor_2d(c, GGML_TYPE_F16, W, T))); } },
+        { "CONT", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * a = f32(c, W, T);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_cont(c, ggml_transpose(c, a))); } },
+        { "GET_ROWS", [&](ggml_context * c, int64_t T, auto & o, auto & ids) {
+            ggml_tensor * a = f32(c, W, 1024);
+            ggml_tensor * r = ggml_new_tensor_1d(c, GGML_TYPE_I32, T);
+            ids.push_back(r);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_get_rows(c, a, r)); } },
+        { "SSM_CONV", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * sx = ggml_new_tensor_3d(c, GGML_TYPE_F32, CONV - 1 + T, 2 * S * HK + S * HV, 1);
+            ggml_tensor * k  = f32(c, CONV, 2 * S * HK + S * HV);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_ssm_conv(c, sx, k)); } },
+        { "GATED_DELTA_NET", [&](ggml_context * c, int64_t T, auto & o, auto &) {
+            ggml_tensor * q  = ggml_new_tensor_4d(c, GGML_TYPE_F32, S, HK, T, 1);
+            ggml_tensor * k  = ggml_new_tensor_4d(c, GGML_TYPE_F32, S, HK, T, 1);
+            ggml_tensor * v  = ggml_new_tensor_4d(c, GGML_TYPE_F32, S, HV, T, 1);
+            ggml_tensor * g  = ggml_new_tensor_4d(c, GGML_TYPE_F32, 1, HV, T, 1);
+            ggml_tensor * bt = ggml_new_tensor_4d(c, GGML_TYPE_F32, 1, HV, T, 1);
+            ggml_tensor * st = ggml_new_tensor_4d(c, GGML_TYPE_F32, S, S, HV, 1);
+            for (int i = 0; i < REPS; i++) o.push_back(ggml_gated_delta_net(c, q, k, v, g, bt, st, 1)); } },
+    };
+
+    printf("=== Small ops ===\n\n");
+    for (const auto & oc : cases) {
+        for (int32_t T : batch_sizes) {
+            if (T > max_tokens || (filter_batch >= 0 && T != filter_batch)) continue;
+            ggml_init_params params = { 64ULL * 1024 * 1024, NULL, true };
+            ggml_context * ctx = ggml_init(params);
+            std::vector<ggml_tensor *> outs, ids;
+            try {
+                oc.build(ctx, T, outs, ids);
+            } catch (const std::exception & e) {
+                printf("SKIPPED: %s T=%d (%s)\n", oc.name, T, e.what());
+                ggml_free(ctx);
+                continue;
+            }
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
+
+            ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, be);
+            if (!buffer) {
+                printf("SKIPPED: %s T=%d (allocation)\n", oc.name, T);
+                ggml_free(ctx);
+                continue;
+            }
+            // inputs: small finite values, row ids inside the table
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->op != GGML_OP_NONE || t->view_src != nullptr) continue;
+                if (t->type == GGML_TYPE_F32) {
+                    std::vector<float> d((size_t) ggml_nelements(t), 0.01f);
+                    ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+                } else if (t->type == GGML_TYPE_I32) {
+                    std::vector<int32_t> d((size_t) ggml_nelements(t));
+                    for (size_t i = 0; i < d.size(); i++) d[i] = (int32_t) (i % 1024);
+                    ggml_backend_tensor_set(t, d.data(), 0, ggml_nbytes(t));
+                }
+            }
+
+            for (int i = 0; i < GPU_WARMUP_ITERS; ++i) ggml_backend_graph_compute(be, gf);
+            ggml_backend_synchronize(be);
+            bench_timer tm; tm.start();
+            for (int i = 0; i < GPU_TIMED_ITERS; ++i) ggml_backend_graph_compute_async(be, gf);
+            ggml_backend_synchronize(be);
+            const double t_node = tm.stop() / GPU_TIMED_ITERS / (double) outs.size();
+
+            bench_result res;
+            res.op_name    = ggml_op_name(outs[0]->op);
+            res.quant_type = ggml_type_name(outs[0]->type);
+            small_op_size(outs[0], res.bytes, res.n_elements);
+            res.time_s = t_node;
+            res.calculate_derived();
+            printf("%-20s quant=%-6s BW=%.2f GB/s time=%.2f us", res.op_name.c_str(), res.quant_type.c_str(),
+                res.effective_bw_gb_s, t_node * 1e6);
+            res.print_dims();
+            printf("\n");
+            results.push_back(res);
+
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+    }
+    printf("\n");
+}
+
 static void save_results_gpu(
         const char * path,
         const std::vector<bench_result> & results,
@@ -404,10 +566,11 @@ int main(int argc, char ** argv) {
     run_matmul_benchmarks(gpu_be, batch_sizes, filter_batch, fast_mode, all_results);
     run_moe_benchmarks(gpu_be, batch_sizes, filter_batch, fast_mode, all_results);
     run_attention_benchmarks(gpu_be, batch_sizes, filter_batch, fast_mode, all_results);
+    run_small_op_benchmarks(gpu_be, batch_sizes, filter_batch, all_results);
 
     double peak_gpu_bw = 0.0, peak_gpu_compute = 0.0;
     for (const auto & r : all_results) {
-        if (r.arithmetic_intensity < 2.0)
+        if (r.arithmetic_intensity < 2.0 && r.ops > 0.0)
             peak_gpu_bw = std::max(peak_gpu_bw, (double)r.effective_bw_gb_s);
         if (r.arithmetic_intensity > 10.0 || (r.op_name == "MUL_MAT" && r.N >= 4096 && r.K >= 4096))
             peak_gpu_compute = std::max(peak_gpu_compute, (double)r.effective_gflops);

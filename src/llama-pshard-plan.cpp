@@ -38,11 +38,12 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data_safe(
         llama_probe_hook_t probe_hook = nullptr,
         void * probe_hook_data = nullptr,
         uint32_t probe_n_tokens = 0,
-        uint32_t probe_n_outputs = 0) {
+        uint32_t probe_n_outputs = 0,
+        int32_t  probe_expert_slice_tokens = -1) {
     std::lock_guard<std::mutex> lock(g_probe_mutex);
     return llama_get_device_memory_data(path_model, mparams, cparams, devs,
         hp_ngl, hp_n_ctx_train, hp_n_expert, hp_n_embd_r, log_level, probe_hook, probe_hook_data,
-        probe_n_tokens, probe_n_outputs);
+        probe_n_tokens, probe_n_outputs, probe_expert_slice_tokens);
 }
 
 
@@ -429,10 +430,8 @@ static bool pshard_alternate_ids_cross_wins(const struct llama_pshard_search_ctx
         return false;
     }
     const uint32_t bs = ctx.cparams->n_batch;
-    // mirror the runtime gate: slicing only engages when few expert-token pairs are gathered
-    if ((uint64_t) bs * ctx.n_expert_used * 2 >= ctx.n_expert) {
-        return false;
-    }
+    // the runtime slices when the tier's priced crossover says so (the probe hook's expert_slice_tokens), so the
+    // comparison below decides alone
     // every rate from the machine profile and every byte count from the gguf table; without them the
     // decision cannot be priced and the full-upload prefetch (the default placement) stands
     const llama_benchmark_stats * st = ctx.predictor ? &ctx.predictor->stats : nullptr;
@@ -475,25 +474,87 @@ struct llama_pshard_tps_hook_data {
     int32_t  batch_size;
     uint32_t n_outputs;
     bool     has_rs;
-    float  * out_tps;
-    llama_benchmark_predictor::breakdown * out_bd = nullptr; // optional attribution (expert pool)
+    llama_pshard_plan * out_plan;   // tps, expert_slice_tokens, piece curve
+    llama_benchmark_predictor::breakdown * out_bd = nullptr;                    // optional attribution (expert pool)
+    std::vector<llama_benchmark_predictor::breakdown> * out_piece_bd = nullptr; // the same per piece of the curve
+    bool     price_slice = true;    // false: the expert pool serves the experts, the probe's classification stays
 };
+
+// a split the prefetch pass serves holds expert tensors whose ids an earlier split computed: the slice crossover
+// decides how they move
+static bool pshard_sched_has_sliceable_experts(ggml_backend_sched_t sched) {
+    const int n_splits = ggml_backend_sched_get_n_splits(sched);
+    for (int i = 0; i < n_splits; i++) {
+        ggml_backend_sched_split_info si = {};
+        if (ggml_backend_sched_get_split_info(sched, i, &si) && si.can_prefetch_weights &&
+                si.input_weight_sliced_bytes + si.input_expert_bytes > 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
     auto * d = (llama_pshard_tps_hook_data *) user_data;
-    if (!d || !d->predictor || !ctx) return;
+    if (!d || !d->predictor || !ctx || !d->out_plan) return;
 
     // the probe reserves for n_seq_max sequences and graph_reserve rounds the token count up to a
     // multiple of them; the tier itself steps batch_size tokens
     const uint32_t n_seqs = std::max<uint32_t>(1, d->n_outputs);
     const int32_t n_tokens_graph = (int32_t) (((d->batch_size + n_seqs - 1) / n_seqs) * n_seqs);
-    double tps = d->predictor->predict_tps(ctx->get_sched(), d->cpu_backend_id, d->kv_size, d->batch_size, n_tokens_graph,
-        d->n_outputs, d->has_rs, d->out_bd);
-    if (d->out_tps) {
-        *d->out_tps = (float)tps;
+    ggml_backend_sched_t sched = ctx->get_sched();
+    llama_pshard_plan & plan = *d->out_plan;
+
+    // ms of one ubatch of n tokens on the probe's graph under the slice crossover s
+    auto ubatch_ms = [&](int32_t n, int32_t s, llama_benchmark_predictor::breakdown * bd) -> double {
+        const uint32_t n_out = std::min<uint32_t>(d->n_outputs, (uint32_t) n);
+        const double tps = d->predictor->predict_tps(sched, d->cpu_backend_id, d->kv_size, n, n_tokens_graph, n_out,
+            d->has_rs, bd, s);
+        return tps > 0.0 ? (double) n * 1000.0 / tps : 0.0;
+    };
+
+    // the slice crossover: the fewest tokens at which copying only the used experts after the router stops beating
+    // the whole-tensor prefetch, whose part under the previous split's compute is hidden
+    plan.expert_slice_tokens = -1;
+    if (d->price_slice && pshard_sched_has_sliceable_experts(sched)) {
+        int32_t lo = 1;
+        int32_t hi = d->batch_size + 1;
+        while (lo < hi) {
+            const int32_t mid = lo + (hi - lo) / 2;
+            if (ubatch_ms(mid, mid + 1, nullptr) < ubatch_ms(mid, 0, nullptr)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        plan.expert_slice_tokens = lo;
     }
-    char tag[96];
-    snprintf(tag, sizeof(tag), "probe bs=%d (n_tokens_graph=%d n_outputs=%u)", d->batch_size, n_tokens_graph, d->n_outputs);
+
+    plan.tps = (float) d->predictor->predict_tps(sched, d->cpu_backend_id, d->kv_size, d->batch_size, n_tokens_graph,
+        d->n_outputs, d->has_rs, d->out_bd, plan.expert_slice_tokens);
+
+    // the piece curve: ubatches of 1, 2, 4, ... tokens below the tier's batch on the same graph
+    plan.piece_n.clear();
+    plan.piece_ms.clear();
+    if (d->out_piece_bd) {
+        d->out_piece_bd->clear();
+    }
+    for (int32_t n = 1; n < d->batch_size; n *= 2) {
+        llama_benchmark_predictor::breakdown bd;
+        const double ms = ubatch_ms(n, plan.expert_slice_tokens, &bd);
+        if (ms <= 0.0) {
+            break;
+        }
+        plan.piece_n.push_back((uint32_t) n);
+        plan.piece_ms.push_back((float) ms);
+        if (d->out_piece_bd) {
+            d->out_piece_bd->push_back(bd);
+        }
+    }
+
+    char tag[128];
+    snprintf(tag, sizeof(tag), "probe bs=%d (n_tokens_graph=%d n_outputs=%u slice_tokens=%d)", d->batch_size, n_tokens_graph,
+        d->n_outputs, plan.expert_slice_tokens);
     ctx->pshard_log_reserve_breakdown(tag);
 }
 
@@ -504,7 +565,8 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
         ggml_log_level                  log_level,
         llama_probe_hook_t              probe_hook = nullptr,
         void                          * probe_hook_data = nullptr,
-        bool                            overlap = true) {
+        bool                            overlap = true,
+        int32_t                         expert_slice_tokens = -1) {
     std::vector<llama_device> devs;
     uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0, hp_n_embd_r = 0;
 
@@ -533,7 +595,35 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
         ctx.path_model, &mparams_probe_clean, &cparams_probe, devs,
         hp_ngl, hp_n_ctx_train, hp_n_expert, hp_n_embd_r,
         log_level, probe_hook, probe_hook_data,
-        probe_n_tokens, probe_n_outputs);
+        probe_n_tokens, probe_n_outputs, expert_slice_tokens);
+}
+
+// the final measurement of a candidate placement: device memory, price, slice crossover and piece curve. The probe
+// reserves under the scheduler's default slice rule; when the crossover puts the tier's own batch on the other side
+// of it, the prefetch keepalives differ and the memory is measured again under the crossover
+static std::vector<llama_device_memory_data> llama_pshard_probe_final(
+        const llama_pshard_search_ctx & ctx,
+        const llama_model_params      & mparams,
+        const llama_context_params    & cparams,
+        bool                            overlap,
+        llama_pshard_plan             & plan,
+        llama_benchmark_predictor::breakdown              * bd       = nullptr,
+        std::vector<llama_benchmark_predictor::breakdown> * piece_bd = nullptr) {
+    llama_pshard_tps_hook_data tps_data = { ctx.predictor, ctx.layout.cpu, ctx.kv_size, (int32_t) cparams.n_batch,
+        cparams.n_seq_max, ctx.has_rs, &plan, bd, piece_bd, plan.strategy != LLAMA_PSHARD_EXPERT_POOL };
+    auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
+    auto * hookdata = ctx.predictor ? (void *) &tps_data     : nullptr;
+    plan.expert_slice_tokens = -1;
+    auto d = llama_pshard_probe_memory(ctx, mparams, cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, overlap);
+
+    const uint64_t n_seqs = std::max<uint32_t>(1, cparams.n_seq_max);
+    const uint64_t rows   = ((uint64_t) cparams.n_batch + n_seqs - 1) / n_seqs * n_seqs;
+    if (plan.expert_slice_tokens >= 0 &&
+            (rows * 2 < ctx.n_expert) != (rows < (uint64_t) plan.expert_slice_tokens)) {
+        d = llama_pshard_probe_memory(ctx, mparams, cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, overlap,
+            plan.expert_slice_tokens);
+    }
+    return d;
 }
 
 // strategies a tier search leaves out (the union-budget enforcer re-plans a tier with its
@@ -708,12 +798,9 @@ static llama_pshard_plan llama_pshard_search_strategy(
         mp.pshard_delegate_compute = delegate_compute;
         mp.n_gpu_layers = n_layers + 1;
         mp.tensor_buft_overrides = tensor_buft_overrides;
-        llama_pshard_tps_hook_data tps_data = { ctx.predictor, layout.cpu, ctx.kv_size, (int32_t)cparams->n_batch, cparams->n_seq_max, ctx.has_rs, &plan.tps };
-        auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
-        auto * hookdata = ctx.predictor ? (void *)&tps_data     : nullptr;
 
         try {
-            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, overlap);
+            const auto d = llama_pshard_probe_final(ctx, mp, *cparams, overlap, plan);
             plan.total_vram_req   = d[0].mb.total();
             plan.scratch_measured = d[0].mb.compute;
             plan.cache_measured   = d[0].mb.context;
@@ -737,11 +824,8 @@ static llama_pshard_plan llama_pshard_search_strategy(
         mp.pshard_delegate_compute = delegate_compute;
         mp.n_gpu_layers = n_layers + 1;
         mp.tensor_buft_overrides = tensor_buft_overrides;
-        llama_pshard_tps_hook_data tps_data = { ctx.predictor, layout.cpu, ctx.kv_size, (int32_t)cparams->n_batch, cparams->n_seq_max, ctx.has_rs, &plan.tps };
-        auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
-        auto * hookdata = ctx.predictor ? (void *)&tps_data     : nullptr;
         try {
-            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, overlap);
+            const auto d = llama_pshard_probe_final(ctx, mp, *cparams, overlap, plan);
             plan.total_vram_req   = d[0].mb.total();
             plan.scratch_measured = d[0].mb.compute;
             plan.cache_measured   = d[0].mb.context;
@@ -995,12 +1079,9 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
         mp.pshard_delegate_compute = llama_pshard_strategy_delegates_compute(strategy);
         mp.n_gpu_layers = n_layers + 1;
         mp.tensor_buft_overrides = tensor_buft_overrides;
-        llama_pshard_tps_hook_data tps_data = { ctx.predictor, layout.cpu, ctx.kv_size, (int32_t)cparams->n_batch, cparams->n_seq_max, ctx.has_rs, &plan.tps };
-        auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
-        auto * hookdata = ctx.predictor ? (void *)&tps_data     : nullptr;
 
         try {
-            const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, overlap);
+            const auto d = llama_pshard_probe_final(ctx, mp, *cparams, overlap, plan);
             plan.total_vram_req   = d[0].mb.total();
             plan.scratch_measured = d[0].mb.compute;
             plan.cache_measured   = d[0].mb.context;
@@ -1085,11 +1166,10 @@ static bool pshard_parse_variant_header(const std::string & line, uint32_t & bud
 
 static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current);
 
-// estimate, for every tier plan, the one-way cost of switching into it from the decode
-// (tier 0) plan: the pinned-residency delta uploaded over PCIe. Byte counts are the gguf
-// table's per-layer averages (the registry persists the averages, not per-layer sizes):
-// the term separates "same residency, free switch" from "multi-GB pin swap around every
-// prompt". Unpriced (fields stay 0) without a scanned table or a profiled upload rate.
+// publish the switch-cost inputs and estimate, for every tier plan, the cost of switching into
+// it from the decode (tier 0) plan. Byte counts are the gguf table's per-layer averages (the
+// registry persists the averages, not per-layer sizes). Unpriced (fields stay 0) without a
+// scanned table or a profiled upload rate.
 static void pshard_compute_switch_costs(
         llama_pshard_plan_registry * registry, const llama_pshard_search_ctx & ctx,
         uint32_t n_layers, double pcie_gb_s) {
@@ -1118,27 +1198,8 @@ static void pshard_compute_switch_costs(
     registry->switch_pcie_gb_s = (float)pcie_gb_s;
     registry->n_layers         = n_layers;
 
-    const double base_attn_extra = (double)(registry->attn_resident(base) - base.n_pinned);
     for (auto & plan : registry->best_plans) {
-        if (&plan == &registry->best_plans[0] || !plan.is_viable) {
-            plan.switch_ms = 0.0f;
-            continue;
-        }
-        double bytes = 0.0;
-        // fully pinned layers: nested sets when pinned from the same end, disjoint otherwise
-        if (plan.pin_from_back == base.pin_from_back) {
-            bytes += std::abs((double)plan.n_pinned - (double)base.n_pinned) * layer_bytes;
-        } else {
-            bytes += ((double)plan.n_pinned + (double)base.n_pinned) * layer_bytes;
-        }
-        // attention-only pins: resident attention beyond the fully pinned layers
-        // (structural pins included, see llama_pshard_plan_registry::attn_resident)
-        const double attn_extra = (double)(registry->attn_resident(plan) - plan.n_pinned);
-        bytes += std::abs(attn_extra - base_attn_extra) * layer_bytes * attn_frac;
-        if (plan.output_on_gpu != base.output_on_gpu) {
-            bytes += head_bytes;
-        }
-        plan.switch_ms = (float)(bytes / 1e9 / pcie_gb_s * 1000.0);
+        plan.switch_ms = (&plan == &base || !plan.is_viable) ? 0.0f : registry->switch_cost_ms(base, plan);
     }
 }
 
@@ -1311,7 +1372,7 @@ bool pshard_registry_save(
 
     // trailing fields after cache_ubatch are ignored by older parsers (sscanf assigns
     // the two %u before the literal ']' mismatch and still returns 2)
-    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.2f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu kernel_cap_mb=%.0f machine=%016llx]\n",
+    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.4f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu kernel_cap_mb=%.0f machine=%016llx]\n",
         budget_mib, cache_ubatch,
         registry->switch_layer_mb, registry->switch_attn_frac,
         registry->switch_head_mb, registry->switch_pcie_gb_s,
@@ -1349,11 +1410,18 @@ bool pshard_registry_save(
                 plan.switch_ms, (int)plan.ids_cross);
             if (plan.strategy == LLAMA_PSHARD_EXPERT_POOL) {
                 // POOL-only columns; legacy tier lines stay byte-identical
-                fprintf(f, " K=%u s=%u miss_policy=%s prefill_mode=%s hybrid_frac=%.3f",
+                fprintf(f, " K=%u s=%u miss_policy=%s prefill_mode=%s hybrid_frac=%.3f cold_ms=%.2f",
                     plan.pool_k, plan.pool_slots,
                     llama_pshard_miss_policy_name((llama_pshard_miss_policy)plan.pool_miss),
                     llama_pshard_prefill_mode_name((llama_pshard_prefill_mode)plan.pool_prefill),
-                    plan.pool_hybrid_frac);
+                    plan.pool_hybrid_frac, plan.cold_ms);
+            }
+            fprintf(f, " slice_tokens=%d", plan.expert_slice_tokens);
+            if (!plan.piece_n.empty()) {
+                fprintf(f, " piece=");
+                for (size_t i = 0; i < plan.piece_n.size(); i++) {
+                    fprintf(f, "%s%u:%.3f", i > 0 ? "," : "", plan.piece_n[i], plan.piece_ms[i]);
+                }
             }
             fprintf(f, "\n");
             fprintf(f, "ot=%s\n", pshard_plan_to_ot(plan, host_buft).c_str());
@@ -1401,6 +1469,10 @@ bool pshard_registry_load(
         int pool_miss = 0;
         int pool_prefill = 0;
         float pool_hybrid_frac = 0.0f;
+        float cold_ms = 0.0f;
+        int32_t expert_slice_tokens = -1;
+        std::vector<uint32_t> piece_n;
+        std::vector<float>    piece_ms;
         std::string ot_line;
         std::vector<llama_pshard_candidate> cands;
     };
@@ -1522,6 +1594,29 @@ bool pshard_registry_load(
             td.pool_prefill = ppm ? pshard_prefill_mode_from_name(ppm + 13) : 0;
             const char * phf = strstr(s.c_str(), "hybrid_frac=");
             td.pool_hybrid_frac = phf ? (float)atof(phf + 12) : 0.0f;
+            const char * pcm = strstr(s.c_str(), "cold_ms=");
+            td.cold_ms = pcm ? (float)atof(pcm + 8) : 0.0f;
+            const char * pst = strstr(s.c_str(), "slice_tokens=");
+            td.expert_slice_tokens = pst ? (int32_t) atoi(pst + 13) : -1;
+            if (const char * pc = strstr(s.c_str(), " piece=")) {
+                // n:ms pairs separated by commas, ascending n
+                const char * q = pc + 7;
+                unsigned n  = 0;
+                float    ms = 0.0f;
+                int      used = 0;
+                while (sscanf(q, "%u:%f%n", &n, &ms, &used) == 2) {
+                    if (!td.piece_n.empty() && n <= td.piece_n.back()) {
+                        break;
+                    }
+                    td.piece_n.push_back(n);
+                    td.piece_ms.push_back(ms);
+                    q += used;
+                    if (*q != ',') {
+                        break;
+                    }
+                    q++;
+                }
+            }
 
             td.overflow = pshard_overflow_from_name(overflow_name);
             bool found_strategy = false;
@@ -1588,6 +1683,10 @@ bool pshard_registry_load(
         plan.pool_miss        = td.pool_miss;
         plan.pool_prefill     = td.pool_prefill;
         plan.pool_hybrid_frac = td.pool_hybrid_frac;
+        plan.cold_ms          = td.cold_ms;
+        plan.expert_slice_tokens = td.expert_slice_tokens;
+        plan.piece_n          = td.piece_n;
+        plan.piece_ms         = td.piece_ms;
 
         if (!td.ot_line.empty()) {
             std::string remaining = td.ot_line;
@@ -2208,14 +2307,11 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     // predictor prices it as FULL-LAYER STREAMING: right for whole-stack (A/B) tiers,
     // and the breakdown lets cache tiers swap the weight-upload term for the miss term
     llama_benchmark_predictor::breakdown bd;
-    llama_pshard_tps_hook_data tps_data = { ctx.predictor, layout.cpu, ctx.kv_size, (int32_t) cparams->n_batch,
-                                            cparams->n_seq_max, ctx.has_rs, &plan.tps, &bd };
-    auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
-    auto * hookdata = ctx.predictor ? (void *) &tps_data     : nullptr;
+    std::vector<llama_benchmark_predictor::breakdown> piece_bd;
 
     int64_t gpu_used = -1;
     try {
-        const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, true);
+        const auto d = llama_pshard_probe_final(ctx, mp, *cparams, true, plan, &bd, &piece_bd);
         gpu_used = d[0].mb.total();
         plan.scratch_measured = d[0].mb.compute;
         plan.cache_measured   = d[0].mb.context;
@@ -2379,48 +2475,61 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         };
         const double h        = s >= E ? 1.0
             : (s >= 1.0 ? zipf_mass(s) / zipf_mass(E) : 0.0);
-        double distinct = std::min<double>(E, (double) bs * k);   // distinct experts with an empty pool
-        double misses   = distinct * (1.0 - h);
-        double hits     = distinct - misses;
+        // distinct experts, misses and hits per pooled layer of one pass of `rows` rows
+        struct pass_routes {
+            double distinct;
+            double misses;
+            double hits;
+        };
         const llama_pshard_workload * wl = ctx.predictor ? ctx.predictor->workload : nullptr;
-        double miss_growth = 0.0;
-        if (bs > 1 && wl != nullptr && wl->share_n_expert == ctx.n_expert && wl->share_n_used == ctx.n_expert_used &&
-                wl->pool_miss_growth(bs, (uint32_t) s, miss_growth)) {
-            distinct = E * wl->distinct_share(bs);
-            hits     = std::min(s, std::max(0.0, distinct - k * (1.0 - h) * miss_growth));
-            misses   = distinct - hits;
-        }
+        auto routes_at = [&](uint32_t rows) -> pass_routes {
+            pass_routes r;
+            r.distinct = std::min<double>(E, (double) rows * k);   // distinct experts with an empty pool
+            r.misses   = r.distinct * (1.0 - h);
+            r.hits     = r.distinct - r.misses;
+            double miss_growth = 0.0;
+            if (rows > 1 && wl != nullptr && wl->share_n_expert == ctx.n_expert && wl->share_n_used == ctx.n_expert_used &&
+                    wl->pool_miss_growth(rows, (uint32_t) s, miss_growth)) {
+                r.distinct = E * wl->distinct_share(rows);
+                r.hits     = std::min(s, std::max(0.0, r.distinct - k * (1.0 - h) * miss_growth));
+                r.misses   = r.distinct - r.hits;
+            }
+            return r;
+        };
+        const pass_routes routes = routes_at(bs);
+        const double misses = routes.misses;
+        const double hits   = routes.hits;
         // the CPU chain of a layer runs while the GPU chain uploads and computes the fetched
         // experts (the scheduler overlaps the CPU split; the fetched rows arrive by kernel
         // copies on the GPU's own stream), so a hybrid layer pays the longer of the two chains
         // plus the handoff, not their sum
-        auto miss_ms_layer = [&](int pol) -> double {
+        auto miss_ms_layer = [&](int pol, const pass_routes & r) -> double {
             switch (pol) {
                 case LLAMA_PSHARD_MISS_CPU_EXEC:
                     // never admits: the pool stays empty, every route is a CPU route
                     // (h = 0, independent of s); nothing on the GPU side to overlap
-                    return distinct * t_cpu + t_split;
+                    return r.distinct * t_cpu + t_split;
                 case LLAMA_PSHARD_MISS_HYBRID: {
                     // q* fetched, capped by the free slots (hits + q resident at once);
                     // the rest run on the CPU chain, overlapped with the upload
-                    const double q = std::min(std::round(plan.pool_hybrid_frac * misses), std::max(0.0, s - hits));
-                    return std::max(q * t_fetch_loaded, (misses - q) * t_cpu) + t_split;
+                    const double q = std::min(std::round(plan.pool_hybrid_frac * r.misses), std::max(0.0, s - r.hits));
+                    return std::max(q * t_fetch_loaded, (r.misses - q) * t_cpu) + t_split;
                 }
                 case LLAMA_PSHARD_MISS_FETCH_ON_2ND:
-                    return 0.5 * misses * t_cpu + 0.5 * misses * t_fetch_loaded + t_split; // half admitted (TBD: counters)
+                    return 0.5 * r.misses * t_cpu + 0.5 * r.misses * t_fetch_loaded + t_split; // half admitted (TBD: counters)
                 case LLAMA_PSHARD_MISS_CPU_ADMIT: {
                     // misses run on the CPU chain this pass, their rows upload on the pool's
                     // copy stream for the next pass. The GPU expert chain (hits, VRAM-bound)
                     // is far shorter than the CPU chain at decode, so the CPU time is
                     // visible whole; the background upload leaves the critical path as
                     // long as the copy engine keeps up with the layer.
-                    const double cpu_ms    = misses * t_cpu;
-                    const double upload_ms = misses * t_fetch_loaded;
+                    const double cpu_ms    = r.misses * t_cpu;
+                    const double upload_ms = r.misses * t_fetch_loaded;
                     const double excess_up = std::max(0.0, upload_ms - (cpu_ms + t_split));
                     return cpu_ms + excess_up + t_split;
                 }
                 default:
-                    return misses * t_fetch_idle;   // fetch: no CPU chain shares the bus
+                    return r.misses * t_fetch_idle;   // fetch: no CPU chain shares the bus
             }
         };
         const bool  priced    = ctx.predictor && plan.tps > 0.0f;
@@ -2429,7 +2538,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             if (!priced) {
                 return 0.0f;
             }
-            const double pool_ms = bd.compute_ms + bd.other_ms + (miss_ms_layer(pol) + t_serve) * n_layers_exp;
+            const double pool_ms = bd.compute_ms + bd.other_ms + (miss_ms_layer(pol, routes) + t_serve) * n_layers_exp;
             return pool_ms > 0.0 ? (float) ((double) bs * 1000.0 / pool_ms) : 0.0f;
         };
 
@@ -2447,7 +2556,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             if (priced || !ok || cands.size() > 1) {
                 LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u   %-17s %s %6.1f t/s  (%.2f ms/layer miss)\n",
                     __func__, bs, llama_pshard_miss_policy_name((llama_pshard_miss_policy) pol),
-                    ok ? "ok   " : "floor", tps, miss_ms_layer(pol));
+                    ok ? "ok   " : "floor", tps, miss_ms_layer(pol, routes));
             }
             if (ok && (best < 0 || tps > best_tps)) {
                 best     = pol;
@@ -2457,13 +2566,41 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         plan.is_viable = best >= 0;
         if (plan.is_viable) {
             plan.pool_miss = best;
+            // landing on empty slots: each distinct expert of the first decode steps misses once, where the warm
+            // pool misses r1.misses per step. The excess peaks where the distinct-expert curve's slope falls to that
+            // rate (while the curve fits the slots) and is paid at this tier's marginal cost per miss (its fixed
+            // per-layer part is paid warm too). cpu_exec never admits, so it has no warm state to lose
+            const pass_routes r1 = routes_at(1);
+            if (best != LLAMA_PSHARD_MISS_CPU_EXEC && r1.misses > 0.0) {
+                const bool curve = wl != nullptr && wl->share_n_expert == ctx.n_expert &&
+                                   wl->share_n_used == ctx.n_expert_used && wl->distinct_share(1.0) >= 0.0;
+                double extra = 0.0;
+                for (uint32_t rows = 1; (double) rows <= s; rows++) {
+                    const double d = curve ? E * wl->distinct_share((double) rows) : std::min(E, (double) rows * k);
+                    if (d > s) {
+                        break;
+                    }
+                    extra = std::max(extra, d - (double) rows * r1.misses);
+                }
+                pass_routes r0 = r1;
+                r0.misses = 0.0;
+                const double per_miss = (miss_ms_layer(best, r1) - miss_ms_layer(best, r0)) / r1.misses;
+                plan.cold_ms = (float) (extra * per_miss * n_layers_exp);
+                LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u empty-slot start: %.1f misses/layer above the warm rate, %.1f ms\n",
+                    __func__, bs, extra, plan.cold_ms);
+            }
             if (priced) {
                 plan.tps = best_tps;
+                // the pieces the same way: their own compute and the misses of their own rows
+                for (size_t i = 0; i < plan.piece_n.size() && i < piece_bd.size(); i++) {
+                    plan.piece_ms[i] = (float) (piece_bd[i].compute_ms + piece_bd[i].other_ms +
+                        (miss_ms_layer(best, routes_at(plan.piece_n[i])) + t_serve) * n_layers_exp);
+                }
                 LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u priced: probe %.1f t/s (compute %.1f + upload %.1f + other %.1f ms) -> "
                     "pool %.1f t/s (h(%u)=%.2f, %.1f misses + %.1f hits/layer, %.2f ms/layer, %s; t_fetch %.3f idle / %.3f loaded, "
                     "t_cpu %.3f ms/expert, serve %.3f, split %.3f ms/layer)\n",
                     __func__, bs, probe_tps, bd.compute_ms, bd.weight_upload_ms, bd.other_ms, plan.tps,
-                    plan.pool_slots, h, misses, hits, miss_ms_layer(best),
+                    plan.pool_slots, h, misses, hits, miss_ms_layer(best, routes),
                     llama_pshard_miss_policy_name((llama_pshard_miss_policy) best), t_fetch_idle, t_fetch_loaded, t_cpu,
                     t_serve, t_split);
             }

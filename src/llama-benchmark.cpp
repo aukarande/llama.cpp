@@ -554,6 +554,78 @@ std::string llama_benchmark_predictor::make_timing_key(
     return key;
 }
 
+// a GPU small-op entry (elementwise, norm, routing, recurrence): timed by element count, no matmul or attention shape
+static bool llama_benchmark_small_op(const llama_benchmark_entry & e) {
+    return e.N == 0 && e.K == 0 && e.B == 0 && e.n_tokens == 0 && e.n_elements > 0 &&
+           e.op_name.compare(0, 10, "FLASH_ATTN") != 0;
+}
+
+enum llama_benchmark_series_kind { LLAMA_SERIES_EXPERTS, LLAMA_SERIES_ATTN, LLAMA_SERIES_SIZE };
+
+// where an entry sits in its series: rows per expert of a MUL_MAT_ID entry (B tokens routed to n_used of n_expert
+// experts), tokens of an attention entry, elements of a small-op entry
+static double llama_benchmark_series_x(const llama_benchmark_entry & e, llama_benchmark_series_kind kind) {
+    switch (kind) {
+        case LLAMA_SERIES_ATTN: return (double) e.n_tokens;
+        case LLAMA_SERIES_SIZE: return (double) e.n_elements;
+        default: return e.ctx_len > 0 ? (double) e.B * (double) e.n_tokens / (double) e.ctx_len : (double) e.B;
+    }
+}
+
+// the rate a series is measured by: GFLOP/s, bandwidth for small ops
+static double llama_benchmark_series_rate(const llama_benchmark_entry & e, llama_benchmark_series_kind kind) {
+    return kind == LLAMA_SERIES_SIZE ? e.bw_gb_s : e.peak_gflops;
+}
+
+// measured rate of the matched entry's series (its op, quant and shape at every profiled batch or size) at x,
+// log-linear in x between the two entries around it; 0 when x lies outside the series. x_min: the series'
+// smallest x
+static double llama_benchmark_series_gflops(const std::vector<llama_benchmark_entry> & entries,
+        const llama_benchmark_entry & match, double x, llama_benchmark_series_kind kind, double & x_min) {
+    const llama_benchmark_entry * lo = nullptr;
+    const llama_benchmark_entry * hi = nullptr;
+    for (const auto & e : entries) {
+        bool same = e.op_name == match.op_name && e.quant == match.quant;
+        switch (kind) {
+            case LLAMA_SERIES_ATTN:
+                same = same && e.ctx_len == match.ctx_len && e.n_heads == match.n_heads && e.head_dim == match.head_dim;
+                break;
+            case LLAMA_SERIES_SIZE:
+                same = same && llama_benchmark_small_op(e);
+                break;
+            default:
+                same = same && e.N == match.N && e.K == match.K && e.n_tokens == match.n_tokens && e.ctx_len == match.ctx_len;
+                break;
+        }
+        if (!same || llama_benchmark_series_rate(e, kind) <= 0.0) {
+            continue;
+        }
+        const double ex = llama_benchmark_series_x(e, kind);
+        if (ex <= 0.0) {
+            continue;
+        }
+        x_min = x_min > 0.0 ? std::min(x_min, ex) : ex;
+        if (ex <= x && (lo == nullptr || ex > llama_benchmark_series_x(*lo, kind))) {
+            lo = &e;
+        }
+        if (ex >= x && (hi == nullptr || ex < llama_benchmark_series_x(*hi, kind))) {
+            hi = &e;
+        }
+    }
+    if (lo == nullptr || hi == nullptr) {
+        return 0.0;
+    }
+    const double x0 = llama_benchmark_series_x(*lo, kind);
+    const double x1 = llama_benchmark_series_x(*hi, kind);
+    const double r0 = llama_benchmark_series_rate(*lo, kind);
+    const double r1 = llama_benchmark_series_rate(*hi, kind);
+    if (x1 <= x0) {
+        return r0;
+    }
+    const double t = std::log(x / x0) / std::log(x1 / x0);
+    return std::exp(std::log(r0) + t * (std::log(r1) - std::log(r0)));
+}
+
 llama_split_timing llama_benchmark_predictor::predict_split(
         struct ggml_tensor ** nodes, int n_nodes,
         bool is_gpu, int32_t batch_size, bool async_copy,
@@ -660,7 +732,19 @@ llama_split_timing llama_benchmark_predictor::predict_split(
             const double gflops = is_gpu ? match->peak_gflops
                                          : (async_copy ? match->eff_gflops : match->peak_gflops);
 
-            if (exact) {
+            if (is_gpu && llama_benchmark_small_op(*match)) {
+                // a small op moves its bytes at the rate its op measured near its size, launch share included;
+                // past the profiled sizes, the nearest one's
+                double x_min = 0.0;
+                double bw = llama_benchmark_series_gflops(entries, *match, (double) m.n_elements, LLAMA_SERIES_SIZE, x_min);
+                if (bw <= 0.0) {
+                    bw = match->bw_gb_s;
+                }
+                if (bw > 0.0) {
+                    op_time_ms = (m.bytes / 1e9) / bw * 1000.0;
+                    price_branch = "small-op";
+                }
+            } else if (exact) {
                 if (gflops > 0.0) {
                     op_time_ms = (m.ops / 1e9) / gflops * 1000.0;
                     price_branch = "exact-comp";
@@ -687,6 +771,28 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                 } else if (gflops > 0.0) {
                     op_time_ms = (m.ops / 1e9) / gflops * 1000.0;
                     price_branch = "near-comp";
+                }
+
+                // between two profiled batches a GPU expert matmul or attention runs at a rate between theirs,
+                // not at the nearer one's: the nearer row prices a small prompt's expert matmuls at the
+                // bandwidth of a far larger batch, and its attention at the decode rate. Expert matmuls go by
+                // rows per expert and only rise to this rate (below it they stay memory-bound); attention
+                // takes it inside the series, the decode row itself keeps its price
+                const bool attn = node->op == GGML_OP_FLASH_ATTN_EXT;
+                if (is_gpu && m.ops > 0.0 && (attn || node->op == GGML_OP_MUL_MAT_ID)) {
+                    const double n_expert = attn ? 0.0 : (double) node->src[0]->ne[2];
+                    const double x = attn ? (double) m.n_tokens
+                                          : (n_expert > 0.0 ? (double) m.M * (double) m.n_experts_used / n_expert : 0.0);
+                    double x_min = 0.0;
+                    const double rate = x > 0.0 ? llama_benchmark_series_gflops(entries, *match, x,
+                        attn ? LLAMA_SERIES_ATTN : LLAMA_SERIES_EXPERTS, x_min) : 0.0;
+                    if (rate > 0.0) {
+                        const double series_ms = (m.ops / 1e9) / rate * 1000.0;
+                        if (attn ? x > x_min : series_ms > op_time_ms) {
+                            op_time_ms   = series_ms;
+                            price_branch = "series";
+                        }
+                    }
                 }
             }
 
@@ -900,7 +1006,8 @@ double llama_benchmark_predictor::predict_tps(
         int32_t n_tokens_graph,
         uint32_t n_outputs,
         bool has_rs,
-        breakdown * bd) const {
+        breakdown * bd,
+        int32_t expert_slice_tokens) const {
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched);
     if (n_splits <= 0) return 0.0;
@@ -935,6 +1042,26 @@ double llama_benchmark_predictor::predict_tps(
         have_info[i] = ggml_backend_sched_get_split_info(sched, i, &infos[i]);
     }
 
+    // classify each split's expert tensors with the crossover at this step's rows, as the runtime scheduler will
+    if (expert_slice_tokens >= 0) {
+        for (int i = 0; i < n_splits; i++) {
+            auto & si = infos[i];
+            const size_t governed = si.input_weight_sliced_bytes + si.input_expert_bytes;
+            if (!have_info[i] || governed == 0) {
+                continue;
+            }
+            const double rows  = std::max(1.0, std::round((double) si.input_expert_n_rows * token_scale));
+            const bool   slice = rows < (double) expert_slice_tokens;
+            si.input_weight_prefetch_bytes = si.input_weight_prefetch_bytes - si.input_expert_bytes + (slice ? 0 : governed);
+            si.input_weight_sliced_bytes   = slice ? governed : 0;
+            si.input_expert_bytes          = slice ? 0 : governed;
+        }
+    }
+
+    // a sliced copy waits for its layer's ids on the host: readback, sync, decision, launch, and the
+    // copy-engine transition of the readback
+    const double ids_round_trip_ms = (std::max(0.0, stats.pool_serve_us) + std::max(0.0, stats.engine_switch_us)) / 1000.0;
+
     for (int i = 0; i < n_splits; i++) {
         if (!have_info[i]) continue;
         const ggml_backend_sched_split_info & si = infos[i];
@@ -966,7 +1093,7 @@ double llama_benchmark_predictor::predict_tps(
             input_copy_weight_ms = (rest_weight_bytes / 1e9 / weight_bw) * 1000.0
                                  + (slice_copy_bytes > 0.0
                                      ? sliced_expert_copy_ms(slice_copy_bytes, share, (double) si.input_expert_n_expert,
-                                           (double) si.input_expert_size, si.input_expert_segments)
+                                           (double) si.input_expert_size, si.input_expert_segments) + ids_round_trip_ms
                                      : 0.0);
             input_copy_ms = input_copy_weight_ms + (rest_wb_bytes / 1e9 / pcie_bw) * 1000.0;
         }

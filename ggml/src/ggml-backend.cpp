@@ -836,6 +836,8 @@ struct ggml_backend_sched {
     void * callback_eval_user_data;
 
     bool prefetch_weights;
+    // ubatches below this many tokens copy only the used experts (ggml_backend_sched_set_expert_slice_tokens); -1 = default rule
+    int  expert_slice_tokens;
 
     // redirect_target[backend_id] is -1 for regular compute backends
     // alias backends on the same physical device point to the regular compute backend id
@@ -1168,8 +1170,8 @@ static struct ggml_tensor * ggml_backend_sched_split_find_moe_consumer(
 
 // expert weights consumed by a small-batch MUL_MAT_ID are far cheaper to copy sliced-by-used-ids
 // at consume time than to prefetch in full; both the prefetch and consume loops must agree on
-// this decision, so it is a pure function of the split graph
-static bool ggml_backend_sched_prefer_sliced_expert_copy(
+// this decision, so it is a pure function of the split graph and the scheduler's crossover
+static bool ggml_backend_sched_prefer_sliced_expert_copy(const struct ggml_backend_sched * sched,
         const struct ggml_cgraph * g, const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
     const struct ggml_tensor * node = ggml_backend_sched_split_find_moe_consumer(g, input_cpy);
     if (node == NULL) {
@@ -1179,6 +1181,9 @@ static bool ggml_backend_sched_prefer_sliced_expert_copy(
     // tokens this evaluation routes, counted on the ids so every expert tensor of a layer takes the same mode
     // (src[1] holds one row per token for up/gate but one per expert-token pair for down)
     const int64_t n_tokens = node->src[2]->ne[1];
+    if (sched->expert_slice_tokens >= 0) {
+        return n_tokens < sched->expert_slice_tokens;
+    }
     return n_tokens * 2 < n_expert;
 }
 
@@ -1218,7 +1223,7 @@ static bool ggml_backend_sched_split_has_prefetchable_weights(
             }
             continue;
         }
-        if (!ggml_backend_sched_prefer_sliced_expert_copy(g, input, input_cpy)) {
+        if (!ggml_backend_sched_prefer_sliced_expert_copy(sched, g, input, input_cpy)) {
             return true;
         }
     }
@@ -2154,7 +2159,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         continue;
                     }
-                    if (ggml_backend_sched_prefer_sliced_expert_copy(&next_gpu->graph, next_input, input_cpy)) {
+                    if (ggml_backend_sched_prefer_sliced_expert_copy(sched, &next_gpu->graph, next_input, input_cpy)) {
                         // leave small-batch expert weights to the sliced consume-time copy
                         continue;
                     }
@@ -2238,7 +2243,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 input_buf != NULL &&
                 ggml_backend_buffer_get_usage(input_buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                 ggml_backend_buffer_is_host(input_buf) &&
-                !ggml_backend_sched_prefer_sliced_expert_copy(&split->graph, input, input_cpy)) {
+                !ggml_backend_sched_prefer_sliced_expert_copy(sched, &split->graph, input, input_cpy)) {
                 // inputs the prefetch pass skipped (sliced experts) still need the copy below
                 continue;
             }
@@ -2731,6 +2736,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->expert_slice_tokens = -1;
 
     ggml_backend_sched_reset(sched);
 
@@ -2910,6 +2916,11 @@ void ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool en
             }
         }
     }
+}
+
+void ggml_backend_sched_set_expert_slice_tokens(ggml_backend_sched_t sched, int n_tokens) {
+    GGML_ASSERT(sched);
+    sched->expert_slice_tokens = n_tokens;
 }
 
 void ggml_backend_sched_set_split_callbacks(
@@ -3115,7 +3126,7 @@ bool ggml_backend_sched_get_split_info(
                 out->input_expert_size    += inp->nb[2];
                 n_expert_tensors++;
             }
-            if (moe != NULL && ggml_backend_sched_prefer_sliced_expert_copy(&s->graph, inp, inp_cpy)) {
+            if (moe != NULL && ggml_backend_sched_prefer_sliced_expert_copy(sched, &s->graph, inp, inp_cpy)) {
                 // runtime prefetch SKIPS this tensor; the consume-time sliced copy pays instead
                 out->input_weight_sliced_bytes += full;
             } else {

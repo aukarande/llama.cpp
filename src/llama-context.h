@@ -45,6 +45,7 @@ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_b
 struct llama_context_probe_reserve {
     uint32_t n_tokens  = 0;
     uint32_t n_outputs = 0;
+    int32_t  expert_slice_tokens = -1;   // the scheduler's slice crossover during the reserve (-1: its default rule)
 };
 
 struct llama_context {
@@ -309,7 +310,8 @@ private:
             size_t                    old_tier,
             size_t                    new_tier,
             uint32_t                  n_tokens);
-    uint32_t pshard_maybe_switch(uint32_t n_tokens); // returns the landed plan's batch size (the ubatch cap), n_tokens when no tier is viable
+    // lands tier_want (else the tier for n_tokens); returns the landed plan's batch size (the ubatch cap), n_tokens when no tier is viable
+    uint32_t pshard_maybe_switch(uint32_t n_tokens, size_t tier_want = SIZE_MAX);
     void pshard_update_write_cells(llama_memory_context_i * mctx);
     bool pshard_prepare_host_access();
     void pshard_restore_after_host_access();

@@ -17,7 +17,7 @@ struct llama_pshard_workload;
 
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 6;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 8;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory
@@ -286,6 +286,8 @@ struct llama_benchmark_predictor {
 
     // batch_size: tokens per step of the priced tier; n_tokens_graph: tokens the reserved
     // graph was built for (graph_reserve rounds up to a multiple of n_seq_max)
+    // expert_slice_tokens: the scheduler's slice crossover for this step (see ggml_backend_sched_set_expert_slice_tokens);
+    // -1 = the split classification the scheduler reported
     double predict_tps(
             ggml_backend_sched_t sched,
             int cpu_backend_id,
@@ -294,7 +296,8 @@ struct llama_benchmark_predictor {
             int32_t n_tokens_graph,
             uint32_t n_outputs = 0,
             bool has_rs = false,
-            breakdown * bd = nullptr) const;
+            breakdown * bd = nullptr,
+            int32_t expert_slice_tokens = -1) const;
 
     // ms of a copy sliced by used ids: `bytes` are the `share` of tensors of n_expert experts of expert_size bytes
     // the rows route to. segments: the device takes the copy as one segment-batch launch
