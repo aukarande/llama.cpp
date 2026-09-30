@@ -2056,8 +2056,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     // one range per address-contiguous run of a layer's tensors of one placement class
                     // (the file stores a layer's tensors back to back). Consecutive runs share a
                     // boundary page, which stays with the earlier run so no page is registered twice;
-                    // the later run's first tensor then spans two registrations and its copies take
-                    // the DMA path (pinned, no copy kernel) - one small tensor per run
+                    // the later run's first tensor then spans two registrations and is copied one
+                    // registration at a time
                     const size_t page = 4096;
                     auto page_floor = [&](const char * p) { return (const char *) ((uintptr_t) p & ~(uintptr_t) (page - 1)); };
                     auto page_ceil  = [&](const char * p) { return (const char *) (((uintptr_t) p + page - 1) & ~(uintptr_t) (page - 1)); };

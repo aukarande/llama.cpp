@@ -3148,26 +3148,36 @@ bool ggml_backend_cuda_copy_segments_async(ggml_backend_t backend, const ggml_ba
     if (n <= 0 || !ggml_backend_is_cuda(backend) || !ggml_cuda_kernel_copies_for(backend)) {
         return false;
     }
-    // validate and translate everything first: nothing is issued when any segment cannot take this path
-    std::vector<ggml_cuda_copy_seg> v((size_t) n);
+    // validate and translate everything first: nothing is issued when any segment cannot take this path. A
+    // segment that runs past its host registration goes one registration at a time
+    std::vector<ggml_cuda_copy_seg> v;
+    v.reserve((size_t) n);
     size_t max_n16 = 0;
     for (int i = 0; i < n; i++) {
-        const void * src_dev = ggml_cuda_host_device_ptr(segs[i].src, segs[i].size);
-        if (src_dev == nullptr || segs[i].dst == nullptr ||
-            (((uintptr_t) src_dev | (uintptr_t) segs[i].dst | (uintptr_t) segs[i].size) & 15) != 0 ||
-            segs[i].size > ggml_cuda_kernel_copy_max_bytes()) {
+        if (segs[i].dst == nullptr || segs[i].size > ggml_cuda_kernel_copy_max_bytes()) {
             return false;
         }
-        v[i] = { (const int4 *) src_dev, (int4 *) segs[i].dst, segs[i].size / 16 };
-        max_n16 = std::max(max_n16, v[i].n16);
+        for (size_t off = 0; off < segs[i].size; ) {
+            const char * src  = (const char *) segs[i].src + off;
+            char       * dst  = (char *) segs[i].dst + off;
+            const size_t part = ggml_cuda_host_region_part(src, segs[i].size - off);
+            const void * src_dev = ggml_cuda_host_device_ptr(src, part);
+            if (src_dev == nullptr || (((uintptr_t) src_dev | (uintptr_t) dst | (uintptr_t) part) & 15) != 0) {
+                return false;
+            }
+            v.push_back({ (const int4 *) src_dev, (int4 *) dst, part / 16 });
+            max_n16 = std::max(max_n16, part / 16);
+            off += part;
+        }
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
     // one int4 per thread for the largest segment: PCIe reads need many requests in flight
     const int blocks_per_seg = (int) std::max<size_t>(1, std::min<size_t>(256, (max_n16 + 255) / 256));
-    for (int i0 = 0; i0 < n; i0 += GGML_CUDA_COPY_SEG_MAX) {
+    const int n_v = (int) v.size();
+    for (int i0 = 0; i0 < n_v; i0 += GGML_CUDA_COPY_SEG_MAX) {
         ggml_cuda_copy_seg_batch batch;
-        const int nb = std::min(n - i0, GGML_CUDA_COPY_SEG_MAX);
+        const int nb = std::min(n_v - i0, GGML_CUDA_COPY_SEG_MAX);
         for (int i = 0; i < nb; i++) {
             batch.s[i] = v[i0 + i];
         }
