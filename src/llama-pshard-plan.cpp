@@ -498,6 +498,7 @@ struct llama_pshard_tps_hook_data {
     llama_benchmark_predictor::breakdown * out_bd = nullptr;                    // optional attribution (expert pool)
     std::vector<llama_benchmark_predictor::breakdown> * out_piece_bd = nullptr; // the same per piece of the curve
     bool     price_slice = true;    // false: the expert pool serves the experts, the probe's classification stays
+    uint32_t n_kv_stream = 1;       // KV cache streams: one per sequence unless the cache is unified
 };
 
 // a split the prefetch pass serves holds expert tensors whose ids an earlier split computed: the slice crossover
@@ -529,7 +530,7 @@ static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
     auto ubatch_ms = [&](int32_t n, int32_t s, llama_benchmark_predictor::breakdown * bd) -> double {
         const uint32_t n_out = std::min<uint32_t>(d->n_outputs, (uint32_t) n);
         const double tps = d->predictor->predict_tps(sched, d->cpu_backend_id, d->kv_size, n, n_tokens_graph, n_out,
-            d->has_rs, bd, s);
+            d->has_rs, bd, s, d->n_kv_stream);
         return tps > 0.0 ? (double) n * 1000.0 / tps : 0.0;
     };
 
@@ -551,7 +552,7 @@ static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
     }
 
     plan.tps = (float) d->predictor->predict_tps(sched, d->cpu_backend_id, d->kv_size, d->batch_size, n_tokens_graph,
-        d->n_outputs, d->has_rs, d->out_bd, plan.expert_slice_tokens);
+        d->n_outputs, d->has_rs, d->out_bd, plan.expert_slice_tokens, d->n_kv_stream);
 
     // the piece curve: ubatches of 1, 2, 4, ... tokens below the tier's batch on the same graph, their experts copied
     // as the tier's batch copies them (ggml_backend_sched_set_expert_slice_rows)
@@ -633,7 +634,8 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_final(
         llama_benchmark_predictor::breakdown              * bd       = nullptr,
         std::vector<llama_benchmark_predictor::breakdown> * piece_bd = nullptr) {
     llama_pshard_tps_hook_data tps_data = { ctx.predictor, ctx.layout.cpu, ctx.kv_size, (int32_t) cparams.n_batch,
-        cparams.n_seq_max, ctx.has_rs, &plan, bd, piece_bd, plan.strategy != LLAMA_PSHARD_EXPERT_POOL };
+        cparams.n_seq_max, ctx.has_rs, &plan, bd, piece_bd, plan.strategy != LLAMA_PSHARD_EXPERT_POOL,
+        cparams.kv_unified ? 1u : std::max<uint32_t>(1, cparams.n_seq_max) };
     auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
     auto * hookdata = ctx.predictor ? (void *) &tps_data     : nullptr;
     plan.expert_slice_tokens = -1;
@@ -3053,6 +3055,8 @@ static void llama_pshard_strategy_sweep(
         cp_tier.n_batch  = registry.tier_sizes[t];
         cp_tier.n_ubatch = cp_tier.n_batch;
         ctx.cparams = &cp_tier;
+        // a strategy's own variants are ranked like the tiers: over the ubatch sizes the tier runs
+        ctx.tier_from = t > 0 ? registry.tier_sizes[t - 1] : 0;
         memo.tier(cp_tier.n_batch);
 
         llama_pshard_strategy strat = (llama_pshard_strategy)strategy;

@@ -2102,11 +2102,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         std::vector<llama_model_tensor_buft_override> ovs(4 * (size_t) hparams.n_layer_all + 8);
                         const double n_exp  = std::max(1u, hparams.n_expert);
                         const double n_used = std::max(1u, hparams.n_expert_used);
+                        // the layer count the plans were made for: an MTP head counts only when it is loaded
+                        const uint32_t n_layers_plan = pimpl->plan_registry->n_layers > 0
+                            ? pimpl->plan_registry->n_layers : hparams.n_layer_all;
                         for (const auto & plan : pimpl->plan_registry->best_plans) {
                             if (!plan.is_viable) {
                                 continue;
                             }
-                            llama_pshard_generate_overrides(plan.n_pinned, hparams.n_layer_all, nullptr, nullptr, ovs.data(),
+                            llama_pshard_generate_overrides(plan.n_pinned, n_layers_plan, nullptr, nullptr, ovs.data(),
                                 (llama_layer_fraction) plan.overflow, plan.strategy, layout, plan.pin_from_back,
                                 plan.output_on_gpu, plan.n_attn_pinned, plan.overlap, plan.ids_cross, plan.n_ffn_gpu);
                             std::vector<std::regex> res;

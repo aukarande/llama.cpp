@@ -784,6 +784,7 @@ struct ggml_backend_sched_split {
     int n_inputs;
     int inputs_capacity;
     struct ggml_tensor * writeback[GGML_SCHED_MAX_SPLIT_INPUTS];
+    bool writeback_cells[GGML_SCHED_MAX_SPLIT_INPUTS];   // moved by cells, as the owner registered it
     int n_writeback;
     int prefetch_from;   // the split whose step issues this split's prefetch at build time, -1 = none
     // graph view of this split
@@ -816,6 +817,7 @@ struct ggml_backend_sched {
     int                 * hv_tensor_backend_ids; // [hash_set.size]
     bool                * hv_tensor_usr;         // [hash_set.size] -- true if set by set_tensor_backend
     bool                * hv_tensor_writeback;   // [hash_set.size] -- true if registered for pre/post-compute callbacks
+    bool                * hv_tensor_writeback_cells; // [hash_set.size] -- registered writeback moved by cells, not in full
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
 
     int * node_backend_ids; // [graph_size]
@@ -1841,11 +1843,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 // walk view_src to root, check hv_tensor_writeback hash
                 {
                     struct ggml_tensor * wb = NULL;
+                    bool wb_cells = false;
                     struct ggml_tensor * root = src;
                     while (root) {
                         size_t root_id = ggml_hash_find(&sched->hash_set, root);
                         if (root_id != SIZE_MAX && root_id < sched->hash_set.size && sched->hv_tensor_writeback[root_id]) {
                             wb = root;
+                            wb_cells = sched->hv_tensor_writeback_cells[root_id];
                             break;
                         }
                         root = root->view_src;
@@ -1856,6 +1860,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             if (split->writeback[w] == wb) { found = true; break; }
                         }
                         if (!found) {
+                            split->writeback_cells[split->n_writeback] = wb_cells;
                             split->writeback[split->n_writeback++] = wb;
                         }
                     }
@@ -2965,6 +2970,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_usr         = (bool *) calloc(sched->hash_set.size, sizeof(bool));
     sched->hv_tensor_writeback   = (bool *) calloc(sched->hash_set.size, sizeof(bool));
+    sched->hv_tensor_writeback_cells = (bool *) calloc(sched->hash_set.size, sizeof(bool));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
@@ -3076,6 +3082,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_usr);
     free(sched->hv_tensor_writeback);
+    free(sched->hv_tensor_writeback_cells);
     free(sched->split_before);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
@@ -3096,6 +3103,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_usr,         0, sched->hash_set.size * sizeof(bool));
         memset(sched->hv_tensor_writeback,   0, sched->hash_set.size * sizeof(bool));
+        memset(sched->hv_tensor_writeback_cells, 0, sched->hash_set.size * sizeof(bool));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         sched->is_reset = true;
     }
@@ -3343,11 +3351,12 @@ void ggml_backend_sched_set_async_host_copies(ggml_backend_sched_t sched, bool o
     sched->async_host_copies = on;
 }
 
-void ggml_backend_sched_add_writeback(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
+void ggml_backend_sched_add_writeback(ggml_backend_sched_t sched, struct ggml_tensor * tensor, bool by_cells) {
     GGML_ASSERT(sched);
     size_t id = ggml_hash_find_or_insert(&sched->hash_set, tensor);
     GGML_ASSERT(id != SIZE_MAX);
-    sched->hv_tensor_writeback[id] = true;
+    sched->hv_tensor_writeback[id]       = true;
+    sched->hv_tensor_writeback_cells[id] = by_cells;
 
     // defer upfront alloc; keepalive view makes the leaf split-scoped
     tensor->flags |= GGML_TENSOR_FLAG_WRITEBACK;
@@ -3435,6 +3444,11 @@ bool ggml_backend_sched_get_split_info(
     out->input_expert_n_expert       = 0;
     out->input_expert_n_rows         = 0;
     out->input_expert_n_used         = 0;
+    out->input_weight_n              = 0;
+    out->input_weight_sliced_n       = 0;
+    out->input_weight_prefetch_n     = 0;
+    out->input_expert_n              = 0;
+    out->input_moe_n                 = 0;
     // the consume path batches sliced copies on the device the split runs on
     const int seg_bid = sched->redirect_target[s->backend_id] >= 0 ? sched->redirect_target[s->backend_id] : s->backend_id;
     out->input_expert_segments = sched->copy_segments_fn[seg_bid] != NULL;
@@ -3446,6 +3460,7 @@ bool ggml_backend_sched_get_split_info(
             ggml_backend_buffer_is_host(inp->buffer)) {
             const size_t full = ggml_nbytes(inp);
             out->input_weight_bytes += full;
+            out->input_weight_n++;
             struct ggml_tensor * inp_cpy = tensor_copy(inp, s->backend_id, sched->cur_copy);
             // an expert tensor whose MUL_MAT_ID reads ids an earlier split computed: the consume path slices it by
             // used ids unless the prefetch pass moved it first
@@ -3460,14 +3475,18 @@ bool ggml_backend_sched_get_split_info(
             if (moe != NULL && ggml_backend_sched_prefer_sliced_expert_copy(sched, &s->graph, inp, inp_cpy)) {
                 // runtime prefetch SKIPS this tensor; the consume-time sliced copy pays instead
                 out->input_weight_sliced_bytes += full;
+                out->input_weight_sliced_n++;
             } else {
                 out->input_weight_prefetch_bytes += full;
+                out->input_weight_prefetch_n++;
                 if (moe != NULL) {
                     out->input_expert_bytes += full;
+                    out->input_expert_n++;
                 }
             }
             if (moe != NULL || (inp_cpy != NULL && ggml_backend_sched_split_reads_experts(&s->graph, inp_cpy))) {
                 out->input_moe_bytes += full;
+                out->input_moe_n++;
             }
         } else {
             out->input_activ_bytes += ggml_nbytes(inp);
@@ -3477,19 +3496,21 @@ bool ggml_backend_sched_get_split_info(
         out->input_expert_size /= n_expert_tensors;
     }
 
-    // classify writebacks: the runtime delta-syncs attention KV (write-cells) but
-    // moves recurrent state in full every evaluation
+    // classify writebacks as their owner registered them: by cells (a copy per stream) or in full every evaluation
     out->writeback_bytes    = 0;
     out->writeback_kv_bytes = 0;
     out->writeback_rs_bytes = 0;
+    out->writeback_kv_n     = 0;
+    out->writeback_rs_n     = 0;
     for (int w = 0; w < s->n_writeback; w++) {
         const size_t wb = ggml_nbytes(s->writeback[w]);
         out->writeback_bytes += wb;
-        const char * wn = s->writeback[w]->name;
-        if (strncmp(wn, "cache_k", 7) == 0 || strncmp(wn, "cache_v", 7) == 0) {
+        if (s->writeback_cells[w]) {
             out->writeback_kv_bytes += wb;
+            out->writeback_kv_n     += (int32_t) std::max<int64_t>(1, s->writeback[w]->ne[2]);
         } else {
             out->writeback_rs_bytes += wb;
+            out->writeback_rs_n++;
         }
     }
 

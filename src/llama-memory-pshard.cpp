@@ -440,7 +440,7 @@ void llama_memory_pshard::upload_cells_one(int32_t il, ggml_tensor * t_gpu, ggml
     if (!t_gpu || !t_cpu || !t_cpu->data || !on_cells_used) return;
 
     const uint32_t ns     = (uint32_t)t_gpu->ne[2];
-    const size_t   t_row  = t_gpu->ne[0] * ggml_element_size(t_gpu);
+    const size_t   t_row  = ggml_row_size(t_gpu->type, t_gpu->ne[0]);
     const size_t   seq_sz = t_gpu->ne[1];
 
     LLAMA_LOG_DEBUG("upload_cells_one: il=%d name=%s gpu_data=%p cpu_data=%p ns=%u\n",
@@ -457,9 +457,12 @@ void llama_memory_pshard::upload_cells_one(int32_t il, ggml_tensor * t_gpu, ggml
         if (n_used > 0) {
             ggml_backend_tensor_set_async(gpu, t_gpu, (char *)t_cpu->data + base, base, n_used * t_row);
         }
-        if (zero_tail && n_used < seq_sz) {
+        // the rows attention reads past the cells in use are masked, not skipped: they must hold finite values. Rows
+        // past what it reads stay as they are (the whole cache when the read length is not known)
+        const size_t read_end = read_rows > 0 ? std::min(seq_sz, std::max((size_t) read_rows, (size_t) n_used)) : seq_sz;
+        if (zero_tail && n_used < read_end) {
             size_t tail = base + n_used * t_row;
-            size_t tail_n = seq_sz - n_used;
+            size_t tail_n = read_end - n_used;
             ggml_backend_tensor_memset_async(gpu, t_gpu, 0, tail, tail_n * t_row);
         }
     }
@@ -470,7 +473,7 @@ void llama_memory_pshard::download_cells_one(int32_t il, ggml_tensor * t_gpu, gg
     if (!t_gpu || !t_cpu || !t_cpu->data || !on_cells_used) return;
 
     const uint32_t ns     = (uint32_t)t_gpu->ne[2];
-    const size_t   t_row  = t_gpu->ne[0] * ggml_element_size(t_gpu);
+    const size_t   t_row  = ggml_row_size(t_gpu->type, t_gpu->ne[0]);
     const size_t   seq_sz = t_gpu->ne[1];
 
     LLAMA_LOG_DEBUG("download_cells_one: il=%d name=%s gpu_data=%p cpu_data=%p ns=%u\n",
@@ -491,7 +494,7 @@ void llama_memory_pshard::download_written_one(
     (void) il;
     if (!t_gpu || !t_cpu || !t_cpu->data) return;
 
-    const size_t   t_row  = t_gpu->ne[0] * ggml_element_size(t_gpu);
+    const size_t   t_row  = ggml_row_size(t_gpu->type, t_gpu->ne[0]);
     const size_t   seq_sz = t_gpu->ne[1];
     const uint32_t ns     = (uint32_t)t_gpu->ne[2];
     const uint32_t ns_wc  = (uint32_t)std::min((size_t)ns, wc_per_stream.size());
@@ -628,7 +631,7 @@ size_t llama_memory_pshard::switch_bytes(int32_t il) const {
             n += ggml_nbytes(t);
         } else if (on_cells_used) {
             // the cells in use of every stream, as upload_cells / download_cells move them
-            const size_t t_row = t->ne[0] * ggml_element_size(t);
+            const size_t t_row = ggml_row_size(t->type, t->ne[0]);
             for (uint32_t s = 0; s < (uint32_t) t->ne[2]; s++) {
                 n += (size_t) on_cells_used(s) * t_row;
             }
@@ -644,7 +647,7 @@ size_t llama_memory_pshard::switch_row_bytes(int32_t il) const {
     size_t n = 0;
     for (const ggml_tensor * t : { l.t1_gpu, l.t2_gpu }) {
         if (t != nullptr) {
-            n += t->ne[0] * ggml_element_size(t);
+            n += ggml_row_size(t->type, t->ne[0]);
         }
     }
     return n;
@@ -686,11 +689,11 @@ bool llama_memory_pshard::assign_tensors(
                 activate_gpu(l.il);
                 l.t1_gpu->data = NULL; l.t1_gpu->buffer = NULL;
                 ggml_backend_sched_set_tensor_backend(sched, l.t1_gpu, backends[it->second].get());
-                ggml_backend_sched_add_writeback(sched, l.t1_gpu);
+                ggml_backend_sched_add_writeback(sched, l.t1_gpu, mode == CELL_GRANULAR);
                 if (l.t2_gpu) {
                     l.t2_gpu->data = NULL; l.t2_gpu->buffer = NULL;
                     ggml_backend_sched_set_tensor_backend(sched, l.t2_gpu, backends[it->second].get());
-                    ggml_backend_sched_add_writeback(sched, l.t2_gpu);
+                    ggml_backend_sched_add_writeback(sched, l.t2_gpu, mode == CELL_GRANULAR);
                 }
             }
         }

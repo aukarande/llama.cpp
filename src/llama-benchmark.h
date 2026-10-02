@@ -17,7 +17,7 @@ struct llama_pshard_workload;
 
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 12;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 13;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory
@@ -159,6 +159,8 @@ struct llama_benchmark_stats {
                                         // -1 = not in the profile (0.0 is legitimate where the driver imposes no copy-engine transition fence)
     double pool_serve_us      = 0.0;    // a pooled layer's host round trip: ids readback, sync, decision, upload, launch
     double pool_split_us      = 0.0;    // a CPU route's handoff: activation download, host graph, partial upload, join
+    double copy_setup_us      = 0.0;    // what each separate copy of a back-to-back upload adds beyond its bytes (0 = not in
+                                        // the profile: copies priced by their bytes alone)
 
     // log-linear interpolation of a 4-point chunk-size curve (bandwidth ramps with transfer size);
     // 0 when the curve is not in the profile
@@ -247,20 +249,18 @@ struct llama_benchmark_predictor {
             timing_cache_t * timing_cache = nullptr, double token_scale = 1.0) const;
 
     // Nearest-neighbor search with weighted scoring (batch > dims > quant).
-    // For FLASH_ATTN queries, pass op_name="FLASH_ATTN" -- matches all FLASH_ATTN_* entries.
+    // For FLASH_ATTN queries, pass op_name="FLASH_ATTN" -- matches all FLASH_ATTN_* entries -- and the op's
+    // arithmetic intensity: the queries each KV head serves set it, not the KV head count.
     static const llama_benchmark_entry * find_nearest(
             const std::vector<llama_benchmark_entry> & entries,
             const char * op_name, const char * quant,
             int64_t N, int64_t K, int64_t ctx_len, int64_t n_elements,
-            int64_t n_kv_heads = -1, int64_t target_batch = 1);
+            double ai = 0.0, int64_t target_batch = 1);
 
     // Key generators for hash map lookup (used by predict to build exact-match keys).
     static std::string make_key(
             const std::string & op, const std::string & quant,
             int64_t N, int64_t K, int64_t batch);
-
-    static std::string make_attn_key(
-            int64_t ctx_len, int64_t n_kv_heads, int64_t n_tokens);
 
     static std::string make_elem_key(
             const std::string & op, int64_t n_elements);
@@ -288,8 +288,8 @@ struct llama_benchmark_predictor {
         double cpu_ms           = 0.0;
         double expert_copy_ms   = 0.0;
         double stream_copy_ms   = 0.0;
-        // the FFNs alone: compute of the CPU splits that hold one, compute of the FFN matmuls on the GPU (cpu_ms
-        // also holds the other CPU splits, e.g. a host output head)
+        // the FFNs alone: compute and handoff of the CPU splits that hold one, compute of the FFN matmuls on the
+        // GPU (cpu_ms also holds the other CPU splits, e.g. a host output head)
         double cpu_ffn_ms       = 0.0;
         double gpu_ffn_ms       = 0.0;
     };
@@ -298,6 +298,7 @@ struct llama_benchmark_predictor {
     // graph was built for (graph_reserve rounds up to a multiple of n_seq_max)
     // expert_slice_tokens: the scheduler's slice crossover for this step (see ggml_backend_sched_set_expert_slice_tokens);
     // -1 = the split classification the scheduler reported
+    // n_kv_stream: KV cache streams (one per sequence unless unified); a step moves only the streams it touches
     double predict_tps(
             ggml_backend_sched_t sched,
             int cpu_backend_id,
@@ -307,7 +308,8 @@ struct llama_benchmark_predictor {
             uint32_t n_outputs = 0,
             bool has_rs = false,
             breakdown * bd = nullptr,
-            int32_t expert_slice_tokens = -1) const;
+            int32_t expert_slice_tokens = -1,
+            uint32_t n_kv_stream = 1) const;
 
     // ms of a copy sliced by used ids: `bytes` are the `share` of tensors of n_expert experts of expert_size bytes
     // the rows route to. segments: the device takes the copy as one segment-batch launch

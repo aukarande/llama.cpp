@@ -227,8 +227,11 @@ public:
 
     // pshard write-cells binding: the base half is driven through a regular KV context
     // (nullptr for full/update contexts); the SWA half writes through this context's own
-    // slot infos and carries no per-ubatch write-cell set (the shard downloads whole layers)
+    // slot infos
     const llama_kv_cache_context * get_base_ctx() const;
+
+    // cells the current ubatch writes in the SWA half, per stream (empty for full/update contexts)
+    std::vector<std::vector<uint32_t>> get_write_cells() const;
 
 private:
     size_t i_next = 0;

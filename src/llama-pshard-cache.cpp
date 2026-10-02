@@ -221,20 +221,6 @@ static bool pshard_parse_variant_header(const std::string & line, uint32_t & bud
     return sscanf(line.c_str(), "[variant budget=%u]", &budget_mib) == 1;
 }
 
-static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current) {
-    if (!current.is_viable) return true;
-    const bool candidate_has_tps = candidate.tps > 0.0f;
-    const bool current_has_tps   = current.tps   > 0.0f;
-    if (candidate_has_tps || current_has_tps) {
-        if (candidate_has_tps != current_has_tps) return candidate_has_tps;
-        if (candidate.tps != current.tps) return candidate.tps > current.tps;
-    }
-    if (candidate.n_pinned != current.n_pinned) return candidate.n_pinned > current.n_pinned;
-    if (candidate.n_attn_pinned != current.n_attn_pinned) return candidate.n_attn_pinned > current.n_attn_pinned;
-    if (candidate.overflow != current.overflow) return candidate.overflow > current.overflow;
-    return candidate.total_vram_req < current.total_vram_req;
-}
-
 uint64_t pshard_registry_fingerprint(
         const struct llama_model_params * mparams,
         const struct llama_context_params * cparams,

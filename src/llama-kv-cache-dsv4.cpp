@@ -1863,6 +1863,22 @@ const llama_kv_cache_context * llama_kv_cache_dsv4_raw_context::get_base_ctx() c
     return dynamic_cast<const llama_kv_cache_context *>(ctx_base_mem.get());
 }
 
+std::vector<std::vector<uint32_t>> llama_kv_cache_dsv4_raw_context::get_write_cells() const {
+    if (ubatches_write.empty() || i_next >= sinfos_write.size()) {
+        return {};
+    }
+    const auto & sinfo = sinfos_write[i_next];
+    const uint32_t ns = kv_swa->get_n_stream();
+    std::vector<std::vector<uint32_t>> result(ns);
+    for (size_t i = 0; i < sinfo.idxs.size(); ++i) {
+        const uint32_t s = sinfo.strm[i];
+        if (s < ns) {
+            result[s] = sinfo.idxs[i];
+        }
+    }
+    return result;
+}
+
 bool llama_kv_cache_dsv4_raw_context::next() {
     if (ubatches.empty()) {
         return true;

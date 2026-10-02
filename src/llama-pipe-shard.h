@@ -35,6 +35,10 @@ struct llama_memory_pipe_shard_i {
     const std::vector<std::vector<uint32_t>> * write_cells = nullptr;
     void set_write_cells(const std::vector<std::vector<uint32_t>> * wc) { write_cells = wc; }
 
+    // per-batch rows per stream the step's attention reads (the KV context's n_kv); 0 = unknown: the whole cache
+    uint32_t read_rows = 0;
+    void set_read_rows(uint32_t n) { read_rows = n; }
+
     virtual void clear_prefetch() = 0;
 
     // sched split callbacks

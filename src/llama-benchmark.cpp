@@ -229,12 +229,6 @@ std::string llama_benchmark_predictor::make_key(
              + std::to_string(K) + "|" + std::to_string(batch);
 }
 
-std::string llama_benchmark_predictor::make_attn_key(
-        int64_t ctx_len, int64_t n_kv_heads, int64_t n_tokens) {
-    return "FLASH_ATTN|" + std::to_string(ctx_len) + "|"
-             + std::to_string(n_kv_heads) + "|" + std::to_string(n_tokens);
-}
-
 std::string llama_benchmark_predictor::make_elem_key(
         const std::string & op, int64_t n_elements) {
     return op + "|" + std::to_string(n_elements);
@@ -250,8 +244,9 @@ static void build_entry_map(
         if (e.op_name == "MUL_MAT" || e.op_name == "MUL_MAT_ID") {
             key = llama_benchmark_predictor::make_key(e.op_name, e.quant, e.N, e.K, e.B);
         } else if (e.op_name.compare(0, 10, "FLASH_ATTN") == 0) {
-            // n_heads stores n_kv_heads for attention benchmarks (written by profiler)
-            key = llama_benchmark_predictor::make_attn_key(e.ctx_len, e.n_heads, e.n_tokens);
+            // no exact key: the KV head count it would carry does not fix the shape (find_nearest matches the
+            // queries per KV head)
+            continue;
         } else {
             key = llama_benchmark_predictor::make_elem_key(e.op_name, e.n_elements);
         }
@@ -382,6 +377,7 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                 if (sscanf(line, "#   Engine_Switch_us: %lf", &v) == 1)   { stats.engine_switch_us   = v; }
                 if (sscanf(line, "#   Pool_Serve_us: %lf", &v) == 1)      { stats.pool_serve_us      = v; }
                 if (sscanf(line, "#   Pool_Split_us: %lf", &v) == 1)      { stats.pool_split_us      = v; }
+                if (sscanf(line, "#   Copy_Setup_us: %lf", &v) == 1)      { stats.copy_setup_us      = v; }
                 char gpu[160] = { 0 }, cpu[160] = { 0 }, os[32] = { 0 };
                 unsigned long long vram = 0;
                 int mt = 0, schema = 0;
@@ -458,9 +454,11 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                        __func__, stats.machine.schema, stats.machine.gpu.c_str(), stats.machine.vram_mib,
                        stats.machine.cpu.c_str(), stats.machine.os.c_str(), stats.machine.threads);
         LLAMA_LOG_INFO("%s: kernel-copy measurements: sliced kernel 2MB=%.1f GB/s, segment kernel 2MB=%.1f GB/s loaded / %.1f idle,"
-                       " staged %.1f GB/s, kernel-copy cap %.0f MB, engine switch %.1f us, pool serve %.1f us, split %.1f us\n",
+                       " staged %.1f GB/s, kernel-copy cap %.0f MB, engine switch %.1f us, pool serve %.1f us, split %.1f us,"
+                       " copy setup %.1f us\n",
                        __func__, stats.sliced_kernel_bw[1], stats.segs_kernel_bw[1], stats.segs_kernel_idle_bw[1], stats.staged_bw,
-                       stats.kernel_copy_cap_mb, stats.engine_switch_us, stats.pool_serve_us, stats.pool_split_us);
+                       stats.kernel_copy_cap_mb, stats.engine_switch_us, stats.pool_serve_us, stats.pool_split_us,
+                       stats.copy_setup_us);
     }
 
     return !cpu_entries.empty();
@@ -676,9 +674,6 @@ llama_split_timing llama_benchmark_predictor::predict_split(
             case GGML_OP_MUL_MAT_ID:
                 hkey = make_key("MUL_MAT_ID", m.quant_type ? m.quant_type : "", m.N, m.K, batch_size);
                 break;
-            case GGML_OP_FLASH_ATTN_EXT:
-                hkey = make_attn_key(m.ctx_len, m.n_kv_heads, batch_size);
-                break;
             case GGML_OP_ROPE:
             case GGML_OP_RMS_NORM:
             case GGML_OP_GLU:
@@ -709,16 +704,17 @@ llama_split_timing llama_benchmark_predictor::predict_split(
         if (!match) {
             switch (node->op) {
                 case GGML_OP_MUL_MAT:
-                    match = find_nearest(entries, "MUL_MAT", m.quant_type, m.N, m.K, 0, 0, -1, batch_size);
+                    match = find_nearest(entries, "MUL_MAT", m.quant_type, m.N, m.K, 0, 0, 0.0, batch_size);
                     break;
                 case GGML_OP_MUL_MAT_ID:
-                    match = find_nearest(entries, "MUL_MAT_ID", m.quant_type, m.N, m.K, 0, 0, -1, batch_size);
+                    match = find_nearest(entries, "MUL_MAT_ID", m.quant_type, m.N, m.K, 0, 0, 0.0, batch_size);
                     break;
                 case GGML_OP_FLASH_ATTN_EXT:
-                    match = find_nearest(entries, "FLASH_ATTN", nullptr, 0, 0, m.ctx_len, 0, m.n_kv_heads, batch_size);
+                    match = find_nearest(entries, "FLASH_ATTN", nullptr, 0, 0, m.ctx_len, 0,
+                        m.bytes > 0.0 ? m.ops / m.bytes : 0.0, batch_size);
                     break;
                 default:
-                    match = find_nearest(entries, op_name, nullptr, 0, 0, 0, m.n_elements, -1, batch_size);
+                    match = find_nearest(entries, op_name, nullptr, 0, 0, 0, m.n_elements, 0.0, batch_size);
                     break;
             }
             if (match) {
@@ -872,7 +868,7 @@ const llama_benchmark_entry * llama_benchmark_predictor::find_nearest(
         const std::vector<llama_benchmark_entry> & entries,
         const char * op_name, const char * quant,
         int64_t N, int64_t K, int64_t ctx_len, int64_t n_elements,
-        int64_t n_kv_heads, int64_t target_batch) {
+        double ai, int64_t target_batch) {
 
     if (!op_name || entries.empty()) {
         return nullptr;
@@ -880,6 +876,7 @@ const llama_benchmark_entry * llama_benchmark_predictor::find_nearest(
 
     const llama_benchmark_entry * best = nullptr;
     double best_score = 1e20;
+    double best_shape = 1e20;
 
     const double target_bpw = quant ? get_bits_per_weight(quant) : -1.0;
 
@@ -898,18 +895,24 @@ const llama_benchmark_entry * llama_benchmark_predictor::find_nearest(
         double dim_score   = 0.0;
         double batch_score = 0.0;
         double quant_score = 0.0;
+        double shape_score = 0.0;
 
         if (matmul_query) {
-            const double n_diff = std::abs((double)b.N - N) / std::max(N, (int64_t)1);
-            const double k_diff = std::abs((double)b.K - K) / std::max(K, (int64_t)1);
-            dim_score = n_diff + k_diff;
+            // a matmul's rate follows the bytes it streams: rows are matched on matrix size in doublings (a row
+            // 100x too small is not as close as one 2x too small), the shape only breaks ties
+            const double n_e = (double) std::max<int64_t>(b.N, 1), k_e = (double) std::max<int64_t>(b.K, 1);
+            const double n_q = (double) std::max<int64_t>(N, 1),   k_q = (double) std::max<int64_t>(K, 1);
+            dim_score   = std::abs(std::log2((n_e * k_e) / (n_q * k_q)));
+            shape_score = std::abs(std::log2((n_e / k_e) / (n_q / k_q)));
         } else if (attn_query) {
             const double ctx_diff = std::abs((double)b.ctx_len - ctx_len) / std::max(ctx_len, (int64_t)1);
-            double kv_diff = 0.0;
-            if (n_kv_heads > 0 && b.n_heads > 0) {
-                kv_diff = std::abs((double)b.n_heads - n_kv_heads) / std::max(n_kv_heads, (int64_t)1);
+            // queries per KV head, as arithmetic intensity: 16 queries over 2 KV heads run like 32 over 4, not like
+            // 32 over 1
+            double ai_diff = 0.0;
+            if (ai > 0.0 && b.ai > 0.0) {
+                ai_diff = std::abs(std::log2(b.ai / ai));
             }
-            dim_score = ctx_diff + kv_diff * 0.5;
+            dim_score = ctx_diff + ai_diff * 0.5;
         } else {
             const double elem_diff = std::abs((double)b.n_elements - n_elements) / std::max(n_elements, (int64_t)1);
             dim_score = elem_diff;
@@ -936,8 +939,9 @@ const llama_benchmark_entry * llama_benchmark_predictor::find_nearest(
         // batch most important (memory vs compute regime), then dims, then quant
         const double score = batch_score * 1.0 + dim_score * 0.5 + quant_score * 0.3;
 
-        if (score < best_score) {
+        if (score < best_score || (score == best_score && shape_score < best_shape)) {
             best_score = score;
+            best_shape = shape_score;
             best       = &b;
         }
     }
@@ -1019,7 +1023,8 @@ double llama_benchmark_predictor::predict_tps(
         uint32_t n_outputs,
         bool has_rs,
         breakdown * bd,
-        int32_t expert_slice_tokens) const {
+        int32_t expert_slice_tokens,
+        uint32_t n_kv_stream) const {
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched);
     if (n_splits <= 0) return 0.0;
@@ -1037,11 +1042,11 @@ double llama_benchmark_predictor::predict_tps(
     // host-DRAM-bound rate); KV/RS writebacks and activations always move through
     // pinned pools at the full rate.
     const double weight_bw = stats.upload_bw > 0.0 ? stats.upload_bw : pcie_bw;
-    // per-class writeback ratios, matching what the runtime actually moves:
-    //   attention KV: write-cells delta sync -> batch_size/kv_size in both directions
-    //   recurrent state: FULL mode, entire tensor every eval -> 1.0
-    // one ratio for both would charge a hybrid model's attention KV at full-cache cost
-    // per decode step and under-predict plans that pin attention
+    // writebacks as the runtime moves them:
+    //   by cells (writeback_kv): every cell in use goes up before the split (the graph is priced at its reserved
+    //   length, so the whole cache), the cells the step wrote come back -> batch_size/kv_size
+    //   in full (writeback_rs: recurrent state, transposed V, caches without per-token cells): the whole tensor
+    //   every eval, both ways
     GGML_UNUSED(has_rs);
     const double kv_ratio = (kv_size > 0) ? std::min(1.0, (double)batch_size / kv_size) : 1.0;
     double total_ms = 0.0;
@@ -1063,9 +1068,24 @@ double llama_benchmark_predictor::predict_tps(
             }
             const double rows  = std::max(1.0, std::round((double) si.input_expert_n_rows * token_scale));
             const bool   slice = rows < (double) expert_slice_tokens;
+            const int32_t governed_n = si.input_weight_sliced_n + si.input_expert_n;
             si.input_weight_prefetch_bytes = si.input_weight_prefetch_bytes - si.input_expert_bytes + (slice ? 0 : governed);
             si.input_weight_sliced_bytes   = slice ? governed : 0;
             si.input_expert_bytes          = slice ? 0 : governed;
+            si.input_weight_prefetch_n     = si.input_weight_prefetch_n - si.input_expert_n + (slice ? 0 : governed_n);
+            si.input_weight_sliced_n       = slice ? governed_n : 0;
+            si.input_expert_n              = slice ? 0 : governed_n;
+        }
+    }
+
+    // a cache with a stream per sequence moves only the streams the step touches, at most one per token: their cells
+    // in use go up, their written cells come back, a copy per touched stream and tensor
+    const double kv_stream_f = n_kv_stream > 1 ? std::min(1.0, (double) batch_size / n_kv_stream) : 1.0;
+    if (kv_stream_f < 1.0) {
+        for (int i = 0; i < n_splits; i++) {
+            if (have_info[i] && infos[i].writeback_kv_n > 0) {
+                infos[i].writeback_kv_n = std::max<int32_t>(1, (int32_t) std::lround(infos[i].writeback_kv_n * kv_stream_f));
+            }
         }
     }
 
@@ -1073,6 +1093,8 @@ double llama_benchmark_predictor::predict_tps(
     // copy-engine transition of the readback
     const double ids_round_trip_ms = (std::max(0.0, stats.pool_serve_us) + std::max(0.0, stats.engine_switch_us)) / 1000.0;
     const bool   prefetch_window   = ggml_backend_sched_get_prefetch_window(sched);
+    // weights and writebacks move tensor by tensor: each copy adds its setup time to its bytes
+    const double copy_setup_ms     = std::max(0.0, stats.copy_setup_us) / 1000.0;
 
     // the scheduler's prefetch state machine (ggml_backend_sched_next_prefetch_split): one prefetch outstanding; a
     // trigger split issues the next split within the lookahead whose weights the prefetch pass moves (window mode:
@@ -1130,6 +1152,7 @@ double llama_benchmark_predictor::predict_tps(
     };
     double pending_w[2]  = { 0.0, 0.0 };   // bytes of the outstanding prefetch still to move: pinned, staged world
     double pending_wb[2] = { 0.0, 0.0 };
+    double pending_su[2] = { 0.0, 0.0 };   // ms of its copies' setup still to run
     int    pending_to    = -1;
 
     for (int i = 0; i < n_splits; i++) {
@@ -1158,15 +1181,16 @@ double llama_benchmark_predictor::predict_tps(
                 : std::max(0.0, (double) si.input_weight_bytes - sliced_bytes - expert_bytes);
             const double rest_wb_bytes = copy_prefetched
                 ? 0.0
-                : (double)si.writeback_kv_bytes * kv_ratio
-                    + (double)si.writeback_rs_bytes;
+                : (double)si.writeback_kv_bytes * kv_stream_f + (double)si.writeback_rs_bytes;
+            const int rest_weight_n = copy_prefetched ? 0 : si.input_weight_prefetch_n - si.input_expert_n;
+            const int rest_wb_n     = copy_prefetched ? 0 : si.writeback_kv_n + si.writeback_rs_n;
             input_copy_bytes = slice_copy_bytes + rest_weight_bytes + rest_wb_bytes;
-            input_copy_weight_ms = (rest_weight_bytes / 1e9 / weight_bw) * 1000.0
+            input_copy_weight_ms = (rest_weight_bytes / 1e9 / weight_bw) * 1000.0 + rest_weight_n * copy_setup_ms
                                  + (slice_copy_bytes > 0.0
                                      ? sliced_expert_copy_ms(slice_copy_bytes, share, (double) si.input_expert_n_expert,
                                            (double) si.input_expert_size, si.input_expert_segments) + ids_round_trip_ms
                                      : 0.0);
-            input_copy_ms = input_copy_weight_ms + (rest_wb_bytes / 1e9 / pcie_bw) * 1000.0;
+            input_copy_ms = input_copy_weight_ms + (rest_wb_bytes / 1e9 / pcie_bw) * 1000.0 + rest_wb_n * copy_setup_ms;
 
             if (bd != nullptr) {
                 // this split's copy work, prefetched or not
@@ -1179,8 +1203,12 @@ double llama_benchmark_predictor::predict_tps(
                         ? sliced_expert_copy_ms(sliced * s_all, s_all, (double) si.input_expert_n_expert,
                               (double) si.input_expert_size, si.input_expert_segments) + ids_round_trip_ms
                         : 0.0)
-                    + (whole / 1e9 / weight_bw) * 1000.0;
-                bd->stream_copy_ms += (std::max(0.0, (double) si.input_weight_bytes - sliced - whole) / 1e9 / weight_bw) * 1000.0;
+                    + (whole / 1e9 / weight_bw) * 1000.0 + (si.input_moe_n - si.input_weight_sliced_n) * copy_setup_ms;
+                // a streamed attention layer moves its weights and its cache upload together
+                bd->stream_copy_ms += (std::max(0.0, (double) si.input_weight_bytes - sliced - whole) / 1e9 / weight_bw) * 1000.0
+                    + (si.input_weight_n - si.input_moe_n) * copy_setup_ms
+                    + (((double) si.writeback_kv_bytes * kv_stream_f + (double) si.writeback_rs_bytes) / 1e9 / pcie_bw) * 1000.0
+                    + (si.writeback_kv_n + si.writeback_rs_n) * copy_setup_ms;
             }
         }
 
@@ -1192,9 +1220,10 @@ double llama_benchmark_predictor::predict_tps(
             prefetch_rates(is_gpu, 0.0, w_bw, wb_bw);
             for (int c = 0; c < 2; c++) {
                 const double share = c == 0 ? 1.0 - f_staged : f_staged;
-                exposed_ms += share * (pending_w[c] / 1e9 / w_bw[c] + pending_wb[c] / 1e9 / wb_bw) * 1000.0;
+                exposed_ms += share * ((pending_w[c] / 1e9 / w_bw[c] + pending_wb[c] / 1e9 / wb_bw) * 1000.0 + pending_su[c]);
                 pending_w[c]  = 0.0;
                 pending_wb[c] = 0.0;
+                pending_su[c] = 0.0;
             }
             pending_to = -1;
         }
@@ -1205,19 +1234,21 @@ double llama_benchmark_predictor::predict_tps(
             const ggml_backend_sched_split_info & tsi = infos[target_of[i]];
             for (int c = 0; c < 2; c++) {
                 pending_w[c]  = (double) tsi.input_weight_prefetch_bytes;
-                pending_wb[c] = (double) tsi.writeback_kv_bytes * kv_ratio + (double) tsi.writeback_rs_bytes;
+                pending_wb[c] = (double) tsi.writeback_kv_bytes * kv_stream_f + (double) tsi.writeback_rs_bytes;
+                pending_su[c] = (tsi.input_weight_prefetch_n + tsi.writeback_kv_n + tsi.writeback_rs_n) * copy_setup_ms;
             }
             pending_to = target_of[i];
             if (!is_gpu && f_staged > 0.0) {
                 // a staged copy issued from a CPU split's host thread completes before that split computes
-                staged_serial_ms = f_staged * pending_w[1] / 1e9 / stats.upload_staged_bw * 1000.0;
-                pending_w[1] = 0.0;
+                staged_serial_ms = f_staged * (pending_w[1] / 1e9 / stats.upload_staged_bw * 1000.0 + pending_su[1]);
+                pending_w[1]  = 0.0;
+                pending_su[1] = 0.0;
             }
         }
 
         // a CPU split contends with the prefetch only while its bytes move
         const bool async_copy = pending_to >= 0 &&
-            (pending_w[0] + pending_wb[0] + pending_w[1] + pending_wb[1]) > 0.0;
+            (pending_w[0] + pending_wb[0] + pending_w[1] + pending_wb[1] + pending_su[0] + pending_su[1]) > 0.0;
 
         // compute cost (CPU splits use eff_gflops when async_copy due to PCIe contention)
         struct ggml_tensor ** nodes = ggml_graph_nodes(si.graph);
@@ -1258,13 +1289,22 @@ double llama_benchmark_predictor::predict_tps(
         if (is_gpu && si.writeback_bytes > 0 && pcie_bw > 0.0) {
             double dl_bytes = (double)si.writeback_kv_bytes * kv_ratio
                             + (double)si.writeback_rs_bytes;
-            kv_dl_ms = (dl_bytes / 1e9 / pcie_bw) * 1000.0;
+            kv_dl_ms = (dl_bytes / 1e9 / pcie_bw) * 1000.0 + (si.writeback_kv_n + si.writeback_rs_n) * copy_setup_ms;
         }
 
         // activation copy cost (synchronous, between splits on different backends)
         double activ_copy_ms = 0.0;
         if (si.input_activ_bytes > 0 && pcie_bw > 0.0) {
             activ_copy_ms = ((double)si.input_activ_bytes / 1e9 / pcie_bw) * 1000.0;
+        }
+        // a CPU split's handoff: its inputs come down and its result goes up as copies ordered against the GPU's
+        // kernels, each a copy-engine transition (the expert pool prices its CPU routes' handoff itself)
+        double handoff_ms = 0.0;
+        if (!is_gpu && !pool_sched && stats.engine_switch_us > 0.0) {
+            const bool down = si.input_activ_bytes > 0;
+            const bool up   = i + 1 < n_splits && have_info[i + 1] && infos[i + 1].backend_id != cpu_backend_id;
+            handoff_ms = ((down ? 1 : 0) + (up ? 1 : 0)) * stats.engine_switch_us / 1000.0;
+            activ_copy_ms += handoff_ms;
         }
 
         // the outstanding prefetch moves under this split's compute (the link is the split's own after its input
@@ -1275,6 +1315,9 @@ double llama_benchmark_predictor::predict_tps(
             prefetch_rates(is_gpu, t.eff_pcie_bw, w_bw, wb_bw);
             for (int c = 0; c < 2; c++) {
                 double cap_ms = comp_ms;
+                const double su_use = std::min(cap_ms, pending_su[c]);
+                pending_su[c] -= su_use;
+                cap_ms -= su_use;
                 const double w_use = std::min(cap_ms, pending_w[c] / 1e9 / w_bw[c] * 1000.0);
                 pending_w[c] = std::max(0.0, pending_w[c] - w_use / 1000.0 * 1e9 * w_bw[c]);
                 cap_ms -= w_use;
@@ -1297,7 +1340,7 @@ double llama_benchmark_predictor::predict_tps(
             } else {
                 for (int j = 0; j < n_nodes; j++) {
                     if (llama_benchmark_node_is_ffn(nodes[j])) {
-                        bd->cpu_ffn_ms += t.time_ms;
+                        bd->cpu_ffn_ms += t.time_ms + handoff_ms;
                         break;
                     }
                 }

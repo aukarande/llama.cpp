@@ -406,8 +406,9 @@ extern "C" {
         ggml_backend_sched_t sched,
         ggml_backend_sched_split_cb prefetch_cb);
 
-    // Register a tensor for pre/post-compute split callbacks.
-    GGML_API void ggml_backend_sched_add_writeback(ggml_backend_sched_t sched, struct ggml_tensor * tensor);
+    // Register a tensor for pre/post-compute split callbacks. by_cells: the owner moves the cells in use up and the
+    // cells written back (else the whole tensor both ways)
+    GGML_API void ggml_backend_sched_add_writeback(ggml_backend_sched_t sched, struct ggml_tensor * tensor, bool by_cells);
 
     // expert-pool integration: bind a persistent externally-allocated device view as
     // the input copy of a host weight tensor. The view replaces the transient
@@ -484,8 +485,9 @@ extern "C" {
         size_t               input_weight_prefetch_bytes; // what the prefetch pass would move (excludes sliced-eligible experts)
         size_t               input_activ_bytes;
         size_t               writeback_bytes;             // total (kv + rs)
-        size_t               writeback_kv_bytes;          // attention KV cache: runtime moves only newly written cells
-        size_t               writeback_rs_bytes;          // recurrent state: runtime moves the full tensor every eval
+        size_t               writeback_kv_bytes;          // moved by cells: up every cell in use, back the cells written
+        size_t               writeback_rs_bytes;          // moved in full both ways every eval (recurrent state, transposed
+                                                          // V, caches without per-token cells)
         bool                 can_prefetch_weights;
         // expert tensors the prefetch pass moves in full; a split that was not prefetched copies them sliced by
         // used ids instead (their MUL_MAT_ID reads ids an earlier split computed)
@@ -498,6 +500,15 @@ extern "C" {
         int64_t              input_expert_n_rows;         // token rows of the consumer's ids
         int64_t              input_expert_n_used;         // experts per row
         bool                 input_expert_segments;       // the split's device takes the sliced copy as one segment-batch launch
+        // the separate copies behind those bytes (one per tensor, a KV tensor one per stream): each costs a setup
+        // time beyond its bytes
+        int32_t              input_weight_n;              // tensors in input_weight_bytes
+        int32_t              input_weight_sliced_n;       // ... in input_weight_sliced_bytes
+        int32_t              input_weight_prefetch_n;     // ... in input_weight_prefetch_bytes
+        int32_t              input_expert_n;              // ... in input_expert_bytes
+        int32_t              input_moe_n;                 // ... in input_moe_bytes
+        int32_t              writeback_kv_n;              // copies of writeback_kv_bytes
+        int32_t              writeback_rs_n;              // copies of writeback_rs_bytes
     };
 
     GGML_API bool ggml_backend_sched_get_split_info(

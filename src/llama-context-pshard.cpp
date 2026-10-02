@@ -1246,6 +1246,7 @@ void llama_context::pshard_update_write_cells(llama_memory_context_i * mctx) {
     g_lid_write_cells.clear();
     for (auto * ps : g_split_ctx.pipe_shards) {
         ps->set_write_cells(nullptr);
+        ps->set_read_rows(0);
         ps->clear_prefetch();
     }
 
@@ -1259,21 +1260,26 @@ void llama_context::pshard_update_write_cells(llama_memory_context_i * mctx) {
     //   hybrid_iswa:    [base_ps, swa_ps, rs_ps]
     //   DSA:            [mla_ps, lid_ps]
     //   DSA_iswa:       [mla_ps, lid_ps, swa_ps]
-    //   DSV4:           [raw_base_ps, raw_swa_ps, csa_ps, hca_ps, lid_ps] - only the raw base
-    //                   half writes through a KV context; the SWA half and the compressed
-    //                   caches (graph-output rows) keep no write-cell set, so their shards
-    //                   fall back to whole-layer downloads on a pin change
-    auto assign_wc = [&](const llama_kv_cache_context * kv_ctx,
-                         std::vector<std::vector<uint32_t>> & storage, size_t ps_idx) {
-        if (!kv_ctx || ps_idx >= g_split_ctx.pipe_shards.size()) return;
-        storage = kv_ctx->get_write_cells();
+    //   DSV4:           [raw_base_ps, raw_swa_ps, csa_ps, hca_ps, lid_ps] - the raw halves
+    //                   bind their write cells; the compressed caches (graph-output rows)
+    //                   keep no write-cell set and move whole layers
+    auto bind_wc = [&](std::vector<std::vector<uint32_t>> cells, uint32_t n_kv,
+                       std::vector<std::vector<uint32_t>> & storage, size_t ps_idx) {
+        if (ps_idx >= g_split_ctx.pipe_shards.size()) return;
+        storage = std::move(cells);
         bool has_any = false;
         for (const auto & v : storage) { if (!v.empty()) { has_any = true; break; } }
         if (has_any) {
             g_split_ctx.pipe_shards[ps_idx]->set_write_cells(&storage);
+            g_split_ctx.pipe_shards[ps_idx]->set_read_rows(n_kv);
             LLAMA_LOG_DEBUG("%s: bound write_cells to pipe_shard[%zu] (%zu streams)\n",
                 __func__, ps_idx, storage.size());
         }
+    };
+    auto assign_wc = [&](const llama_kv_cache_context * kv_ctx,
+                         std::vector<std::vector<uint32_t>> & storage, size_t ps_idx) {
+        if (!kv_ctx) return;
+        bind_wc(kv_ctx->get_write_cells(), kv_ctx->get_n_kv(), storage, ps_idx);
     };
 
     if (auto * kv_ctx = dynamic_cast<llama_kv_cache_context *>(mctx)) {
@@ -1306,6 +1312,7 @@ void llama_context::pshard_update_write_cells(llama_memory_context_i * mctx) {
     if (auto * d4 = dynamic_cast<llama_kv_cache_dsv4_context *>(mctx)) {
         if (const auto * raw = d4->get_raw()) {
             assign_wc(raw->get_base_ctx(), g_kv_write_cells, 0);
+            bind_wc(raw->get_write_cells(), raw->get_n_kv(), g_swa_write_cells, 1);
         }
         return;
     }

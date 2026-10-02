@@ -2821,7 +2821,7 @@ std::vector<std::vector<uint32_t>> llama_kv_cache_context::get_write_cells() con
     const uint32_t ns = kv->get_n_stream();
     std::vector<std::vector<uint32_t>> result(ns);
     for (size_t i = 0; i < sinfo.idxs.size(); ++i) {
-        uint32_t s = sinfo.s0 + (uint32_t)i;
+        const uint32_t s = sinfo.strm[i];
         if (s < ns) {
             result[s] = sinfo.idxs[i];
         }

@@ -346,6 +346,7 @@ struct calib_results {
     double dma_bw[n_cross]    = { 0 };                      // the same on the copy engine
     double kernel_cap_mb = -1.0;                            // largest size at which the kernel copy still wins (-1 = not calibrated)
     double engine_switch_us = 0.0;
+    double copy_setup_us = 0.0;                             // per copy of a back-to-back upload, beyond its bytes
     double pool_serve_us = 0.0, pool_split_us = 0.0;
     double pin_ceiling_gb = 0.0;
 };
@@ -517,6 +518,42 @@ static void calibrate_copy_crossover(pcie_stress_ctx * pcie, const gpu_procs & p
     sg.release();
 }
 
+// streamed weights go up tensor by tensor, back to back on the copy engine, one synchronize per split. Bursts of
+// copies of one size: a least-squares line through the time per copy gives the link rate (slope) and what each
+// separate copy adds beyond its bytes (intercept)
+static void calibrate_copy_setup(pcie_stress_ctx * pcie, const gpu_procs & procs, calib_results & cr) {
+    printf("Calibrating back-to-back tensor uploads (copy engine)...\n");
+    kernel_copy_scope kc(procs, false);
+    ggml_backend_t gpu = pcie->gpu_backend;
+    static const double size_mb[] = { 0.125, 0.5, 2.0, 8.0, 32.0 };
+    const int n_sizes = (int) (sizeof(size_mb) / sizeof(size_mb[0]));
+    double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+    for (int i = 0; i < n_sizes; i++) {
+        const size_t size  = (size_t) (size_mb[i] * 1024.0 * 1024.0);
+        const int    burst = (int) (pcie->transfer_size / size);
+        auto run = [&]() {
+            for (int b = 0; b < burst; b++) {
+                ggml_backend_tensor_set_async(gpu, pcie->d_tensor, (const char *) pcie->h_tensor->data + (size_t) b * size,
+                    (size_t) b * size, size);
+            }
+            ggml_backend_synchronize(gpu);
+        };
+        run();
+        const int reps = 4;
+        bench_timer t;
+        t.start();
+        for (int r = 0; r < reps; r++) run();
+        const double us = t.stop() / ((double) reps * burst) * 1e6;
+        const double gb = (double) size / 1e9;
+        sx += gb; sy += us; sxx += gb * gb; sxy += gb * us;
+        printf("  %6.3fMB x %4d: %7.1f us per copy (%.1f GB/s)\n", size_mb[i], burst, us, gb / us * 1e6);
+    }
+    const double slope = (n_sizes * sxy - sx * sy) / (n_sizes * sxx - sx * sx);   // us per GB
+    const double icpt  = (sy - slope * sx) / n_sizes;
+    cr.copy_setup_us = std::max(0.0, icpt);
+    printf("  fit: %.1f GB/s per byte, %.1f us per copy\n\n", slope > 0.0 ? 1e6 / slope : 0.0, cr.copy_setup_us);
+}
+
 // the expert pool's per-layer fixed costs, issued the way the runtime issues them (kernel copies on):
 //   serve: router kernel -> ids readback (64 B) -> event sync -> decision -> ids upload (64 B) -> expert launch
 //   split: router kernel -> activation download (8 KB) -> event sync -> CPU graph on a persistent thread pool
@@ -659,6 +696,7 @@ static void write_profile_header(FILE * f, const calib_results & cr, int threads
         fprintf(f, "#   Kernel_Copy_Cap_MB: %.0f\n", cr.kernel_cap_mb);
         fprintf(f, "#   Engine_Switch_us: %.1f\n", cr.engine_switch_us);
     }
+    if (cr.copy_setup_us > 0.0) fprintf(f, "#   Copy_Setup_us: %.1f\n", cr.copy_setup_us);
     if (cr.pool_serve_us > 0.0 || cr.pool_split_us > 0.0) {
         fprintf(f, "#   Pool_Serve_us: %.1f\n", cr.pool_serve_us);
         fprintf(f, "#   Pool_Split_us: %.1f\n", cr.pool_split_us);
@@ -1271,6 +1309,7 @@ int main(int argc, char ** argv) {
         cr.pcie_standalone = pcie.calibrated_bw_gb_s;
         procs = lookup_gpu_procs(pcie.gpu_backend);
         calibrate_pcie_sliced(&pcie, procs, threads, SLICED_DMA, true, cr.sliced_bw);
+        calibrate_copy_setup(&pcie, procs, cr);
         if (procs.kernel_copies) {
             calibrate_pcie_sliced(&pcie, procs, threads, SLICED_KERNEL, true, cr.sliced_kernel_bw);
             if (procs.copy_segments) {
