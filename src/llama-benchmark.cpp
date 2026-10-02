@@ -134,11 +134,12 @@ llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node, double token
             m.n_experts_used = node->ne[1];
             m.M              = tokens(node->ne[2]);
             m.K              = node->src[0]->ne[0];
-            const int64_t total_experts = node->src[0]->ne[2];
+            // a compact sliced copy holds fewer slots than the model has experts
+            const int64_t total_experts = ggml_backend_sched_weight_n_expert(node->src[0]);
             m.ops  = 2.0 * m.N * m.K * m.M * m.n_experts_used;
             // a memory-bound step streams the distinct experts the M tokens route to, not used/total per token
             const double share = llama_expert_distinct_share(wl, (double) m.M, (double) m.n_experts_used, (double) total_experts);
-            m.bytes = (double) ggml_nbytes(node->src[0]) * share
+            m.bytes = (double) node->src[0]->nb[2] * (double) total_experts * share
                     + act(node->src[1]) + act(node);
             m.quant_type = ggml_type_name(node->src[0]->type);
             break;
@@ -780,7 +781,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                 // takes it inside the series, the decode row itself keeps its price
                 const bool attn = node->op == GGML_OP_FLASH_ATTN_EXT;
                 if (is_gpu && m.ops > 0.0 && (attn || node->op == GGML_OP_MUL_MAT_ID)) {
-                    const double n_expert = attn ? 0.0 : (double) node->src[0]->ne[2];
+                    const double n_expert = attn ? 0.0 : (double) ggml_backend_sched_weight_n_expert(node->src[0]);
                     const double x = attn ? (double) m.n_tokens
                                           : (n_expert > 0.0 ? (double) m.M * (double) m.n_experts_used / n_expert : 0.0);
                     double x_min = 0.0;
@@ -944,6 +945,17 @@ const llama_benchmark_entry * llama_benchmark_predictor::find_nearest(
     return best;
 }
 
+// a matmul of a layer's FFN proper: the dense up/gate/down or the routed experts (not the router, not a shared
+// expert). Weight copies keep the weight's name inside their own
+static bool llama_benchmark_node_is_ffn(const ggml_tensor * node) {
+    if ((node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) || node->src[0] == nullptr) {
+        return false;
+    }
+    const char * name = node->src[0]->name;
+    return strstr(name, "exps") != nullptr || strstr(name, ".ffn_up.") != nullptr ||
+           strstr(name, ".ffn_gate.") != nullptr || strstr(name, ".ffn_down.") != nullptr;
+}
+
 // the consume path copies the runs of consecutive used experts as one segment-batch launch when the device
 // offers it, else run by run on the copy engine; staged mappings cannot take the kernel path. The copy waits for
 // ids its own layer computed, so no CPU expert chain runs beside it: the CPU-idle kernel curve prices it
@@ -1033,7 +1045,6 @@ double llama_benchmark_predictor::predict_tps(
     GGML_UNUSED(has_rs);
     const double kv_ratio = (kv_size > 0) ? std::min(1.0, (double)batch_size / kv_size) : 1.0;
     double total_ms = 0.0;
-    bool copy_prefetched = false;
     timing_cache_t timing_cache;
 
     std::vector<ggml_backend_sched_split_info> infos(n_splits);
@@ -1061,10 +1072,70 @@ double llama_benchmark_predictor::predict_tps(
     // a sliced copy waits for its layer's ids on the host: readback, sync, decision, launch, and the
     // copy-engine transition of the readback
     const double ids_round_trip_ms = (std::max(0.0, stats.pool_serve_us) + std::max(0.0, stats.engine_switch_us)) / 1000.0;
+    const bool   prefetch_window   = ggml_backend_sched_get_prefetch_window(sched);
+
+    // the scheduler's prefetch state machine (ggml_backend_sched_next_prefetch_split): one prefetch outstanding; a
+    // trigger split issues the next split within the lookahead whose weights the prefetch pass moves (window mode:
+    // only a split that streams nothing triggers). Expert-pool scheds decide their prefetch in a callback: the next
+    // split stands in for it
+    const bool pool_sched = ggml_backend_sched_has_copy_overrides(sched);
+    const int  lookahead  = pool_sched ? 1 : ggml_backend_sched_get_prefetch_lookahead();
+    std::vector<int>  target_of(n_splits, -1);
+    std::vector<char> is_target(n_splits, 0);
+    {
+        auto streams = [&](int j) { return have_info[j] && infos[j].can_prefetch_weights; };
+        auto movable = [&](int j) {
+            const double wb = (double) infos[j].writeback_kv_bytes + (double) infos[j].writeback_rs_bytes;
+            return streams(j) && (infos[j].input_weight_prefetch_bytes > 0 || (pool_sched && wb > 0.0));
+        };
+        int outstanding = -1;
+        for (int i = 0; i < n_splits; i++) {
+            if (outstanding == i) {
+                outstanding = -1;
+            }
+            if (outstanding >= 0 || (prefetch_window && streams(i))) {
+                continue;
+            }
+            for (int j = i + 1; j < std::min(n_splits, i + 1 + lookahead); j++) {
+                if (movable(j)) {
+                    target_of[i] = j;
+                    is_target[j] = 1;
+                    outstanding  = j;
+                    break;
+                }
+            }
+        }
+    }
+
+    // a split's weights come from one mapping class (see llama_benchmark_stats::upload_staged_frac): the prefetch is
+    // timed in a pinned world and a staged world, the exposed time weighted by the staged share
+    const double f_staged = stats.upload_staged_frac > 0.0 && stats.upload_staged_bw > 0.0
+        ? std::min(1.0, stats.upload_staged_frac) : 0.0;
+    // rates of a prefetch under a split's compute: a GPU split leaves the link to it, a CPU split shares host DRAM
+    auto prefetch_rates = [&](bool gpu, double split_eff_pcie, double w_bw[2], double & wb_bw) {
+        double eff = pcie_bw;
+        if (!gpu) {
+            eff = std::max(split_eff_pcie, stats.eff_pcie_bw);
+            if (eff <= 0.0) {
+                eff = pcie_bw;
+            }
+        }
+        wb_bw = eff;
+        if (f_staged > 0.0) {
+            w_bw[0] = std::min(eff, pcie_bw);
+            w_bw[1] = std::min(eff, stats.upload_staged_bw);
+        } else {
+            w_bw[0] = w_bw[1] = stats.upload_bw > 0.0 ? std::min(eff, weight_bw) : eff;
+        }
+    };
+    double pending_w[2]  = { 0.0, 0.0 };   // bytes of the outstanding prefetch still to move: pinned, staged world
+    double pending_wb[2] = { 0.0, 0.0 };
+    int    pending_to    = -1;
 
     for (int i = 0; i < n_splits; i++) {
         if (!have_info[i]) continue;
         const ggml_backend_sched_split_info & si = infos[i];
+        const bool copy_prefetched = is_target[i] != 0;
 
         const bool is_gpu = (si.backend_id != cpu_backend_id);
 
@@ -1096,50 +1167,62 @@ double llama_benchmark_predictor::predict_tps(
                                            (double) si.input_expert_size, si.input_expert_segments) + ids_round_trip_ms
                                      : 0.0);
             input_copy_ms = input_copy_weight_ms + (rest_wb_bytes / 1e9 / pcie_bw) * 1000.0;
-        }
 
-        // peek at next split to determine if async prefetch will overlap with this split
-        double prefetch_bytes = 0.0;
-        double prefetch_weight_bytes = 0.0;
-        double prefetch_wb_bytes = 0.0;
-        bool next_copy_prefetched = false;
-        if (i + 1 < n_splits) {
-            const ggml_backend_sched_split_info & next_si = infos[i + 1];
-            if (have_info[i + 1] && next_si.can_prefetch_weights) {
-                // the prefetch pass moves non-sliceable weights + writebacks only
-                prefetch_weight_bytes = (double)next_si.input_weight_prefetch_bytes;
-                prefetch_wb_bytes     = (double)next_si.writeback_kv_bytes * kv_ratio
-                                      + (double)next_si.writeback_rs_bytes;
-                prefetch_bytes = prefetch_weight_bytes + prefetch_wb_bytes;
-                next_copy_prefetched = prefetch_bytes > 0.0;
+            if (bd != nullptr) {
+                // this split's copy work, prefetched or not
+                const double sliced = (double) si.input_weight_sliced_bytes;
+                const double whole  = std::max(0.0, (double) si.input_moe_bytes - sliced);
+                const double s_all  = sliced > 0.0
+                    ? llama_expert_distinct_share(workload, rows, (double) si.input_expert_n_used, (double) si.input_expert_n_expert)
+                    : 0.0;
+                bd->expert_copy_ms += (sliced > 0.0
+                        ? sliced_expert_copy_ms(sliced * s_all, s_all, (double) si.input_expert_n_expert,
+                              (double) si.input_expert_size, si.input_expert_segments) + ids_round_trip_ms
+                        : 0.0)
+                    + (whole / 1e9 / weight_bw) * 1000.0;
+                bd->stream_copy_ms += (std::max(0.0, (double) si.input_weight_bytes - sliced - whole) / 1e9 / weight_bw) * 1000.0;
             }
         }
 
-        const bool async_copy = (prefetch_bytes > 0.0);
+        // the outstanding prefetch arrives here: what the compute of the splits since its trigger did not hide is
+        // exposed at this split
+        double exposed_ms = 0.0;
+        if (pending_to == i) {
+            double w_bw[2], wb_bw;
+            prefetch_rates(is_gpu, 0.0, w_bw, wb_bw);
+            for (int c = 0; c < 2; c++) {
+                const double share = c == 0 ? 1.0 - f_staged : f_staged;
+                exposed_ms += share * (pending_w[c] / 1e9 / w_bw[c] + pending_wb[c] / 1e9 / wb_bw) * 1000.0;
+                pending_w[c]  = 0.0;
+                pending_wb[c] = 0.0;
+            }
+            pending_to = -1;
+        }
+        // this split issues a prefetch: enqueued after its inputs, before its compute (the prefetch pass moves the
+        // target's non-sliced weights and its writebacks)
+        double staged_serial_ms = 0.0;
+        if (target_of[i] >= 0) {
+            const ggml_backend_sched_split_info & tsi = infos[target_of[i]];
+            for (int c = 0; c < 2; c++) {
+                pending_w[c]  = (double) tsi.input_weight_prefetch_bytes;
+                pending_wb[c] = (double) tsi.writeback_kv_bytes * kv_ratio + (double) tsi.writeback_rs_bytes;
+            }
+            pending_to = target_of[i];
+            if (!is_gpu && f_staged > 0.0) {
+                // a staged copy issued from a CPU split's host thread completes before that split computes
+                staged_serial_ms = f_staged * pending_w[1] / 1e9 / stats.upload_staged_bw * 1000.0;
+                pending_w[1] = 0.0;
+            }
+        }
+
+        // a CPU split contends with the prefetch only while its bytes move
+        const bool async_copy = pending_to >= 0 &&
+            (pending_w[0] + pending_wb[0] + pending_w[1] + pending_wb[1]) > 0.0;
 
         // compute cost (CPU splits use eff_gflops when async_copy due to PCIe contention)
         struct ggml_tensor ** nodes = ggml_graph_nodes(si.graph);
         int n_nodes = ggml_graph_n_nodes(si.graph);
         llama_split_timing t = predict_split(nodes, n_nodes, is_gpu, batch_size, async_copy, &timing_cache, token_scale);
-
-        // prefetch cost: use concurrent PCIe BW for CPU splits (bus shared with DRAM),
-        // peak PCIe BW for GPU splits (GPU compute doesn't contend with PCIe DMA).
-        // the per-op aggregate eff_pcie_bw can sit far below the machine's concurrent
-        // PCIe rate when the matched entries are unrepresentative (as in the memory-bound
-        // branch) - floor it with the profiler's own concurrent value
-        double prefetch_ms = 0.0;
-        if (prefetch_bytes > 0.0) {
-            double eff_bw = pcie_bw;
-            if (!is_gpu) {
-                eff_bw = std::max(t.eff_pcie_bw, stats.eff_pcie_bw);
-                if (eff_bw <= 0.0) {
-                    eff_bw = pcie_bw;
-                }
-            }
-            const double pf_weight_bw = stats.upload_bw > 0.0 ? std::min(eff_bw, weight_bw) : eff_bw;
-            prefetch_ms = (prefetch_weight_bytes / 1e9 / pf_weight_bw) * 1000.0
-                        + (prefetch_wb_bytes / 1e9 / eff_bw) * 1000.0;
-        }
 
         // output scaling: use the output rows in the reserved graph, then scale to
         // the runtime number of logits. This keeps the memory-probe graph as the
@@ -1184,46 +1267,52 @@ double llama_benchmark_predictor::predict_tps(
             activ_copy_ms = ((double)si.input_activ_bytes / 1e9 / pcie_bw) * 1000.0;
         }
 
-        // Prefetch is enqueued after current inputs/precompute and before graph compute,
-        // so whatever remains can overlap the current split compute. CPU splits use the
-        // effective PCIe BW above because DMA contends with CPU memory traffic.
+        // the outstanding prefetch moves under this split's compute (the link is the split's own after its input
+        // copies)
         const double comp_ms = t.time_ms + kv_dl_ms;
-        double split_ms = input_copy_ms + activ_copy_ms;
-        if (stats.upload_staged_frac > 0.0 && stats.upload_staged_bw > 0.0 && prefetch_weight_bytes > 0.0) {
-            // mixture over mapping classes (see llama_benchmark_stats::upload_staged_frac)
-            double eff_bw2 = pcie_bw;
-            if (!is_gpu) {
-                eff_bw2 = std::max(t.eff_pcie_bw, stats.eff_pcie_bw);
-                if (eff_bw2 <= 0.0) {
-                    eff_bw2 = pcie_bw;
+        if (pending_to >= 0 && comp_ms > 0.0) {
+            double w_bw[2], wb_bw;
+            prefetch_rates(is_gpu, t.eff_pcie_bw, w_bw, wb_bw);
+            for (int c = 0; c < 2; c++) {
+                double cap_ms = comp_ms;
+                const double w_use = std::min(cap_ms, pending_w[c] / 1e9 / w_bw[c] * 1000.0);
+                pending_w[c] = std::max(0.0, pending_w[c] - w_use / 1000.0 * 1e9 * w_bw[c]);
+                cap_ms -= w_use;
+                const double wb_use = std::min(cap_ms, pending_wb[c] / 1e9 / wb_bw * 1000.0);
+                pending_wb[c] = std::max(0.0, pending_wb[c] - wb_use / 1000.0 * 1e9 * wb_bw);
+            }
+        }
+        const double split_ms = input_copy_ms + activ_copy_ms + exposed_ms + staged_serial_ms + comp_ms;
+        if (bd != nullptr) {
+            bd->compute_ms       += t.time_ms;
+            bd->cpu_ms           += is_gpu ? 0.0 : t.time_ms;
+            bd->weight_upload_ms += input_copy_weight_ms + exposed_ms + staged_serial_ms;
+            bd->other_ms         += (input_copy_ms - input_copy_weight_ms) + activ_copy_ms + kv_dl_ms;
+            if (is_gpu) {
+                for (int j = 0; j < n_nodes; j++) {
+                    if (llama_benchmark_node_is_ffn(nodes[j])) {
+                        bd->gpu_ffn_ms += predict_split(&nodes[j], 1, true, batch_size, async_copy, &timing_cache, token_scale).time_ms;
+                    }
+                }
+            } else {
+                for (int j = 0; j < n_nodes; j++) {
+                    if (llama_benchmark_node_is_ffn(nodes[j])) {
+                        bd->cpu_ffn_ms += t.time_ms;
+                        break;
+                    }
                 }
             }
-            const double wb_ms     = (prefetch_wb_bytes / 1e9 / eff_bw2) * 1000.0;
-            const double pf_pinned = (prefetch_weight_bytes / 1e9 / std::min(eff_bw2, pcie_bw)) * 1000.0 + wb_ms;
-            const double pf_staged = (prefetch_weight_bytes / 1e9 / std::min(eff_bw2, stats.upload_staged_bw)) * 1000.0 + wb_ms;
-            const double f = std::min(1.0, stats.upload_staged_frac);
-            split_ms += f * std::max(comp_ms, pf_staged) + (1.0 - f) * std::max(comp_ms, pf_pinned);
-        } else {
-            split_ms += std::max(comp_ms, prefetch_ms);
-        }
-        if (bd != nullptr) {
-            // the max() term minus the compute it hid = exposed prefetch (weights)
-            const double overlap_ms = split_ms - input_copy_ms - activ_copy_ms;
-            bd->compute_ms       += t.time_ms;
-            bd->weight_upload_ms += input_copy_weight_ms + std::max(0.0, overlap_ms - comp_ms);
-            bd->other_ms         += (input_copy_ms - input_copy_weight_ms) + activ_copy_ms + kv_dl_ms;
         }
         total_ms += split_ms;
-        copy_prefetched = next_copy_prefetched;
 
         double dl_bytes = is_gpu ? (double)si.writeback_kv_bytes * kv_ratio + (double)si.writeback_rs_bytes : 0.0;
-        LLAMA_LOG_DEBUG("%s:   split %d/%d [%s] input_copy=%.3f (%.2f MiB) compute=%.3f kv_dl=%.3f (%.2f MiB) prefetch=%.3f (%.2f MiB) activ=%.3f (%.2f MiB) -> %.3f ms"
+        LLAMA_LOG_DEBUG("%s:   split %d/%d [%s] input_copy=%.3f (%.2f MiB) compute=%.3f kv_dl=%.3f (%.2f MiB) prefetch exposed=%.3f -> split %d activ=%.3f (%.2f MiB) -> %.3f ms"
             " (exact=%d near=%d fall=%d cache=%d)\n",
             __func__, i, n_splits, is_gpu ? "GPU" : "CPU",
             input_copy_ms, input_copy_bytes / (1024.0 * 1024.0),
             t.time_ms,
             kv_dl_ms, dl_bytes / (1024.0 * 1024.0),
-            prefetch_ms, prefetch_bytes / (1024.0 * 1024.0),
+            exposed_ms, target_of[i],
             activ_copy_ms, (double)si.input_activ_bytes / (1024.0 * 1024.0),
             split_ms,
             t.n_exact, t.n_nearest, t.n_fallback, t.n_cache_hit);

@@ -511,10 +511,16 @@ void llama_context::pshard_assign_pool_tensors() {
 }
 
 void llama_context::pshard_setup_sched() {
-    ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap);
+    // the active tier's transport; a planner probe reserves under the one it measures
+    ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap &&
+        (pshard_active_plan == nullptr || pshard_active_plan->overlap != 0));
+    ggml_backend_sched_set_prefetch_window(sched.get(),
+        pshard_active_plan ? pshard_active_plan->overlap == 2 : probe_reserve.prefetch_window);
     // the active tier's slice crossover; a planner probe reserves under the one it measures
     ggml_backend_sched_set_expert_slice_tokens(sched.get(),
         pshard_active_plan ? pshard_active_plan->expert_slice_tokens : probe_reserve.expert_slice_tokens);
+    ggml_backend_sched_set_expert_slice_rows(sched.get(),
+        pshard_active_plan ? (int) pshard_active_plan->batch_size : (int) probe_reserve.n_tokens);
     ggml_backend_sched_set_ids_observe_cb(sched.get(), pshard_ids_observe, this);
 
     g_split_ctx = {};
@@ -570,7 +576,10 @@ void llama_context::pshard_setup_sched() {
 void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload, bool force_upload) {
     // per-tier transport mode: governs split_graph keepalives and the runtime prefetch scan
     ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
+    ggml_backend_sched_set_prefetch_window(sched.get(), plan.overlap == 2);
     ggml_backend_sched_set_expert_slice_tokens(sched.get(), plan.expert_slice_tokens);
+    // every ubatch the tier runs copies experts as its reserved batch does, so it fits the tier's reserved allocation
+    ggml_backend_sched_set_expert_slice_rows(sched.get(), (int) plan.batch_size);
     ggml_backend_t gpu = backends[pshard_layout.compute].get();
     size_t scratch_off = const_cast<llama_model &>(model).pshard_apply_plan(plan, with_upload ? gpu : nullptr, force_upload);
 
@@ -891,7 +900,9 @@ void llama_context::pshard_warmup_plan_reserves() {
 
         // the reserve must see the same prefetch/keepalive mode this tier will run with
         ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
+        ggml_backend_sched_set_prefetch_window(sched.get(), plan.overlap == 2);
         ggml_backend_sched_set_expert_slice_tokens(sched.get(), plan.expert_slice_tokens);
+        ggml_backend_sched_set_expert_slice_rows(sched.get(), (int) plan.batch_size);
 
         const_cast<llama_model &>(model).pshard_compute_scratch_off(plan); // see pshard_apply_plan
 

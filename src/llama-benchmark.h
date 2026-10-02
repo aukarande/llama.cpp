@@ -17,7 +17,7 @@ struct llama_pshard_workload;
 
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 9;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 12;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory
@@ -282,6 +282,16 @@ struct llama_benchmark_predictor {
         double compute_ms       = 0.0;
         double weight_upload_ms = 0.0;
         double other_ms         = 0.0;
+        // the two chains a CPU/GPU FFN split balances, whether or not they overlap: compute of the CPU splits,
+        // copies of the expert tensors GPU splits consume (sliced by used ids or whole), copies of their other
+        // streamed weights
+        double cpu_ms           = 0.0;
+        double expert_copy_ms   = 0.0;
+        double stream_copy_ms   = 0.0;
+        // the FFNs alone: compute of the CPU splits that hold one, compute of the FFN matmuls on the GPU (cpu_ms
+        // also holds the other CPU splits, e.g. a host output head)
+        double cpu_ffn_ms       = 0.0;
+        double gpu_ffn_ms       = 0.0;
     };
 
     // batch_size: tokens per step of the priced tier; n_tokens_graph: tokens the reserved

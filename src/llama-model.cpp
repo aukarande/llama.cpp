@@ -1767,9 +1767,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // build tensor -> backend_id map from overrides (for pshard scheduling)
     if (params.tensor_buft_overrides) {
+        std::vector<std::regex> ov_regex;   // compiled once, not per tensor
+        for (const auto * ov = params.tensor_buft_overrides; ov->pattern; ++ov) {
+            ov_regex.emplace_back(ov->pattern);
+        }
         for (const auto & [name, tensor] : tensors_by_name) {
-            for (const auto * ov = params.tensor_buft_overrides; ov->pattern; ++ov) {
-                if (ov->backend_id >= 0 && std::regex_search(name, std::regex(ov->pattern))) {
+            size_t io = 0;
+            for (const auto * ov = params.tensor_buft_overrides; ov->pattern; ++ov, ++io) {
+                if (ov->backend_id >= 0 && std::regex_search(name, ov_regex[io])) {
                     pimpl->tensor_backend_ids[tensor] = ov->backend_id;
                     break;
                 }
@@ -2103,7 +2108,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                             }
                             llama_pshard_generate_overrides(plan.n_pinned, hparams.n_layer_all, nullptr, nullptr, ovs.data(),
                                 (llama_layer_fraction) plan.overflow, plan.strategy, layout, plan.pin_from_back,
-                                plan.output_on_gpu, plan.n_attn_pinned, plan.overlap, plan.ids_cross);
+                                plan.output_on_gpu, plan.n_attn_pinned, plan.overlap, plan.ids_cross, plan.n_ffn_gpu);
                             std::vector<std::regex> res;
                             for (const auto * ov = ovs.data(); ov->pattern; ++ov) {
                                 res.emplace_back(ov->pattern);

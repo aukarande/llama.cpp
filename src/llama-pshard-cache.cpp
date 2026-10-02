@@ -20,22 +20,22 @@ const char * llama_get_overflow_pattern(size_t il, llama_layer_fraction lf) {
     GGML_ASSERT(il < n_strings);
     switch (lf) {
         case LLAMA_LAYER_FRACTION_ATTN: {
-            static std::array<std::string, n_strings> p;
+            thread_local std::array<std::string, n_strings> p;
             if (p[il].empty()) { p[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|gate|down).*"; }
             return p[il].c_str();
         }
         case LLAMA_LAYER_FRACTION_UP: {
-            static std::array<std::string, n_strings> p;
+            thread_local std::array<std::string, n_strings> p;
             if (p[il].empty()) { p[il] = "blk\\." + std::to_string(il) + "\\.ffn_(gate|down).*"; }
             return p[il].c_str();
         }
         case LLAMA_LAYER_FRACTION_GATE: {
-            static std::array<std::string, n_strings> p;
+            thread_local std::array<std::string, n_strings> p;
             if (p[il].empty()) { p[il] = "blk\\." + std::to_string(il) + "\\.ffn_down.*"; }
             return p[il].c_str();
         }
         case LLAMA_LAYER_FRACTION_MOE: {
-            static std::array<std::string, n_strings> p;
+            thread_local std::array<std::string, n_strings> p;
             if (p[il].empty()) { p[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate)_(ch|)exps"; }
             return p[il].c_str();
         }
@@ -57,7 +57,8 @@ void llama_pshard_generate_overrides(
         bool output_on_gpu,
         uint32_t n_attn_pinned,
         bool overlap,
-        bool ids_cross) {
+        bool ids_cross,
+        uint32_t n_ffn_gpu) {
     GGML_UNUSED(gpu_buft);
 
     thread_local std::array<std::string, 1000> patterns_layer;
@@ -75,6 +76,10 @@ void llama_pshard_generate_overrides(
     const bool output_on_cpu = !output_on_gpu;
 
     size_t itbo = 0;
+    // HYBRID_ATTNPRIO_FFNBALANCE: the unpinned layers (the MTP head aside) and those placed so far
+    const uint32_t n_ffn = n_layers > n_pinned + g_pshard_n_layers_mtp ? n_layers - n_pinned - g_pshard_n_layers_mtp : 0;
+    uint32_t n_unpinned = 0;
+    uint32_t n_ffn_streamed = 0;   // HYBRID_ATTNPRIO_FFNBALANCE: FFNs streamed so far
 
     auto emit = [&](const char * pat, ggml_backend_buffer_type_t buft, int32_t bid) {
         tensor_buft_overrides[itbo] = { pat, buft, bid };
@@ -92,6 +97,7 @@ void llama_pshard_generate_overrides(
         if (patterns_layer[il].empty())      { patterns_layer[il]      = "blk\\." + std::to_string(il) + "\\..*"; }
         if (patterns_layer_attn[il].empty()) { patterns_layer_attn[il] = "blk\\." + std::to_string(il) + "\\.attn_(q|k|v|output|q_norm|k_norm).*"; }
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
+        if (patterns_layer_router[il].empty()) { patterns_layer_router[il] = "blk\\." + std::to_string(il) + "\\.(ffn_gate_inp|ffn_exp_probs_b).*"; }
 
         if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
             // MTP head layers: pinned whole, experts included, the placement the planner's copy prices
@@ -142,10 +148,6 @@ void llama_pshard_generate_overrides(
                     emit(patterns_layer_ffn[il].c_str(), host_buft, shard_bid);
                     emit(patterns_layer[il].c_str(), host_buft, layout.compute);
                     break;
-                case LLAMA_PSHARD_DYNAMIC_FFNCPU_ATTNSTREAM:
-                    emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
-                    emit(patterns_layer[il].c_str(), host_buft, shard_bid);
-                    break;
                 case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS:
                     if (n_attn_pinned > 0 && il < n_attn_pinned) {
                         emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
@@ -154,26 +156,33 @@ void llama_pshard_generate_overrides(
                         emit(patterns_layer[il].c_str(), host_buft, layout.cpu);
                     }
                     break;
-                case LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE:
-                    // even unpinned FFNs compute on CPU, odd ones stream to alternating shard
-                    // slots so the copy overlaps CPU-FFN + attn compute; attn is pinned for the
-                    // first n_attn_pinned layers and streamed for the rest (budget knob)
-                    if (il % 2 == 0) {
-                        emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
-                    } else {
+                case LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE: {
+                    // n_ffn_gpu of the unpinned FFNs stream to the GPU, spread evenly, the rest compute on the CPU;
+                    // attention is pinned for the first n_attn_pinned layers and streamed for the rest. Consecutive
+                    // streamed FFNs alternate lanes, so the expert copies split evenly over both lanes, and a layer
+                    // streaming only attention takes the lane of the next streamed FFN (the first lane when none
+                    // streams): its shared expert then copies with the next layer's attention
+                    const bool    ffn_gpu  = llama_pshard_hybrid_ffn_on_gpu(n_unpinned++, n_ffn_gpu, n_ffn);
+                    const bool    attn_gpu = n_attn_pinned > 0 && il < n_attn_pinned;
+                    const int32_t lane     = overlap ? layout.shard(n_ffn_streamed) : layout.shard_a;
+                    n_ffn_streamed += ffn_gpu ? 1 : 0;
+                    if (ffn_gpu) {
                         if (ids_cross) {
                             // router pinned on the compute GPU: ids land in an earlier split
                             // than the streamed experts -> sliced-by-used-ids uploads
                             emit(patterns_layer_router[il].c_str(), host_buft, layout.compute);
                         }
-                        emit(patterns_layer_ffn[il].c_str(), host_buft, overlap ? layout.shard(il / 2) : layout.shard_a);
+                        emit(patterns_layer_ffn[il].c_str(), host_buft, lane);
+                    } else {
+                        emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
                     }
-                    if (n_attn_pinned > 0 && il < n_attn_pinned) {
+                    if (attn_gpu) {
                         emit(patterns_layer[il].c_str(), host_buft, layout.compute);
                     } else {
-                        emit(patterns_layer[il].c_str(), host_buft, overlap ? layout.shard(il / 2) : layout.shard_a);
+                        emit(patterns_layer[il].c_str(), host_buft, lane);
                     }
                     break;
+                }
                 default: break;
             }
         }
@@ -600,7 +609,7 @@ void llama_params_fit_pshard(
         (llama_layer_fraction)best->overflow,
         best->strategy, layout,
         best->pin_from_back, best->output_on_gpu, best->n_attn_pinned,
-        best->overlap, best->ids_cross);
+        best->overlap, best->ids_cross, best->n_ffn_gpu);
 
     for (size_t i = 0; tensor_buft_overrides[i].pattern; i++) {
         if (tensor_buft_overrides[i].backend_id == layout.compute) {

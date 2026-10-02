@@ -17,15 +17,14 @@
 enum llama_pshard_strategy {
     LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM        = 0,
     LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM           = 1,
-    LLAMA_PSHARD_DYNAMIC_FFNCPU_ATTNSTREAM           = 2,
-    LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS           = 3,
-    // unpinned FFNs alternate CPU compute / GPU streaming: the PCIe copy of the next streamed
-    // FFN overlaps CPU-FFN + pinned-attn compute, so DDR and PCIe bandwidth add up
-    LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE               = 4,
+    LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS           = 2,
+    // attention pinned first, the rest streamed to the GPU; the unpinned FFNs split between CPU compute and GPU
+    // streaming by the fraction that balances the CPU chain against the copy chain (0 = every FFN on the CPU)
+    LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE          = 3,
     // routed experts become a managed VRAM cache (docs/expert-pool-design.md):
     // per-tier variables n_attn_pinned / K / miss_policy / prefill_mode; the
     // pool region serves the prefill ab_stream double buffer and decode LRU slots
-    LLAMA_PSHARD_EXPERT_POOL                         = 5,
+    LLAMA_PSHARD_EXPERT_POOL                         = 4,
     LLAMA_PSHARD_COUNT
 };
 
@@ -34,9 +33,8 @@ inline const char * llama_pshard_strategy_name(llama_pshard_strategy s) {
     switch (s) {
         case LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM: return "GPUONLY_LAYERPIN_LAYERSTREAM";
         case LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM:    return "GPUONLY_ATTNPIN_FFNSTREAM";
-        case LLAMA_PSHARD_DYNAMIC_FFNCPU_ATTNSTREAM:    return "DYNAMIC_FFNCPU_ATTNSTREAM";
         case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS:    return "STATIC_ATTNPRIO_ALLMODELS";
-        case LLAMA_PSHARD_DYNAMIC_FFN_ALTERNATE:        return "DYNAMIC_FFN_ALTERNATE";
+        case LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE:   return "HYBRID_ATTNPRIO_FFNBALANCE";
         case LLAMA_PSHARD_EXPERT_POOL:                  return "EXPERT_POOL";
         default:                                        return "UNKNOWN";
     }
@@ -228,8 +226,10 @@ struct llama_pshard_plan {
     int                  overflow        = 0;   // llama_layer_fraction
     bool                 pin_from_back   = false;
     bool                 output_on_gpu   = false;
-    bool                 overlap         = true;   // transport mode: double-buffer slots + prefetch scan-ahead
-    bool                 ids_cross       = false;  // ALTERNATE only: pin routers on the compute GPU so
+    // transport: 0 one slot, no prefetch; 1 two slots, prefetch scan-ahead; 2 one live streamed shard, prefetched
+    // only from splits that stream nothing (ggml_backend_sched_set_prefetch_window)
+    uint8_t              overlap         = 1;
+    bool                 ids_cross       = false;  // HYBRID_ATTNPRIO_FFNBALANCE only: pin routers on the compute GPU so
                                                    // expert ids cross a split boundary -> sliced uploads
 
     // EXPERT_POOL per-tier variables (docs/expert-pool-design.md 3b.2); legacy
@@ -239,6 +239,8 @@ struct llama_pshard_plan {
     int      pool_miss        = 0;     // llama_pshard_miss_policy
     int      pool_prefill     = 0;     // llama_pshard_prefill_mode
     float    pool_hybrid_frac = 0.0f;  // fetched share of misses under hybrid (B_P / B_H)
+    // HYBRID_ATTNPRIO_FFNBALANCE: how many of the unpinned FFNs stream to the GPU (the rest compute on the CPU)
+    uint32_t n_ffn_gpu        = 0;
 
     std::vector<llama_pshard_override> overrides;
 
@@ -321,7 +323,14 @@ void llama_pshard_generate_overrides(
         bool output_on_gpu = false,
         uint32_t n_attn_pinned = 0,
         bool overlap = true,
-        bool ids_cross = false);
+        bool ids_cross = false,
+        uint32_t n_ffn_gpu = 0);
+
+// HYBRID_ATTNPRIO_FFNBALANCE: whether the k-th of n_ffn unpinned layers streams its FFN to the GPU when n_gpu of them
+// do; the GPU ones are spread evenly so each copy overlaps CPU work on the layers around it
+inline bool llama_pshard_hybrid_ffn_on_gpu(uint32_t k, uint32_t n_gpu, uint32_t n_ffn) {
+    return n_ffn > 0 && (uint64_t) (k + 1) * n_gpu / n_ffn > (uint64_t) k * n_gpu / n_ffn;
+}
 
 // llama_device_memory_data and llama_memory_breakdown_data come from
 // ToT's src/llama-ext.h (included above)
@@ -340,7 +349,8 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         void * probe_hook_data = nullptr,
         uint32_t probe_n_tokens = 0,
         uint32_t probe_n_outputs = 0,
-        int32_t  probe_expert_slice_tokens = -1);
+        int32_t  probe_expert_slice_tokens = -1,
+        bool     probe_prefetch_window = false);
 
 // fit params entry point used by pshard planning; upstream's generic fit lives in common/fit
 void llama_params_fit_impl(

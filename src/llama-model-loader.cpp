@@ -551,6 +551,11 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+    if (tensor_buft_overrides) {
+        for (const auto * ov = tensor_buft_overrides; ov->pattern != nullptr; ++ov) {
+            tensor_buft_override_regex.emplace_back(ov->pattern);
+        }
+    }
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
@@ -1182,9 +1187,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             // placed independently (e.g. token_embd on CPU, output on GPU)
             std::string tensor_name = (tn_tensor != tn.tensor)
                 ? LLM_TN_IMPL(tn.arch, tn_tensor, tn.suffix, tn.bid, tn.xid).str() : tn.str();
-            for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
-                std::regex pattern(overrides->pattern);
-                if (std::regex_search(tensor_name, pattern)) {
+            size_t io = 0;
+            for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides, ++io) {
+                if (std::regex_search(tensor_name, tensor_buft_override_regex[io])) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);

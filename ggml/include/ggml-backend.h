@@ -376,10 +376,22 @@ extern "C" {
 
     // Enable async weight prefetching to overlap CPU->GPU transfers with compute
     GGML_API void                 ggml_backend_sched_set_prefetch_weights(ggml_backend_sched_t sched, bool enabled);
+    // with prefetch on: only a split that streams no weights (CPU, pinned) triggers the next prefetch, so the target
+    // is allocated after the previous streamed split's copies were freed and one streamed shard is live at a time
+    GGML_API void                 ggml_backend_sched_set_prefetch_window(ggml_backend_sched_t sched, bool enabled);
+    GGML_API bool                 ggml_backend_sched_get_prefetch_window(ggml_backend_sched_t sched);
+    // splits after a trigger the prefetch scan looks at, and whether expert-pool copy overrides decide the prefetch
+    GGML_API int                  ggml_backend_sched_get_prefetch_lookahead(void);
+    GGML_API bool                 ggml_backend_sched_has_copy_overrides(ggml_backend_sched_t sched);
 
     // expert tensors whose ids an earlier split computed are copied sliced by used ids when the ubatch has fewer than
     // n_tokens tokens, else prefetched whole; -1 (default) = sliced below n_expert / 2 tokens
     GGML_API void                 ggml_backend_sched_set_expert_slice_tokens(ggml_backend_sched_t sched, int n_tokens);
+    // ubatches are classified as if they had at least n_rows tokens (default 0): a smaller ubatch then copies experts
+    // the way the graph reserved at n_rows does and keeps its buffer lifetimes
+    GGML_API void                 ggml_backend_sched_set_expert_slice_rows(ggml_backend_sched_t sched, int n_rows);
+    // the experts of a MUL_MAT_ID weight: a compact sliced copy holds fewer slots than its source has experts
+    GGML_API int64_t              ggml_backend_sched_weight_n_expert(const struct ggml_tensor * w);
 
     // Per-split callbacks for stateful tensors (e.g. KV cache, recurrent state).
     typedef void (*ggml_backend_sched_split_cb)(struct ggml_tensor * tensor, ggml_backend_t backend, void * user_data);
@@ -478,6 +490,7 @@ extern "C" {
         // expert tensors the prefetch pass moves in full; a split that was not prefetched copies them sliced by
         // used ids instead (their MUL_MAT_ID reads ids an earlier split computed)
         size_t               input_expert_bytes;          // full size of those tensors (part of input_weight_prefetch_bytes)
+        size_t               input_moe_bytes;             // full size of every expert tensor the split's MUL_MAT_IDs read, wherever their ids come from
         // shape of the sliced copies of both kinds: they move only the distinct experts the rows route to, a share
         // of the full size the caller prices
         size_t               input_expert_size;           // one expert's bytes (mean over the split's expert tensors)

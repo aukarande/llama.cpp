@@ -72,7 +72,7 @@ def steps_per_s(r):
     except Exception:
         return None
 
-ARM_ORDER = ["stock", "auto", "s0", "s1", "s2", "s3", "s4", "pool:fetch", "pool:fetch+pred", "pool:fetch+pred+warm",
+ARM_ORDER = ["stock", "auto", "s0", "s1", "s2", "s3", "pool:fetch", "pool:fetch+pred", "pool:fetch+pred+warm",
              "pool:hybrid", "pool:hybrid+pred", "pool:hybrid+noovl", "pool:cpu_admit", "pool:cpu_admit+pred",
              "pool:cpu_admit+noovl", "pool:cpu_exec", "pool:fetch_on_2nd_miss", "pool:plan", "poolauto"]
 def budgets_of(model):
@@ -168,7 +168,7 @@ def table_spec(model, spec):
     w()
     w("| arm | " + " | ".join("%s/%s" % (b if b != "14500" else "full", p) for b, p in cols) + " |")
     w("|---|" + "---|" * len(cols))
-    for a in ["stock", "auto", "s3", "pool:fetch", "pool:hybrid", "pool:plan", "poolauto"]:
+    for a in ["stock", "auto", "s2", "pool:fetch", "pool:hybrid", "pool:plan", "poolauto"]:
         cells = []
         for b, p in cols:
             r = idx.get((a, b, p))
@@ -239,7 +239,7 @@ for model, spec in [("q35", "none"), ("dsv4", "none"), ("q35mtp", "mtp"), ("dsv4
         if r["kind"] == "perf" and r["model"] == model and r["spec"] == spec and r["arm"] == "stock" and r["mva"] == "3000":
             for b in buds:
                 idx.setdefault(("stock", b, r["prompt"]), r)
-    for a in ["stock", "auto", "s3", "pool:fetch", "pool:fetch+pred", "pool:hybrid", "pool:plan", "poolauto"]:
+    for a in ["stock", "auto", "s2", "pool:fetch", "pool:fetch+pred", "pool:hybrid", "pool:plan", "poolauto"]:
         cells = []
         for b, p in cols:
             r = idx.get((a, b, p))

@@ -48,10 +48,10 @@ Example registry output:
 
 [variant budget=12000 cache_ubatch=8192]
 [tier 0 bs=1]
-strategy=DYNAMIC_FFNCPU_ATTNSTREAM n_pinned=54 n_attn_pinned=0 overflow=NONE tps=12.85   vram=11975.7 output_on_gpu=0 pin_from_back=0
+strategy=HYBRID_ATTNPRIO_FFNBALANCE n_pinned=54 n_attn_pinned=54 overflow=NONE tps=12.85   vram=11975.7 output_on_gpu=0 pin_from_back=0 ffn_gpu=0
 ot=^output=CUDA_Host:3,^token_embd=CUDA_Host:3,blk\.0\..*=CUDA_Host:0, ... ,blk\.53\..*=CUDA_Host:0,blk\.54\.ffn_(up|gate|down).*=CUDA_Host:3,blk\.54\..*=CUDA_Host:1,blk\.55\.ffn_(up|gate|down).*=CUDA_Host:3,blk\.55\..*=CUDA_Host:2, ... ,blk\.63\.ffn_(up|gate|down).*=CUDA_Host:3,blk\.63\..*=CUDA_Host:2
 cand strategy=STATIC_ATTNPRIO_ALLMODELS viable=1 tps=9.10 n_pinned=40 n_attn_pinned=64 slots=0 vram=11980.2
-cand strategy=DYNAMIC_FFNCPU_ATTNSTREAM viable=1 tps=12.85 n_pinned=54 n_attn_pinned=0 slots=0 vram=11975.7
+cand strategy=HYBRID_ATTNPRIO_FFNBALANCE viable=1 tps=12.85 n_pinned=54 n_attn_pinned=54 slots=0 vram=11975.7
 cand strategy=GPUONLY_LAYERPIN_LAYERSTREAM viable=1 tps=4.20 n_pinned=52 n_attn_pinned=0 slots=0 vram=11973.3
 [tier 1 bs=16]
 strategy=GPUONLY_ATTNPIN_FFNSTREAM n_pinned=48 n_attn_pinned=0 overflow=NONE tps=208.27  vram=11964.1 output_on_gpu=0 pin_from_back=0
@@ -106,7 +106,7 @@ Static schedules run GPU-resident tensors on GPU and CPU-resident tensors on CPU
 
 Dynamic schedules split the layer between CPU and GPU execution. Some host-resident tensors are streamed to GPU scratch for execution, while other parts of the layer remain on CPU.
 
-- `DYNAMIC_FFNCPU_ATTNSTREAM`: pin as many full layers as fit, keep FFN/MoE on CPU in the remaining layers, and stream the attention/dense side for GPU execution.
+- `HYBRID_ATTNPRIO_FFNBALANCE`: pin the attention/dense side across as many layers as fit, then full layers, and stream the remaining attention/dense side for GPU execution. The unpinned FFN/MoE is split between CPU execution and GPU streaming: `ffn_gpu` of them stream, spread evenly, the number at which the CPU work and the copies take equally long (`ffn_gpu=0` keeps them all on CPU).
 
 GPU-only schedules execute repeating-layer compute on GPU. Weights that do not fit in VRAM stay resident in host memory and are streamed to GPU scratch before use.
 

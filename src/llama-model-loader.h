@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <regex>
+#include <vector>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -103,6 +105,7 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
+    std::vector<std::regex> tensor_buft_override_regex;   // tensor_buft_overrides' patterns, compiled once
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set

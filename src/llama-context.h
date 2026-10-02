@@ -46,6 +46,7 @@ struct llama_context_probe_reserve {
     uint32_t n_tokens  = 0;
     uint32_t n_outputs = 0;
     int32_t  expert_slice_tokens = -1;   // the scheduler's slice crossover during the reserve (-1: its default rule)
+    bool     prefetch_window     = false; // the window transport (ggml_backend_sched_set_prefetch_window)
 };
 
 struct llama_context {
