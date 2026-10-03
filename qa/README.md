@@ -51,7 +51,9 @@ Stock llama.cpp is the golden. Three gates, applied over the full config grid:
 ## Grid
 
 full  = 3 models (q35 MoE, oss MoE/SWA-hybrid, q8d dense/SSM-hybrid)
-        x ctx {2048, 16384} x mva {4000, 12000} x strategies {auto, 0..4}
+        x ctx {2048, 16384} x mva {4000, 12000} x strategies {auto, 0, 2, 3, 4}
+        (labels: 0 GPUONLY_LAYERPIN_LAYERSTREAM, 2 STATIC_ATTNPRIO_ALLMODELS, 3 HYBRID_ATTNPRIO_FFNBALANCE,
+        4 EXPERT_POOL; run-qa.sh forces them by name. 1 was GPUONLY_ATTNPIN_FFNSTREAM, removed)
 smoke = 3 models x ctx 2048 x mva {4000, 8000} x auto   (per-commit, ~30 min)
 (override with QA_MODELS_LIST / QA_CTX_LIST / QA_MVA_LIST / QA_STRAT_LIST)
 

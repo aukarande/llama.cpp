@@ -87,7 +87,7 @@ MODELS_LIST="q35:Qwen3.6-35B-A3B-UD-Q4_K_M oss:gpt-oss-20b-Q4_0 q8d:Qwen3.6-27B-
 if [ "$GRID" = "full" ]; then
     CTX_LIST="2048 16384"
     MVA_LIST="4000 12000"
-    STRAT_LIST="auto 0 1 2 3 4"
+    STRAT_LIST="auto 0 2 3 4"
 else
     CTX_LIST="2048"
     MVA_LIST="4000 8000"
@@ -98,6 +98,17 @@ MODELS_LIST=${QA_MODELS_LIST:-$MODELS_LIST}
 CTX_LIST=${QA_CTX_LIST:-$CTX_LIST}
 MVA_LIST=${QA_MVA_LIST:-$MVA_LIST}
 STRAT_LIST=${QA_STRAT_LIST:-$STRAT_LIST}
+# a ledger label -> the strategy it forces (labels keep the numbering of the reference ledger)
+strat_env() {
+    case $1 in
+        0) echo GPUONLY_LAYERPIN_LAYERSTREAM ;;
+        2) echo STATIC_ATTNPRIO_ALLMODELS ;;
+        3) echo HYBRID_ATTNPRIO_FFNBALANCE ;;
+        4) echo EXPERT_POOL ;;
+        *) echo "unknown strategy label $1 (1 = GPUONLY_ATTNPIN_FFNSTREAM was removed)" >&2; exit 2 ;;
+    esac
+}
+for STRAT in $STRAT_LIST; do [ "$STRAT" = "auto" ] || strat_env "$STRAT" > /dev/null || exit 2; done
 
 hash_gen() { # generation file (pure stdout) -> hash
     tr -d '\r\n' < "$1" | md5sum | cut -c1-16
@@ -165,7 +176,7 @@ for MDL in $MODELS_LIST; do
                 if [ "$STRAT" = "auto" ]; then
                     ./llama-pshard-plan-params.exe -m "$MP" -c "$CTX" -mva "$MVA" > "$PLOG" 2>&1
                 else
-                    env PSHARD_STRATEGY=$STRAT ./llama-pshard-plan-params.exe -m "$MP" -c "$CTX" -mva "$MVA" > "$PLOG" 2>&1
+                    env PSHARD_STRATEGY=$(strat_env $STRAT) ./llama-pshard-plan-params.exe -m "$MP" -c "$CTX" -mva "$MVA" > "$PLOG" 2>&1
                 fi
                 if [ $? -ne 0 ]; then
                     echo "$CFG,pshard,$MK,$CTX,$MVA,$STRAT,PLAN_FAILED,,,,,,,,,,,,,FAIL" >> "$LEDGER"
@@ -228,7 +239,7 @@ for MDL in $MODELS_LIST; do
                     STOCK_DONE=1
                 fi
 
-                PSH=""; [ "$STRAT" != "auto" ] && PSH="env PSHARD_STRATEGY=$STRAT"
+                PSH=""; [ "$STRAT" != "auto" ] && PSH="env PSHARD_STRATEGY=$(strat_env $STRAT)"
                 # 3a. pshard PERF run - DEFAULTS ONLY (PERF RULE): perf + VRAM. WARN lines
                 #     are visible at default verbosity, so "pshard DISABLED" (STOCK_FALLBACK)
                 #     and pshard_prefill_ubatch_eff still parse from this log.
@@ -278,7 +289,7 @@ for MDL in $MODELS_LIST; do
                         ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
                             -pshard -mva "$MVA" -v > "$OUT/ppl_pshard_$CFG.log" 2>&1
                     else
-                        env PSHARD_STRATEGY=$STRAT ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
+                        env PSHARD_STRATEGY=$(strat_env $STRAT) ./llama-perplexity.exe -m "$MP" -f "$PPLC" -c "$CTX" --chunks $CH \
                             -pshard -mva "$MVA" -v > "$OUT/ppl_pshard_$CFG.log" 2>&1
                     fi
                     PP_=$(grep -aoE "Final estimate: PPL = [0-9.]+" "$OUT/ppl_pshard_$CFG.log" | grep -aoE "[0-9.]+$")

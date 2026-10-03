@@ -1193,9 +1193,28 @@ double llama_benchmark_predictor::predict_tps(
             input_copy_ms = input_copy_weight_ms + (rest_wb_bytes / 1e9 / pcie_bw) * 1000.0 + rest_wb_n * copy_setup_ms;
 
             if (bd != nullptr) {
-                // this split's copy work, prefetched or not
+                // this split's copy work, prefetched or not; a dense FFN's streamed weights are FFN copies like an
+                // expert stack's, not the layer's attention (weight copies carry the weight's name after a '#')
+                double dense_ffn   = 0.0;
+                int    dense_ffn_n = 0;
+                {
+                    std::vector<const ggml_tensor *> seen;
+                    struct ggml_tensor ** gnodes = ggml_graph_nodes(si.graph);
+                    const int n_gnodes = ggml_graph_n_nodes(si.graph);
+                    for (int j = 0; j < n_gnodes; j++) {
+                        const ggml_tensor * w = gnodes[j]->src[0];
+                        if (gnodes[j]->op != GGML_OP_MUL_MAT || !llama_benchmark_node_is_ffn(gnodes[j]) ||
+                                strchr(w->name, '#') == nullptr ||
+                                std::find(seen.begin(), seen.end(), w) != seen.end()) {
+                            continue;
+                        }
+                        seen.push_back(w);
+                        dense_ffn += (double) ggml_nbytes(w);
+                        dense_ffn_n++;
+                    }
+                }
                 const double sliced = (double) si.input_weight_sliced_bytes;
-                const double whole  = std::max(0.0, (double) si.input_moe_bytes - sliced);
+                const double whole  = std::max(0.0, (double) si.input_moe_bytes - sliced) + dense_ffn;
                 const double s_all  = sliced > 0.0
                     ? llama_expert_distinct_share(workload, rows, (double) si.input_expert_n_used, (double) si.input_expert_n_expert)
                     : 0.0;
@@ -1203,10 +1222,10 @@ double llama_benchmark_predictor::predict_tps(
                         ? sliced_expert_copy_ms(sliced * s_all, s_all, (double) si.input_expert_n_expert,
                               (double) si.input_expert_size, si.input_expert_segments) + ids_round_trip_ms
                         : 0.0)
-                    + (whole / 1e9 / weight_bw) * 1000.0 + (si.input_moe_n - si.input_weight_sliced_n) * copy_setup_ms;
+                    + (whole / 1e9 / weight_bw) * 1000.0 + (si.input_moe_n - si.input_weight_sliced_n + dense_ffn_n) * copy_setup_ms;
                 // a streamed attention layer moves its weights and its cache upload together
                 bd->stream_copy_ms += (std::max(0.0, (double) si.input_weight_bytes - sliced - whole) / 1e9 / weight_bw) * 1000.0
-                    + (si.input_weight_n - si.input_moe_n) * copy_setup_ms
+                    + std::max(0, si.input_weight_n - si.input_moe_n - dense_ffn_n) * copy_setup_ms
                     + (((double) si.writeback_kv_bytes * kv_stream_f + (double) si.writeback_rs_bytes) / 1e9 / pcie_bw) * 1000.0
                     + (si.writeback_kv_n + si.writeback_rs_n) * copy_setup_ms;
             }

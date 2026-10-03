@@ -72,7 +72,7 @@ mva_of()      { case $1 in full) echo "$FULL" ;; *) echo "$1" ;; esac; }
 #   kind   perf | gate | ppl
 #   mva    MiB or "full"
 #   prompt 512 | 4k
-#   arm    stock | auto | s0..s3 (forced legacy, by name: see expected_strategy) | pool:<policy> | pool:plan | poolauto
+#   arm    stock | auto | s0 | s2 | s3 (forced legacy, by name: see expected_strategy) | pool:<policy> | pool:plan | poolauto
 #   warm   1 = RETIRED 2026-09-13: PSHARD_POOL_WARM / PSHARD_POOL_ALLOC were removed (measured no win);
 #              the arm now repeats the pred arm - drop it at the next rerun
 #   noovl  always 0 (column kept for ledger compatibility; the no-overlap switch was removed
@@ -98,13 +98,13 @@ plain_set() { # model mva prompt stock_ok pool_ok
     M=$1; B=$2; PR=$3; ST=$4; POOL=$5
     [ "$ST" = "1" ] && add perf $M $B $PR none stock 0 0 0
     add perf $M $B $PR none auto 0 0 0
-    for st in 0 1 2 3; do add perf $M $B $PR none s$st 0 0 0; done   # forced legacy strategies (user, 2026-09-04)
+    for st in 0 2 3; do add perf $M $B $PR none s$st 0 0 0; done   # forced legacy strategies (user, 2026-09-04)
     [ "$POOL" = "1" ] && pool_block $M $B $PR
     # gates: 32-token md5 vs stock (stock always runs as the reference, even where its
     # perf cell is not in the table) + pool counters; every policy at 512, fetch at 4k
     add gate $M $B $PR none stock 0 0 0
     add gate $M $B $PR none auto  0 0 0
-    if [ "$PR" = "512" ]; then for st in 0 1 2 3; do add gate $M $B $PR none s$st 0 0 0; done; fi
+    if [ "$PR" = "512" ]; then for st in 0 2 3; do add gate $M $B $PR none s$st 0 0 0; done; fi
     if [ "$POOL" = "1" ]; then
         if [ "$PR" = "512" ]; then
             add gate $M $B $PR none pool:fetch 0 0 0
@@ -131,7 +131,7 @@ spec_set() { # model mva spec prompt pool_ok  -> stock + auto (+ 5 pool variants
     M=$1; B=$2; SPC=$3; PR=$4; POOL=$5
     add perf $M $B $PR $SPC stock 0 0 0
     add perf $M $B $PR $SPC auto  0 0 0
-    for st in 0 1 2 3; do add perf $M $B $PR $SPC s$st 0 0 0; done
+    for st in 0 2 3; do add perf $M $B $PR $SPC s$st 0 0 0; done
     if [ "$POOL" = "1" ]; then
         add perf $M $B $PR $SPC pool:fetch  0 0 0
         add perf $M $B $PR $SPC pool:fetch  1 0 0
@@ -283,7 +283,7 @@ sched_grew() { # log -> 0 (grew) / 1
              END { print (sz + 0 > ex + 1) ? 0 : 1 }'
 }
 expected_strategy() { # arm -> the tier-0 strategy name the arm must produce ("" = any)
-    case $1 in s0) echo GPUONLY_LAYERPIN_LAYERSTREAM ;; s1) echo GPUONLY_ATTNPIN_FFNSTREAM ;;
+    case $1 in s0) echo GPUONLY_LAYERPIN_LAYERSTREAM ;;
                s2) echo STATIC_ATTNPRIO_ALLMODELS ;; s3) echo HYBRID_ATTNPRIO_FFNBALANCE ;; pool:*) echo EXPERT_POOL ;; *) echo "" ;; esac
 }
 fallback()    { strip < "$1" | grep -aqE 'pshard not active|disabling pshard|pshard DISABLED|invalid PSHARD_'; }
@@ -317,6 +317,9 @@ run_side() { # samp log gen cmd... -> "rc vram_delta clock_ok"; samples memory.u
 
 # ---------------------------------------------------------------- main loop
 LAST_PLAN_KEY=""; LAST_TIER0=""
+if echo "$CELLS" | grep -q '^[^|]*|[^|]*|[^|]*|[^|]*|[^|]*|s1|'; then
+    echo "s1 cells are gone: HYBRID_ATTNPRIO_FFNBALANCE covers GPUONLY_ATTNPIN_FFNSTREAM" >&2; exit 2
+fi
 echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
     [ -z "$K" ] && continue
     case $M in q35mtp) BM=q35 ;; *) BM=$M ;; esac
@@ -348,10 +351,10 @@ echo "$CELLS" | while IFS='|' read -r K M B PR S A P W N; do
     case $A in
         stock)    ;;
         auto)     ;;
-        s[0-3])   ENVF="PSHARD_STRATEGY=$(expected_strategy $A)" ;;   # forced legacy strategy, by name (fingerprinted)
+        s0|s2|s3) ENVF="PSHARD_STRATEGY=$(expected_strategy $A)" ;;   # forced legacy strategy, by name (fingerprinted)
         pool:plan) ENVF="PSHARD_STRATEGY=EXPERT_POOL PSHARD_POOL_RUNTIME=1" ;;
         pool:*)   ENVF="PSHARD_STRATEGY=EXPERT_POOL PSHARD_MISS_POLICY=${A#pool:} PSHARD_POOL_RUNTIME=1" ;;
-        poolauto) ENVF="PSHARD_STRATEGY=ALL" ;;              # the ladder with the pool (the default ladder is s0-s3)
+        poolauto) ENVF="PSHARD_STRATEGY=ALL" ;;              # the ladder with the pool (the default ladder is s0, s2, s3)
     esac
     [ "$N" = "1" ] && { echo "noovl cells are gone: the no-overlap switch was removed 2026-09-09 ($NM)" >&2; exit 2; }
     ENVV=$ENVF

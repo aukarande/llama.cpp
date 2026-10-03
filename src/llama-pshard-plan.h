@@ -16,15 +16,14 @@
 
 enum llama_pshard_strategy {
     LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM        = 0,
-    LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM           = 1,
-    LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS           = 2,
+    LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS           = 1,
     // attention pinned first, the rest streamed to the GPU; the unpinned FFNs split between CPU compute and GPU
     // streaming by the fraction that balances the CPU chain against the copy chain (0 = every FFN on the CPU)
-    LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE          = 3,
+    LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE          = 2,
     // routed experts become a managed VRAM cache (docs/expert-pool-design.md):
     // per-tier variables n_attn_pinned / K / miss_policy / prefill_mode; the
     // pool region serves the prefill ab_stream double buffer and decode LRU slots
-    LLAMA_PSHARD_EXPERT_POOL                         = 4,
+    LLAMA_PSHARD_EXPERT_POOL                         = 3,
     LLAMA_PSHARD_COUNT
 };
 
@@ -32,7 +31,6 @@ enum llama_pshard_strategy {
 inline const char * llama_pshard_strategy_name(llama_pshard_strategy s) {
     switch (s) {
         case LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM: return "GPUONLY_LAYERPIN_LAYERSTREAM";
-        case LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM:    return "GPUONLY_ATTNPIN_FFNSTREAM";
         case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS:    return "STATIC_ATTNPRIO_ALLMODELS";
         case LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE:   return "HYBRID_ATTNPRIO_FFNBALANCE";
         case LLAMA_PSHARD_EXPERT_POOL:                  return "EXPERT_POOL";
@@ -44,7 +42,7 @@ inline bool llama_pshard_strategy_delegates_compute(llama_pshard_strategy s) {
     return s == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS;
 }
 
-// PSHARD_STRATEGY=ALL: the auto search includes the expert pool; unset = the legacy ladder (s0-s4)
+// PSHARD_STRATEGY=ALL: the auto search includes the expert pool; unset = every strategy but the expert pool
 constexpr int PSHARD_STRATEGY_ALL = -2;
 
 // host memory the runtime pins outside the loader's page-lock loop (load staging, the
@@ -475,10 +473,9 @@ struct llama_pshard_plan_registry {
     }
 
     // whether a plan keeps layer il's non-FFN tensors (attention, norms, router) and its KV / recurrent state
-    // on the device: its whole layers, the attention pins (from the front), or every layer under
-    // ATTNPIN_FFNSTREAM, whose n_attn_pinned stays 0
+    // on the device: its whole layers or the attention pins (from the front)
     bool attn_resident(const llama_pshard_plan & p, uint32_t il) const {
-        return full_resident(p, il) || il < p.n_attn_pinned || p.strategy == LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM;
+        return full_resident(p, il) || il < p.n_attn_pinned;
     }
 
     // cost of switching from one plan to another, in ms. Weights move one way only: what `to` keeps on the device

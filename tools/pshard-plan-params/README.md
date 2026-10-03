@@ -54,7 +54,7 @@ cand strategy=STATIC_ATTNPRIO_ALLMODELS viable=1 tps=9.10 n_pinned=40 n_attn_pin
 cand strategy=HYBRID_ATTNPRIO_FFNBALANCE viable=1 tps=12.85 n_pinned=54 n_attn_pinned=54 slots=0 vram=11975.7
 cand strategy=GPUONLY_LAYERPIN_LAYERSTREAM viable=1 tps=4.20 n_pinned=52 n_attn_pinned=0 slots=0 vram=11973.3
 [tier 1 bs=16]
-strategy=GPUONLY_ATTNPIN_FFNSTREAM n_pinned=48 n_attn_pinned=0 overflow=NONE tps=208.27  vram=11964.1 output_on_gpu=0 pin_from_back=0
+strategy=HYBRID_ATTNPRIO_FFNBALANCE n_pinned=48 n_attn_pinned=64 overflow=NONE tps=208.27  vram=11964.1 output_on_gpu=0 pin_from_back=0 ffn_gpu=16
 ot=...
 [tier 2 bs=512]
 strategy=GPUONLY_LAYERPIN_LAYERSTREAM n_pinned=52 n_attn_pinned=0 overflow=NONE tps=1994.90 vram=11973.3 output_on_gpu=0 pin_from_back=0
@@ -63,14 +63,14 @@ ot=...
 strategy=GPUONLY_LAYERPIN_LAYERSTREAM n_pinned=51 n_attn_pinned=0 overflow=NONE tps=2286.87 vram=11909.8 output_on_gpu=0 pin_from_back=0
 ot=...
 [tier 4 bs=2048]
-strategy=GPUONLY_ATTNPIN_FFNSTREAM n_pinned=44 n_attn_pinned=0 overflow=NONE tps=2249.44 vram=11914.3 output_on_gpu=0 pin_from_back=0
+strategy=HYBRID_ATTNPRIO_FFNBALANCE n_pinned=44 n_attn_pinned=64 overflow=NONE tps=2249.44 vram=11914.3 output_on_gpu=0 pin_from_back=0 ffn_gpu=20
 ot=...
 [tier 5 bs=4096]
-strategy=GPUONLY_ATTNPIN_FFNSTREAM n_pinned=40 n_attn_pinned=0 overflow=NONE tps=2095.88 vram=11868.6 output_on_gpu=0 pin_from_back=0
+strategy=HYBRID_ATTNPRIO_FFNBALANCE n_pinned=40 n_attn_pinned=64 overflow=NONE tps=2095.88 vram=11868.6 output_on_gpu=0 pin_from_back=0 ffn_gpu=24
 ot=...
 [tier 6 bs=8192]
-strategy=GPUONLY_ATTNPIN_FFNSTREAM n_pinned=33 n_attn_pinned=0 overflow=NONE tps=2148.21 vram=11937.2 output_on_gpu=0 pin_from_back=0
-ot=^output=CUDA_Host:3,^token_embd=CUDA_Host:3,blk\.0\..*=CUDA_Host:0, ... ,blk\.32\..*=CUDA_Host:0,blk\.33\.ffn_(up|gate|down).*=CUDA_Host:2,blk\.33\..*=CUDA_Host:0, ... ,blk\.63\.ffn_(up|gate|down).*=CUDA_Host:2,blk\.63\..*=CUDA_Host:0
+strategy=HYBRID_ATTNPRIO_FFNBALANCE n_pinned=33 n_attn_pinned=64 overflow=NONE tps=2148.21 vram=11937.2 output_on_gpu=0 pin_from_back=0 ffn_gpu=31
+ot=^output=CUDA_Host:3,^token_embd=CUDA_Host:3,blk\.0\..*=CUDA_Host:0, ... ,blk\.32\..*=CUDA_Host:0,blk\.33\.ffn_(up|gate|down).*=CUDA_Host:1,blk\.33\..*=CUDA_Host:0, ... ,blk\.63\.ffn_(up|gate|down).*=CUDA_Host:1,blk\.63\..*=CUDA_Host:0
 ```
 
 ## Planning for llama-bench
@@ -106,12 +106,11 @@ Static schedules run GPU-resident tensors on GPU and CPU-resident tensors on CPU
 
 Dynamic schedules split the layer between CPU and GPU execution. Some host-resident tensors are streamed to GPU scratch for execution, while other parts of the layer remain on CPU.
 
-- `HYBRID_ATTNPRIO_FFNBALANCE`: pin the attention/dense side across as many layers as fit, then full layers, and stream the remaining attention/dense side for GPU execution. The unpinned FFN/MoE is split between CPU execution and GPU streaming: `ffn_gpu` of them stream, spread evenly, the number at which the CPU work and the copies take equally long (`ffn_gpu=0` keeps them all on CPU).
+- `HYBRID_ATTNPRIO_FFNBALANCE`: pin the attention/dense side across as many layers as fit, then full layers, and stream the remaining attention/dense side for GPU execution. The unpinned FFN/MoE is split between CPU execution and GPU streaming: `ffn_gpu` of them stream, spread evenly, the number at which the CPU work and the copies take equally long (`ffn_gpu=0` keeps them all on CPU). With the attention side pinned for every layer and every unpinned FFN/MoE streamed, the whole repeating-layer compute runs on GPU.
 
 GPU-only schedules execute repeating-layer compute on GPU. Weights that do not fit in VRAM stay resident in host memory and are streamed to GPU scratch before use.
 
 - `GPUONLY_LAYERPIN_LAYERSTREAM`: pin as many full layers as fit, then stream the remaining layers for GPU execution.
-- `GPUONLY_ATTNPIN_FFNSTREAM`: pin the attention/dense side for all layers, pin as many complete layers as the remaining budget allows, and stream FFN/MoE weights for GPU execution.
 
 ## Notes
 

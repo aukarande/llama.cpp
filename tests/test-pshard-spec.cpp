@@ -10,8 +10,8 @@
 //     (the prompt), so its position-0 logits are compared value-wise and the pairwise
 //     max |delta| matrix is printed with each mode's top-2 margin. Enforced only when
 //     LLAMA_TEST_PSHARD_SPEC_TOL is set: on MoE targets a placement-level rounding difference
-//     can flip an expert-routing near-tie and move logits by O(1) (q35: s0 vs s1 ~1.0 while
-//     each is bitwise deterministic), so the tolerance is per model. Token-stream equality
+//     can flip an expert-routing near-tie and move logits by O(1) (q35: two GPU-only placements ~1.0
+//     while each is bitwise deterministic), so the tolerance is per model. Token-stream equality
 //     across strategies is REPORTED, and enforced with LLAMA_TEST_PSHARD_SPEC_STRICT=1,
 //   - pshard actually engaged (a silent stock fallback fails the test),
 //   - the draft accelerated something (n_accept > 0).
@@ -28,7 +28,8 @@
 //   LLAMA_TEST_PSHARD_SPEC_CTX      n_ctx (default 2048)
 //   LLAMA_TEST_PSHARD_SPEC_NPREDICT tokens to generate (default 48)
 //   LLAMA_TEST_PSHARD_SPEC_NDRAFT   draft length (default 8; 2 for MTP)
-//   LLAMA_TEST_PSHARD_SPEC_STRATS   comma list of strategies, "auto" or 0..4 (default "0,1,auto")
+//   LLAMA_TEST_PSHARD_SPEC_STRATS   comma list of strategy names or "auto"
+//                                   (default "GPUONLY_LAYERPIN_LAYERSTREAM,HYBRID_ATTNPRIO_FFNBALANCE,auto")
 //   LLAMA_TEST_PSHARD_SPEC_TOL      max |logit delta| of the first verify step across modes (0 = report only, default)
 //   LLAMA_TEST_PSHARD_SPEC_STRICT   1 -> cross-strategy token/hash mismatch fails the test
 //   LLAMA_TEST_PSHARD_SPEC_STOCK    1 (default) also run the stock reference at -fitb MVA
@@ -429,7 +430,7 @@ int main() {
         }
         c.n_draft_max = atoi(env_or("LLAMA_TEST_PSHARD_SPEC_NDRAFT", "8"));
     }
-    const std::string strats_s = env_or("LLAMA_TEST_PSHARD_SPEC_STRATS", "0,1,auto");
+    const std::string strats_s = env_or("LLAMA_TEST_PSHARD_SPEC_STRATS", "GPUONLY_LAYERPIN_LAYERSTREAM,HYBRID_ATTNPRIO_FFNBALANCE,auto");
     std::vector<std::string> strats;
     for (size_t i = 0, j; i < strats_s.size(); i = j + 1) {
         j = strats_s.find(',', i);

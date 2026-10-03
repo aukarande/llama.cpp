@@ -144,10 +144,6 @@ void llama_pshard_generate_overrides(
                 case LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM:
                     emit(patterns_layer[il].c_str(), host_buft, shard_bid);
                     break;
-                case LLAMA_PSHARD_GPUONLY_ATTNPIN_FFNSTREAM:
-                    emit(patterns_layer_ffn[il].c_str(), host_buft, shard_bid);
-                    emit(patterns_layer[il].c_str(), host_buft, layout.compute);
-                    break;
                 case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS:
                     if (n_attn_pinned > 0 && il < n_attn_pinned) {
                         emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);

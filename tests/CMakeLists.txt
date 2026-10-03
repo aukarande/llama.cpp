@@ -293,7 +293,7 @@ llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 # pshard speculative certification: token stream + FNV-1a over every verify step's logits must
 # agree across pshard strategies (and vs stock at the same budget). Env-gated, skips when unset:
-#   LLAMA_TEST_PSHARD_SPEC_TARGET=<gguf> [LLAMA_TEST_PSHARD_SPEC_DRAFT=<gguf>] [..._MVA=4000] [..._STRATS=0,1,auto]
+#   LLAMA_TEST_PSHARD_SPEC_TARGET=<gguf> [LLAMA_TEST_PSHARD_SPEC_DRAFT=<gguf>] [..._MVA=4000] [..._STRATS=GPUONLY_LAYERPIN_LAYERSTREAM,HYBRID_ATTNPRIO_FFNBALANCE,auto]
 llama_build_and_test(test-pshard-spec.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
