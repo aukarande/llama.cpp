@@ -102,4 +102,5 @@ std::string format(const char * fmt, ...);
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
-std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+// an array stops at the first element past max_len characters
+std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len = (size_t) -1);

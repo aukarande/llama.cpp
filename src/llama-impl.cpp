@@ -133,7 +133,7 @@ static std::string gguf_data_to_str(enum gguf_type type, const void * data, int 
     }
 }
 
-std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
+std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len) {
     const enum gguf_type type = gguf_get_kv_type(ctx_gguf, i);
 
     switch (type) {
@@ -160,6 +160,9 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
                     }
                     if (j < arr_n - 1) {
                         ss << ", ";
+                    }
+                    if ((size_t) ss.tellp() > max_len) {
+                        break;
                     }
                 }
                 ss << "]";

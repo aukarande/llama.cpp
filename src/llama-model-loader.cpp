@@ -537,7 +537,8 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        llama_model_meta_cache * meta_cache)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -560,7 +561,37 @@ llama_model_loader::llama_model_loader(
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
-    if (!fname.empty()) {
+    // a file the metadata cache holds is not parsed again: its metadata, tensor index and split list are read from
+    // the cache. A file it does not hold is parsed below and added to it
+    std::unique_lock<std::mutex> cache_lock;
+    llama_model_meta_cache::entry * cached = nullptr;
+    if (!fname.empty() && meta_cache != nullptr) {
+        cache_lock = std::unique_lock<std::mutex>(meta_cache->mtx);
+        const auto it = meta_cache->entries.find(fname);
+        if (it != meta_cache->entries.end()) {
+            cached = it->second.get();
+        }
+    }
+    std::vector<gguf_context_ptr> split_metas; // the additional splits' metadata, kept for the cache
+
+    if (cached != nullptr) {
+        metadata = cached->metas[0].get();
+
+        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        for (size_t idx = 1; idx < cached->splits.size(); idx++) {
+            files.emplace_back(new llama_file(cached->splits[idx].c_str(), "rb", use_direct_io));
+        }
+        if (splits.empty()) {
+            splits = cached->splits;
+        }
+        weights_map = cached->weights_map;
+        n_elements  = cached->n_elements;
+        n_bytes     = cached->n_bytes;
+        cache_lock.unlock();
+    } else if (!fname.empty()) {
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {
@@ -659,6 +690,9 @@ llama_model_loader::llama_model_loader(
                     n_bytes    += ggml_nbytes(cur);
                     weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
                 }
+                if (meta_cache != nullptr) {
+                    split_metas.push_back(std::move(ctx_gguf));
+                }
             }
 
             get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
@@ -672,6 +706,22 @@ llama_model_loader::llama_model_loader(
             }
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
+        }
+
+        if (meta_cache != nullptr) {
+            auto e = std::make_unique<llama_model_meta_cache::entry>();
+            e->metas.push_back(std::move(metadata_ptr)); // metadata keeps pointing at it
+            for (auto & m : split_metas) {
+                e->metas.push_back(std::move(m));
+            }
+            e->ctxs        = std::move(contexts);
+            e->splits      = splits;
+            e->weights_map = weights_map;
+            e->n_elements  = n_elements;
+            e->n_bytes     = n_bytes;
+            meta_cache->entries.emplace(fname, std::move(e));
+            contexts.clear();
+            cache_lock.unlock();
         }
     } else if (file != nullptr) {
         struct ggml_context * ctx = NULL;
@@ -800,8 +850,8 @@ llama_model_loader::llama_model_loader(
                 ? format("%s[%s,%zu]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(metadata, i)), gguf_get_arr_n(metadata, i))
                 : gguf_type_name(type);
 
-            std::string value          = gguf_kv_to_str(metadata, i);
             const size_t MAX_VALUE_LEN = 40;
+            std::string value          = gguf_kv_to_str(metadata, i, MAX_VALUE_LEN);
             if (value.size() > MAX_VALUE_LEN) {
                 value = format("%s...", value.substr(0, MAX_VALUE_LEN - 3).c_str());
             }

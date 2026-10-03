@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <regex>
 #include <vector>
 #include <stdexcept>
@@ -40,6 +42,8 @@ enum llama_fver {
 };
 
 const char * llama_file_version_name(llama_fver version);
+
+struct llama_model_meta_cache;
 
 struct llama_model_loader {
     // Holds information on a model weight
@@ -95,6 +99,7 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
     bool force_duplicate_tied = false;
+    bool vocab_size_only      = false; // the vocabulary loads its size only (metadata-only probes)
 
     llama_files files;
     llama_ftype ftype;
@@ -148,7 +153,8 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        llama_model_meta_cache * meta_cache = nullptr);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
@@ -247,3 +253,24 @@ struct llama_model_loader {
 
     void print_info() const;
 };
+
+// parsed GGUF metadata of model files, reused by repeated metadata-only loads of the same file: the first loader
+// parses a file, later loaders read the cached metadata. Owned by the caller, alive while a loader that uses it runs
+struct llama_model_meta_cache {
+    struct entry {
+        std::vector<gguf_context_ptr> metas;   // [split]
+        std::vector<ggml_context_ptr> ctxs;    // [split] tensor metadata
+        std::vector<std::string>      splits;  // split paths, empty for a single file
+        std::map<std::string, llama_model_loader::llama_tensor_weight, llama_model_loader::weight_name_comparer> weights_map;
+        uint64_t n_elements = 0;
+        size_t   n_bytes    = 0;
+    };
+
+    std::mutex                                    mtx;
+    std::map<std::string, std::unique_ptr<entry>> entries; // by the path of the first split
+};
+
+// a metadata-only model for memory probes: no weights, a vocabulary of the right size without tokens, the parsed
+// GGUF taken from (or added to) meta_cache. The model cannot run or tokenize
+struct llama_model * llama_model_load_for_probe(
+        const char * path_model, struct llama_model_params params, llama_model_meta_cache * meta_cache);

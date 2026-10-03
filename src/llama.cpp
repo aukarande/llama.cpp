@@ -316,10 +316,13 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
-        const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+        const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params,
+        llama_model_meta_cache * meta_cache = nullptr, bool vocab_size_only = false) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides,
+            meta_cache);
+        ml.vocab_size_only = vocab_size_only;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -389,7 +392,9 @@ static struct llama_model * llama_model_load_from_file_impl(
         const std::string & path_model,
         std::vector<std::string> & splits,
         FILE * file,
-        struct llama_model_params params) {
+        struct llama_model_params params,
+        llama_model_meta_cache * meta_cache = nullptr,
+        bool vocab_size_only = false) {
     {
         int n_sources_defined = 0;
         if (metadata != nullptr) {
@@ -430,7 +435,8 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
-    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params);
+    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params,
+        meta_cache, vocab_size_only);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -472,6 +478,17 @@ struct llama_model * llama_model_load_from_file(
         struct llama_model_params params) {
     std::vector<std::string> splits = {};
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
+}
+
+struct llama_model * llama_model_load_for_probe(
+        const char * path_model,
+        struct llama_model_params params,
+        llama_model_meta_cache * meta_cache) {
+    std::vector<std::string> splits = {};
+    params.no_alloc  = true;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params,
+        meta_cache, /*vocab_size_only*/ true);
 }
 
 struct llama_model * llama_model_load_from_splits(

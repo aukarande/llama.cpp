@@ -333,6 +333,8 @@ inline bool llama_pshard_hybrid_ffn_on_gpu(uint32_t k, uint32_t n_gpu, uint32_t 
 // llama_device_memory_data and llama_memory_breakdown_data come from
 // ToT's src/llama-ext.h (included above)
 
+struct llama_model_meta_cache;
+
 // probe hook runs before context teardown
 // used by TPS prediction to inspect scheduler splits
 typedef void (*llama_probe_hook_t)(llama_context * ctx, void * user_data);
@@ -348,7 +350,8 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         uint32_t probe_n_tokens = 0,
         uint32_t probe_n_outputs = 0,
         int32_t  probe_expert_slice_tokens = -1,
-        bool     probe_prefetch_window = false);
+        bool     probe_prefetch_window = false,
+        struct llama_model_meta_cache * meta_cache = nullptr);
 
 // fit params entry point used by pshard planning; upstream's generic fit lives in common/fit
 void llama_params_fit_impl(

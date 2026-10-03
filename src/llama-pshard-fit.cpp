@@ -10,6 +10,7 @@
 #include "llama-context.h"
 #include "llama-cparams.h"
 #include "llama-model.h"
+#include "llama-model-loader.h"
 #include "llama-pshard-plan.h"
 
 #include "ggml.h"
@@ -78,14 +79,17 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         uint32_t & hp_n_embd_r,
         enum ggml_log_level log_level,
         llama_probe_hook_t probe_hook, void * probe_hook_data,
-        uint32_t probe_n_tokens, uint32_t probe_n_outputs, int32_t probe_expert_slice_tokens, bool probe_prefetch_window) {
+        uint32_t probe_n_tokens, uint32_t probe_n_outputs, int32_t probe_expert_slice_tokens, bool probe_prefetch_window,
+        llama_model_meta_cache * meta_cache) {
     probe_log_scope probe_log(log_level);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
-    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    // repeated probes of one model share its parsed metadata and skip the tokenizer
+    llama_model * model = meta_cache ? llama_model_load_for_probe(path_model, mparams_copy, meta_cache)
+                                     : llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
     }

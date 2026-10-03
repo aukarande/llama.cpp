@@ -1923,6 +1923,33 @@ private:
 void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
     struct gguf_context * ctx = ml.metadata;
 
+    // metadata-only probes need the size of the vocabulary alone: placeholder tokens, no specials, no tokenizer
+    if (ml.vocab_size_only) {
+        ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_model, false);
+        ml.get_key(LLM_KV_TOKENIZER_PRE,   tokenizer_pre,   false);
+        ml.get_key(LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT, n_token_types, false);
+
+        type = LLAMA_VOCAB_TYPE_NONE;
+
+        special_bos_id  = LLAMA_TOKEN_NULL;
+        special_eos_id  = LLAMA_TOKEN_NULL;
+        special_unk_id  = LLAMA_TOKEN_NULL;
+        special_sep_id  = LLAMA_TOKEN_NULL;
+        special_pad_id  = LLAMA_TOKEN_NULL;
+        special_mask_id = LLAMA_TOKEN_NULL;
+        linefeed_id     = LLAMA_TOKEN_NULL;
+
+        uint32_t n_tokens = 0;
+        const int token_idx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_LIST).c_str());
+        if (token_idx != -1) {
+            n_tokens = gguf_get_arr_n(ctx, token_idx);
+        } else {
+            ml.get_key(LLM_KV_VOCAB_SIZE, n_tokens, false);
+        }
+        id_to_token.resize(n_tokens);
+        return;
+    }
+
     // determine vocab type
     {
         ml.get_key(LLM_KV_TOKENIZER_MODEL, tokenizer_model);

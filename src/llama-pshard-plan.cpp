@@ -38,10 +38,11 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data_safe(
         uint32_t probe_n_tokens = 0,
         uint32_t probe_n_outputs = 0,
         int32_t  probe_expert_slice_tokens = -1,
-        bool     probe_prefetch_window = false) {
+        bool     probe_prefetch_window = false,
+        llama_model_meta_cache * meta_cache = nullptr) {
     return llama_get_device_memory_data(path_model, mparams, cparams, devs,
         hp_ngl, hp_n_ctx_train, hp_n_expert, hp_n_embd_r, log_level, probe_hook, probe_hook_data,
-        probe_n_tokens, probe_n_outputs, probe_expert_slice_tokens, probe_prefetch_window);
+        probe_n_tokens, probe_n_outputs, probe_expert_slice_tokens, probe_prefetch_window, meta_cache);
 }
 
 
@@ -318,6 +319,9 @@ struct llama_pshard_search_ctx {
 
     // probe memo of the strategy sweep this search belongs to (nullptr: every candidate is probed)
     llama_pshard_probe_memo                  * memo = nullptr;
+
+    // parsed model metadata shared by the probes of this planning run
+    llama_model_meta_cache                   * meta_cache = nullptr;
 
     // routed-expert bytes read from the gguf tensor table (0 = unknown: pool tiers are
     // refused, the ids-cross decision is not priced): the largest layer's full expert
@@ -623,7 +627,7 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
         ctx.path_model, &mparams_probe_clean, &cparams_probe, devs,
         hp_ngl, hp_n_ctx_train, hp_n_expert, hp_n_embd_r,
         log_level, probe_hook, probe_hook_data,
-        probe_n_tokens, probe_n_outputs, expert_slice_tokens, overlap == 2);
+        probe_n_tokens, probe_n_outputs, expert_slice_tokens, overlap == 2, ctx.meta_cache);
 }
 
 // the final measurement of a candidate placement: device memory, price, slice crossover and piece curve. The probe
@@ -3291,10 +3295,14 @@ void llama_params_fit_pshard_plan(
     std::vector<llama_device> devs;
     uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0, hp_nr = 0;
 
+    // every probe of this planning run reads the model metadata parsed by the first
+    llama_model_meta_cache meta_cache;
+
     llama_model_params mparams_probe = *mparams;
     mparams_probe.pshard = false;
     const auto dmds = llama_get_device_memory_data(
-        path_model, &mparams_probe, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_nr, GGML_LOG_LEVEL_ERROR);
+        path_model, &mparams_probe, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_nr, GGML_LOG_LEVEL_ERROR,
+        nullptr, nullptr, 0, 0, -1, false, &meta_cache);
 
     if (devs.empty()) {
         LLAMA_LOG_ERROR("%s: no GPU devices found\n", __func__);
@@ -3412,6 +3420,7 @@ void llama_params_fit_pshard_plan(
         /*is_moe=*/(hp_nex > 0), /*has_rs=*/(hp_nr > 0),
         predictor.get(), n_ctx_plan, 0,
     };
+    ctx.meta_cache = &meta_cache;
 
     // step 4: registry lookup -- try to load <model>.tensor_overrides.pshard_registry; merge cached plans by tier
     const std::string cache_path = std::string(path_model) + ".tensor_overrides.pshard_registry";
