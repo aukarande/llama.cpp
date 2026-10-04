@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <atomic>
+#include <exception>
 #include <mutex>
 #include <thread>
 
@@ -2343,7 +2344,9 @@ static void pshard_enforce_union_budget(
     for (size_t t = 0; t < registry->best_plans.size(); t++) { orig_viable[t] = registry->best_plans[t].is_viable; }
 
     auto replan_tier = [&](size_t t, size_t vram_free) {
+        std::vector<llama_model_tensor_buft_override> overrides(4096, { nullptr, nullptr, -1 });
         llama_pshard_search_ctx ctx_t = ctx;
+        ctx_t.overrides = overrides.data();
         ctx_t.vram_free = vram_free;
         // probes must not take the canonical-preload path (best_plans is non-empty now)
         llama_model_params mp_replan = *mparams;
@@ -2373,6 +2376,33 @@ static void pshard_enforce_union_budget(
         }
         registry->best_plans[t] = p;
         registry->best_plans[t].is_viable = p.is_viable;
+    };
+
+    // the re-plans of one round are independent: each runs on its own thread, the MTP thread-locals follow it
+    auto replan_tiers = [&](const std::vector<std::pair<size_t, size_t>> & jobs) {   // (tier, budget)
+        const uint32_t n_layers_mtp = g_pshard_n_layers_mtp;
+        const bool     mtp_head_cpu = g_pshard_mtp_head_cpu;
+        std::vector<std::exception_ptr> errors(jobs.size());
+        std::vector<std::thread> threads;
+        for (size_t i = 0; i < jobs.size(); i++) {
+            threads.emplace_back([&, i]() {
+                g_pshard_n_layers_mtp = n_layers_mtp;
+                g_pshard_mtp_head_cpu = mtp_head_cpu;
+                try {
+                    replan_tier(jobs[i].first, jobs[i].second);
+                } catch (...) {
+                    errors[i] = std::current_exception();
+                }
+            });
+        }
+        for (auto & th : threads) {
+            th.join();
+        }
+        for (const auto & e : errors) {
+            if (e) {
+                std::rethrow_exception(e);
+            }
+        }
     };
 
     for (int pass = 0; pass < 2; pass++) {
@@ -2455,6 +2485,7 @@ static void pshard_enforce_union_budget(
             }
 
             // 4. demote every violator: re-plan it at its (escalating) reduced budget
+            std::vector<std::pair<size_t, size_t>> jobs;
             for (const auto & [t, over] : violators) {
                 auto & plan = registry->best_plans[t];
                 // `over` carries the margin, and a placement rarely moves for a few MiB: start the
@@ -2464,8 +2495,9 @@ static void pshard_enforce_union_budget(
                 LLAMA_LOG_WARN("%s: canonical union overshoots by %.2f MiB; re-planning tier bs=%u at %.0f MiB\n",
                     __func__, over / (1024.0*1024.0), plan.batch_size, new_bud / (1024.0*1024.0));
                 if (new_bud == 0) { plan.is_viable = false; continue; }
-                replan_tier(t, new_bud);
+                jobs.emplace_back(t, new_bud);
             }
+            replan_tiers(jobs);
         }
 
         // trunk shaving did not converge: MTP head lever (once), then shave again
@@ -2479,9 +2511,11 @@ static void pshard_enforce_union_budget(
                 __func__, max_rounds);
             g_pshard_mtp_head_cpu  = true;
             registry->mtp_head_cpu = true;
+            std::vector<std::pair<size_t, size_t>> jobs;
             for (size_t t = 0; t < registry->best_plans.size(); t++) {
-                if (orig_viable[t]) { replan_tier(t, ctx.vram_free); }
+                if (orig_viable[t]) { jobs.emplace_back(t, ctx.vram_free); }
             }
+            replan_tiers(jobs);
             continue;
         }
         break;
