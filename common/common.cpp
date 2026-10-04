@@ -1392,6 +1392,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         if (!mparams.pshard) {
             // this process continues on the STOCK path
             LOG_WRN("%s: pshard not active for this configuration\n", __func__);
+            LOG_WRN("%s: >>> pshard DISABLED: this run uses the STOCK path - benchmark numbers will not be pshard numbers <<<\n", __func__);
             llama_pshard_registry_free(mparams.pshard_registry);
             mparams.pshard_registry = nullptr;
             if (params.fit_params) {

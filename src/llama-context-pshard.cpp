@@ -847,7 +847,7 @@ size_t llama_context::pshard_plan_pinned_cache_size(const llama_pshard_plan & pl
     return total;
 }
 
-void llama_context::pshard_log_reserve_breakdown(const char * tag) const {
+void llama_context::pshard_log_reserve_breakdown(const char * tag, enum ggml_log_level level) const {
     const int n_splits = ggml_backend_sched_get_n_splits(sched.get());
     // per scheduler backend: 0 compute GPU, 1/2 shard lanes (streamed weights), 3 CPU
     struct acc { int n = 0; size_t w_in = 0, w_pref = 0, w_sliced = 0, act = 0, wb_kv = 0, wb_rs = 0; };
@@ -883,7 +883,7 @@ void llama_context::pshard_log_reserve_breakdown(const char * tag) const {
         }
         chunks += "]";
     }
-    LLAMA_LOG_INFO("%s: %s:%s | galloc chunk max sizes (MiB):%s\n", __func__, tag, per_bid.c_str(), chunks.c_str());
+    llama_log_internal(level, "%s: %s:%s | galloc chunk max sizes (MiB):%s\n", __func__, tag, per_bid.c_str(), chunks.c_str());
 }
 
 void llama_context::pshard_warmup_plan_reserves() {
@@ -968,6 +968,15 @@ void llama_context::pshard_warmup_plan_reserves() {
     const int64_t t1 = llama_time_us();
     LLAMA_LOG_INFO("%s: pre-computed %zu tiers in %.1f ms\n",
         __func__, registry->tier_sizes.size(), (t1 - t0) / 1000.0);
+
+    // a load no tier plan covers cannot decode: refuse it here rather than at its first ubatch
+    bool any_viable = false;
+    for (const auto & plan : registry->best_plans) {
+        any_viable = any_viable || plan.is_viable;
+    }
+    if (!any_viable) {
+        throw std::runtime_error("the pshard plan does not cover this load: no tier reserved");
+    }
 }
 
 void llama_context::pshard_apply_initial_plan() {

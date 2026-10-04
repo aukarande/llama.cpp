@@ -588,7 +588,7 @@ static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
     char tag[128];
     snprintf(tag, sizeof(tag), "probe bs=%d (n_tokens_graph=%d n_outputs=%u slice_tokens=%d)", d->batch_size, n_tokens_graph,
         d->n_outputs, plan.expert_slice_tokens);
-    ctx->pshard_log_reserve_breakdown(tag);
+    ctx->pshard_log_reserve_breakdown(tag, GGML_LOG_LEVEL_DEBUG);
 }
 
 static std::vector<llama_device_memory_data> llama_pshard_probe_memory(

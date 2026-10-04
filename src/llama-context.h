@@ -73,7 +73,7 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
     // what the last reserve asked of the compute GPU: streamed weights, activations, write-back staging, galloc chunks
-    void pshard_log_reserve_breakdown(const char * tag) const;
+    void pshard_log_reserve_breakdown(const char * tag, enum ggml_log_level level = GGML_LOG_LEVEL_INFO) const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
