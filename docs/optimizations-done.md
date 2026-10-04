@@ -159,6 +159,7 @@ All q35 numbers are Qwen3.6-35B-A3B (UD-Q4_K_M) at ctx 2048 unless a context is 
 - 29c763ad3 stock fit measures dflash-class drafts against a context of the main model (DSpark stock cells had run at -fitb 3000 with the 10.7 GB draft on top); DSv4+DSpark stock @14500 now at the real budget, @8000 NOFIT recorded
 - d409e1340 synchronous set_tensor copies a host source one page-lock registration at a time; forced GPUONLY_ATTNPIN_FFNSTREAM + MTP @4000 CUDA invalid argument -> runs, 24.5 t/s
 - ef0dc6dbf the scheduler split context and backend id arrays are sized to the graph being split, not the graph capacity (an 8192-token probe committed 19.8 GB for a 3,727-node graph; ~7 parallel planner probes passed the 145 GB Windows commit limit -> NULL calloc -> crash in split_graph); peak commit during planning 98.8 -> 51.7 GB, parallel-planning stress 30/30 clean (crashed at run 14 before), plans byte-identical, planning time unchanged, 16/16 greedy texts identical (q35, q35+MTP, 27B, gpt-oss, Nemotron, Qwen3-30B, DeepSeek-V4)
+- e4c78c4ba the union enforcer's re-plans keep the forced strategy: a forced HYBRID tier holding the STATIC fallback was re-planned with STATIC only, so HYBRID was never retried, also after the MTP head moved to the CPU; 8 forced/auto configs 0/54 tiers changed, the fallback tier's re-plan now searches HYBRID (q35+MTP 16k @2500 bs=512: 2212 MiB, still does not fit); the head-on-CPU pass that would let it win was not reached at 1800-5000 MiB
 
 ## 4. Measurement, planning inputs and tooling
 
