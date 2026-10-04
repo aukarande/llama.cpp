@@ -2357,11 +2357,13 @@ static void pshard_enforce_union_budget(
         llama_pshard_tier_prune prune;
         prune.init();
         // a repair step: keep the tier's strategy and re-place it within the reduced budget; when
-        // that strategy has no placement there, the full ladder gets its turn before the tier is lost
+        // that strategy has no placement there, the full ladder gets its turn before the tier is lost.
+        // A forced strategy stays in: the tier may hold the fallback of a forced search that did not fit,
+        // and the re-plan (a head moved to the CPU) can make room for it
         const bool keep_strategy = registry->best_plans[t].is_viable;
         if (keep_strategy) {
             for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
-                prune.skip[s] = s != (int) registry->best_plans[t].strategy;
+                prune.skip[s] = s != (int) registry->best_plans[t].strategy && s != force_strategy;
             }
         }
         llama_pshard_plan p = llama_pshard_search_tier(ctx_t, force_strategy, dmds, prune);
