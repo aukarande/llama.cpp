@@ -3791,40 +3791,30 @@ void llama_params_fit_pshard_plan(
             }
 
             if (min_global_tier < n_tiers) {
-                size_t global_fit_tier = n_tiers;
+                // a model that fits falls back to the stock path, which runs at the caller's batch sizes: probe
+                // exactly that load, without the tier ladder's ubatch (a top-tier compute buffer the stock path
+                // never reserves would refuse a model that fits)
+                llama_pshard_plan baseline_plan;
+                {
+                    const llama_context_params * saved_cparams = ctx.cparams;
+                    const uint32_t               saved_cache_ubatch = ctx.cache_ubatch;
+                    llama_context_params cp_stock = *cparams;
+                    ctx.cparams      = &cp_stock;
+                    ctx.cache_ubatch = 0;
 
-                for (size_t t = n_tiers; t-- > min_global_tier; ) {
-                    llama_pshard_plan baseline_plan;
-                    if (pshard_plan_is_baseline_fit(registry->best_plans[t], n_layers, layout.compute)) {
-                        LLAMA_LOG_INFO("%s: === tier %zu (bs=%u) [cached global-fit check] ===\n",
-                            __func__, t, registry->tier_sizes[t]);
-                        baseline_plan = registry->best_plans[t];
-                    } else {
-                        const llama_context_params * saved = ctx.cparams;
-                        llama_context_params cp_tier = *cparams;
-                        cp_tier.n_batch  = registry->tier_sizes[t];
-                        cp_tier.n_ubatch = cp_tier.n_batch;
-                        ctx.cparams = &cp_tier;
+                    LLAMA_LOG_INFO("%s: === global-fit check at the stock batch sizes (n_batch=%u n_ubatch=%u) ===\n",
+                        __func__, cp_stock.n_batch, cp_stock.n_ubatch);
+                    baseline_plan = llama_pshard_search_baseline_fit_tier(ctx, dmds);
 
-                        LLAMA_LOG_INFO("%s: === tier %zu (bs=%u) [global-fit check] ===\n",
-                            __func__, t, registry->tier_sizes[t]);
-                        baseline_plan = llama_pshard_search_baseline_fit_tier(ctx, dmds);
-
-                        ctx.cparams = saved;
-                    }
-
-                    if (pshard_plan_is_baseline_fit(baseline_plan, n_layers, layout.compute)) {
-                        registry->best_plans[t] = baseline_plan;
-                        global_fit_tier = t;
-                        break;
-                    }
+                    ctx.cparams      = saved_cparams;
+                    ctx.cache_ubatch = saved_cache_ubatch;
                 }
 
-                if (global_fit_tier < n_tiers) {
-                    const llama_pshard_plan & global = registry->best_plans[global_fit_tier];
+                if (pshard_plan_is_baseline_fit(baseline_plan, n_layers, layout.compute)) {
+                    const size_t   global_fit_tier = n_tiers - 1;
                     const uint32_t global_ubatch = registry->tier_sizes[global_fit_tier];
                     const uint32_t global_cache_ubatch = std::min(global_ubatch, GLOBAL_FIT_MIN_BATCH);
-                    const size_t global_vram_req = global.total_vram_req;
+                    const size_t global_vram_req = baseline_plan.total_vram_req;
 
                     registry->pshard_disabled = true;
                     registry->baseline_vram_req = global_vram_req;
@@ -3850,8 +3840,7 @@ void llama_params_fit_pshard_plan(
                 }
             }
 
-            LLAMA_LOG_INFO("%s: no full-fit global plan found down to bs=%u\n",
-                __func__, min_global_tier < n_tiers ? registry->tier_sizes[min_global_tier] : GLOBAL_FIT_MIN_BATCH);
+            LLAMA_LOG_INFO("%s: the model does not fit the budget whole at the stock batch sizes: planning tiers\n", __func__);
         } else {
             LLAMA_LOG_INFO("%s: skipping baseline global-fit check for forced strategy %s\n",
                 __func__, llama_pshard_strategy_name((llama_pshard_strategy) force_strategy));
