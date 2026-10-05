@@ -110,6 +110,9 @@ int llama_completion(int argc, char ** argv) {
         return 0;
     }
 
+    // every decode here reads the last token's logits only: reserve one output per sequence, not n_batch
+    params.n_outputs_max = std::max(1, params.n_parallel);
+
     if (params.n_ctx != 0 && params.n_ctx < 8) {
         LOG_WRN("%s: warning: minimum context size is 8, using minimum size.\n", __func__);
         params.n_ctx = 8;

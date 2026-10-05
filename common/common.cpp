@@ -1618,16 +1618,17 @@ bool common_pshard_plan(common_params & params, uint32_t n_ctx, uint32_t bench_t
 
     // spec verify tier: mirror the runtime's output-limits derivation. n_outputs_max is what the
     // runtime reserve and the planner's probes clamp a tier's outputs to: speculative tools set it
-    // to the output limits' total; completion/perplexity leave it 0 (= n_batch, every token may be
-    // an output), so a plain plan must too, or the probes would price the logits scratch at 1 output
-    // while the runtime reserves bs (types defaults to { NONE }, so "configured" means a draft model
-    // or a non-zero draft length)
+    // to the output limits' total; tools that cap their outputs (completion, the server) keep their
+    // cap; perplexity and embeddings leave it 0 (= n_batch, every token may be an output). The plan
+    // must use the runtime's value, or the probes would price a logits scratch the runtime does not
+    // reserve (types defaults to { NONE }, so "configured" means a draft model or a non-zero draft length)
     const bool spec_cfg = params.speculative.has_dft() || common_speculative_n_max(&params.speculative) > 0;
     const auto output_limits = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
-    params.n_outputs_max = spec_cfg ? output_limits.total : 0;
+    const int32_t n_outputs_max = spec_cfg ? output_limits.total : std::max(params.n_outputs_max, 0);
+    params.n_outputs_max = n_outputs_max;
     params.n_outputs_max_per_seq = output_limits.per_seq;
-    cparams.n_outputs_max = spec_cfg ? output_limits.total : 0;
+    cparams.n_outputs_max = n_outputs_max;
     cparams.n_outputs_max_per_seq = output_limits.per_seq;
     const uint32_t n_draft_tier = output_limits.per_seq > 1 ? (uint32_t) output_limits.per_seq - 1 : 0;
 

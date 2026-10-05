@@ -230,6 +230,8 @@ uint64_t pshard_registry_fingerprint(
     mix((uint64_t)(mparams->load_mtp ? 1 : 0));
     // verify-tier shape: spec runs advertise n_draft+1 outputs per sequence
     mix((uint64_t)cparams->n_outputs_max_per_seq);
+    // the logits scratch every tier reserves: min(bs, n_outputs_max) rows (0 = n_batch)
+    mix((uint64_t)cparams->n_outputs_max);
 
     mix(cparams->n_ctx);
     mix(cparams->n_seq_max);

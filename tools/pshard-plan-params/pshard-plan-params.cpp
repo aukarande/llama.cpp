@@ -237,6 +237,11 @@ int main(int argc, char ** argv) {
             ok = plan_pshard_context(params, ctx_cap.first, ctx_cap.second, true) && ok;
         }
     } else {
+        // plan for the tools that run plans (completion, the server): one output per sequence per ubatch,
+        // their runtime cap - the fingerprint carries it
+        if (!params.embedding && params.n_outputs_max == 0) {
+            params.n_outputs_max = std::max(1, params.n_parallel);
+        }
         auto cparams = common_context_params_to_llama(params);
         ok = plan_pshard_context(params, cparams.n_ctx);
     }
