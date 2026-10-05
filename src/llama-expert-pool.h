@@ -28,6 +28,12 @@
 
 struct llama_model;
 
+// whether the pool's slot views can hold an expert tensor: the upload paths reserve and zero MMQ row padding for a
+// quantized tensor whose ne0 is not a multiple of 512, the slots do not. The planner refuses pool tiers by the same rule
+inline bool llama_expert_pool_tensor_supported(enum ggml_type type, int64_t ne0) {
+    return !ggml_is_quantized(type) || ne0 % 512 == 0;
+}
+
 struct llama_expert_pool {
     // one routed-expert weight tensor of one layer (fused gate_up, or up/gate, and down)
     struct tensor_entry {

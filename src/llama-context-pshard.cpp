@@ -678,13 +678,13 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
         ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, SIZE_MAX/2);
     }
 
-    // a pool tier whose region did not fit beside its pinned set (pshard_update_pool_mode
-    // disengaged the pool) cannot run: its experts are host-resident and the redirect
-    // splits read the pool views. Streaming them instead needs whole expert tensors in the
-    // scratch - not this tier's budget. Unviable, like the scratch overflow below.
-    if (external_buf && expert_pool && !expert_pool->active && plan.strategy == LLAMA_PSHARD_EXPERT_POOL) {
-        LLAMA_LOG_WARN("%s: tier bs=%u (expert pool): the pool region does not fit beside this tier's pinned set; tier unviable\n",
-            __func__, plan.batch_size);
+    // a pool tier without an engaged pool (none was created for this model, or its region did
+    // not fit beside the tier's pinned set) cannot run: its experts are host-resident and the
+    // redirect splits read the pool views. Streaming them instead needs whole expert tensors in
+    // the scratch - not this tier's budget. Unviable, like the scratch overflow below.
+    if (external_buf && plan.strategy == LLAMA_PSHARD_EXPERT_POOL && (!expert_pool || !expert_pool->active)) {
+        LLAMA_LOG_WARN("%s: tier bs=%u (expert pool): %s; tier unviable\n", __func__, plan.batch_size,
+            expert_pool ? "the pool region does not fit beside this tier's pinned set" : "no expert pool was created");
         ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, scratch_avail);  // never leave the window open
         plan.alloc_state.valid = false;
         return;

@@ -1,4 +1,5 @@
 #include "llama-pshard-plan.h"
+#include "llama-expert-pool.h"
 #include "llama-pshard-workload.h"
 
 #include <cmath>
@@ -335,6 +336,8 @@ struct llama_pshard_search_ctx {
     uint32_t                                   n_layers_moe     = 0;
     uint32_t                                   exps_tensors_per_layer = 0; // expert tensors in a layer (3 = up/gate/down,
                                                                            // 2 = gate_up/down): the pool's segment size
+    std::string                                exps_pool_refusal;      // a routed-expert tensor the pool's slots cannot hold
+                                                                       // (llama_expert_pool_tensor_supported), empty = none
     // whole-layer, attention and head bytes from the gguf table (the switch-cost estimator's inputs; 0 = no scan)
     size_t                                     layer_bytes_all  = 0;   // every blk.N tensor, summed over the scanned layers
     size_t                                     attn_bytes_all   = 0;   // the attention-priority resident set (layer minus FFN) of the same
@@ -385,7 +388,7 @@ std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * 
 static void pshard_scan_tensor_bytes(const struct gguf_context * g, uint32_t n_expert,
         std::vector<size_t> & per_layer, size_t & per_expert, size_t & total_weights, uint32_t & tensors_per_layer,
         std::vector<size_t> & per_layer_all, std::vector<size_t> & per_layer_attn, size_t & head_bytes, size_t & tok_embd_bytes,
-        bool & has_output_weight) {
+        bool & has_output_weight, std::string & pool_refusal) {
     const int64_t n = gguf_get_n_tensors(g);
     std::vector<size_t>   row_this(per_layer.size(), 0);
     std::vector<uint32_t> cnt_this(per_layer.size(), 0);
@@ -429,6 +432,9 @@ static void pshard_scan_tensor_bytes(const struct gguf_context * g, uint32_t n_e
         const size_t bytes = gguf_get_tensor_size(g, i);
         per_layer[il] += bytes;
         cnt_this[il]++;
+        if (pool_refusal.empty() && !llama_expert_pool_tensor_supported(gguf_get_tensor_type(g, i), gguf_get_tensor_ne(g, i)[0])) {
+            pool_refusal = name;
+        }
         {
             // element count from the block type (exact for block quants)
             const enum ggml_type t = gguf_get_tensor_type(g, i);
@@ -2778,6 +2784,11 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             __func__, cparams->n_batch);
         return plan;   // not viable
     }
+    if (!ctx.exps_pool_refusal.empty()) {
+        LLAMA_LOG_WARN("%s: [EXPERT_POOL] bs=%u %s: quantized rows not a multiple of 512, which the pool's slots do not "
+            "hold - tier refused\n", __func__, cparams->n_batch, ctx.exps_pool_refusal.c_str());
+        return plan;   // not viable
+    }
     const double   b_layer_exps = (double) ctx.exps_layer_bytes;
     const uint32_t n_layers_exp = ctx.n_layers_moe;
     const double   b_slot       = (double) ctx.exps_total_bytes / ctx.n_expert;   // one slot in every layer
@@ -3465,6 +3476,7 @@ void llama_params_fit_pshard_plan(
     size_t exps_per_expert = 0;
     size_t exps_weights    = 0;
     uint32_t exps_tensors  = 0;
+    std::string exps_pool_refusal;
     std::vector<size_t> all_per_layer(n_layers, 0), attn_per_layer(n_layers, 0);
     size_t head_bytes = 0, tok_embd_bytes = 0;
     bool   has_output_weight = false;
@@ -3479,7 +3491,7 @@ void llama_params_fit_pshard_plan(
                 n_split = (int) gguf_get_val_u16(g, ks);
             }
             pshard_scan_tensor_bytes(g, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors,
-                all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight);
+                all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pool_refusal);
             gguf_free(g);
             if (n_split > 1) {
                 char prefix[1024];
@@ -3498,7 +3510,7 @@ void llama_params_fit_pshard_plan(
                             fclose(sf);
                             if (struct gguf_context * gs = gguf_init_from_file(split_path, gip_s)) {
                                 pshard_scan_tensor_bytes(gs, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors,
-                                    all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight);
+                                    all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pool_refusal);
                                 gguf_free(gs);
                             }
                         } else {
@@ -3578,6 +3590,7 @@ void llama_params_fit_pshard_plan(
     ctx.exps_row_bytes    = exps_per_expert;
     ctx.exps_total_weights = exps_weights;
     ctx.exps_tensors_per_layer = exps_tensors;
+    ctx.exps_pool_refusal      = exps_pool_refusal;
     for (uint32_t il = 0; il < n_layers; il++) {
         if (all_per_layer[il] > 0) {
             ctx.n_layers_scanned++;

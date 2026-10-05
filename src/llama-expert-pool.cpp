@@ -91,13 +91,11 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
         }
     }
 
-    // quantized-padding contract: the sliced/prefetch upload paths reserve and
-    // zero MMQ row padding for tensors whose ne0 is not a multiple of 512; the
-    // pool's slot views do not (yet) - refuse such models instead of computing
+    // quantized-padding contract (llama_expert_pool_tensor_supported): refuse such models instead of computing
     // with garbage tail scales
     for (const auto & L : layers) {
         for (const auto & e : L.tensors) {
-            if (ggml_is_quantized(e.host->type) && e.host->ne[0] % 512 != 0) {
+            if (!llama_expert_pool_tensor_supported(e.host->type, e.host->ne[0])) {
                 LLAMA_LOG_WARN("%s: expert pool: %s has ne0=%lld %% 512 != 0 (MMQ padding "
                     "contract unhandled) - pool disabled for this model\n",
                     __func__, e.host->name, (long long) e.host->ne[0]);
