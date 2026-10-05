@@ -1924,9 +1924,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             }
         }
+        // the decode after load (the warmup) stays on the plan landed at load when its tier holds it
+        size_t hold = SIZE_MAX;
+        if (pshard_hold_initial) {
+            for (size_t t = 0; t < pshard_registry->best_plans.size(); t++) {
+                if (&pshard_registry->best_plans[t] == pshard_active_plan && n_tokens_all <= pshard_registry->tier_sizes[t]) {
+                    hold = t;
+                }
+            }
+        }
         // switches are pairwise: the price depends on the plan that is active RIGHT NOW
         // (not necessarily the decode plan, e.g. bs=16 decode or back-to-back prompts)
-        const auto cut = pshard_registry->find_cut(n_tokens_all, max_ubatch, min_ubatch, pshard_active_plan, &switch_state);
+        const auto cut = hold != SIZE_MAX ? llama_pshard_plan_registry::cut { hold, hold, 0.0 } :
+            pshard_registry->find_cut(n_tokens_all, max_ubatch, min_ubatch, pshard_active_plan, &switch_state);
         if (cut.tier < pshard_registry->tier_sizes.size()) {
             pshard_cut_tier = cut.tier;
             pshard_cut_tail = cut.tail;
@@ -1952,6 +1962,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // n_ubatch_eff ubatches, so keying the tier off n_tokens_all would apply the
         // top tier's plan (e.g. an unviable-streaming fallback) to smaller ubatches
         // that were chosen precisely because their tier predicts far better tps
+        pshard_hold_initial = false;
         const uint32_t landed = pshard_maybe_switch(std::min(n_tokens_all, n_ubatch_eff), pshard_cut_tier);
         if (pshard_cut_tier < SIZE_MAX && landed != pshard_registry->tier_sizes[pshard_cut_tier]) {
             pshard_cut_tail = SIZE_MAX;   // the cut's tier did not land: no tail switch

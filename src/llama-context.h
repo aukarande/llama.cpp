@@ -417,6 +417,9 @@ private:
     // set after creation, e.g. by a draft context enabling layer-input extraction on this
     // target) must redo both - the cached per-plan alloc states belong to the old galloc
     bool pshard_runtime_ready = false;
+    // the next decode stays on the plan landed at load when that plan's tier holds it (the warmup), so a pool
+    // ladder's first prompt finds its prefill tier's pins already uploaded (pshard_apply_initial_plan)
+    bool pshard_hold_initial = false;
     pshard_dev_layout   pshard_layout = {};
 
     ggml_backend_t backend_cpu = nullptr;

@@ -984,6 +984,18 @@ void llama_context::pshard_apply_initial_plan() {
     if (!registry) return;
 
     size_t initial_tier = registry->tier_index(16);
+    // an expert pool cache tier pins nothing: landing it would leave the first prompt to upload its prefill
+    // tier's pins inside prompt eval. Land the smallest prefill tier instead (its pins upload here, like a
+    // legacy ladder's) and keep it through the warmup
+    if (initial_tier < registry->best_plans.size() && registry->best_plans[initial_tier].is_viable &&
+            registry->best_plans[initial_tier].strategy == LLAMA_PSHARD_EXPERT_POOL) {
+        const size_t prefill = registry->viable_tier_for(512);
+        if (prefill < registry->tier_sizes.size() && prefill > initial_tier &&
+                registry->best_plans[prefill].strategy != LLAMA_PSHARD_EXPERT_POOL) {
+            initial_tier = prefill;
+            pshard_hold_initial = true;
+        }
+    }
     llama_pshard_plan * initial = registry->get_best(initial_tier);
 
     if (!initial) {
