@@ -3039,10 +3039,17 @@ void llama_model::pshard_set_backend_maps(const llama_pshard_plan & plan) {
         }
         pimpl->layer_backend_ids = plan.cached_layer_bids;
     } else {
+        // each pattern compiled once, not per tensor
+        std::vector<std::regex> res;
+        res.reserve(plan.overrides.size());
+        for (const auto & ov : plan.overrides) {
+            res.emplace_back(ov.backend_id >= 0 ? ov.pattern : std::string());
+        }
         pimpl->tensor_backend_ids.clear();
         for (const auto & [name, tensor] : tensors_by_name) {
-            for (const auto & ov : plan.overrides) {
-                if (ov.backend_id >= 0 && std::regex_search(name, std::regex(ov.pattern))) {
+            for (size_t i = 0; i < plan.overrides.size(); i++) {
+                const auto & ov = plan.overrides[i];
+                if (ov.backend_id >= 0 && std::regex_search(name, res[i])) {
                     pimpl->tensor_backend_ids[tensor] = ov.backend_id;
                     plan.cached_tensor_bids[name] = ov.backend_id;
                     break;
@@ -3051,10 +3058,11 @@ void llama_model::pshard_set_backend_maps(const llama_pshard_plan & plan) {
         }
 
         pimpl->layer_backend_ids.clear();
+        static const std::regex re_layer(R"(blk\\\.(\d+)\\\.)");
         for (const auto & ov : plan.overrides) {
             if (ov.backend_id >= 0) {
                 std::smatch m;
-                if (std::regex_search(ov.pattern, m, std::regex(R"(blk\\\.(\d+)\\\.)"))) {
+                if (std::regex_search(ov.pattern, m, re_layer)) {
                     int layer = std::stoi(m[1].str());
                     pimpl->layer_backend_ids[layer] = ov.backend_id;
                 }

@@ -1075,6 +1075,10 @@ void llama_context::pshard_switch_plan(
             n_up++;
         }
     }
+    if (n_up > 0) {
+        // the state rows land inside the switch's timing, not in the next batch's compute (which waits on them anyway)
+        ggml_backend_synchronize(gpu);
+    }
 
     auto * registry = model.get_plan_registry();
     auto tier_bs = [&](size_t tier) -> uint32_t {
