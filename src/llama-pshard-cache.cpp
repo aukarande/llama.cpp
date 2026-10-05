@@ -2,6 +2,7 @@
 #include "llama-pshard-plan.h"
 #include "llama-benchmark.h"
 #include "llama-impl.h"
+#include "llama-model-loader.h"
 
 #include "ggml-backend.h"
 
@@ -314,7 +315,8 @@ static bool llama_pshard_probe_model_only(
     mparams_probe.pshard    = false;
     mparams_probe.load_mode = LLAMA_LOAD_MODE_NONE;
 
-    llama_model * model = llama_model_load_from_file(path_model, mparams_probe);
+    // hparams and devices only: a vocabulary of the right size, no tokens
+    llama_model * model = llama_model_load_for_probe(path_model, mparams_probe, nullptr);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     if (!model) {
