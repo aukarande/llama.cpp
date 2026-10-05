@@ -845,6 +845,12 @@ private:
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
+    // the ubatch that spaces the prompt-end context checkpoints: the requested one (-ub). A pshard context runs
+    // with its largest tier as n_ubatch, which would put the checkpoint one ubatch before the prompt end so far
+    // back that SWA models re-process up to a tier of prompt every turn
+    int32_t n_ubatch_req  = 0;
+    int32_t n_ubatch_ckpt = 0;
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -962,6 +968,11 @@ private:
 
         const bool is_resume = sleeping;
 
+        // the requested ubatch, before a pshard init raises it (a resume passes params_base back in)
+        if (n_ubatch_req == 0) {
+            n_ubatch_req = params.n_ubatch;
+        }
+
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
@@ -1066,6 +1077,8 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        n_ubatch_ckpt = std::min<int32_t>((int32_t) llama_n_ubatch(ctx_tgt), n_ubatch_req > 0 ? n_ubatch_req : INT32_MAX);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -3442,11 +3455,11 @@ private:
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
+                        //  - 4 + n_ubatch (the requested ubatch, see n_ubatch_ckpt)
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets[] = {4 + n_ubatch_ckpt, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
@@ -3467,7 +3480,7 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch_ckpt;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
