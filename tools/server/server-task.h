@@ -568,9 +568,13 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // position of the prompt-end checkpoint n_ubatch + 4 tokens back, had the last prompt created it (-1 = none)
+    llama_pos ckpt_far_pos = -1;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        ckpt_far_pos = -1;
     }
 
     int n_tokens() const {
@@ -581,6 +585,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            ckpt_far_pos,
         };
     }
 };

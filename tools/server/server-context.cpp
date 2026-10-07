@@ -851,6 +851,15 @@ private:
     int32_t n_ubatch_req  = 0;
     int32_t n_ubatch_ckpt = 0;
 
+    // the prompt-end checkpoint n_ubatch + 4 tokens back splits the prompt into one more decode call; under pshard
+    // every call streams the non-resident weights again, so it is created only once a restore needed it (kept
+    // across sleep)
+    bool ckpt_far_needed = false;
+
+    bool ckpt_far_on() const {
+        return ckpt_far_needed || !llama_model_pshard_active(model_tgt);
+    }
+
     common_speculative_ptr spec;
 
     bool add_bos_token = true;
@@ -3261,6 +3270,20 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    // the far prompt-end checkpoint of the last prompt would have been usable here
+                                    // and saved more than a ubatch of re-processing: create it from now on
+                                    if (!ckpt_far_on() && slot.prompt.ckpt_far_pos > 0) {
+                                        const llama_pos far_max = slot.prompt.ckpt_far_pos - 1;
+                                        const llama_pos far_min = std::max(0, far_max - n_swa);
+                                        const llama_pos cur_max = do_reset ? -1 : it->pos_max;
+                                        const bool far_usable = far_max <= pos_next && (far_min < pos_min_thold || far_min == 0);
+                                        if (far_usable && far_max - cur_max > n_ubatch_ckpt) {
+                                            ckpt_far_needed = true;
+                                            SLT_INF(slot, "creating the prompt-end checkpoint %d tokens back from now on (pos %d would have replaced pos %d)\n",
+                                                    4 + n_ubatch_ckpt, far_max, cur_max);
+                                        }
+                                    }
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3455,7 +3478,7 @@ private:
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch (the requested ubatch, see n_ubatch_ckpt)
+                        //  - 4 + n_ubatch (the requested ubatch, see n_ubatch_ckpt), under pshard once a restore needed it (see ckpt_far_on)
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
@@ -3463,6 +3486,9 @@ private:
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (offset != 4 && !ckpt_far_on()) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -3488,6 +3514,13 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+
+                        // where the far checkpoint would sit, if this prompt processed past that point
+                        {
+                            const int32_t n_far = slot.task->n_tokens() - std::min(n_batch, 4 + n_ubatch_ckpt);
+                            slot.prompt.ckpt_far_pos = do_checkpoint && (int32_t) slot.stats.n_prompt_cached < n_far
+                                ? slot.prompt.tokens.pos_next(n_far) : -1;
+                        }
 
                         GGML_ASSERT(batch.size() > 0);
 
