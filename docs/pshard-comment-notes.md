@@ -3,6 +3,9 @@
 Code comments follow llama.cpp convention (what/why, no dates, measurements or narrative). The measurements,
 dates and experiment references that used to sit in comments are kept here, keyed by file. Full original text:
 git history up to f549c0419 and grid-results/sweep-snapshot-20260914/. Results: grid-results/*/RESULTS.md.
+Line numbers, counts and "kept as" texts are those of the rewrite (f4e001d0e, 0b01f0267). Where a later commit
+moved or replaced a kept-as comment, the entry says so; entries for code deleted since are dropped (the full
+notes stay in e0808edbe).
 
 ## common/common.h
 
@@ -99,7 +102,7 @@ File is LF (not CRLF); line endings preserved. Only comment text changed; 4 comm
 
 - original: `//   - its context follows the context of the main model, so its memory is measured again whenever that context changes`
 - kept as: `//   - its context follows the context of the main model, so the fit re-evaluates its memory whenever that context changes`
-- removed information: none of substance. The regex matched the word "measured"; the sentence was already mechanism-only (the fit re-runs the no_alloc load of the extra model when the followed context changes - see common/fit.cpp, the `n_ctx_extra` block in common_fit_params_impl). Reworded only so the word does not read as a recorded measurement.
+- removed information: none of substance. The regex matched the word "measured"; the sentence was already mechanism-only (the fit re-runs the no_alloc load of the extra model when the followed context changes - see common/fit.cpp, the `n_ctx_extra` block in common_params_fit_impl). Reworded only so the word does not read as a recorded measurement.
 
 ## common/fit.h:71-73 (struct common_device_memory_need doc block)
 
@@ -134,7 +137,7 @@ Convention: "line (function) - original text - kept as: new text". Line numbers 
 
 ## rewritten
 
-121 (struct pcie_stress_ctx) - `// bytes the stress loop moved and the time it ran: the concurrent PCIe rate is measured, not derived` - kept as: `// bytes the stress loop moved and the time it ran: the concurrent PCIe rate is computed from these` (dropped the "not derived" contrast with the earlier derived rate; the what/why stays)
+121 (struct pcie_stress_ctx) - `// bytes the stress loop moved and the time it ran: the concurrent PCIe rate is measured, not derived` - kept as: `// bytes the stress loop moved and the time it ran: the concurrent PCIe rate is computed from these` (dropped the "not derived" contrast with the earlier derived rate; the what/why stays). 1b53179cd later reworded it: the loop counts only bytes moved inside accounting windows.
 
 146 (file-level "machine calibrations" block above CPU_PROFILE_SCHEMA) - `// Every machine-specific number the planner prices with is measured here and written as a header line; the` - kept as: `// Every machine-specific number the planner prices with is calibrated here and written as a header line; the`
 
@@ -231,7 +234,7 @@ The regex from the brief flagged one line (2370, "WDDM"). Step 2 read every psha
   // fence would have to track the previous tenant of the same bytes
   ```
 - removed information:
-  - "the upload/compute serialization is host-DRAM-bandwidth bound, so it has little headroom": an experiment conclusion about how much decode speed a narrower fence could recover. It states that the copy stream waiting on compute_events[fence_bid] (uploads chained behind the previous split's compute) was judged not to be the bottleneck because the uploads are bound by host DRAM read bandwidth. Note that the memory file s4-serialization-mechanism.md records the opposite reading for the s4 tier (per-slot fence named as the lever, ~2x s4 decode at stake), so the sentence was contested as well as narrative; the code comment now states only the correctness argument for the conservative fence.
+  - "the upload/compute serialization is host-DRAM-bandwidth bound, so it has little headroom": an experiment conclusion about how much decode speed a narrower fence could recover. It states that the copy stream waiting on compute_events[fence_bid] (uploads chained behind the previous split's compute) was judged not to be the bottleneck because the uploads are bound by host DRAM read bandwidth. docs/expert-pool-design.md section 1 records the measurement behind it (the slot carve-out post-mortem, commit 30d3f4ed1): with the prefetch fence removed entirely, q8d decode under DYNAMIC_FFN_ALTERNATE (a strategy since removed) stayed at ~445 ms/token, because CPU FFN weight reads and upload-DMA source reads share host RAM bandwidth. The code comment now states only the correctness argument for the conservative fence.
   - the design hint "a sound per-slot fence needs previous-same-bytes-tenant tracking" is kept in shorter form (last clause of the new text).
 
 ## ggml/src/ggml-backend.cpp:2206-2209 (ggml_backend_sched_compute_splits -> run_split, input loop, produced_by_skipped branch) -> now 2204-2206
@@ -312,7 +315,7 @@ Line numbers below are the pre-edit positions.
 ## Rewritten comments
 
 - 2550-2561 (file-scope header above `struct ggml_cuda_stage_ring`) - original: "cudaMemcpyAsync from PAGEABLE host memory is host-synchronous and, on file-backed mmap pages, runs at ~4 GB/s (Windows, DeepSeek-V4's 45 GB shard that exceeded the page-lock ceiling; pinned copies run ~40 GB/s on the same box). Stage such copies through a small pinned ring: worker threads memcpy chunk k+1 into the ring while the GPU DMAs chunk k from it. The call stays host-synchronous for the duration (exactly like the pageable copy it replaces) but at memcpy speed (~30 GB/s with 8 threads) instead of the driver's pageable path. Ring: 512 MiB = 8 x 64 MiB chunks, 8 memcpy threads per chunk (measured 2026-09-02). Pinned/registered/device sources, copies < 1 MiB, and copies issued during graph capture take the direct path. One ring per PHYSICAL device: a CUDA event can only be recorded on a stream of the device it was created on, so the slot events are created under that device (review finding 2026-09-02); the pinned buffers are portable and the host memcpy bandwidth is shared regardless." - kept as: "cudaMemcpyAsync from PAGEABLE host memory is host-synchronous and slow on file-backed mmap pages (a model mapping that exceeds the page-lock ceiling stays pageable). Stage such copies through a small pinned ring: worker threads memcpy chunk k+1 into the ring while the GPU DMAs chunk k from it. The call stays host-synchronous for the duration (like the pageable copy it replaces) but at host memcpy speed instead of the driver's pageable path. Pinned/registered/device sources, copies < 1 MiB, and copies issued during graph capture take the direct path. One ring per PHYSICAL device: a CUDA event can only be recorded on a stream of the device it was created on, so the slot events are created under that device; the pinned buffers are portable and the host memcpy bandwidth is shared regardless."
-  Removed: pageable ~4 GB/s vs pinned ~40 GB/s on the dev box (Windows); DeepSeek-V4's 45 GB shard as the case that exceeded the page-lock ceiling; ~30 GB/s with 8 memcpy threads; ring geometry 512 MiB = 8 x 64 MiB measured 2026-09-02 (the geometry itself is in the code: `chunk = 64 << 20`, `mb = 512`); the per-device slot-event placement was a review finding of 2026-09-02.
+  Removed: pageable ~4 GB/s vs pinned ~40 GB/s on the dev box (Windows); DeepSeek-V4's 45 GB shard as the case that exceeded the page-lock ceiling; ~30 GB/s with 8 memcpy threads; ring geometry 512 MiB = 8 x 64 MiB measured 2026-09-02 (the geometry itself is in the code: `chunk = 64ull << 20`, `mb = 512`); the per-device slot-event placement was a review finding of 2026-09-02.
 
 - 2566-2570 (`ggml_cuda_stage_ring::n_threads` member) - original: "memcpy threads per copy: the logical core count, capped at 8 - the measured saturation point for both prefill (64 MiB chunks, q35 all-pageable: 2 -> 115, 4 -> 157, 8 -> 211, 12 -> 206 t/s prompt) and decode misses (10 MB, persistent pool, locked clocks, DSv4: 1 -> 15.3, 8 -> 16.2, 12 -> 16.1, 16 -> 16.2 t/s). Fewer copiers leave cores to the CPU-route miss policies." - kept as: "memcpy threads per copy: the logical core count, capped at 8 where the host memcpy bandwidth saturates; the remaining cores stay with the CPU-route miss policies"
   Removed: the thread-count sweep. Prefill, 64 MiB chunks, q35 all-pageable: 2 threads -> 115, 4 -> 157, 8 -> 211, 12 -> 206 t/s prompt. Decode misses, 10 MB, persistent pool, locked clocks, DSv4: 1 -> 15.3, 8 -> 16.2, 12 -> 16.1, 16 -> 16.2 t/s.
@@ -526,6 +529,10 @@ Kept as:
 Removed: the history that the code previously used a blanket has_rs ratio, and its measured effect
 (pinned-attn plans under-predicted 2-12x at 16k ctx).
 
+a18a3141c later replaced this comment ("writebacks as the runtime moves them"). It now splits writebacks
+by how they move: by cells (writeback_kv) or in full (writeback_rs: recurrent state, transposed V, caches
+without per-token cells).
+
 ## src/llama-benchmark.cpp:814-820 (llama_benchmark_predictor::predict_tps, GPU split input-copy pricing)
 
 Original text:
@@ -553,6 +560,9 @@ Kept as:
 Removed: measured sliced-upload rate (29.5 GB/s at 0.6 MB chunks vs 45 GB/s peak), the over-prediction
 range (10-24%) and the audit outcome (6 of 14 audited cells mis-ranked when priced at peak).
 
+f009995cc later replaced this block: sliced_expert_copy_ms prices the sliced copies from the profiled
+chunk-size curves over the distinct experts a step touches.
+
 ## src/llama-benchmark.cpp:867-871 (llama_benchmark_predictor::predict_tps, prefetch cost bandwidth)
 
 Original text:
@@ -576,6 +586,9 @@ Kept as:
 ```
 
 Removed: the two uses of "measured" (regex trigger); the mechanism is unchanged.
+
+4c9f460d0 later replaced this block with the prefetch_rates helper, which keeps the floor
+(stats.eff_pcie_bw) for CPU splits.
 
 ## totals
 
@@ -805,20 +818,6 @@ Kept as:
     // chunks (ggml_backend_sched_alloc_splits' re-reserve) ran outside it. Name the ubatch
     // so the shape mismatch against the tier's reserve can be found.
 
-## src/llama-context.cpp:1907-1908 (llama_context::decode) - one-time pshard_prefill_ubatch_eff log
-
-Original text:
-
-    // eval shape changes numerics on shape-sensitive models - log once so A/B
-    // baselines can match -ub to what pshard actually evaluates with
-
-Removed: the experiment reference "A/B baselines" (the log exists so the stock arm of an A/B perf pair can be run with the same -ub the pshard arm evaluated with, keeping numerics comparable).
-
-Kept as:
-
-    // eval shape changes numerics on shape-sensitive models - log once so a stock
-    // reference run can match -ub to what pshard actually evaluates with
-
 ## Blocks read but left unchanged (mechanism-only, no dates/numbers/history)
 
 - 255 (llama_context ctor): auto probe disabling under pshard
@@ -973,7 +972,7 @@ Removed information preserved here (dates, measured numbers, machine/experiment/
 
 - 2199-2204 (llm_graph_context::build_moe_ffn, the EXPERT_POOL ids-leaves block) - original: `ids leaves for a pool-managed layer. fetch-only policies remap the four expert MUL_MAT_IDs to slot ids (one leaf); policies that admit CPU routes (cpu_exec / hybrid / fetch_on_2nd_miss) run TWO expert-FFN chains - GPU over the pool slots and CPU over the host homes - each seeing -1 for the other side's routes, merged by one ADD at the down output (the split-op, design 6e). Biases then need expert ids with -1 for the foreign routes too.` - kept as: `The ids leaves for a pool-managed layer: fetch-only policies remap the four expert MUL_MAT_IDs to slot ids (one leaf); policies that admit CPU routes (cpu_exec / hybrid / fetch_on_2nd_miss) run TWO expert-FFN chains - GPU over the pool slots and CPU over the host homes - each seeing -1 for the other side's routes, merged by one ADD at the down output (the split-op). Biases then need expert ids with -1 for the foreign routes too.` Dropped: the design-document reference "design 6e" - the split-op (two expert-FFN chains, GPU over pool slots and CPU over host homes, merged by one ADD) is design item 6e of the expert-pool RFC execution model (cpu_admit + sched CPU/GPU overlap), landed with the split-op commit e45601565 and the review fixes f6174db7c. The dangling fragment "ids leaves for a pool-managed layer." (the residue of an earlier heading) was folded into the first sentence; no information lost.
 
-- 2208 (llm_graph_context::build_moe_ffn) - original: `whole-stack (A/B) tiers have every expert resident: no CPU routes, single chain.` - kept as: `whole-stack tiers (ab_mode) have every expert resident: no CPU routes, single chain.` Dropped: the "A/B" wording. It was not an A/B experiment pair but the pool's own name for the whole-stack prefill tier mode (llama_expert_pool::ab_mode - the pool overlays the layer's A/B half on the region start when bs*top_k*2 >= n_expert); the rewrite names the identifier so the regex cannot mistake it for an experiment reference. Single-chain-on-A/B-tiers was one of the split-op review fixes (f6174db7c).
+- 2208 (llm_graph_context::build_moe_ffn) - original: `whole-stack (A/B) tiers have every expert resident: no CPU routes, single chain.` - kept as: `whole-stack tiers (ab_mode) have every expert resident: no CPU routes, single chain.` Dropped: the "A/B" wording. It was not an A/B experiment pair but the pool's own name for the whole-stack prefill tier mode (llama_expert_pool::ab_mode - the pool overlays the layer's A/B half on the region start when bs*top_k >= n_expert, since e559fd368; bs*top_k*2 before); the rewrite names the identifier so the regex cannot mistake it for an experiment reference. Single-chain-on-A/B-tiers was one of the split-op review fixes (f6174db7c).
 
 Step 2 sweep (all pshard/expert-pool comments: build_lora_mm_id pin note 1553-1555, build_moe_select header 1965-1968, prefetch predictor 2120-2136, ids landing copy 2232-2233, expert-chain lambda 2243-2246, dual-chain ORDER MATTERS block 2415-2424, RS shadow 3603-3604, DFlash mask 476-477): no further narrative found. "Measurement / prefetch only" (2123) describes what the predictor node is for (it does not feed the real routing), not a measured number; "stock 2-D" (3604) states the upstream tensor shape the reshape stays compatible with; both left as is.
 
@@ -1051,7 +1050,7 @@ dates, measurements, model/machine sizes and cell names stay recoverable.
 Regex hits before: 2 (lines 1544, 1997). Regex hits after: 0. Three comment blocks rewritten (9 comment
 lines changed); the block at 1990-1991 was not a regex hit and was trimmed in the step-2 sweep.
 
-## src/llama-model.cpp:1543-1547 (llama_model::load_tensors, tensor-split fallback when every device reports 0 free bytes)
+## src/llama-model.cpp:1543-1547 (llama_model_base::load_tensors, tensor-split fallback when every device reports 0 free bytes)
 
 Original text:
 
@@ -1075,7 +1074,7 @@ Kept as:
 // budget decides what fits, not the split.
 ```
 
-## src/llama-model.cpp:1990-1991 (llama_model::load_tensors, pshard mmap page-lock failure branch)
+## src/llama-model.cpp:1990-1991 (llama_model_base::load_tensors, pshard mmap page-lock failure branch)
 
 Not a grep hit; trimmed for the machine-specific sizes.
 
@@ -1096,7 +1095,7 @@ Kept as:
 // - streamed copies from this region run pageable
 ```
 
-## src/llama-model.cpp:1995-1999 (llama_model::load_tensors, _WIN32 VirtualLock fallback inside the page-lock failure branch)
+## src/llama-model.cpp:1995-1999 (llama_model_base::load_tensors, _WIN32 VirtualLock fallback inside the page-lock failure branch)
 
 Original text:
 
@@ -1119,6 +1118,9 @@ Kept as:
 // resident and mapped: the CUDA DMA still goes through the staging ring, but the
 // ring's memcpy then runs at memory speed.
 ```
+
+61ca7ad17 (page-locking per layer range) later reworded this block and the one above: only the ranges
+that did not page-lock stay pageable, and only those are VirtualLock'd.
 
 ## Step-2 sweep: reviewed and left unchanged
 
@@ -1217,7 +1219,7 @@ Kept as:
 
 ## reviewed, left unchanged
 
-Other pshard comments in the file (fetch corner, overlap slot rationale, FFN_ALTERNATE, ids_cross,
+Other pshard comments in the file (fetch corner, overlap slot rationale, ids_cross,
 fingerprint inputs, miss-policy mixing, delegate-flag mirror, mtp_head_cpu variant, n_layers publish)
 state mechanism only and carry no dates, measurements, cell names or history. Log-message string
 literals contain no dates or measurements.
@@ -1232,27 +1234,25 @@ Line numbers are the pre-edit ones (file was 3248 lines, now 3231). Information 
 
 ## Rewritten
 
-src/llama-pshard-plan.cpp:100-104 (llama_pshard_generate_overrides, EXPERT_POOL branch, MTP head layers) - original: `// MTP head layers: the draft context (a stock sched, no pool) reads them` / `// on every draft step - a pooled head would stream its whole expert set` / `// per draft token (measured: 9.5 ms per draft on q35). Pin the head whole,` / `// experts included, like the legacy plans do; the pool region shrinks by` / `// one layer of experts (~6 of 82 slots on q35).` - kept as: `// MTP head layers: the draft context (a stock sched, no pool) reads them` / `// on every draft step - a pooled head would stream its whole expert set` / `// per draft token. Pin the head whole, experts included, like the legacy` / `// plans do; the pool region shrinks by one layer of experts.` (removed: a pooled MTP head measured 9.5 ms per draft step on q35; pinning the head whole costs about 6 of the 82 pool slots on q35)
+src/llama-pshard-plan.cpp:100-104 (pshard_plan_generate_overrides, named llama_pshard_generate_overrides until 6d0c1fc17; EXPERT_POOL branch, MTP head layers) - original: `// MTP head layers: the draft context (a stock sched, no pool) reads them` / `// on every draft step - a pooled head would stream its whole expert set` / `// per draft token (measured: 9.5 ms per draft on q35). Pin the head whole,` / `// experts included, like the legacy plans do; the pool region shrinks by` / `// one layer of experts (~6 of 82 slots on q35).` - kept as: `// MTP head layers: the draft context (a stock sched, no pool) reads them` / `// on every draft step - a pooled head would stream its whole expert set` / `// per draft token. Pin the head whole, experts included, like the legacy` / `// plans do; the pool region shrinks by one layer of experts.` (removed: a pooled MTP head measured 9.5 ms per draft step on q35; pinning the head whole costs about 6 of the 82 pool slots on q35)
 
-src/llama-pshard-plan.cpp:137-138 (llama_pshard_generate_overrides, legacy MTP head branch) - original: `// price it, so viability shrinks the trunk pins accordingly). Pinned is` / `// sound now that the draft ctx gets stock, backed KV (per-context gate).` - kept as: same with `now that` -> `because` (removed: the history marker - before the per-context gate the draft context did not get stock, backed KV, and pinning the head was not sound then)
+src/llama-pshard-plan.cpp:137-138 (pshard_plan_generate_overrides, legacy MTP head branch) - original: `// price it, so viability shrinks the trunk pins accordingly). Pinned is` / `// sound now that the draft ctx gets stock, backed KV (per-context gate).` - kept as: same with `now that` -> `because` (removed: the history marker - before the per-context gate the draft context did not get stock, backed KV, and pinning the head was not sound then)
 
-src/llama-pshard-plan.cpp:229-232 (struct llama_pshard_search_ctx, routed-expert byte fields) - original: `// routed-expert bytes read from the gguf tensor table (0 = unknown -> the` / `// file-size heuristic): the largest layer's full expert set, one expert's rows` / `// summed over its tensors (up/gate/down or gate_up/down), and how many layers` / `// carry routed experts (DSv4-class models have dense lead layers)` - kept as: `// routed-expert bytes read from the gguf tensor table (0 = unknown: pool tiers are` / `// refused, the ids-cross decision is not priced): the largest layer's full expert` / `// set, one expert's rows summed over its tensors (up/gate/down or gate_up/down), and` / `// how many layers carry routed experts (DSv4-class models have dense lead layers)` (removed: the stale reference to the file-size-fraction fallback, which commit 8bbfc347f deleted; today a 0 makes llama_pshard_search_pool refuse the tier and pshard_alternate_ids_cross_wins leave the decision unpriced, which the new text states)
+src/llama-pshard-plan.cpp:229-232 (struct llama_pshard_search_ctx, routed-expert byte fields) - original: `// routed-expert bytes read from the gguf tensor table (0 = unknown -> the` / `// file-size heuristic): the largest layer's full expert set, one expert's rows` / `// summed over its tensors (up/gate/down or gate_up/down), and how many layers` / `// carry routed experts (DSv4-class models have dense lead layers)` - kept as: `// routed-expert bytes read from the gguf tensor table (0 = unknown: pool tiers are` / `// refused, the ids-cross decision is not priced): the largest layer's full expert` / `// set, one expert's rows summed over its tensors (up/gate/down or gate_up/down), and` / `// how many layers carry routed experts (DSv4-class models have dense lead layers)` (removed: the stale reference to the file-size-fraction fallback, which commit 8bbfc347f deleted; today a 0 makes llama_pshard_search_pool refuse the tier and pshard_hybrid_ids_cross_wins leave the decision unpriced, which the new text states)
 
-src/llama-pshard-plan.cpp:367-368 (pshard_alternate_ids_cross_wins, cover_ms) - original: `// cover the full upload could hide behind: the paired CPU-FFN's DRAM-bound expert reads (the streamed` / `// layer's attention compute was a 0.1 ms constant here: unmeasured, no longer charged)` - kept as: `// cover the full upload could hide behind: the paired CPU-FFN's DRAM-bound expert reads` (removed history: cover_ms used to add a 0.1 ms constant for the streamed layer's attention compute; the constant was never measured and was dropped under the no-constants directive)
+src/llama-pshard-plan.cpp:367-368 (pshard_hybrid_ids_cross_wins, named pshard_alternate_ids_cross_wins until 4c9f460d0; cover_ms) - original: `// cover the full upload could hide behind: the paired CPU-FFN's DRAM-bound expert reads (the streamed` / `// layer's attention compute was a 0.1 ms constant here: unmeasured, no longer charged)` - kept as: `// cover the full upload could hide behind: the paired CPU-FFN's DRAM-bound expert reads` (removed history: cover_ms used to add a 0.1 ms constant for the streamed layer's attention compute; the constant was never measured and was dropped under the no-constants directive)
 
 src/llama-pshard-plan.cpp:407-408 (llama_pshard_probe_memory, mparams_probe_clean) - original: `// probe load packs pinned KV into the external preload buffer and the` / `// measurement no longer attributes it to mb.context (measured cache = 0)` - kept as: `// probe load packs pinned KV into the external preload buffer and the` / `// probe no longer attributes it to mb.context (it reports cache = 0)` (wording only; no information removed)
 
 src/llama-pshard-plan.cpp:414-416 (llama_pshard_probe_memory, probe_n_outputs) - original: `// to n_outputs_max; 0 = n_batch, llama_context's own rule). Probing every token as an output` / `// charged (bs - n_outputs_max) x n_vocab x 4 B of logits the runtime never reserves - ~1 GiB` / `// at DSv4 bs=2048 under a speculative target's cap of 4 (review 2026-09-06)` - kept as: `// to n_outputs_max; 0 = n_batch, llama_context's own rule). Probing every token as an output` / `// would charge (bs - n_outputs_max) x n_vocab x 4 B of logits the runtime never reserves` (removed: the over-charge was about 1 GiB at DeepSeek-V4 bs=2048 with a speculative target's n_outputs_max cap of 4; found by the review of 2026-09-06)
 
-src/llama-pshard-plan.cpp:463-466 (llama_pshard_prune_state::attn_hint) - original: `// an attn-pin bound proven at a larger batch is INVALID at bs=1: activation` / `// scratch shrinks ~350x between bs=8192 and bs=1, so far more attention fits.` / `// (q35-16k-mva2000: inherited hi_attn=11 hid the attn=40 STATIC winner, 12.1` / `// vs 29.6 predicted tps.) Search the decode tier with a fresh bound.` - kept as: `// an attn-pin bound proven at a larger batch is INVALID at bs=1: activation` / `// scratch shrinks with the batch, so far more attention fits. Search the` / `// decode tier with a fresh bound.` (removed: activation scratch shrinks about 350x between bs=8192 and bs=1; in cell q35-16k-mva2000 an inherited hi_attn=11 bound hid the attn=40 STATIC winner, 12.1 vs 29.6 predicted t/s)
+src/llama-pshard-plan.cpp:1488-1489 (pshard_registry_load, variant selection) - original: `// deterministic variant selection (the accumulate + first-match era produced plans` / `// from mixed planning sessions - see the phantom q8d 2.84 t/s incident):` - kept as: `// deterministic variant selection (a first-match pick can mix plans from` / `// different planning sessions):` (removed history: the earlier accumulate + first-match loader could assemble a variant from plans of different planning sessions; the "phantom q8d 2.84 t/s incident" was a bogus decode result produced by such a mixed variant and motivated rules 1-4 below the comment)
 
-src/llama-pshard-plan.cpp:1488-1489 (llama_pshard_registry_load, variant selection) - original: `// deterministic variant selection (the accumulate + first-match era produced plans` / `// from mixed planning sessions - see the phantom q8d 2.84 t/s incident):` - kept as: `// deterministic variant selection (a first-match pick can mix plans from` / `// different planning sessions):` (removed history: the earlier accumulate + first-match loader could assemble a variant from plans of different planning sessions; the "phantom q8d 2.84 t/s incident" was a bogus decode result produced by such a mixed variant and motivated rules 1-4 below the comment)
+src/llama-pshard-plan.cpp:1775-1782 (pshard_enforce_union_budget, per-tier need) - original: `// the tier's compute scratch (streaming slots + graph temporaries, probe-measured)` / `// must fit above the packed weights and the pinned cache too: otherwise the` / `// runtime reserve falls back to constrained packing and galloc spills into an` / `// overflow chunk OUTSIDE the arena (measured +496 MiB at a 3929 MiB budget)` / `// + margin: the runtime canonical packing (pshard_compute_scratch_off) rounds` / `// differently from this metadata pass by up to a few tens of MiB (seen +29.7 MiB` / `// at a 2024 MiB budget: a tier that passed here by 1.2 MiB was marked unviable at` / `// load, and every verify batch then ran in the 512-token streaming plan)` - kept as: `// the tier's compute scratch (streaming slots + graph temporaries, from the probe)` / `// must fit above the packed weights and the pinned cache too: otherwise the` / `// runtime reserve falls back to constrained packing and galloc spills into an` / `// overflow chunk OUTSIDE the arena` / `// + margin: the runtime canonical packing (pshard_compute_scratch_off) rounds` / `// differently from this metadata pass by up to a few tens of MiB, and a tier` / `// that passes here by less than that is marked unviable at load` (removed measurements: the galloc overflow chunk outside the arena measured +496 MiB at a 3929 MiB budget; at a 2024 MiB budget the runtime packing came out +29.7 MiB above this pass, a tier that had passed here by 1.2 MiB was marked unviable at load, and every verify batch then ran in the 512-token streaming plan - this is why `margin` exists)
 
-src/llama-pshard-plan.cpp:1775-1782 (llama_pshard_enforce_union_budget, per-tier need) - original: `// the tier's compute scratch (streaming slots + graph temporaries, probe-measured)` / `// must fit above the packed weights and the pinned cache too: otherwise the` / `// runtime reserve falls back to constrained packing and galloc spills into an` / `// overflow chunk OUTSIDE the arena (measured +496 MiB at a 3929 MiB budget)` / `// + margin: the runtime canonical packing (pshard_compute_scratch_off) rounds` / `// differently from this metadata pass by up to a few tens of MiB (seen +29.7 MiB` / `// at a 2024 MiB budget: a tier that passed here by 1.2 MiB was marked unviable at` / `// load, and every verify batch then ran in the 512-token streaming plan)` - kept as: `// the tier's compute scratch (streaming slots + graph temporaries, from the probe)` / `// must fit above the packed weights and the pinned cache too: otherwise the` / `// runtime reserve falls back to constrained packing and galloc spills into an` / `// overflow chunk OUTSIDE the arena` / `// + margin: the runtime canonical packing (pshard_compute_scratch_off) rounds` / `// differently from this metadata pass by up to a few tens of MiB, and a tier` / `// that passes here by less than that is marked unviable at load` (removed measurements: the galloc overflow chunk outside the arena measured +496 MiB at a 3929 MiB budget; at a 2024 MiB budget the runtime packing came out +29.7 MiB above this pass, a tier that had passed here by 1.2 MiB was marked unviable at load, and every verify batch then ran in the 512-token streaming plan - this is why `margin` exists)
+src/llama-pshard-plan.cpp:1822-1827 (pshard_enforce_union_budget, MTP head lever) - original: `// the MTP context's pre-fit reserve (common_pshard_draft_reserve_mb) was measured with` / `// the head pinned; with the head on the CPU its device compute grows by the logits` / `// scratch (+177.5 / +179.5 MiB on q35, 2026-09-04 grid). The one-budget fit` / `// (common_pshard_fit_one_budget) re-measures the context under the fitted placement and` / `// refits once with the larger reserve; the analytical arena charge that stood in for` / `// that (2026-09-05, n_vocab x 128 x 6 B, mtp_head_extra_mb) is retired (2026-09-06)` - kept as: `// the MTP context's pre-fit reserve (common_pshard_draft_reserve_mb) was taken with` / `// the head pinned; with the head on the CPU its device compute grows by the logits` / `// scratch. The one-budget fit (common_pshard_fit_one_budget) re-measures the context` / `// under the fitted placement and refits once with the larger reserve, so nothing is` / `// charged for it here` (removed: the logits scratch growth measured +177.5 / +179.5 MiB on q35 in the 2026-09-04 grid; an analytical arena charge of n_vocab x 128 x 6 B (mtp_head_extra_mb, added 2026-09-05) stood in for the re-measure and was retired on 2026-09-06 when the one-budget fit's post-fit re-measure landed)
 
-src/llama-pshard-plan.cpp:1822-1827 (llama_pshard_enforce_union_budget, MTP head lever) - original: `// the MTP context's pre-fit reserve (common_pshard_draft_reserve_mb) was measured with` / `// the head pinned; with the head on the CPU its device compute grows by the logits` / `// scratch (+177.5 / +179.5 MiB on q35, 2026-09-04 grid). The one-budget fit` / `// (common_pshard_fit_one_budget) re-measures the context under the fitted placement and` / `// refits once with the larger reserve; the analytical arena charge that stood in for` / `// that (2026-09-05, n_vocab x 128 x 6 B, mtp_head_extra_mb) is retired (2026-09-06)` - kept as: `// the MTP context's pre-fit reserve (common_pshard_draft_reserve_mb) was taken with` / `// the head pinned; with the head on the CPU its device compute grows by the logits` / `// scratch. The one-budget fit (common_pshard_fit_one_budget) re-measures the context` / `// under the fitted placement and refits once with the larger reserve, so nothing is` / `// charged for it here` (removed: the logits scratch growth measured +177.5 / +179.5 MiB on q35 in the 2026-09-04 grid; an analytical arena charge of n_vocab x 128 x 6 B (mtp_head_extra_mb, added 2026-09-05) stood in for the re-measure and was retired on 2026-09-06 when the one-budget fit's post-fit re-measure landed)
-
-src/llama-pshard-plan.cpp:1958-1959 (llama_pshard_attn_pin_fallback) - original: `// WARN: the grid runner labels rows by the forced arm; a silent substitution recorded three` / `// s1 cells and seven speculative pool cells as something they were not (audit 2026-09-05)` - kept as: `// WARN level: a caller that keys its results on the forced strategy must see the substitution` (removed: the qa grid runner labels result rows by the forced strategy arm; the audit of 2026-09-05 found three s1 cells and seven speculative pool cells recorded under the wrong strategy because this fallback used to be silent)
+src/llama-pshard-plan.cpp:1958-1959 (llama_pshard_attn_pin_fallback) - original: `// WARN: the grid runner labels rows by the forced arm; a silent substitution recorded three` / `// [GPUONLY_ATTNPIN_FFNSTREAM] cells and seven speculative pool cells as something they were not (audit 2026-09-05)` - kept as: `// WARN level: a caller that keys its results on the forced strategy must see the substitution` (removed: the qa grid runner labels result rows by the forced strategy arm; the audit of 2026-09-05 found three GPUONLY_ATTNPIN_FFNSTREAM cells (a strategy since removed) and seven speculative pool cells recorded under the wrong strategy because this fallback used to be silent)
 
 src/llama-pshard-plan.cpp:2009-2012 (llama_pshard_search_pool, output head placement) - original: `// output head ON the GPU: with it on the CPU every pass (target token AND draft` / `// step) pays the vocabulary projection at host rate - ~9 ms per pass on q35, the` / `// largest single term of a pool token; the head's bytes come out of the pool` / `// (~11 of 86 slots at 8000) and the probe prices the trade` - kept as: `// output head ON the GPU: with it on the CPU every pass (target token AND draft` / `// step) pays the vocabulary projection at host rate, the largest single term of` / `// a pool token; the head's bytes come out of the pool and the probe prices the trade` (removed: the host-rate vocabulary projection costs about 9 ms per pass on q35; the GPU head takes about 11 of 86 pool slots at the @8000 budget)
 
@@ -1266,19 +1266,17 @@ src/llama-pshard-plan.cpp:2113-2114 (llama_pshard_search_pool, t_cpu line of the
 
 src/llama-pshard-plan.cpp:2179-2185 (llama_pshard_search_pool, cache-tier price) - original: `// the s most popular of E experts (the static optimum). alpha is MEASURED:` / `// the pool histograms every cache-mode route and refits it at exit into` / `// <model>.pshard_workload; a model without one is calibrated at plan time` / `// (sampled generation). The planner prices the long-run rate; short` / `// generations pay the fill (an 86-slot layer needs ~10 tokens of misses),` / `// which the 32-token QA gate reports as the cold one. (An LRU-shortfall` / `// factor and admission gating were both measured unnecessary and removed.)` - kept as: `// the s most popular of E experts (the static optimum). alpha comes from the` / `// routing workload: the pool histograms every cache-mode route and refits it` / `// at exit into <model>.pshard_workload; a model without one is calibrated at` / `// plan time (sampled generation). The planner prices the long-run rate; short` / `// generations pay the fill of the pool first.` (removed: an 86-slot layer needs about 10 tokens of misses to fill; the 32-token QA gate therefore reports the cold (fill) rate, not the long-run one; an LRU-shortfall factor and an admission gate were both tried in this price, measured unnecessary and removed)
 
-src/llama-pshard-plan.cpp:2201-2203 (llama_pshard_search_pool, cpu_chain_overlaps) - original: `// the CPU chain runs concurrently with the GPU chain (scheduler lookahead); the` / `// serial variant is no longer priced (its switch was removed after the grid` / `// certified the overlap)` - kept as: `// the CPU chain runs concurrently with the GPU chain (scheduler lookahead);` / `// only the overlapped price is taken` (removed history: the serial (no-overlap) price had an on/off switch, removed once the grid certified the sched CPU/GPU overlap; `cpu_chain_overlaps` stays a constant true)
+src/llama-pshard-plan.cpp:2657-2659 (llama_params_fit_pshard_plan step 3, g_pshard_mtp_head_cpu reset) - original: `// The one-budget fit's second pass starts here too: a preset that kept pass 1's head home was` / `// tried and reverted on 2026-09-07 (design 11.C.19 xiii) - it rescued one arm and cost the` / `// others; the head home is a planner pricing decision, not a protocol rule.` - kept as: `// The one-budget fit's second pass starts here too: the head home is a planner pricing` / `// decision, not a protocol rule (design 11.C.19 xiii).` (removed: on 2026-09-07 a preset that carried the first pass's MTP head placement into the second pass of the one-budget fit was tried and reverted - it rescued one grid arm and cost the others)
 
-src/llama-pshard-plan.cpp:2657-2659 (llama_params_fit_pshard step 3, g_pshard_mtp_head_cpu reset) - original: `// The one-budget fit's second pass starts here too: a preset that kept pass 1's head home was` / `// tried and reverted on 2026-09-07 (design 11.C.19 xiii) - it rescued one arm and cost the` / `// others; the head home is a planner pricing decision, not a protocol rule.` - kept as: `// The one-budget fit's second pass starts here too: the head home is a planner pricing` / `// decision, not a protocol rule (design 11.C.19 xiii).` (removed: on 2026-09-07 a preset that carried the first pass's MTP head placement into the second pass of the one-budget fit was tried and reverted - it rescued one grid arm and cost the others)
+src/llama-pshard-plan.cpp:2673 (llama_params_fit_pshard_plan, profile fingerprint check) - original: `// the profile must be THIS machine's, complete (schema 2) and measured at this thread count: nothing in` - kept as: `// the profile must be THIS machine's, complete (schema 2) and taken at this thread count: nothing in` (wording only)
 
-src/llama-pshard-plan.cpp:2673 (llama_params_fit_pshard, profile fingerprint check) - original: `// the profile must be THIS machine's, complete (schema 2) and measured at this thread count: nothing in` - kept as: `// the profile must be THIS machine's, complete (schema 2) and taken at this thread count: nothing in` (wording only)
+src/llama-pshard-plan.cpp:2677 (llama_params_fit_pshard_plan, machine_current device) - original: `// the same device the profiler measured and the registry loader hashes: the first GPU-type device in` - kept as: `// the same device the profiler describes and the registry loader hashes: the first GPU-type device in` (wording only)
 
-src/llama-pshard-plan.cpp:2677 (llama_params_fit_pshard, machine_current device) - original: `// the same device the profiler measured and the registry loader hashes: the first GPU-type device in` - kept as: `// the same device the profiler describes and the registry loader hashes: the first GPU-type device in` (wording only)
+src/llama-pshard-plan.cpp:2742-2744 (llama_params_fit_pshard_plan, per-mapping upload pricing) - original: `// Also compute the TOTAL file size: the main split of a sharded gguf can be` / `// tiny (DeepSeek-V4's is 6 MB); the byte counts the planner prices with come` / `// from the gguf tensor table (scan below), the total only feeds sanity checks.` - kept as: `// Also compute the TOTAL file size: the main split of a sharded gguf can be` / `// tiny; the byte counts the planner prices with come from the gguf tensor` / `// table (scan below), the total only feeds sanity checks.` (removed: DeepSeek-V4's main split is 6 MB)
 
-src/llama-pshard-plan.cpp:2742-2744 (llama_params_fit_pshard, per-mapping upload pricing) - original: `// Also compute the TOTAL file size: the main split of a sharded gguf can be` / `// tiny (DeepSeek-V4's is 6 MB); the byte counts the planner prices with come` / `// from the gguf tensor table (scan below), the total only feeds sanity checks.` - kept as: `// Also compute the TOTAL file size: the main split of a sharded gguf can be` / `// tiny; the byte counts the planner prices with come from the gguf tensor` / `// table (scan below), the total only feeds sanity checks.` (removed: DeepSeek-V4's main split is 6 MB)
+src/llama-pshard-plan.cpp:2808-2810 (llama_params_fit_pshard_plan, staged_r) - original: `// the staged rate is measured (PCIe_Staged: a pageable source through the staging ring). A` / `// profile without the line prices staged bytes at the pinned rate and says so; step 5 makes an` / `// incomplete profile a refusal.` - kept as: `// the staged rate comes from the profile (PCIe_Staged: a pageable source through the staging` / `// ring); a profile without the line prices staged bytes at the pinned rate and says so` (removed: the forward reference to "step 5" of the profile-schema-2 plan (landed in f549c0419, 2026-09-13) that makes an incomplete profile a refusal; note the PCIe_Staged line is still optional in this branch - the code warns and prices at the pinned rate)
 
-src/llama-pshard-plan.cpp:2808-2810 (llama_params_fit_pshard, staged_r) - original: `// the staged rate is measured (PCIe_Staged: a pageable source through the staging ring). A` / `// profile without the line prices staged bytes at the pinned rate and says so; step 5 makes an` / `// incomplete profile a refusal.` - kept as: `// the staged rate comes from the profile (PCIe_Staged: a pageable source through the staging` / `// ring); a profile without the line prices staged bytes at the pinned rate and says so` (removed: the forward reference to "step 5" of the profile-schema-2 plan (landed in f549c0419, 2026-09-13) that makes an incomplete profile a refusal; note the PCIe_Staged line is still optional in this branch - the code warns and prices at the pinned rate)
-
-src/llama-pshard-plan.cpp:2896 (llama_params_fit_pshard, routing workload) - original: `// generation (256 tokens, seed 1234, temperature 1) whose router top-k ids are histogrammed - a measured` - kept as: same with `a measured` -> `a sampled` (wording only; 256 / 1234 stay - they are the arguments passed to llama_pshard_workload_calibrate on the lines below)
+src/llama-pshard-plan.cpp:2896 (llama_params_fit_pshard_plan, routing workload) - original: `// generation (256 tokens, seed 1234, temperature 1) whose router top-k ids are histogrammed - a measured` - kept as: same with `a measured` -> `a sampled` (wording only; 256 / 1234 stay - they are the arguments passed to llama_pshard_workload_calibrate on the lines below)
 
 ## Regex hits reviewed and kept unchanged
 
@@ -1406,6 +1404,10 @@ kept as:
     // switch from the raw field would charge an ATTNPIN <-> ATTNPRIO swap for structurally
     // resident attention that never moves.
 
+dd85459d7 later replaced attn_resident with a per-layer check and a new comment.
+GPUONLY_ATTNPIN_FFNSTREAM, DYNAMIC_FFNCPU_ATTNSTREAM and DYNAMIC_FFN_ALTERNATE, which this comment
+named, have since been removed.
+
 ### src/llama-pshard-plan.h:498-501 (`llama_pshard_plan_registry::find_optimal_ubatch`)
 
 original text:
@@ -1424,6 +1426,9 @@ kept as:
     // unviable by design (a pool tier whose scratch leaves no room for its region)
     // and a ubatch routed to it would run on the decode plan and spill past its window.
 
+dd85459d7 later replaced find_optimal_ubatch with largest_viable_ubatch; its comment keeps the
+largest-viable-tier rule and the reason.
+
 ## Regex hits reviewed and left unchanged (false positives)
 
 ### src/llama-pshard-plan.h:26 (`enum llama_pshard_strategy`, `LLAMA_PSHARD_EXPERT_POOL`)
@@ -1438,7 +1443,7 @@ reason: "A/B" here is the name of the pool's double-buffered prefill streaming s
 
 ## Other pshard comments read and left as-is
 
-- 21-22 (ALTERNATE), 24-26 (EXPERT_POOL), 65-74 (miss policies, incl. the RFC #24528 reference), 78-81, 104-106, 129-131, 149-159 (MTP layers / head lever), 170-174 (extra device bytes), 208-218 (plan fields), 226-227 (switch_ms), 291-293, 316-322, 327-329, 336-350, 368-371, 390-391, 397-412, 438-440, 484-487, 510-511, 527-529: mechanism descriptions without dates, measurements, cell names or history.
+- 24-26 (EXPERT_POOL), 65-74 (miss policies, incl. the RFC #24528 reference), 78-81, 104-106, 129-131, 149-159 (MTP layers / head lever), 170-174 (extra device bytes), 208-218 (plan fields), 226-227 (switch_ms), 291-293, 316-322, 327-329, 336-350, 368-371, 390-391, 397-412, 438-440, 484-487, 510-511, 527-529: mechanism descriptions without dates, measurements, cell names or history.
 
 ## Totals
 
@@ -1613,3 +1618,4 @@ Step 1 grep hits: 1 (line 208). Step 2 read-through of the other pshard comments
   // or a non-zero draft length)
   ```
 - removed information: the date clause "since 2026-09-06" - the planner's probes started clamping a tier's outputs to n_outputs_max on 2026-09-06 (the "probe output clamp" follow-up of the three fixes of that day, together with the plan-tool spec-config trap this block guards against: a plain plan must leave n_outputs_max at 0 so the probes price the logits scratch at n_batch outputs, not 1, matching the runtime reserve). Before that date only the runtime reserve applied the clamp. The mechanism sentence is kept in full; only the history marker is gone.
+- since: aad830fa6 moved this block, with the one-budget rule and the fit passes, into common/common.cpp (common_pshard_plan); 271db9160 reworded it - tools that cap their outputs (completion, the server) keep their cap, perplexity and embeddings leave it 0, and the plan uses the runtime's value.
