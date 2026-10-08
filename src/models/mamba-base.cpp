@@ -177,7 +177,9 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
-    const int64_t state_slots     = ssm_states_all->ne[1];
+    // rows of the state tensor (mem_size * (1 + n_rs_seq)); counted from the elements because pshard
+    // allocates the per-layer state as one flat tensor
+    const int64_t state_slots     = ggml_nelements(ssm_states_all) / hparams.n_embd_s();
 
     ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     conv               = ggml_reshape_3d(ctx0, conv, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs);
@@ -213,8 +215,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
                                                    conv_x->nb[1], conv_x->nb[2], (n_seq_tokens - slot) * conv_x->nb[0]);
 
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv,
-                                                   ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs,
-                                                                conv_states_all->nb[1],
+                                                   ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, row_size,
                                                                 ((size_t) slot * mem_size + kv_head) * row_size)));
         }
 
@@ -274,7 +275,7 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
                          ggml_view_3d(ctx0, y_ssm, D, n_seqs, n_written,
                                       y_row_size, y_row_size * n_seqs, state_offset),
                          ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
-                                      ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
+                                      row_size, (size_t) mem_size * row_size, kv_head * row_size)));
 
         ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, n_seq_tokens, n_seqs, x->nb[1], n_head * x->nb[1],
                                        n_seq_tokens * n_head * x->nb[1], 0);
