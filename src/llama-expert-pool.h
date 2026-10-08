@@ -83,6 +83,8 @@ struct llama_expert_pool {
 
     struct layer_state {
         int32_t il = -1;
+        uint32_t ab_half = 0;   // A/B half: alternates over the pooled layers in order (not by il: hybrid
+                                // stacks interleave non-MoE layers, so two pooled neighbours can share a parity)
         std::vector<tensor_entry> tensors;
 
         // slot state is shared across the layer's tensors: slot i holds expert

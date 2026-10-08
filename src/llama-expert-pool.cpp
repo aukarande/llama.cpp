@@ -84,6 +84,7 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
         L.gate_inp_b  = ml.ffn_gate_inp_b;
         L.exp_probs_b = ml.ffn_exp_probs_b;
         if (!L.tensors.empty()) {
+            L.ab_half = (uint32_t) (n_pooled & 1);
             n_pooled++;
             layer_full_bytes = std::max(layer_full_bytes, full);
             L.expert_slot.assign(n_expert, -1);
@@ -206,7 +207,7 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
 
             e.view_ab = ggml_new_tensor_3d(ctx_views, e.host->type,
                 e.host->ne[0], e.host->ne[1], n_expert);
-            e.view_ab->data   = (char *) base + e.ab_off[L.il & 1];
+            e.view_ab->data   = (char *) base + e.ab_off[L.ab_half];
             e.view_ab->buffer = arena;
             ggml_format_name(e.view_ab, "pool_ab#%s", e.host->name);
         }
@@ -330,7 +331,7 @@ bool llama_expert_pool::set_overlay(size_t delta) {
                 e.view_ab->buffer = region_arena;
                 ggml_format_name(e.view_ab, "pool_ab#%s", e.host->name);
             }
-            e.view_ab->data = (char *) region_base + e.ab_off[L.il & 1];
+            e.view_ab->data = (char *) region_base + e.ab_off[L.ab_half];
         }
         L.ab_lost = lost;
         if (lost) {
@@ -644,7 +645,7 @@ bool llama_expert_pool::prefetch(const ggml_tensor * src, ggml_backend_t copy_ba
         return true; // the layer's other tensors: already filled by the first call
     }
     // the sched already waited on the compute fence for this copy stream, so the
-    // half (last read by layer il-2) is free; the consumer waits on the copy event
+    // half (last read by the pooled layer two before) is free; the consumer waits on the copy event
     fill_ab(L, copy_backend);
     L.ab_pass = generation;
     return true;
