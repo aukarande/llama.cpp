@@ -530,6 +530,7 @@ void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
     expert_pool->set_policy(plan.pool_miss, plan.pool_hybrid_frac, sched.get());
     const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used >= expert_pool->n_expert;
     expert_pool->set_ab_mode(on && ab, sched.get());
+    expert_pool->clear_dirty();
 }
 
 // the pool's remapped-ids leaves anchor on the same virtual backend as the
@@ -775,6 +776,7 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
                 plan.alloc_state.valid = false;
                 return;
             }
+            expert_pool->clear_dirty();
             const size_t buf_total = ggml_backend_buffer_get_size(model.get_dev_preload_buf());
             scratch_avail = buf_total - scratch_off - total_pinned_cache_size(memory.get()) - expert_pool_bytes;
             ggml_backend_sched_set_alloc_range(sched.get(), gpu, scratch_off, SIZE_MAX/2);

@@ -75,9 +75,12 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
                 continue;   // pinned on the device (e.g. the MTP head's experts): not a pool home
             }
             tensor_entry e;
-            e.host      = t;
-            e.row_bytes = t->nb[2];
-            full += e.row_bytes * n_expert;
+            e.host       = t;
+            e.row_bytes  = t->nb[2];
+            e.tail_bytes = llama_expert_pool_tail_bytes(t->type, t->ne[0]);
+            has_tail     = has_tail || e.tail_bytes > 0;
+            // the A/B arrays are packed: the tail keeps the next array 16-byte aligned for the device copies
+            full += e.row_bytes * n_expert + GGML_PAD(e.tail_bytes, 16);
             L.tensors.push_back(e);
         }
         L.gate_inp    = ml.ffn_gate_inp;
@@ -92,19 +95,6 @@ bool llama_expert_pool::init(const llama_model & model, uint32_t n_expert_, uint
         }
     }
 
-    // quantized-padding contract (llama_expert_pool_tensor_supported): refuse such models instead of computing
-    // with garbage tail scales
-    for (const auto & L : layers) {
-        for (const auto & e : L.tensors) {
-            if (!llama_expert_pool_tensor_supported(e.host->type, e.host->ne[0])) {
-                LLAMA_LOG_WARN("%s: expert pool: %s has ne0=%lld %% 512 != 0 (MMQ padding "
-                    "contract unhandled) - pool disabled for this model\n",
-                    __func__, e.host->name, (long long) e.host->ne[0]);
-                return false;
-            }
-        }
-    }
-
     LLAMA_LOG_INFO("%s: expert pool: %zu pooled layers, %u experts (%u used), max layer %.1f MiB\n",
         __func__, n_pooled, n_expert, n_expert_used, layer_full_bytes / (1024.0 * 1024.0));
     return n_pooled > 0;
@@ -116,7 +106,7 @@ size_t llama_expert_pool::region_bytes_needed(uint32_t slots_per_layer, bool wit
     size_t cache_bytes = 0;
     for (const auto & L : layers) {
         for (const auto & e : L.tensors) {
-            cache_bytes += ((size_t) slots_per_layer * e.row_bytes + 255) & ~(size_t) 255;
+            cache_bytes += GGML_PAD((size_t) slots_per_layer * e.row_bytes + e.tail_bytes, 256);
         }
     }
     return with_ab ? std::max(cache_bytes, 2 * layer_full_bytes) : cache_bytes;
@@ -137,6 +127,7 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
         ggml_free(ctx_views);
         ctx_views = nullptr;
     }
+    view_region = nullptr;
 
     size_t n_tensors = 0;
     for (const auto & L : layers) {
@@ -151,7 +142,7 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
     for (auto & L : layers) {
         L.n_slots_l = slots_per_layer;
         for (const auto & e : L.tensors) {
-            need += ((size_t) L.n_slots_l * e.row_bytes + 255) & ~(size_t) 255;
+            need += GGML_PAD((size_t) L.n_slots_l * e.row_bytes + e.tail_bytes, 256);
         }
     }
     if (need > bytes) {
@@ -161,11 +152,17 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
     }
 
     ggml_init_params ip = {
-        /*.mem_size   =*/ 2 * n_tensors * ggml_tensor_overhead(),
+        /*.mem_size   =*/ (2 * n_tensors + 1) * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     ctx_views = ggml_init(ip);
+
+    view_region = ggml_new_tensor_1d(ctx_views, GGML_TYPE_I8, (int64_t) bytes);
+    view_region->data   = base;
+    view_region->buffer = arena;
+    ggml_set_name(view_region, "pool_region");
+    dirty_bytes = bytes;
 
     // cache-mode layout: layer-major, per-tensor slot arrays; the ab_mode halves overlay the region start
     // (they are only live on whole-stack prefill tiers, where the cache contents are volatile by design)
@@ -179,13 +176,15 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
         }
         for (auto & e : L.tensors) {
             e.region_off = off;
-            off += ((size_t) L.n_slots_l * e.row_bytes + 255) & ~(size_t) 255;
+            off += GGML_PAD((size_t) L.n_slots_l * e.row_bytes + e.tail_bytes, 256);
 
             e.view_slots = ggml_new_tensor_3d(ctx_views, e.host->type,
                 e.host->ne[0], e.host->ne[1], L.n_slots_l);
             e.view_slots->data   = (char *) base + e.region_off;
             e.view_slots->buffer = arena;
             ggml_format_name(e.view_slots, "pool_s#%s", e.host->name);
+            // the kernels zero the backend's padding past the view on every call: it must stay inside the tail
+            GGML_ASSERT(ggml_backend_buffer_get_alloc_size(arena, e.view_slots) <= ggml_nbytes(e.view_slots) + e.tail_bytes);
         }
     }
 
@@ -203,7 +202,7 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
             }
             e.ab_off[0] = 0    + sub;
             e.ab_off[1] = half + sub;
-            sub += e.row_bytes * n_expert;
+            sub += e.row_bytes * n_expert + GGML_PAD(e.tail_bytes, 16);
 
             e.view_ab = ggml_new_tensor_3d(ctx_views, e.host->type,
                 e.host->ne[0], e.host->ne[1], n_expert);
@@ -267,6 +266,7 @@ void llama_expert_pool::set_active(bool on, ggml_backend_sched_t sched) {
     epoch++;   // pooled-layer graph topology changes with this flag
     reset_slots();
     if (!on) {
+        dirty_bytes = region_bytes;   // the legacy tier's scratch window covers the region
         // the next graphs will not bind these; stale pointers would alias whatever
         // tensor the rebuilt graph places at the same address
         for (auto & L : layers) {
@@ -290,6 +290,9 @@ void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
         return;
     }
     ab_mode = ab;
+    if (ab) {
+        dirty_bytes = std::max(dirty_bytes, keep_ab ? overlay_bytes : std::min(region_bytes, 2 * layer_full_bytes));
+    }
     epoch++;   // stale view bindings must not survive a graph-reuse pass
     // cache contents do not survive the whole-layer overlay (the halves alias the slot arrays): drop the maps and refill
     // lazily. Over a kept layout (set_overlay) only the overlaid layers lost theirs, and set_overlay dropped those.
@@ -302,6 +305,19 @@ void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
     if (sched != nullptr) {
         register_sched(sched);
     }
+}
+
+void llama_expert_pool::clear_dirty() {
+    if (!has_tail || !active || ab_mode || dirty_bytes == 0 || view_region == nullptr || backend_router == nullptr) {
+        return;
+    }
+    // uploads on the copy stream must not land under the clear; the fetches after it must not land before it
+    if (admit_backend != nullptr) {
+        ggml_backend_synchronize(admit_backend);
+    }
+    ggml_backend_tensor_memset_async(backend_router, view_region, 0, 0, std::min(dirty_bytes, region_bytes));
+    ggml_backend_synchronize(backend_router);
+    dirty_bytes = 0;
 }
 
 bool llama_expert_pool::set_overlay(size_t delta) {
@@ -325,7 +341,7 @@ bool llama_expert_pool::set_overlay(size_t delta) {
             lost = lost || e.region_off < overlay_bytes;
             e.ab_off[0] = delta + sub;
             e.ab_off[1] = delta + half + sub;
-            sub += e.row_bytes * n_expert;
+            sub += e.row_bytes * n_expert + GGML_PAD(e.tail_bytes, 16);
             if (e.view_ab == nullptr) {
                 e.view_ab = ggml_new_tensor_3d(ctx_views, e.host->type, e.host->ne[0], e.host->ne[1], n_expert);
                 e.view_ab->buffer = region_arena;
@@ -342,8 +358,9 @@ bool llama_expert_pool::set_overlay(size_t delta) {
         }
         L.ab_pass = 0;
     }
-    ab_capable = true;
-    keep_ab    = true;
+    ab_capable  = true;
+    keep_ab     = true;
+    dirty_bytes = std::max(dirty_bytes, overlay_bytes);   // the tier's scratch and halves
     epoch++;   // the A/B views moved
     return true;
 }

@@ -336,8 +336,8 @@ struct llama_pshard_search_ctx {
     uint32_t                                   n_layers_moe     = 0;
     uint32_t                                   exps_tensors_per_layer = 0; // expert tensors in a layer (3 = up/gate/down,
                                                                            // 2 = gate_up/down): the pool's segment size
-    std::string                                exps_pool_refusal;      // a routed-expert tensor the pool's slots cannot hold
-                                                                       // (llama_expert_pool_tensor_supported), empty = none
+    size_t                                     exps_pad_layer_bytes = 0; // the pool's per-array tails (llama_expert_pool_tail_bytes),
+    size_t                                     exps_pad_total_bytes = 0; // largest layer / all layers; 0 = no padded tensor
     // whole-layer, attention and head bytes from the gguf table (the switch-cost estimator's inputs; 0 = no scan)
     size_t                                     layer_bytes_all  = 0;   // every blk.N tensor, summed over the scanned layers
     size_t                                     attn_bytes_all   = 0;   // the attention-priority resident set (layer minus FFN) of the same
@@ -388,7 +388,7 @@ std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * 
 static void pshard_scan_tensor_bytes(const struct gguf_context * g, uint32_t n_expert,
         std::vector<size_t> & per_layer, size_t & per_expert, size_t & total_weights, uint32_t & tensors_per_layer,
         std::vector<size_t> & per_layer_all, std::vector<size_t> & per_layer_attn, size_t & head_bytes, size_t & tok_embd_bytes,
-        bool & has_output_weight, std::string & pool_refusal) {
+        bool & has_output_weight, std::vector<size_t> & per_layer_pad) {
     const int64_t n = gguf_get_n_tensors(g);
     std::vector<size_t>   row_this(per_layer.size(), 0);
     std::vector<uint32_t> cnt_this(per_layer.size(), 0);
@@ -432,9 +432,7 @@ static void pshard_scan_tensor_bytes(const struct gguf_context * g, uint32_t n_e
         const size_t bytes = gguf_get_tensor_size(g, i);
         per_layer[il] += bytes;
         cnt_this[il]++;
-        if (pool_refusal.empty() && !llama_expert_pool_tensor_supported(gguf_get_tensor_type(g, i), gguf_get_tensor_ne(g, i)[0])) {
-            pool_refusal = name;
-        }
+        per_layer_pad[il] += GGML_PAD(llama_expert_pool_tail_bytes(gguf_get_tensor_type(g, i), gguf_get_tensor_ne(g, i)[0]), 256);
         {
             // element count from the block type (exact for block quants)
             const enum ggml_type t = gguf_get_tensor_type(g, i);
@@ -2812,12 +2810,10 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             __func__, cparams->n_batch);
         return plan;   // not viable
     }
-    if (!ctx.exps_pool_refusal.empty()) {
-        LLAMA_LOG_WARN("%s: [EXPERT_POOL] bs=%u %s: quantized rows not a multiple of 512, which the pool's slots do not "
-            "hold - tier refused\n", __func__, cparams->n_batch, ctx.exps_pool_refusal.c_str());
-        return plan;   // not viable
-    }
+    // the A/B pair and the slot arrays carry the padded tensors' tails (the runtime carve's layout); transfers do not
     const double   b_layer_exps = (double) ctx.exps_layer_bytes;
+    const double   b_pair       = 2.0 * (b_layer_exps + (double) ctx.exps_pad_layer_bytes);
+    const int64_t  b_pad_total  = (int64_t) ctx.exps_pad_total_bytes;
     const uint32_t n_layers_exp = ctx.n_layers_moe;
     const double   b_slot       = (double) ctx.exps_total_bytes / ctx.n_expert;   // one slot in every layer
     const double   b_expert     = b_slot / n_layers_exp;                                      // average expert (per miss)
@@ -2833,12 +2829,12 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     plan.scratch_measured = scratch_pool;   // the tier's real scratch (union enforcer, pool setup, carve)
     const uint64_t floor_slots = std::min<uint64_t>(ctx.n_expert, (uint64_t) bs * ctx.n_expert_used);
     const double floor_bytes = ab_tier
-        ? 2.0 * b_layer_exps
-        : (double) floor_slots * b_slot;
+        ? b_pair
+        : (double) floor_slots * b_slot + (double) b_pad_total;
 
     plan.total_vram_req = (size_t) vram_free;  // the pool absorbs the remainder by design
-    plan.pool_slots = pool_bytes > 0 && b_slot > 0.0
-        ? (uint32_t) ((double) pool_bytes / b_slot) : 0;
+    plan.pool_slots = pool_bytes > b_pad_total && b_slot > 0.0
+        ? (uint32_t) ((double) (pool_bytes - b_pad_total) / b_slot) : 0;
 
     // per-expert rates shared by the miss pricing and the hybrid q* share. Every machine number comes from
     // the profile (schema 2); a pool tier is refused rather than priced with a built-in value.
@@ -2906,9 +2902,9 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         // expert bytes, and the decode refill after it covers only the overlaid slots. Whether the ladder decodes on
         // such a tier is known only at the pick, which applies the estimate (pool_ab_scale, pool_keep_est)
         if (plan.is_viable) {
-            const double kept  = std::max(0.0, (double) pool_bytes - 2.0 * b_layer_exps);
+            const double kept  = std::max(0.0, (double) pool_bytes - b_pair);
             const double f     = std::min(1.0, kept / (double) ctx.exps_total_bytes);
-            const double whole = kept + 2.0 * b_layer_exps + (double) scratch_pool;
+            const double whole = kept + b_pair + (double) scratch_pool;
             const double ms_stream = bd.compute_ms + bd.weight_upload_ms + bd.other_ms;
             const double ms_kept   = bd.compute_ms + bd.other_ms + bd.weight_upload_ms * (1.0 - f);
             if (ms_stream > 0.0 && plan.tps > 0.0f) {
@@ -3577,7 +3573,7 @@ void llama_params_fit_pshard_plan(
     size_t exps_per_expert = 0;
     size_t exps_weights    = 0;
     uint32_t exps_tensors  = 0;
-    std::string exps_pool_refusal;
+    std::vector<size_t> exps_pad_per_layer(n_layers, 0);
     std::vector<size_t> all_per_layer(n_layers, 0), attn_per_layer(n_layers, 0);
     size_t head_bytes = 0, tok_embd_bytes = 0;
     bool   has_output_weight = false;
@@ -3592,7 +3588,7 @@ void llama_params_fit_pshard_plan(
                 n_split = (int) gguf_get_val_u16(g, ks);
             }
             pshard_scan_tensor_bytes(g, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors,
-                all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pool_refusal);
+                all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pad_per_layer);
             gguf_free(g);
             if (n_split > 1) {
                 char prefix[1024];
@@ -3611,7 +3607,7 @@ void llama_params_fit_pshard_plan(
                             fclose(sf);
                             if (struct gguf_context * gs = gguf_init_from_file(split_path, gip_s)) {
                                 pshard_scan_tensor_bytes(gs, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors,
-                                    all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pool_refusal);
+                                    all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pad_per_layer);
                                 gguf_free(gs);
                             }
                         } else {
@@ -3691,7 +3687,10 @@ void llama_params_fit_pshard_plan(
     ctx.exps_row_bytes    = exps_per_expert;
     ctx.exps_total_weights = exps_weights;
     ctx.exps_tensors_per_layer = exps_tensors;
-    ctx.exps_pool_refusal      = exps_pool_refusal;
+    for (size_t b : exps_pad_per_layer) {
+        ctx.exps_pad_layer_bytes  = std::max(ctx.exps_pad_layer_bytes, b);
+        ctx.exps_pad_total_bytes += b;
+    }
     for (uint32_t il = 0; il < n_layers; il++) {
         if (all_per_layer[il] > 0) {
             ctx.n_layers_scanned++;

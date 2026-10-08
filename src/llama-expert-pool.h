@@ -29,10 +29,10 @@
 
 struct llama_model;
 
-// whether the pool's slot views can hold an expert tensor: the upload paths reserve and zero MMQ row padding for a
-// quantized tensor whose ne0 is not a multiple of 512, the slots do not. The planner refuses pool tiers by the same rule
-inline bool llama_expert_pool_tensor_supported(enum ggml_type type, int64_t ne0) {
-    return !ggml_is_quantized(type) || ne0 % 512 == 0;
+// bytes a pool view of this expert tensor needs past its last row: a quantized tensor whose ne0 is not a multiple of
+// 512 gets the CUDA backend's MMQ row padding, zeroed by the kernels on every call. The planner reserves the same tail
+inline size_t llama_expert_pool_tail_bytes(enum ggml_type type, int64_t ne0) {
+    return ggml_is_quantized(type) && ne0 % 512 != 0 ? ggml_row_size(type, 512 - ne0 % 512) : 0;
 }
 
 struct llama_expert_pool {
@@ -42,6 +42,7 @@ struct llama_expert_pool {
         ggml_tensor *       view_slots = nullptr; // cache-mode view, ne[2] = n_slots
         ggml_tensor *       view_ab    = nullptr; // A/B-mode view,  ne[2] = n_expert
         size_t              row_bytes  = 0;       // one expert = host->nb[2]
+        size_t              tail_bytes = 0;       // padding after the last row (llama_expert_pool_tail_bytes)
         size_t              region_off = 0;       // slot 0 offset inside the region (cache mode)
         size_t              ab_off[2]  = {0, 0};  // layer-half offsets (A/B mode)
     };
@@ -214,6 +215,13 @@ struct llama_expert_pool {
     size_t   layer_slot_bytes = 0;     // per-layer cache-mode footprint (all tensors)
     size_t   layer_full_bytes = 0;     // per-layer whole-expert-set footprint
     bool     ab_capable       = false; // the region holds the A/B pair (set_region)
+    // padded tensors (tail_bytes > 0): MMQ reads a slot's last row past its end into the next slot, so the slots that
+    // hold no expert must hold finite bytes. dirty_bytes = the region prefix whose contents are not slot rows
+    // (fresh carve, a whole-stack tier's halves and scratch, a legacy tier's window), zeroed on entry to cache mode
+    bool     has_tail    = false;
+    size_t   dirty_bytes = 0;
+    ggml_tensor * view_region = nullptr;   // I8 view of the whole region
+    void clear_dirty();
 
     std::vector<layer_state> layers;   // dense by il; tensors empty for non-moe layers
     ggml_context * ctx_views = nullptr;
