@@ -1590,6 +1590,10 @@ bool llama_pshard_registry_cache_missed(const struct llama_pshard_plan_registry 
     return registry != nullptr && registry->cache_missed;
 }
 
+bool llama_pshard_registry_stock_fit(const struct llama_pshard_plan_registry * registry) {
+    return registry != nullptr && registry->pshard_disabled;
+}
+
 size_t llama_pshard_registry_n_tiers(const struct llama_pshard_plan_registry * registry) {
     return registry ? registry->tier_sizes.size() : 0;
 }

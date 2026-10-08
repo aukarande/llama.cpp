@@ -1601,7 +1601,7 @@ size_t common_pshard_mtp_need_mb(common_params & params, uint32_t n_ctx,
     return (m.context + m.compute + mib - 1) / mib;   // the weights are the target's
 }
 
-bool common_pshard_plan(common_params & params, uint32_t n_ctx, uint32_t bench_tier_cap, bool bench_plan) {
+bool common_pshard_plan(common_params & params, uint32_t n_ctx, uint32_t bench_tier_cap, bool bench_plan, bool * stock_fit) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1671,6 +1671,9 @@ bool common_pshard_plan(common_params & params, uint32_t n_ctx, uint32_t bench_t
         });
 
     const bool planned = mparams.pshard;
+    if (stock_fit != nullptr) {
+        *stock_fit = !planned && llama_pshard_registry_stock_fit(mparams.pshard_registry);
+    }
     llama_pshard_registry_free(mparams.pshard_registry);
     return planned;
 }

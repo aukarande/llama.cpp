@@ -999,10 +999,12 @@ void common_pshard_fit_one_budget(common_params & params, struct llama_model_par
 void common_pshard_draft_leftover(common_params & params, const struct llama_pshard_plan_registry * registry, size_t arena_budget_mb);
 
 // plan the pshard tiers for this configuration and write the registry next to the model
-// (the same passes as the runtime load); returns false when planning is refused. Used by
+// (the same passes as the runtime load); returns false when no tiers were planned. Used by
 // llama-pshard-plan-params and by common_init_from_params when the registry has no plan.
-// bench_plan: llama-bench context planning with a tier cap.
-bool common_pshard_plan(common_params & params, uint32_t n_ctx, uint32_t bench_tier_cap = 0, bool bench_plan = false);
+// bench_plan: llama-bench context planning with a tier cap. stock_fit: set when the model fits the
+// budget whole (the registry records stock loading for it; nothing was refused)
+bool common_pshard_plan(common_params & params, uint32_t n_ctx, uint32_t bench_tier_cap = 0, bool bench_plan = false,
+                        bool * stock_fit = nullptr);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

@@ -188,11 +188,21 @@ static std::map<uint32_t, uint32_t> bench_plan_context_tier_caps(const bench_pla
 }
 
 // false when the planner refused pshard for this context (no or foreign machine profile, unsupported params):
-// nothing was written for it
+// nothing was written for it. A model that fits the budget whole is not a refusal: the registry records
+// stock loading for it
 // the planner lives in common (common_pshard_plan) so that the tools can plan in-process when the
 // registry has no plan; this tool is the explicit, plan-only entry point
 static bool plan_pshard_context(common_params & params, uint32_t n_ctx, uint32_t bench_tier_cap = 0, bool bench_plan = false) {
-    return common_pshard_plan(params, n_ctx, bench_tier_cap, bench_plan);
+    bool stock_fit = false;
+    if (common_pshard_plan(params, n_ctx, bench_tier_cap, bench_plan, &stock_fit)) {
+        return true;
+    }
+    if (stock_fit) {
+        LOG_INF("%s: n_ctx=%u: the model fits the budget whole - registry written with stock loading, no tiers\n",
+            __func__, n_ctx);
+        return true;
+    }
+    return false;
 }
 
 int main(int argc, char ** argv) {

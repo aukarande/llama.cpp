@@ -620,6 +620,8 @@ extern "C" {
         struct llama_model_tensor_buft_override * out, size_t n_max);
     // true when llama_params_fit_pshard found no plan for this configuration in the cache
     LLAMA_API bool     llama_pshard_registry_cache_missed(const struct llama_pshard_plan_registry * registry);
+    // true when the model fits the budget whole: the registry holds a stock-loading variant, no tiers
+    LLAMA_API bool     llama_pshard_registry_stock_fit(const struct llama_pshard_plan_registry * registry);
 
     // true when the loaded model runs under pshard (false after a silent stock fallback)
     LLAMA_API bool llama_model_pshard_active(const struct llama_model * model);
