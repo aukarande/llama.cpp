@@ -1934,9 +1934,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
         // switches are pairwise: the price depends on the plan that is active RIGHT NOW
-        // (not necessarily the decode plan, e.g. bs=16 decode or back-to-back prompts)
+        // (not necessarily the decode plan, e.g. bs=16 decode or back-to-back prompts) and on the
+        // share of the expert cache that is filled right now
+        std::vector<float> fill;
+        if (expert_pool) {
+            expert_pool->layer_fill(fill);
+        }
         const auto cut = hold != SIZE_MAX ? llama_pshard_plan_registry::cut { hold, hold, 0.0 } :
-            pshard_registry->find_cut(n_tokens_all, max_ubatch, min_ubatch, pshard_active_plan, &switch_state);
+            pshard_registry->find_cut(n_tokens_all, max_ubatch, min_ubatch, pshard_active_plan, &switch_state,
+                expert_pool ? &fill : nullptr);
         if (cut.tier < pshard_registry->tier_sizes.size()) {
             pshard_cut_tier = cut.tier;
             pshard_cut_tail = cut.tail;

@@ -1532,33 +1532,46 @@ static llama_pshard_plan llama_pshard_search_hybrid(const llama_pshard_search_ct
 // it from the decode (tier 0) plan. Byte counts are the gguf table's per-layer averages (the
 // registry persists the averages, not per-layer sizes). Unpriced (fields stay 0) without a
 // scanned table or a profiled upload rate.
+// publish the estimate constants: switches are pairwise (any plan to any plan), so the planner's tier pick and
+// the runtime evaluate switch_cost_ms(from, to) on demand from these. False (left unpriced) without them
+static bool pshard_publish_switch_constants(
+        llama_pshard_plan_registry * registry, const llama_pshard_search_ctx & ctx,
+        uint32_t n_layers, double pcie_gb_s, bool quiet) {
+    if (!registry || n_layers == 0) {
+        return false;
+    }
+    if (ctx.n_layers_scanned == 0 || ctx.layer_bytes_all == 0 || pcie_gb_s <= 0.0) {
+        if (!quiet) {
+            LLAMA_LOG_WARN("%s: switch costs not priced - %s\n", __func__,
+                pcie_gb_s <= 0.0 ? "no upload rate in the machine profile (missing, or no Threads line for this thread count)"
+                                 : "no layer bytes (gguf tensor table scan)");
+        }
+        return false;
+    }
+    const double layer_bytes = (double) ctx.layer_bytes_all / ctx.n_layers_scanned;          // every blk.N tensor
+    const double attn_frac   = (double) ctx.attn_bytes_all / (double) ctx.layer_bytes_all;  // the attention-priority pin set's share
+    const double head_bytes  = (double) ctx.head_bytes;
+    registry->switch_layer_mb  = (float)(layer_bytes / 1e6);
+    registry->switch_attn_frac = (float)attn_frac;
+    registry->switch_head_mb   = (float)(head_bytes / 1e6);
+    registry->switch_pcie_gb_s = (float)pcie_gb_s;
+    registry->n_layers         = n_layers;
+    return true;
+}
+
 static void pshard_compute_switch_costs(
         llama_pshard_plan_registry * registry, const llama_pshard_search_ctx & ctx,
         uint32_t n_layers, double pcie_gb_s) {
     if (!registry || registry->best_plans.empty() || n_layers == 0) {
         return;
     }
-    if (ctx.n_layers_scanned == 0 || ctx.layer_bytes_all == 0 || pcie_gb_s <= 0.0) {
-        LLAMA_LOG_WARN("%s: switch costs not priced - %s\n", __func__,
-            pcie_gb_s <= 0.0 ? "no upload rate in the machine profile (missing, or no Threads line for this thread count)"
-                             : "no layer bytes (gguf tensor table scan)");
+    if (!pshard_publish_switch_constants(registry, ctx, n_layers, pcie_gb_s, /*quiet=*/false)) {
         return;
     }
     const llama_pshard_plan & base = registry->best_plans[0];
     if (!base.is_viable) {
         return;
     }
-    const double layer_bytes = (double) ctx.layer_bytes_all / ctx.n_layers_scanned;          // every blk.N tensor
-    const double attn_frac   = (double) ctx.attn_bytes_all / (double) ctx.layer_bytes_all;  // the attention-priority pin set's share
-    const double head_bytes  = (double) ctx.head_bytes;
-
-    // publish the estimate constants: switches are pairwise (any plan to any plan), so
-    // the runtime evaluates switch_cost_ms(from, to) on demand from these
-    registry->switch_layer_mb  = (float)(layer_bytes / 1e6);
-    registry->switch_attn_frac = (float)attn_frac;
-    registry->switch_head_mb   = (float)(head_bytes / 1e6);
-    registry->switch_pcie_gb_s = (float)pcie_gb_s;
-    registry->n_layers         = n_layers;
 
     for (auto & plan : registry->best_plans) {
         plan.switch_ms = (&plan == &base || !plan.is_viable) ? 0.0f : registry->switch_cost_ms(base, plan);
@@ -1772,11 +1785,12 @@ bool pshard_registry_save(
                 plan.switch_ms, (int)plan.ids_cross);
             if (plan.strategy == LLAMA_PSHARD_EXPERT_POOL) {
                 // POOL-only columns; legacy tier lines stay byte-identical
-                fprintf(f, " K=%u s=%u miss_policy=%s prefill_mode=%s hybrid_frac=%.3f cold_ms=%.2f",
+                fprintf(f, " K=%u s=%u miss_policy=%s prefill_mode=%s hybrid_frac=%.3f cold_ms=%.2f pool_keep=%.3f ab_scale=%.4f",
                     plan.pool_k, plan.pool_slots,
                     llama_pshard_miss_policy_name((llama_pshard_miss_policy)plan.pool_miss),
                     llama_pshard_prefill_mode_name((llama_pshard_prefill_mode)plan.pool_prefill),
-                    plan.pool_hybrid_frac, plan.cold_ms);
+                    plan.pool_hybrid_frac, plan.cold_ms, plan.pool_keep,
+                    plan.pool_ab_applied ? plan.pool_ab_scale : 1.0f);
             }
             if (plan.strategy == LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE) {
                 fprintf(f, " ffn_gpu=%u", plan.n_ffn_gpu);
@@ -1836,6 +1850,8 @@ bool pshard_registry_load(
         float pool_hybrid_frac = 0.0f;
         uint32_t n_ffn_gpu = 0;
         float cold_ms = 0.0f;
+        float pool_keep = 0.0f;
+        float pool_ab_scale = 1.0f;
         int32_t expert_slice_tokens = -1;
         std::vector<uint32_t> piece_n;
         std::vector<float>    piece_ms;
@@ -1962,6 +1978,10 @@ bool pshard_registry_load(
             td.pool_hybrid_frac = phf ? (float)atof(phf + 12) : 0.0f;
             const char * pcm = strstr(s.c_str(), "cold_ms=");
             td.cold_ms = pcm ? (float)atof(pcm + 8) : 0.0f;
+            const char * pkp = strstr(s.c_str(), "pool_keep=");
+            td.pool_keep = pkp ? (float)atof(pkp + 10) : 0.0f;
+            const char * pas = strstr(s.c_str(), "ab_scale=");
+            td.pool_ab_scale = pas ? (float)atof(pas + 9) : 1.0f;
             const char * pfg = strstr(s.c_str(), "ffn_gpu=");
             td.n_ffn_gpu = pfg ? (uint32_t) atoi(pfg + 8) : 0;
             const char * pst = strstr(s.c_str(), "slice_tokens=");
@@ -2053,6 +2073,10 @@ bool pshard_registry_load(
         plan.pool_hybrid_frac = td.pool_hybrid_frac;
         plan.n_ffn_gpu        = td.n_ffn_gpu;
         plan.cold_ms          = td.cold_ms;
+        plan.pool_keep        = td.pool_keep;
+        plan.pool_ab_scale    = td.pool_ab_scale;
+        plan.pool_ab_applied  = td.pool_ab_scale > 0.0f && td.pool_ab_scale < 1.0f;
+        plan.pool_keep_est    = plan.pool_ab_applied ? td.pool_keep : 0.0f;
         plan.expert_slice_tokens = td.expert_slice_tokens;
         plan.piece_n          = td.piece_n;
         plan.piece_ms         = td.piece_ms;
@@ -2868,8 +2892,30 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
 
     if (ab_tier) {
         // whole-stack tier: one resident chain over the A/B half, so the pair must
-        // fit and the probe's streaming price (upload under the compute fence) holds
+        // fit and the probe's streaming price (upload under the compute fence) holds.
+        // Identity ids: no misses, so no miss policy (a cpu_exec one marks a cache tier that keeps the slots)
         plan.is_viable = pool_bytes >= (int64_t) floor_bytes;
+        plan.pool_miss = LLAMA_PSHARD_MISS_FETCH;
+        // over a pool cache tier's layout (runtime pshard_pool_resize) its scratch and the pair take the region's
+        // bottom, the slots above stay and fill their layers' halves on the device. A prompt-sized pass touches
+        // nearly every expert, so the share of expert bytes it does not upload is the kept slot bytes over all
+        // expert bytes, and the decode refill after it covers only the overlaid slots. Whether the ladder decodes on
+        // such a tier is known only at the pick, which applies the estimate (pool_ab_scale, pool_keep_est)
+        if (plan.is_viable) {
+            const double kept  = std::max(0.0, (double) pool_bytes - 2.0 * b_layer_exps);
+            const double f     = std::min(1.0, kept / (double) ctx.exps_total_bytes);
+            const double whole = kept + 2.0 * b_layer_exps + (double) scratch_pool;
+            const double ms_stream = bd.compute_ms + bd.weight_upload_ms + bd.other_ms;
+            const double ms_kept   = bd.compute_ms + bd.other_ms + bd.weight_upload_ms * (1.0 - f);
+            if (ms_stream > 0.0 && plan.tps > 0.0f) {
+                plan.pool_ab_scale = (float) (ms_kept / ms_stream);
+                plan.pool_keep_est = (float) (whole > 0.0 ? kept / whole : 0.0);
+                LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u whole-stack over a kept cache layout: %.0f%% of expert bytes from slots, "
+                    "%.0f%% of the slots kept -> %.1f t/s (streaming %.1f; compute %.1f + upload %.1f + other %.1f ms)\n",
+                    __func__, bs, 100.0 * f, 100.0 * plan.pool_keep_est, plan.tps / plan.pool_ab_scale, plan.tps,
+                    bd.compute_ms, bd.weight_upload_ms, bd.other_ms);
+            }
+        }
     } else {
         // cache tier. A fetch-only pool needs this pass's distinct experts resident
         // at once (the fetch floor); CPU-route policies spill the overflow to the CPU
@@ -3291,6 +3337,57 @@ static bool llama_pshard_params_supported(
     }
 
     return true;
+}
+
+// a tier whose batch can touch every expert (whole-stack regime): over a warm pool cache tier it runs on the kept layout
+static bool pshard_whole_stack_tier(const llama_pshard_plan_registry * registry, const llama_pshard_search_ctx & ctx, size_t t) {
+    return t > 0 && ctx.n_expert > 0 && (uint64_t) registry->tier_sizes[t] * ctx.n_expert_used >= ctx.n_expert;
+}
+
+// a whole-stack tier that runs between two decode passes (its pick charges the switch in and back). The
+// multi-sequence step and the speculative verify batch run back to back instead
+static bool pshard_prompt_tier(const llama_pshard_plan_registry * registry, const llama_pshard_search_ctx & ctx,
+        const llama_context_params & cparams, size_t t) {
+    if (!pshard_whole_stack_tier(registry, ctx, t)) {
+        return false;
+    }
+    const uint32_t bs      = registry->tier_sizes[t];
+    const uint32_t n_seq   = std::max<uint32_t>(1, cparams.n_seq_max);
+    const uint32_t n_draft = cparams.n_outputs_max_per_seq > 1 ? cparams.n_outputs_max_per_seq - 1 : 0;
+    return !((n_seq > 1 && bs == n_seq) || (n_draft > 0 && bs == n_seq * (n_draft + 1)));
+}
+
+// the decode tier (tier 0) is a pool cache tier that admits: the slots a whole-stack tier reuses fill
+static bool pshard_decode_warm(const llama_pshard_plan_registry * registry) {
+    const auto & d = registry->best_plans[0];
+    return d.is_viable && d.strategy == LLAMA_PSHARD_EXPERT_POOL && d.cold_ms > 0.0f;
+}
+
+// a whole-stack pool tier priced over the decode tier's warm cache layout (on) or streaming (off); idempotent
+static void pshard_apply_prompt_reuse(llama_pshard_plan & p, bool on) {
+    const bool want = on && p.is_viable && p.strategy == LLAMA_PSHARD_EXPERT_POOL &&
+                      p.pool_ab_scale > 0.0f && p.pool_ab_scale < 1.0f;
+    if (want == p.pool_ab_applied) {
+        return;
+    }
+    const float k = want ? p.pool_ab_scale : 1.0f / p.pool_ab_scale;   // ms factor
+    p.tps /= k;
+    for (auto & pm : p.piece_ms) {
+        pm *= k;
+    }
+    p.pool_keep       = want ? p.pool_keep_est : 0.0f;
+    p.pool_ab_applied = want;
+}
+
+// after the union enforcer re-planned tiers: re-price every whole-stack tier against the decode tier the ladder ended with
+static void pshard_reapply_prompt_reuse(llama_pshard_plan_registry * registry, const llama_pshard_search_ctx & ctx) {
+    if (registry == nullptr || registry->best_plans.empty()) {
+        return;
+    }
+    const bool warm = pshard_decode_warm(registry);
+    for (size_t t = 1; t < registry->best_plans.size(); t++) {
+        pshard_apply_prompt_reuse(registry->best_plans[t], warm && pshard_whole_stack_tier(registry, ctx, t));
+    }
 }
 
 void llama_params_fit_pshard_plan(
@@ -3894,11 +3991,45 @@ void llama_params_fit_pshard_plan(
                 for (auto & t : threads) t.join();
             }
 
+            const bool sw_priced = pshard_publish_switch_constants(registry, ctx, n_layers,
+                predictor ? (predictor->stats.upload_bw > 0.0 ? predictor->stats.upload_bw : predictor->stats.peak_pcie_bw) : 0.0,
+                /*quiet=*/true);
             for (size_t t = first_probe_tier; t < n_tiers; t++) {
+                const uint32_t from = t > 0 ? registry->tier_sizes[t - 1] : 0;
+                // a prompt tier of a ladder that decodes on the expert pool runs between two decode passes: its pick
+                // charges the switch into it and back (what it uploads to pin, the cache refill it leaves behind)
+                const llama_pshard_plan * rest = sw_priced && pshard_prompt_tier(registry, ctx, *cparams, t) &&
+                    registry->best_plans[0].is_viable && registry->best_plans[0].strategy == LLAMA_PSHARD_EXPERT_POOL
+                    ? &registry->best_plans[0] : nullptr;
+                // a whole-stack pool tier reuses the decode tier's cached experts only when that tier admits them
+                const bool rest_warm = pshard_decode_warm(registry) && pshard_whole_stack_tier(registry, ctx, t);
+                // the top tier runs every longer prompt as several ubatches per switch: about n_ctx_seq / (2 * bs) of
+                // them (a sequence holds n_ctx / n_seq_max tokens unless the KV cache is unified)
+                const uint32_t n_ctx_seq = cparams->kv_unified ? ctx.kv_size
+                    : ctx.kv_size / std::max<uint32_t>(1, cparams->n_seq_max);
+                const double per_switch = t + 1 == n_tiers && n_ctx_seq > 0
+                    ? std::max(1.0, (double) n_ctx_seq / (2.0 * registry->tier_sizes[t])) : 1.0;
                 llama_pshard_plan best;
+                double best_cost = 0.0;
                 for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
-                    auto & p = all_plans[s * n_tiers + t];
-                    if (p.is_viable && pshard_plan_is_better(p, best, t > 0 ? registry->tier_sizes[t - 1] : 0)) {
+                    const auto & p0 = all_plans[s * n_tiers + t];
+                    if (!p0.is_viable) {
+                        continue;
+                    }
+                    llama_pshard_plan p = p0;
+                    pshard_apply_prompt_reuse(p, rest_warm);
+                    if (rest != nullptr && p.tps > 0.0f) {
+                        const double sw_in  = registry->switch_cost_ms(*rest, p);
+                        const double sw_out = registry->switch_cost_ms(p, *rest);
+                        const double cost   = pshard_tier_cost_ms(p, from) + (sw_in + sw_out) / per_switch;
+                        LLAMA_LOG_INFO("%s: [tier %zu bs=%-5u] %-28s ubatch %.1f + (switch in %.1f + back %.1f) / %.1f = %.1f ms\n",
+                            __func__, t, registry->tier_sizes[t], llama_pshard_strategy_name((llama_pshard_strategy) s),
+                            pshard_tier_cost_ms(p, from), sw_in, sw_out, per_switch, cost);
+                        if (!best.is_viable || best.tps <= 0.0f || cost < best_cost) {
+                            best      = p;
+                            best_cost = cost;
+                        }
+                    } else if (rest == nullptr ? pshard_plan_is_better(p, best, from) : !best.is_viable) {
                         best = p;
                     }
                 }
@@ -3947,6 +4078,7 @@ void llama_params_fit_pshard_plan(
 
         pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
             path_model, mparams);
+        pshard_reapply_prompt_reuse(registry, ctx);
         registry->kernel_copy_cap_mb = predictor ? (float) predictor->stats.kernel_copy_cap_mb : -1.0f;
         registry->machine_hash = machine_hash;
         pshard_compute_switch_costs(registry, ctx, n_layers,
@@ -3980,6 +4112,7 @@ void llama_params_fit_pshard_plan(
                     registry->active_plan = &registry->best_plans[t];
                     pshard_enforce_union_budget(registry, ctx, cparams, dmds, force_strategy,
                         path_model, mparams);
+                    pshard_reapply_prompt_reuse(registry, ctx);
                     registry->kernel_copy_cap_mb = predictor ? (float) predictor->stats.kernel_copy_cap_mb : -1.0f;
                     registry->machine_hash = machine_hash;
                     pshard_compute_switch_costs(registry, ctx, n_layers,

@@ -126,6 +126,11 @@ bool llama_expert_pool::set_region(ggml_backend_buffer_t arena, void * base, siz
     region_bytes = bytes;
     region_arena = arena;
     n_slots      = slots_per_layer;
+    keep_ab       = false;
+    overlay_bytes = 0;
+    for (auto & L : layers) {
+        L.ab_lost = false;
+    }
 
     if (ctx_views != nullptr) {
         ggml_free(ctx_views);
@@ -248,6 +253,7 @@ void llama_expert_pool::lookup_backend_procs() {
         return;
     }
     copy_segments    = (ggml_backend_copy_segments_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_segments_async");
+    copy_segments_d2d = (ggml_backend_copy_segments_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_segments_d2d_async");
     wrap_host_buffer = (ggml_backend_wrap_host_buffer_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_wrap_host_buffer");
 }
 
@@ -284,10 +290,175 @@ void llama_expert_pool::set_ab_mode(bool ab, ggml_backend_sched_t sched) {
     }
     ab_mode = ab;
     epoch++;   // stale view bindings must not survive a graph-reuse pass
-    // cache contents do not survive the whole-layer overlay (the halves alias the slot arrays): drop the maps and refill lazily
-    reset_slots();
+    // cache contents do not survive the whole-layer overlay (the halves alias the slot arrays): drop the maps and refill
+    // lazily. Over a kept layout (set_overlay) only the overlaid layers lost theirs, and set_overlay dropped those.
+    if (!keep_ab) {
+        reset_slots();
+    }
+    if (!ab) {
+        keep_ab = false;
+    }
     if (sched != nullptr) {
         register_sched(sched);
+    }
+}
+
+bool llama_expert_pool::set_overlay(size_t delta) {
+    const size_t half = layer_full_bytes;
+    if (region_base == nullptr || delta + 2 * half > region_bytes) {
+        return false;
+    }
+    // in-flight background admissions target slots that may lie under the overlay
+    if (admit_backend != nullptr) {
+        ggml_backend_synchronize(admit_backend);
+    }
+    admit_pending = false;
+    overlay_bytes = delta + 2 * half;
+    for (auto & L : layers) {
+        if (L.tensors.empty()) {
+            continue;
+        }
+        size_t sub = 0;
+        bool lost = false;
+        for (auto & e : L.tensors) {
+            lost = lost || e.region_off < overlay_bytes;
+            e.ab_off[0] = delta + sub;
+            e.ab_off[1] = delta + half + sub;
+            sub += e.row_bytes * n_expert;
+            if (e.view_ab == nullptr) {
+                e.view_ab = ggml_new_tensor_3d(ctx_views, e.host->type, e.host->ne[0], e.host->ne[1], n_expert);
+                e.view_ab->buffer = region_arena;
+                ggml_format_name(e.view_ab, "pool_ab#%s", e.host->name);
+            }
+            e.view_ab->data = (char *) region_base + e.ab_off[L.il & 1];
+        }
+        L.ab_lost = lost;
+        if (lost) {
+            std::fill(L.expert_slot.begin(), L.expert_slot.end(), -1);
+            std::fill(L.slot_expert.begin(), L.slot_expert.end(), -1);
+            std::fill(L.slot_stamp.begin(),  L.slot_stamp.end(),  0);
+            L.stamp = 0;
+        }
+        L.ab_pass = 0;
+    }
+    ab_capable = true;
+    keep_ab    = true;
+    epoch++;   // the A/B views moved
+    return true;
+}
+
+void llama_expert_pool::fill_ab(layer_state & L, ggml_backend_t backend) {
+    // at most this many host upload runs per tensor: short gaps of resident experts ride along with the upload
+    // instead of costing one copy-engine transfer each (a cap of 16 re-uploaded about half of the residents)
+    constexpr size_t max_runs = 64;
+    const bool use_slots = keep_ab && !L.ab_lost && copy_segments_d2d != nullptr && !L.expert_slot.empty();
+    uint32_t n_res = 0;
+    if (use_slots) {
+        for (uint32_t x = 0; x < n_expert; x++) {
+            n_res += L.expert_slot[x] >= 0 ? 1 : 0;
+        }
+    }
+    if (n_res == 0) {
+        for (const auto & e : L.tensors) {
+            ggml_backend_tensor_set_async(backend, e.view_ab, e.host->data, 0, (size_t) n_expert * e.row_bytes);
+        }
+        ab_note(L, 0, n_expert);
+        return;
+    }
+    ab_runs.clear();
+    for (uint32_t x = 0; x < n_expert; ) {
+        if (L.expert_slot[x] >= 0) {
+            x++;
+            continue;
+        }
+        uint32_t y = x;
+        while (y < n_expert && L.expert_slot[y] < 0) {
+            y++;
+        }
+        ab_runs.emplace_back(x, y);
+        x = y;
+    }
+    while (ab_runs.size() > max_runs) {
+        size_t   best = 0;
+        uint32_t gap  = UINT32_MAX;
+        for (size_t i = 0; i + 1 < ab_runs.size(); i++) {
+            const uint32_t g = ab_runs[i + 1].first - ab_runs[i].second;
+            if (g < gap) {
+                gap  = g;
+                best = i;
+            }
+        }
+        ab_runs[best].second = ab_runs[best + 1].second;
+        ab_runs.erase(ab_runs.begin() + best + 1);
+    }
+    uint32_t n_up = 0;
+    for (const auto & r : ab_runs) {
+        n_up += r.second - r.first;
+    }
+    ab_segs.clear();
+    bool aligned = true;
+    for (const auto & e : L.tensors) {
+        size_t ri = 0;
+        for (uint32_t x = 0; x < n_expert; x++) {
+            while (ri < ab_runs.size() && ab_runs[ri].second <= x) {
+                ri++;
+            }
+            const bool uploaded = ri < ab_runs.size() && ab_runs[ri].first <= x;
+            if (uploaded) {
+                continue;
+            }
+            const int32_t s = L.expert_slot[x];
+            GGML_ASSERT(s >= 0);
+            ab_segs.push_back({ (char *) e.view_ab->data + (size_t) x * e.row_bytes,
+                                (const char *) e.view_slots->data + (size_t) s * e.row_bytes, e.row_bytes });
+            const auto & sg = ab_segs.back();
+            aligned = aligned && (((uintptr_t) sg.src | (uintptr_t) sg.dst | (uintptr_t) sg.size) & 15) == 0;
+        }
+    }
+    // the batched device copy needs 16-byte aligned rows: otherwise upload the whole layer
+    if (!aligned) {
+        for (const auto & e : L.tensors) {
+            ggml_backend_tensor_set_async(backend, e.view_ab, e.host->data, 0, (size_t) n_expert * e.row_bytes);
+        }
+        ab_note(L, 0, n_expert);
+        return;
+    }
+    // host uploads first, then the device copies: one copy-engine -> kernel transition per layer on this stream.
+    // The device copies run as a kernel on the scheduler's DMA-only copy stream on purpose: one launch per 32 rows
+    // instead of one engine transfer per row; it shares the SMs with the previous layer's compute
+    for (const auto & e : L.tensors) {
+        for (const auto & r : ab_runs) {
+            ggml_backend_tensor_set_async(backend, e.view_ab, (const char *) e.host->data + (size_t) r.first * e.row_bytes,
+                (size_t) r.first * e.row_bytes, (size_t) (r.second - r.first) * e.row_bytes);
+        }
+    }
+    if (!copy_segments_d2d(backend, ab_segs.data(), (int) ab_segs.size())) {
+        // the device path refused: upload the residents too
+        for (const auto & e : L.tensors) {
+            ggml_backend_tensor_set_async(backend, e.view_ab, e.host->data, 0, (size_t) n_expert * e.row_bytes);
+        }
+        ab_note(L, 0, n_expert);
+        return;
+    }
+    ab_note(L, n_expert - n_up, n_up);
+}
+
+void llama_expert_pool::ab_note(layer_state & L, uint32_t dev, uint32_t up) {
+    L.ab_dev += dev;
+    L.ab_up  += up;
+    ab_pass_dev += dev;
+    ab_pass_up  += up;
+    int32_t last = -1;
+    for (const auto & l : layers) {
+        if (!l.tensors.empty()) {
+            last = l.il;
+        }
+    }
+    if (L.il == last) {
+        LLAMA_LOG_INFO("%s: whole-stack pass: %llu experts copied from slots, %llu uploaded%s\n", __func__,
+            (unsigned long long) ab_pass_dev, (unsigned long long) ab_pass_up, keep_ab ? " (kept layout)" : "");
+        ab_pass_dev = 0;
+        ab_pass_up  = 0;
     }
 }
 
@@ -474,10 +645,7 @@ bool llama_expert_pool::prefetch(const ggml_tensor * src, ggml_backend_t copy_ba
     }
     // the sched already waited on the compute fence for this copy stream, so the
     // half (last read by layer il-2) is free; the consumer waits on the copy event
-    for (const auto & e : L.tensors) {
-        ggml_backend_tensor_set_async(copy_backend, e.view_ab,
-            e.host->data, 0, (size_t) n_expert * e.row_bytes);
-    }
+    fill_ab(L, copy_backend);
     L.ab_pass = generation;
     return true;
 }
@@ -915,10 +1083,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
     if (ab_mode) {
         // whole-stack tier: fill this layer's half once per pass, identity ids
         if (L.ab_pass != generation || generation == 0) {
-            for (const auto & e : L.tensors) {
-                ggml_backend_tensor_set_async(split_backend, e.view_ab,
-                    e.host->data, 0, (size_t) n_expert * e.row_bytes);
-            }
+            fill_ab(L, split_backend);
             L.ab_pass = generation;
         }
         for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
@@ -1294,6 +1459,23 @@ void llama_expert_pool::log_counters() const {
             __func__, (unsigned long long) ids_host_polls,
             ids_host_polls > 0 ? (double) ids_host_wait_us / (double) ids_host_polls : 0.0,
             (unsigned long long) ids_host_drains, (unsigned long long) ids_host_fallbacks, hoisted_nodes, hoist_regions);
+    }
+    {
+        uint64_t ab_dev = 0, ab_up = 0, n_lost = 0, n_pooled = 0;
+        for (const auto & L : layers) {
+            if (L.tensors.empty()) {
+                continue;
+            }
+            ab_dev += L.ab_dev;
+            ab_up  += L.ab_up;
+            n_lost += L.ab_lost ? 1 : 0;
+            n_pooled++;
+        }
+        if (ab_dev + ab_up > 0) {
+            LLAMA_LOG_WARN("%s: expert pool whole-stack fills: %llu experts copied from slots on the device, %llu uploaded (%.3f from slots); %llu of %llu layers under the overlay\n",
+                __func__, (unsigned long long) ab_dev, (unsigned long long) ab_up,
+                (double) ab_dev / (double) (ab_dev + ab_up), (unsigned long long) n_lost, (unsigned long long) n_pooled);
+        }
     }
     if (hits + misses == 0) {
         return; // never served in cache mode (or pool never engaged)

@@ -3186,6 +3186,35 @@ bool ggml_backend_cuda_copy_segments_async(ggml_backend_t backend, const ggml_ba
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+// "ggml_backend_copy_segments_d2d_async": the same batched kernel for segments whose source and destination are both
+// device memory of this backend's device
+bool ggml_backend_cuda_copy_segments_d2d_async(ggml_backend_t backend, const ggml_backend_copy_segment * segs, int n) {
+    if (n <= 0 || !ggml_backend_is_cuda(backend)) {
+        return n == 0;
+    }
+    size_t max_n16 = 0;
+    for (int i = 0; i < n; i++) {
+        if (segs[i].dst == nullptr || segs[i].src == nullptr ||
+                (((uintptr_t) segs[i].src | (uintptr_t) segs[i].dst | (uintptr_t) segs[i].size) & 15) != 0) {
+            return false;
+        }
+        max_n16 = std::max(max_n16, segs[i].size / 16);
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    const int blocks_per_seg = (int) std::max<size_t>(1, std::min<size_t>(256, (max_n16 + 255) / 256));
+    for (int i0 = 0; i0 < n; i0 += GGML_CUDA_COPY_SEG_MAX) {
+        ggml_cuda_copy_seg_batch batch;
+        const int nb = std::min(n - i0, GGML_CUDA_COPY_SEG_MAX);
+        for (int i = 0; i < nb; i++) {
+            batch.s[i] = { (const int4 *) segs[i0 + i].src, (int4 *) segs[i0 + i].dst, segs[i0 + i].size / 16 };
+        }
+        k_kernel_copy_segs<<<nb * blocks_per_seg, 256, 0, cuda_ctx->stream()>>>(batch, blocks_per_seg);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
 template <typename T>
 static __global__ void k_kernel_fill(T * __restrict__ dst, T value, size_t n) {
     const size_t stride = (size_t) gridDim.x * blockDim.x;
@@ -6344,6 +6373,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_copy_segments_async") == 0) {
         return (void *)ggml_backend_cuda_copy_segments_async;
+    }
+    if (strcmp(name, "ggml_backend_copy_segments_d2d_async") == 0) {
+        return (void *)ggml_backend_cuda_copy_segments_d2d_async;
     }
     if (strcmp(name, "ggml_backend_kernel_copy_set") == 0) {
         return (void *)ggml_backend_cuda_kernel_copy_set;

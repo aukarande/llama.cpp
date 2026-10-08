@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct llama_model;
@@ -145,6 +146,11 @@ struct llama_expert_pool {
         std::vector<uint64_t> use_count;       // [n_expert] cache-mode routes per expert (the routing workload histogram)
         std::vector<uint32_t> expert_pending;  // [n_expert] generation whose pass admitted the expert
                                                // in the background (cpu_admit: CPU route that pass)
+        // whole-stack fills over a kept cache layout (set_overlay): the layer's slots lie under the
+        // overlay (lost) or survive; experts copied from slots on the device vs uploaded from host
+        bool     ab_lost = false;
+        uint64_t ab_dev  = 0;
+        uint64_t ab_up   = 0;
     };
 
     uint32_t n_expert      = 0;
@@ -231,8 +237,45 @@ struct llama_expert_pool {
     void register_sched(ggml_backend_sched_t sched);
 
     // tier switch: flip cache/AB mode and re-register; cache contents do not survive
-    // a mode round-trip (the halves alias the slot arrays): maps dropped, lazy refill
+    // a mode round-trip (the halves alias the slot arrays): maps dropped, lazy refill.
+    // After set_overlay the kept layers' maps survive the round trip.
     void set_ab_mode(bool ab, ggml_backend_sched_t sched);
+
+    // share of each pooled layer's slots that hold an expert right now, in region order (the bottom layer first,
+    // the one a whole-stack overlay loses first); empty while the pool is off
+    void layer_fill(std::vector<float> & out) const {
+        out.clear();
+        if (!active || n_slots == 0) {
+            return;
+        }
+        for (const auto & L : layers) {
+            if (L.tensors.empty()) {
+                continue;
+            }
+            uint32_t filled = 0;
+            for (const int32_t s : L.expert_slot) {
+                filled += s >= 0 ? 1 : 0;
+            }
+            out.push_back(std::min(1.0f, (float) filled / (float) n_slots));
+        }
+    }
+
+    // whole-stack tier over the cache tier's layout: the tier's extra scratch takes the
+    // region's first delta bytes and the A/B pair sits right above it; layers whose slot
+    // arrays lie in that span lose their contents, the others keep them and their resident
+    // experts fill the halves by device copies. False when the pair does not fit.
+    bool set_overlay(size_t delta);
+    bool   keep_ab       = false;   // the active whole-stack tier runs over a kept cache layout
+    size_t overlay_bytes = 0;       // region bytes under the scratch + A/B pair
+    ggml_backend_copy_segments_async_t copy_segments_d2d = nullptr;   // batched device copies (CUDA)
+    std::vector<std::pair<uint32_t, uint32_t>> ab_runs;              // fill_ab scratch: upload runs [x0, x1)
+    std::vector<ggml_backend_copy_segment>     ab_segs;              // fill_ab scratch: device copies
+    // fill layer L's half on backend's stream (whole-stack tiers)
+    void fill_ab(layer_state & L, ggml_backend_t backend);
+    // per-pass totals of the fills, logged at the last pooled layer
+    uint64_t ab_pass_dev = 0;
+    uint64_t ab_pass_up  = 0;
+    void ab_note(layer_state & L, uint32_t dev, uint32_t up);
 
     // the ACTIVE plan pools experts; when false the overrides are cleared and
     // pooled layers build/stream like any legacy plan

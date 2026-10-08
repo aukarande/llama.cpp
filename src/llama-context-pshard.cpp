@@ -409,6 +409,39 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
             scratch = it->second;
         }
     }
+    // whole-stack tiers need the two-layer double-buffer pair (ab) in the region; cache tiers only
+    // their slots (the pair is not reserved for them: tight budgets turn it into slots)
+    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used >= expert_pool->n_expert;
+    // fetch-only cache tiers need this pass's distinct experts resident at once;
+    // CPU-route policies spill the overflow to the CPU chain, so one slot suffices
+    const bool cpu_routes = plan.pool_miss != LLAMA_PSHARD_MISS_FETCH;
+    const uint32_t floor_slots = ab ? 0 : cpu_routes ? 1 : (uint32_t) std::min<uint64_t>(expert_pool->n_expert,
+        (uint64_t) plan.batch_size * expert_pool->n_expert_used);
+    const size_t per_slot = expert_pool->region_bytes_needed(1, /*with_ab=*/false);
+    // the slots a window of av bytes holds
+    auto fit_slots = [&](size_t av) -> uint32_t {
+        uint32_t s = per_slot > 0 ? (uint32_t) std::min<size_t>(av / per_slot, expert_pool->n_expert) : 0;
+        while (s > 0 && expert_pool->region_bytes_needed(s, ab) > av) {
+            s--;
+        }
+        return s;
+    };
+
+    // cache tiers share one layout: sized by the largest scratch measured among them, so a switch between
+    // them (decode after a short prompt, decode inside a server turn) keeps the slots instead of re-carving.
+    // A tier whose floor that layout undercuts (a larger tier measured after this one reserved) keeps its
+    // own scratch: that is what its reserve checked
+    if (!ab) {
+        size_t shared = scratch;
+        for (const auto & it : pshard_pool_scratch) {
+            if ((uint64_t) it.first * expert_pool->n_expert_used < expert_pool->n_expert) {
+                shared = std::max(shared, it.second);
+            }
+        }
+        if (preloaded + cache + shared < buf_total && fit_slots(buf_total - preloaded - cache - shared) >= floor_slots) {
+            scratch = shared;
+        }
+    }
     if (preloaded + cache + scratch >= buf_total) {
         LLAMA_LOG_WARN("%s: tier bs=%u: weights %.1f + cache %.1f + scratch %.1f MiB fill the %.1f MiB arena; pool disengaged\n",
             __func__, plan.batch_size, preloaded / (1024.0 * 1024.0), cache / (1024.0 * 1024.0),
@@ -417,23 +450,33 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
     }
     const size_t avail = buf_total - preloaded - cache - scratch;
 
-    // whole-stack tiers need the two-layer double-buffer pair (ab) in the region; cache tiers only
-    // their slots (the pair is not reserved for them: tight budgets turn it into slots)
-    const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used >= expert_pool->n_expert;
+    // a whole-stack tier landing over a cache tier's region keeps that layout: its larger scratch takes the
+    // region's bottom, the A/B pair sits right above, and the layers above the pair keep their cached experts
+    // (the fill copies them on the device and decode resumes warm instead of refilling every layer)
+    // (also when re-sized while active, e.g. after the tier's first reserve measured its scratch)
+    if (ab && expert_pool->region_base != nullptr && expert_pool->n_slots > 0 &&
+            (!expert_pool->ab_mode || expert_pool->keep_ab)) {
+        char * const buf_base   = (char *) ggml_backend_buffer_get_base(buf);
+        char * const region_end = (char *) expert_pool->region_base + expert_pool->region_bytes;
+        const size_t region_off = (size_t) ((char *) expert_pool->region_base - buf_base);
+        if (region_end == buf_base + buf_total - cache && region_off >= preloaded) {
+            size_t delta = preloaded + scratch > region_off ? preloaded + scratch - region_off : 0;
+            delta = (delta + 255) & ~(size_t) 255;
+            if (expert_pool->set_overlay(delta)) {
+                expert_pool_bytes = expert_pool->region_bytes - delta;
+                LLAMA_LOG_INFO("%s: tier bs=%u: keeps the cache layout (s=%u): scratch %.1f MiB (%s) takes %.1f MiB of the region, A/B pair above it, %.1f of %.1f MiB of slots kept\n",
+                    __func__, plan.batch_size, expert_pool->n_slots, scratch / (1024.0 * 1024.0),
+                    pshard_pool_scratch.count(plan.batch_size) ? "measured" : "provisional", delta / (1024.0 * 1024.0),
+                    (expert_pool->region_bytes - expert_pool->overlay_bytes) / (1024.0 * 1024.0),
+                    expert_pool->region_bytes / (1024.0 * 1024.0));
+                return true;
+            }
+        }
+    }
     // slots = what the window holds (the plan's count estimates the same quantity
     // from the probe; the reserved scratch here is the authority - the log shows both)
-    const size_t per_slot = expert_pool->region_bytes_needed(1, /*with_ab=*/false);
-    uint32_t slots = per_slot > 0 ? (uint32_t) std::min<size_t>(avail / per_slot, expert_pool->n_expert) : 0;
-    size_t   want  = expert_pool->region_bytes_needed(slots, ab);
-    while (slots > 0 && want > avail) {
-        slots--;
-        want = expert_pool->region_bytes_needed(slots, ab);
-    }
-    // fetch-only cache tiers need this pass's distinct experts resident at once;
-    // CPU-route policies spill the overflow to the CPU chain, so one slot suffices
-    const bool cpu_routes = plan.pool_miss != LLAMA_PSHARD_MISS_FETCH;
-    const uint32_t floor_slots = ab ? 0 : cpu_routes ? 1 : (uint32_t) std::min<uint64_t>(expert_pool->n_expert,
-        (uint64_t) plan.batch_size * expert_pool->n_expert_used);
+    const uint32_t slots = fit_slots(avail);
+    size_t want = expert_pool->region_bytes_needed(slots, ab);
     if (slots == 0 || want == 0 || (ab && 2 * expert_pool->layer_full_bytes > avail) || slots < floor_slots) {
         LLAMA_LOG_WARN("%s: tier bs=%u: pool does not fit (avail %.1f MiB, s=%u, floor %u, %s)\n",
             __func__, plan.batch_size, avail / (1024.0 * 1024.0), slots, floor_slots,
@@ -446,7 +489,10 @@ bool llama_context::pshard_pool_resize(const llama_pshard_plan & plan) {
     want = (size_t) ((char *) ggml_backend_buffer_get_base(buf) + buf_total - cache - base);
 
     if (expert_pool->region_base == base && expert_pool->region_bytes == want && expert_pool->n_slots == slots) {
-        return true; // same geometry (re-apply of the same tier): keep the cache warm
+        // same geometry (re-apply of the same tier, or the return from a whole-stack tier that kept the layout):
+        // keep the cache warm; the region is whole again
+        expert_pool_bytes = want;
+        return true;
     }
     if (!expert_pool->set_region(buf, base, want, slots)) {
         return false;
@@ -938,6 +984,9 @@ void llama_context::pshard_warmup_plan_reserves() {
                 __func__, t, registry->tier_sizes[t],
                 llama_pshard_strategy_name(plan.strategy), plan.n_pinned);
             plan.is_viable = false;
+            // a tier that never runs must not size the cache tiers' shared layout (only here: at runtime the
+            // map must not shrink under an alloc state another cache tier saved against it)
+            pshard_pool_scratch.erase(plan.batch_size);
         }
     }
 

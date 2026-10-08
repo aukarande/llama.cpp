@@ -250,6 +250,15 @@ struct llama_pshard_plan {
                                      // (tier 0) plan, see llama_pshard_plan_registry::switch_cost_ms
     float  cold_ms          = 0.0f;  // EXPERT_POOL cache tier: est. decode ms its misses cost above the
                                      // warm rate after it lands with empty slots (0 = not a cache tier)
+    float  pool_keep        = 0.0f;  // EXPERT_POOL whole-stack tier: share of the cache tier's slots it leaves
+                                     // in place (it runs over their layout); 0 = it empties them
+    // EXPERT_POOL whole-stack tier, set by the search and applied by the tier pick only when the ladder decodes on a
+    // pool cache tier that admits (else the slots it would reuse are empty): its ms over the kept layout / its
+    // streaming ms, and the pool_keep it then gets. Once applied, tps / piece_ms are the kept-layout rate and the
+    // registry keeps pool_ab_scale (1 otherwise) so a cut that finds the slots empty prices the streaming rate
+    float  pool_ab_scale    = 1.0f;
+    float  pool_keep_est    = 0.0f;
+    bool   pool_ab_applied  = false;
     bool   is_viable        = false;
 
     // ubatches below this many tokens copy only the used experts of a layer whose ids an earlier split computed,
@@ -487,8 +496,9 @@ struct llama_pshard_plan_registry {
     // st->row_mb[il] per row the decode has written (n_rows). An expert pool cache tier that lands on slots
     // another plan used starts empty and pays its refill (cold_ms); a pool cache tier with the same slot count
     // keeps them. Legacy caches fall back to the tier0-anchored per-plan estimate
+    // keep_cap: the share of the slots the path before `from` left in place (a cut whose head emptied them)
     float switch_cost_ms(const llama_pshard_plan & from, const llama_pshard_plan & to,
-                         const llama_pshard_switch_state * st = nullptr, double n_rows = 0.0) const {
+                         const llama_pshard_switch_state * st = nullptr, double n_rows = 0.0, double keep_cap = 1.0) const {
         if (switch_layer_mb <= 0.0f || switch_pcie_gb_s <= 0.0f || n_layers == 0) {
             return to.switch_ms;
         }
@@ -512,12 +522,24 @@ struct llama_pshard_plan_registry {
             mb += (double) switch_head_mb;
         }
         double ms = mb / (double) switch_pcie_gb_s;  // MB / (GB/s) == ms
-        const bool same_slots = from.strategy == LLAMA_PSHARD_EXPERT_POOL && from.cold_ms > 0.0f &&
-                                from.pool_slots == to.pool_slots;
+        // the runtime gives every pool cache tier one layout, so a switch between two of them keeps the slots; a
+        // whole-stack pool tier that ran over that layout leaves pool_keep of them in place
+        const bool same_slots = from.strategy == LLAMA_PSHARD_EXPERT_POOL && from.cold_ms > 0.0f && keep_cap >= 1.0;
         if (to.cold_ms > 0.0f && !same_slots) {
-            ms += (double) to.cold_ms;
+            // the cache tiers share one layout: its refill costs the decode tier's rate whichever tier pays it
+            const double cold = !best_plans.empty() && best_plans[0].is_viable && best_plans[0].cold_ms > 0.0f
+                ? (double) best_plans[0].cold_ms : (double) to.cold_ms;
+            const double keep = std::min(keep_cap, slots_kept(from));
+            ms += cold * (1.0 - keep);
         }
         return (float) ms;
+    }
+
+    // the share of the decode cache's slots a plan leaves in place: a pool cache tier all (a cpu_exec one neither
+    // fills nor empties them), a whole-stack pool tier pool_keep, a legacy tier none
+    static double slots_kept(const llama_pshard_plan & p) {
+        return p.strategy != LLAMA_PSHARD_EXPERT_POOL ? 0.0
+             : p.cold_ms > 0.0f || p.pool_miss == LLAMA_PSHARD_MISS_CPU_EXEC ? 1.0 : (double) p.pool_keep;
     }
 
     // variant marker for a baseline load that fits
@@ -633,8 +655,10 @@ struct llama_pshard_plan_registry {
     // tier's piece curve; the switches are pairwise: from the active plan, between the two tiers, and back to the
     // decode plan. min_ubatch: the smallest ubatch size the memory's splitter accepts when it cuts. st: the state
     // each layer's switch moves (see switch_cost_ms)
+    // fill: the runtime pool's per-layer slot fill in region order (llama_expert_pool::layer_fill; empty = pool off,
+    // nullptr = unknown: from from_plan)
     cut find_cut(uint32_t n_tokens, uint32_t max_ubatch, uint32_t min_ubatch, const llama_pshard_plan * from_plan,
-                 const llama_pshard_switch_state * st = nullptr) const {
+                 const llama_pshard_switch_state * st = nullptr, const std::vector<float> * fill = nullptr) const {
         cut best;
         const llama_pshard_plan * decode_plan =
             (!best_plans.empty() && best_plans[0].is_viable) ? &best_plans[0] : nullptr;
@@ -642,8 +666,9 @@ struct llama_pshard_plan_registry {
             from_plan = decode_plan;
         }
         // n_rows: the rows of this decode written before the switch
-        auto sw = [&](const llama_pshard_plan * a, const llama_pshard_plan * b, double n_rows) -> double {
-            return a != nullptr && b != nullptr ? (double) switch_cost_ms(*a, *b, st, n_rows) : 0.0;
+        // keep_cap: the slots share the cut's earlier steps left in place (the return refills the rest)
+        auto sw = [&](const llama_pshard_plan * a, const llama_pshard_plan * b, double n_rows, double keep_cap = 1.0) -> double {
+            return a != nullptr && b != nullptr ? (double) switch_cost_ms(*a, *b, st, n_rows, keep_cap) : 0.0;
         };
         auto priced = [&](size_t t) {
             return best_plans[t].is_viable && best_plans[t].tps > 0.0f;
@@ -655,6 +680,46 @@ struct llama_pshard_plan_registry {
                 best.ms   = ms;
             }
         };
+        // the share of the cache's slots in place after p runs over `before`: a cache tier refills its own (its entry
+        // pays), a cpu_exec cache tier neither fills nor empties them, a whole-stack pool tier keeps at most pool_keep
+        // of what it found, a legacy tier empties them
+        auto kept_after = [](const llama_pshard_plan & p, double before) -> double {
+            return p.strategy != LLAMA_PSHARD_EXPERT_POOL ? 0.0 : p.cold_ms > 0.0f ? 1.0
+                 : p.pool_miss == LLAMA_PSHARD_MISS_CPU_EXEC ? before : std::min(before, (double) p.pool_keep);
+        };
+        // a whole-stack pool tier priced over a kept layout (pool_ab_scale < 1) uploads what it finds missing
+        auto run_ms = [](const llama_pshard_plan & p, uint32_t n, double kept) -> double {
+            const double ms = p.ubatch_ms(n);
+            if (p.strategy != LLAMA_PSHARD_EXPERT_POOL || p.cold_ms > 0.0f || p.pool_keep <= 0.0f ||
+                    p.pool_ab_scale <= 0.0f || p.pool_ab_scale >= 1.0f) {
+                return ms;
+            }
+            const double c = std::min(1.0, kept / (double) p.pool_keep);
+            return ms * (c + (1.0 - c) / (double) p.pool_ab_scale);
+        };
+        double kept0 = from_plan != nullptr ? slots_kept(*from_plan) : 0.0;
+        if (fill != nullptr) {
+            kept0 = 0.0;
+            for (const float f : *fill) {
+                kept0 += f;
+            }
+            kept0 = fill->empty() ? 0.0 : kept0 / (double) fill->size();
+        }
+        // the share of the slots p finds and keeps when it runs first: a whole-stack pool tier's overlay drops the
+        // bottom layers, so it keeps the filled slots of the top pool_keep share of the layers
+        auto kept_first = [&](const llama_pshard_plan & p) -> double {
+            if (fill == nullptr || fill->empty() || p.strategy != LLAMA_PSHARD_EXPERT_POOL || p.cold_ms > 0.0f ||
+                    p.pool_miss == LLAMA_PSHARD_MISS_CPU_EXEC || p.pool_keep <= 0.0f) {
+                return kept_after(p, kept0);
+            }
+            const size_t n      = fill->size();
+            const size_t n_keep = std::min(n, (size_t) ((double) p.pool_keep * (double) n + 0.5));
+            double s = 0.0;
+            for (size_t i = n - n_keep; i < n; i++) {
+                s += (*fill)[i];
+            }
+            return s / (double) n;
+        };
 
         for (size_t t = 0; t < tier_sizes.size(); t++) {
             const uint32_t ts = tier_sizes[t];
@@ -662,8 +727,10 @@ struct llama_pshard_plan_registry {
                 continue;
             }
             const llama_pshard_plan * plan = &best_plans[t];
+            const double kept1 = kept_first(*plan);
             if (n_tokens <= ts) {
-                consider(t, t, sw(from_plan, plan, 0) + plan->ubatch_ms(n_tokens) + sw(plan, decode_plan, n_tokens));
+                consider(t, t, sw(from_plan, plan, 0, kept0) + run_ms(*plan, n_tokens, kept1) +
+                    sw(plan, decode_plan, n_tokens, kept1));
                 continue;
             }
             if (ts < min_ubatch) {
@@ -671,9 +738,9 @@ struct llama_pshard_plan_registry {
             }
             const uint32_t k = n_tokens / ts;
             const uint32_t r = n_tokens % ts;
-            const double head_ms = sw(from_plan, plan, 0) + (double) k * plan->ubatch_ms(ts);
+            const double head_ms = sw(from_plan, plan, 0, kept0) + (double) k * run_ms(*plan, ts, kept1);
             if (r == 0) {
-                consider(t, t, head_ms + sw(plan, decode_plan, n_tokens));
+                consider(t, t, head_ms + sw(plan, decode_plan, n_tokens, kept1));
                 continue;
             }
             for (size_t u = 0; u <= t; u++) {
@@ -681,7 +748,8 @@ struct llama_pshard_plan_registry {
                     continue;
                 }
                 const llama_pshard_plan * tail = &best_plans[u];
-                consider(t, u, head_ms + sw(plan, tail, (double) k * ts) + tail->ubatch_ms(r) + sw(tail, decode_plan, n_tokens));
+                consider(t, u, head_ms + sw(plan, tail, (double) k * ts, kept1) + run_ms(*tail, r, kept1) +
+                    sw(tail, decode_plan, n_tokens, kept_after(*tail, kept1)));
             }
         }
         return best;
