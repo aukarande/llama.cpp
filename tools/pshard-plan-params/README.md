@@ -137,7 +137,7 @@ The planner always writes `prefill_mode=ab_stream`. `cpu_tail` (stream the stack
 
 A cache tier's hit rate comes from the routing workload (see [Inputs](#inputs)). `cold_ms` is the estimated extra decode time of its misses after it lands with empty slots.
 
-The planner refuses `EXPERT_POOL` tiers when the GGUF has no routed-expert tensors, when a quantized expert tensor's rows are not a multiple of 512 elements (the slots hold no row padding), when there is no routing workload (no file and a failed calibration), or when the CPU profile lacks a pool entry (`PCIe_Segs_Kernel`, `PCIe_Segs_Kernel_Idle`, `DRAM_BW`, the `MUL_MAT` batch entries, `Pool_Serve_us`, `Pool_Split_us`). `llama-profiler-cpu --splice cpu_profile.txt` refreshes the profile header and keeps its op tables.
+The planner refuses `EXPERT_POOL` tiers when the GGUF has no routed-expert tensors, when there is no routing workload (no file and a failed calibration), or when the CPU profile lacks a pool entry (`PCIe_Segs_Kernel`, `PCIe_Segs_Kernel_Idle`, `DRAM_BW`, the `MUL_MAT` batch entries, `Pool_Serve_us`, `Pool_Split_us`). `llama-profiler-cpu --splice cpu_profile.txt` refreshes the profile header and keeps its op tables.
 
 ## Inputs
 
