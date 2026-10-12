@@ -408,6 +408,14 @@ bool llama_pshard_workload::pool_miss_growth(double rows, uint32_t s, double & g
     return true;
 }
 
+double llama_pshard_workload::pool_misses(double rows, uint32_t s) const {
+    double growth = 0.0;
+    if (!pool_miss_growth(rows, s, growth)) {
+        return -1.0;
+    }
+    return pool_table[std::min(s, share_n_expert)] * growth;
+}
+
 double llama_pshard_workload::distinct_share(double rows) const {
     if (share_table.empty()) {
         return -1.0;

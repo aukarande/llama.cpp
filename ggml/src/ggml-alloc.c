@@ -1117,6 +1117,11 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
+    if (talloc->buffer_id >= 0 && talloc->size_max > 0 && talloc->addr.chunk > 0 &&
+            ggml_vbuffer_chunk_size(galloc->buffers[talloc->buffer_id], talloc->addr.chunk) < talloc->addr.offset + talloc->size_max) {
+        // a restored state that points into an overflow chunk another reserve released
+        return false;
+    }
     return talloc->size_max >= node_size;
 }
 

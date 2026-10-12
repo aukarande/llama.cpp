@@ -349,6 +349,8 @@ struct calib_results {
     double copy_setup_us = 0.0;                             // per copy of a back-to-back upload, beyond its bytes
     double pool_serve_us = 0.0, pool_split_us = 0.0;
     double pin_ceiling_gb = 0.0;
+    double ssd_sat = 0.0, ssd_lat = 0.0;                    // SSD_Read (--ssd): GB/s of expert reads with many in flight,
+                                                            // ms a lone read takes beyond its bytes at that rate
 };
 
 enum sliced_mode { SLICED_DMA = 0, SLICED_KERNEL = 1, SLICED_SEGS = 2 };
@@ -653,6 +655,22 @@ static double calibrate_staged_upload(pcie_stress_ctx * pcie) {
     return bw;
 }
 
+static void write_ssd_line(FILE * f, const calib_results & cr) {
+    if (cr.ssd_sat > 0.0) fprintf(f, "#   SSD_Read: sat=%.4g GB/s lat=%.4g ms\n", cr.ssd_sat, cr.ssd_lat);
+}
+
+// the SSD_Read line of an existing profile, which a run without --ssd keeps
+static void read_ssd_line(const char * path, double & sat, double & lat) {
+    FILE * f = fopen(path, "r");
+    if (!f) return;
+    char line[4096];
+    double s = 0.0, l = 0.0;
+    while (fgets(line, sizeof(line), f) && line[0] == '#') {
+        if (sscanf(line, "#   SSD_Read: sat=%lf GB/s lat=%lf ms", &s, &l) == 2) { sat = s; lat = l; break; }
+    }
+    fclose(f);
+}
+
 // the profile header: every calibrated machine number as one parseable line
 static void write_profile_header(FILE * f, const calib_results & cr, int threads, const std::vector<int32_t> * batch_sizes, const char * first_line) {
     if (first_line) {
@@ -668,6 +686,7 @@ static void write_profile_header(FILE * f, const calib_results & cr, int threads
     }
     fprintf(f, "#   Machine: gpu=\"%s\" vram_mib=%zu cpu=\"%s\" threads=%d os=%s schema=%d\n",
         cr.machine.gpu.c_str(), cr.machine.vram_mib, cr.machine.cpu.c_str(), threads, cr.machine.os.c_str(), CPU_PROFILE_SCHEMA);
+    write_ssd_line(f, cr);
     fprintf(f, "# Measured Bandwidths Per Thread Count:\n");
     if (!cr.has_gpu) {
         fprintf(f, "#   Threads=%d: DRAM_BW=%.1f GB/s\n", threads, cr.dram_bw);
@@ -706,9 +725,9 @@ static void write_profile_header(FILE * f, const calib_results & cr, int threads
 
 // replace the header block of an existing profile with freshly calibrated lines, keeping its op tables (they
 // take the long run; the calibrations take seconds). Values the calibration modes do not produce (CPU_Eff,
-// the pin ceiling when its probe was skipped) are carried over from the old header. The old file is kept
-// as <path>.bak.
-static bool splice_profile_header(const char * path, calib_results & cr, int threads) {
+// the pin ceiling when its probe was skipped) are carried over from the old header. ssd_only: replace only the
+// SSD_Read line, every other byte stays. The old file is kept as <path>.bak.
+static bool splice_profile_header(const char * path, calib_results & cr, int threads, bool ssd_only) {
     FILE * in = fopen(path, "r");
     if (!in) { fprintf(stderr, "cannot open %s\n", path); return false; }
     std::vector<std::string> lines;
@@ -725,7 +744,7 @@ static bool splice_profile_header(const char * path, calib_results & cr, int thr
     }
     std::string first = lines[0];
     while (!first.empty() && (first.back() == '\n' || first.back() == '\r')) first.pop_back();
-    for (size_t i = 0; i < cols; i++) {
+    for (size_t i = 0; i < cols && !ssd_only; i++) {
         double a = 0.0, b = 0.0, c = 0.0, d = 0.0;
         int tc = 0;
         if (sscanf(lines[i].c_str(), "#   Threads=%d: DRAM_BW=%lf GB/s, PCIe_Standalone=%lf GB/s, PCIe_Concurrent=%lf GB/s (CPU_Eff=%lf%%)",
@@ -750,10 +769,17 @@ static bool splice_profile_header(const char * path, calib_results & cr, int thr
     }
     FILE * out = fopen(path, "w");
     if (!out) { fprintf(stderr, "cannot write %s\n", path); return false; }
-    write_profile_header(out, cr, threads, nullptr, first.c_str());
+    if (ssd_only) {
+        for (size_t i = 0; i < cols; i++) {
+            if (lines[i].compare(0, 13, "#   SSD_Read:") != 0) fputs(lines[i].c_str(), out);
+            if (lines[i].compare(0, 12, "#   Machine:") == 0) write_ssd_line(out, cr);
+        }
+    } else {
+        write_profile_header(out, cr, threads, nullptr, first.c_str());
+    }
     for (size_t i = cols; i < lines.size(); i++) fputs(lines[i].c_str(), out);
     fclose(out);
-    printf("Header replaced in %s (previous copy in %s)\n", path, bak.c_str());
+    printf("%s replaced in %s (previous copy in %s)\n", ssd_only ? "SSD_Read line" : "Header", path, bak.c_str());
     return true;
 }
 
@@ -1200,6 +1226,7 @@ int main(int argc, char ** argv) {
     bool    no_pin_ceiling = false;
     const char * splice_path = nullptr;
     const char * output_path = "cpu_profile.txt";
+    const char * ssd_model   = nullptr;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
@@ -1217,6 +1244,8 @@ int main(int argc, char ** argv) {
             splice_path = argv[++i];
         } else if (!strcmp(argv[i], "--no-pin-ceiling")) {
             no_pin_ceiling = true;
+        } else if (!strcmp(argv[i], "--ssd") && i + 1 < argc) {
+            ssd_model = argv[++i];
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [options]\n", argv[0]);
             printf("\n");
@@ -1230,12 +1259,35 @@ int main(int argc, char ** argv) {
             printf("                      block in place, keeping its op tables (old file -> .bak)\n");
             printf("  --no-pin-ceiling    skip the host pin ceiling probe (registers RAM\n");
             printf("                      in 2 GiB chunks until the driver refuses)\n");
+            printf("  --ssd <model.gguf>  also measure the SSD reads of pshard's RAM expert store (a model\n");
+            printf("                      larger than RAM) on the model's files: the SSD_Read line (about 3 s).\n");
+            printf("                      With --splice, only that line is replaced. Without --ssd, a run keeps it\n");
             printf("  --threads <n>       number of CPU threads (default: auto)\n");
             printf("  --output <path>     output file (default: cpu_profile.txt)\n");
             return 0;
         } else if (!strcmp(argv[i], "--output") && i + 1 < argc) {
             output_path = argv[++i];
         }
+    }
+
+    // first, so a model path that does not read fails before the long run
+    double ssd_sat = 0.0, ssd_lat = 0.0;
+    if (ssd_model) {
+        printf("Measuring the SSD reads of %s...\n", ssd_model);
+        if (!llama_pshard_ssd_measure(ssd_model, &ssd_sat, &ssd_lat)) {
+            fprintf(stderr, "SSD read measurement of %s failed\n", ssd_model);
+            return 1;
+        }
+        printf("  SSD: %.2f GB/s with many reads in flight, a lone read %.3f ms beyond its bytes at that rate\n\n", ssd_sat, ssd_lat);
+        // the other header bytes stay, so only the models the store serves re-plan
+        if (splice_path) {
+            calib_results cr;
+            cr.ssd_sat = ssd_sat;
+            cr.ssd_lat = ssd_lat;
+            return splice_profile_header(splice_path, cr, 0, true) ? 0 : 1;
+        }
+    } else {
+        read_ssd_line(splice_path ? splice_path : output_path, ssd_sat, ssd_lat);
     }
 
     int32_t default_threads = common_cpu_get_num_math();
@@ -1296,6 +1348,8 @@ int main(int argc, char ** argv) {
     calib_results cr;
     cr.has_gpu = has_gpu;
     cr.machine = identify_machine(has_gpu ? pcie.gpu_backend : nullptr);
+    cr.ssd_sat = ssd_sat;
+    cr.ssd_lat = ssd_lat;
     printf("Machine: gpu=\"%s\" (%zu MiB) cpu=\"%s\" os=%s\n\n",
         cr.machine.gpu.c_str(), cr.machine.vram_mib, cr.machine.cpu.c_str(), cr.machine.os.c_str());
 
@@ -1328,7 +1382,7 @@ int main(int argc, char ** argv) {
 
     if (calibrate_only || splice_path) {
         if (splice_path) {
-            splice_profile_header(splice_path, cr, threads);
+            splice_profile_header(splice_path, cr, threads, false);
         } else {
             if (has_gpu) {
                 printf("CPU_Eff is measured by the op tables only: the header below carries 100%% (no derating)\n");

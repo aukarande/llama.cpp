@@ -761,6 +761,7 @@ struct common_params {
     bool     pshard           = false;
     bool     pshard_plan_on_miss = true;   // plan in-process when the registry has no plan for this configuration
     size_t   max_vram_alloc   = 0;
+    int64_t  max_ram_alloc    = -1;    // MiB of RAM for the expert store of a model larger than RAM (-1 = auto, 0 = off)
     uint32_t pshard_tier_max  = 0;
 };
 

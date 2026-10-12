@@ -440,6 +440,31 @@ extern "C" {
             ggml_backend_t backend, void * user_data);
     GGML_API void ggml_backend_sched_set_split_skip_cb(ggml_backend_sched_t sched,
             ggml_backend_sched_split_skip_cb cb, void * user_data);
+    // optional: called before nodes [j0, ...) of a CPU split compute. Returns j1 > j0 such that the routed experts
+    // of every MUL_MAT_ID in [j0, j1) whose weights are GGML_TENSOR_FLAG_EXPERT_TABLE are ready to read; the
+    // scheduler computes [j0, j1) and calls again at j1 (a cut where the routing ids are made in the same split)
+    typedef int (*ggml_backend_sched_host_experts_cb)(struct ggml_cgraph * split_graph, int j0, void * user_data);
+    GGML_API void ggml_backend_sched_set_host_experts_cb(ggml_backend_sched_t sched,
+            ggml_backend_sched_host_experts_cb cb, void * user_data);
+    // optional: uploads of GGML_TENSOR_FLAG_EXPERT_TABLE host weights to a device split. Each entry copies expert
+    // `expert`'s rows of src to dst at byte dst_off on backend's stream, then `pad` zero bytes. Returns false when
+    // src is not served (the scheduler copies from src->data). ram_only (the copy-stream prefetch of a whole stack):
+    // serve only when no expert needs an SSD read, else return false and issue nothing
+    struct ggml_backend_expert_upload {
+        int32_t expert;
+        size_t  dst_off;
+        size_t  pad;
+    };
+    typedef bool (*ggml_backend_sched_expert_upload_cb)(const struct ggml_tensor * src, struct ggml_tensor * dst,
+            const struct ggml_backend_expert_upload * ups, int n, bool ram_only, ggml_backend_t backend, void * user_data);
+    GGML_API void ggml_backend_sched_set_expert_upload_cb(ggml_backend_sched_t sched,
+            ggml_backend_sched_expert_upload_cb cb, void * user_data);
+    // optional, per graph (ggml_backend_sched_reset clears it): only nodes with GGML_TENSOR_FLAG_COMPUTE run, and a split,
+    // input copy, prefetch or writeback callback that no such node needs is skipped. carry (NULL: none) is a node that does
+    // not run: carry_data is written to it in stream order where it would have been computed
+    GGML_API void ggml_backend_sched_set_partial(ggml_backend_sched_t sched, bool on, struct ggml_tensor * carry, const void * carry_data);
+    // optional: a graph that outgrows an external buffer's range may keep its overflow chunks (default: refused)
+    GGML_API void ggml_backend_sched_set_allow_overflow(ggml_backend_sched_t sched, bool allow);
     // optional: called when an expert copy is sliced by used ids for a multi-row evaluation (ids->ne[1] > 1),
     // once per consumer ids tensor, with the number of distinct experts its rows route to
     typedef void (*ggml_backend_sched_ids_observe_cb)(const struct ggml_tensor * ids, int64_t n_distinct, void * user_data);

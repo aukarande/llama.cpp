@@ -749,6 +749,14 @@ struct llama_model {
     void                set_path_model(const std::string & path);
     const std::string & get_path_model() const;
 
+    // the RAM expert store of a model larger than RAM (nullptr: off)
+    struct llama_expert_store * expert_store() const;
+
+    // expert cache SSD tier: the number of mapped files (splits), and where a mapped tensor's bytes start in its
+    // file (false: not mmap-backed)
+    size_t pshard_n_splits() const;
+    bool   pshard_file_pos(const void * data, size_t & split, size_t & offset) const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

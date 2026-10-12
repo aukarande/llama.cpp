@@ -44,6 +44,7 @@ add_library(llama
             llama-pshard-plan.cpp
             llama-pshard-workload.cpp
             llama-expert-pool.cpp
+            llama-expert-store.cpp
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp

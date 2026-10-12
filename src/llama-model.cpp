@@ -1,5 +1,6 @@
 #include "llama-model.h"
 #include "llama-expert-pool.h"
+#include "llama-expert-store.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1172,6 +1173,11 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // pshard expert cache SSD tier: MiB of pinned RAM for it (0 = off); the routed experts are then read from the
+    // files, never through the mappings
+    // RAM expert store of a model larger than RAM (nullptr: the model fits)
+    std::unique_ptr<llama_expert_store> expert_store;
+
     // mmap regions we VirtualLock'd (Windows) because they could not be page-locked; unlocked on model free
     std::vector<std::pair<void *, size_t>> pshard_virtual_locked;
     // mmap regions we page-locked for pshard streaming; unregistered on model free
@@ -1237,6 +1243,8 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    // the store clears the flags it set on the expert tensors
+    pimpl->expert_store.reset();
     // release pshard's page-locks BEFORE the mappings themselves are torn down
     if (!pimpl->pshard_host_registered.empty()) {
         auto * gpu_dev = pshard_gpu_dev();
@@ -1466,7 +1474,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
-    const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    bool       use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     const auto & tensor_split = params.tensor_split;
 
     const int n_layer_all = hparams.n_layer_all;
@@ -1816,7 +1824,44 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         preload_tensor_backend_ids = pshard_build_canonical_weight_order(preload_order, n_common);
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // a model larger than RAM gets the RAM expert store (llama-expert-store.h): its routed experts are read from the
+    // files on demand, so the mapping is not prefetched, its expert ranges are not page-locked and --mlock is ignored
+    std::vector<llama_expert_store::tensor_src> store_srcs;
+    llama_expert_store_decision store_dec;
+    if (params.pshard && ml.use_mmap) {
+        size_t exps_b  = 0;
+        size_t other_b = 0;
+        for (const auto & [name, t] : tensors_by_name) {
+            const auto * w = ml.get_weight(name.c_str());
+            if (t == nullptr || w == nullptr) {
+                continue;
+            }
+            int il = -1;
+            const bool exps = hparams.n_expert > 0 && ggml_n_dims(t) == 3 && t->ne[2] == (int64_t) hparams.n_expert &&
+                name.find("_exps.weight") != std::string::npos && sscanf(name.c_str(), "blk.%d.", &il) == 1;
+            if (exps) {
+                exps_b += ggml_nbytes(t);
+                store_srcs.push_back({ t, il, w->idx, w->offs });
+            } else {
+                other_b += ggml_nbytes(t);
+            }
+        }
+        size_t ram_free  = 0;
+        size_t ram_total = 0;
+        if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            ggml_backend_dev_memory(cpu_dev, &ram_free, &ram_total);
+        }
+        store_dec = llama_expert_store_decide(exps_b, other_b, ram_total, (size_t) (LLAMA_PSHARD_HOST_PIN_RESERVE_GB * 1e9),
+            params.max_ram_alloc);
+        LLAMA_LOG_INFO("%s: pshard: expert store %s (%.1f GiB of routed experts, %.1f GiB of other weights, %.1f GiB of RAM)\n",
+            __func__, store_dec.why, exps_b / 1073741824.0, other_b / 1073741824.0, ram_total / 1073741824.0);
+        if (store_dec.on && use_mlock) {
+            LLAMA_LOG_WARN("%s: pshard: --mlock ignored: the model is larger than RAM\n", __func__);
+            use_mlock = false;
+        }
+    }
+    const bool store_on = store_dec.on;
+    ml.init_mappings(!store_on, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     std::unordered_set<ggml_tensor *> pshard_device_only_tensors;
@@ -2168,6 +2213,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         if (m.reg_end <= m.reg_beg) {
                             continue;   // swallowed by the previous run's boundary page
                         }
+                        if (store_on && m.cls == PIN_EXPS) {
+                            continue;   // the expert store reads the experts from the files into its own RAM
+                        }
                         const size_t bytes = (size_t) (m.reg_end - m.reg_beg);
                         bool locked = false;
                         if (!refused && pinned_b + bytes <= budget_b) {
@@ -2263,6 +2311,46 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     }
 #endif
                 }
+            }
+        }
+
+        if (store_on) {
+            // after the page-locks: the store's RAM is what they leave. Device-only weights never compute on the CPU
+            std::vector<std::string> paths;
+            const size_t n_split = ml.files.size();
+            if (n_split <= 1) {
+                paths.push_back(pimpl->path_model);
+            } else {
+                char prefix[1024];
+                if (llama_split_prefix(prefix, sizeof(prefix), pimpl->path_model.c_str(), 0, (int) n_split) > 0) {
+                    for (size_t i = 0; i < n_split; i++) {
+                        char path[1024];
+                        llama_split_path(path, sizeof(path), prefix, (int) i, (int) n_split);
+                        paths.push_back(path);
+                    }
+                }
+            }
+            std::vector<llama_expert_store::tensor_src> srcs;
+            for (const auto & src : store_srcs) {
+                if (pshard_device_only_tensors.count(src.t) > 0 || src.t->extra != nullptr || src.split >= pimpl->mappings.size() ||
+                        src.t->buffer == nullptr || !ggml_backend_buffer_is_host(src.t->buffer)) {
+                    continue;
+                }
+                // the CPU reads the mapping where an expert is not in RAM: the tensor must be the file's bytes
+                const auto & mapping = pimpl->mappings[src.split];
+                if ((const char *) src.t->data != (const char *) mapping->addr() + src.file_off) {
+                    continue;
+                }
+                srcs.push_back(src);
+            }
+            auto store = std::make_unique<llama_expert_store>();
+            if (paths.size() != n_split || srcs.empty()) {
+                LLAMA_LOG_WARN("%s: pshard: expert store off: %s\n", __func__,
+                    srcs.empty() ? "no routed-expert tensor is read from the mapping" : "the model path does not follow the split naming");
+            } else if (store->build(paths, srcs, hparams.n_expert, hparams.n_expert_used, store_dec.budget,
+                    (size_t) (LLAMA_PSHARD_HOST_PIN_RESERVE_GB * 1e9), params.max_ram_alloc < 0,
+                    llama_pshard_workload::path_for(pimpl->path_model))) {
+                pimpl->expert_store = std::move(store);
             }
         }
 
@@ -2717,6 +2805,27 @@ void llama_model::set_path_model(const std::string & path) {
 
 const std::string & llama_model::get_path_model() const {
     return pimpl->path_model;
+}
+
+llama_expert_store * llama_model::expert_store() const {
+    return pimpl->expert_store.get();
+}
+
+size_t llama_model::pshard_n_splits() const {
+    return pimpl->mappings.size();
+}
+
+bool llama_model::pshard_file_pos(const void * data, size_t & split, size_t & offset) const {
+    // each mapping covers its whole file from offset 0
+    for (size_t i = 0; i < pimpl->mappings.size(); i++) {
+        const char * base = (const char *) pimpl->mappings[i]->addr();
+        if ((const char *) data >= base && (const char *) data < base + pimpl->mappings[i]->size()) {
+            split  = i;
+            offset = (size_t) ((const char *) data - base);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool llama_model_pshard_active(const struct llama_model * model) {
@@ -3916,6 +4025,7 @@ llama_model_params llama_model_default_params() {
         /*.pshard_delegate_compute     =*/ false,
         /*.pshard_cache_skip_load      =*/ false,
         /*.max_vram_alloc              =*/ 0,
+        /*.max_ram_alloc               =*/ -1,
         /*.pshard_registry             =*/ nullptr,
     };
 

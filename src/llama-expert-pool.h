@@ -28,6 +28,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_ssd_reader;
 
 // bytes a pool view of this expert tensor needs past its last row: a quantized tensor whose ne0 is not a multiple of
 // 512 gets the CUDA backend's MMQ row padding, zeroed by the kernels on every call. The planner reserves the same tail
@@ -45,6 +46,11 @@ struct llama_expert_pool {
         size_t              tail_bytes = 0;       // padding after the last row (llama_expert_pool_tail_bytes)
         size_t              region_off = 0;       // slot 0 offset inside the region (cache mode)
         size_t              ab_off[2]  = {0, 0};  // layer-half offsets (A/B mode)
+        // SSD tier: where expert 0's rows start in the model's files, and this tensor's RAM slot array
+        size_t              file_split = 0;
+        size_t              file_off   = 0;
+        size_t              ram_stride = 0;       // one RAM slot: the expert's rows plus the sector round-out
+        char *              ram_base   = nullptr;
     };
 
     // int32 id buffer: lives in the pool's page-locked arena when it fits (the CUDA backend then uploads
@@ -154,6 +160,12 @@ struct llama_expert_pool {
         bool     ab_lost = false;
         uint64_t ab_dev  = 0;
         uint64_t ab_up   = 0;
+
+        // SSD tier: the layer's RAM slots (LRU), shared by the layer's tensors like the GPU slots
+        std::vector<int32_t>  ram_slot;    // [n_expert] -> RAM slot or -1
+        std::vector<int32_t>  ram_expert;  // [n_ram]    -> expert or -1
+        std::vector<uint64_t> ram_stamp;   // [n_ram]    LRU stamps
+        uint64_t ram_clock = 0;
     };
 
     uint32_t n_expert      = 0;
@@ -222,6 +234,33 @@ struct llama_expert_pool {
     size_t   dirty_bytes = 0;
     ggml_tensor * view_region = nullptr;   // I8 view of the whole region
     void clear_dirty();
+
+    // fill every slot that lies outside a whole-stack overlay with the layer's most routed experts from the
+    // routing workload ledger (load time: the cache starts warm instead of empty); gpu = false seeds only the SSD
+    // tier's RAM slots; returns the experts seeded
+    uint32_t seed_from_workload(bool gpu = true);
+
+    // SSD tier: the routed experts' home is the model's files, not the mapping. A pinned RAM arena holds n_ram slots
+    // per layer between the GPU slots and the files; RAM misses are read unbuffered from the files into an LRU victim.
+    // Admitted misses, whole-stack fills and the seed take their bytes from RAM slots
+    bool     ssd_active = false;
+    uint32_t n_ram      = 0;            // RAM slots per layer
+    ggml_backend_buffer_t ram_arena = nullptr;
+    llama_ssd_reader * reader = nullptr;   // owned (deleted in the destructor)
+    uint64_t ram_hits    = 0;            // experts found in RAM by a GPU miss or a fill
+    uint64_t ssd_reads   = 0;            // experts read from the files
+    uint64_t ssd_bytes   = 0;            // bytes read (sector round-out included)
+    int64_t  ssd_wait_us = 0;            // host time waiting for reads
+    // ram_bytes: the arena budget; false (tier off) when the model's experts fit it or it cannot be set up
+    bool init_ssd(const llama_model & model, size_t ram_bytes);
+    // make these experts of layer L RAM-resident (n <= n_ram): hits refresh, misses are read into LRU victims;
+    // returns once every read landed
+    // scan: a whole-stack fill streaming every expert, kept from displacing the decode working set
+    void ram_fetch(layer_state & L, const int32_t * experts, size_t n, bool scan = false);
+    // tensor ti's rows of expert e in its RAM slot (the expert must be RAM-resident)
+    const char * ram_ptr(const layer_state & L, size_t ti, int32_t e) const;
+    // whole-stack fill when the experts come from RAM slots
+    void fill_ab_ssd(layer_state & L, ggml_backend_t backend);
 
     std::vector<layer_state> layers;   // dense by il; tensors empty for non-moe layers
     ggml_context * ctx_views = nullptr;

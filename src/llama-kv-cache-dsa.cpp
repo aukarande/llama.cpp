@@ -257,6 +257,28 @@ const llama_ubatch & llama_kv_cache_dsa_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+// both caches rewind together: the top_k of the lid row unmasks the MLA mask
+bool llama_kv_cache_dsa_context::layer_major_begin() {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || i_next != 0) {
+        return false;
+    }
+
+    layer_major = ctx_mla->layer_major_begin() && ctx_lid->layer_major_begin();
+
+    return layer_major;
+}
+
+void llama_kv_cache_dsa_context::rewind() {
+    if (!layer_major) {
+        return;
+    }
+
+    ctx_mla->rewind();
+    ctx_lid->rewind();
+
+    i_next = 0;
+}
+
 const llama_kv_cache_context * llama_kv_cache_dsa_context::get_mla() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 

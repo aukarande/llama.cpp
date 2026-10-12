@@ -94,6 +94,15 @@ public:
 
     using slot_info_vec_t = std::vector<slot_info>;
 
+    // the cell metadata before a batch (layer-major prefill: restored at the start of each layer group)
+    struct cells_snapshot {
+        llama_kv_cells_vec    v_cells;
+        std::vector<uint32_t> v_heads;
+
+        // per stream, the cells that v_cells holds; empty: all cells
+        std::vector<std::vector<uint32_t>> idxs;
+    };
+
     // TODO: refactor the memory instances to not depend on `llama_model`
     //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
     //       likely through `struct llama_memory_params`
@@ -131,6 +140,9 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+
+    // shared cells cannot be saved (cells_save)
+    bool get_can_rewind() const override { return other == nullptr; }
 
     void clear(bool data) override;
 
@@ -211,6 +223,10 @@ public:
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+
+    // copy the heads and the cells that applying the batch's slots changes; return false if the cells are shared with another cache
+    bool cells_save(cells_snapshot & snap, const slot_info_vec_t & sinfos) const;
+    void cells_restore(const cells_snapshot & snap);
 
     //
     // input API
@@ -380,6 +396,9 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool layer_major_begin() override;
+    void rewind() override;
+
     //
     // llama_kv_cache_context specific API
     //
@@ -447,6 +466,13 @@ private:
     slot_info_vec_t sinfos;
 
     std::vector<llama_ubatch> ubatches;
+
+    // layer-major prefill: the cells before the first ubatch, and the n_kv of each ubatch in the first pass
+    bool layer_major = false;
+
+    llama_kv_cache::cells_snapshot cells_lm;
+
+    std::vector<int32_t> n_kv_lm;
 
     //
     // data needed for building the compute graph for the current ubatch:

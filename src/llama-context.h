@@ -292,6 +292,20 @@ private:
     // scheduler observer: the distinct experts of a multi-row pass whose expert copies were sliced (pshard_seen)
     static void pshard_ids_observe(const ggml_tensor * ids, int64_t n_distinct, void * user_data);
     void pshard_fold_workload();   // adds pshard_seen to <model>.pshard_workload_rows
+    void expert_store_attach();    // the model's RAM expert store (if any) serves this context's CPU splits
+    // the layer groups and the carry, before the expert store takes the free RAM: the MoE layers of the largest group
+    // (0: no layer-major prefill)
+    uint32_t layer_major_init(uint32_t n_batch_req);
+    // no layer-major prefill for this context: no groups, no carry, n_batch back to the one requested
+    void layer_major_off(uint32_t n_batch_req);
+    // true: this batch runs layer-major and mctx holds the memory snapshot; false: the reason is logged once
+    bool layer_major_check(uint32_t n_tokens_all, uint32_t n_ubatch, bool one_tier, llama_memory_context_i * mctx);
+    // the first reason the batch in balloc cannot run layer-major, without the memory snapshot: its index, and why
+    // (-1: none). find_cut prices the cuts by it
+    int layer_major_refusal(bool one_tier, const char ** why) const;
+    // marks the nodes of the full graph of a ubatch of n_tokens outside lm_cut's layers as not computed; false: it
+    // cannot be cut (logged)
+    bool layer_major_cut(llm_graph_result * res, ggml_cgraph * gf, uint32_t n_tokens);
     bool pshard_pool_resize(const llama_pshard_plan & plan);   // per-tier region: budget - weights - cache - this tier's scratch
     void pshard_assign_pool_tensors();
     void pshard_apply_plan(const llama_pshard_plan & plan, bool with_upload = true, bool force_upload = false);
@@ -454,6 +468,35 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // layer-major prefill (the RAM expert store is on): the layer groups [begin, end) and the hidden state each
+    // group leaves for the next one, f32 [lm_row, n_batch]
+    std::vector<std::pair<int32_t, int32_t>> lm_groups;
+    ggml_backend_buffer_ptr lm_carry_buf;
+    float *  lm_carry   = nullptr;
+    int64_t  lm_row     = 0; // floats per token of a layer output
+    uint32_t lm_refused = 0; // refusal reasons already logged
+
+    // the nodes of each full graph process_ubatch computes during a sweep: after l_out-<in_il> (-1: from the start) up
+    // to l_out-<out_il> (-1: to the end), and the input-only nodes they read. t_in (l_out-<in_il>) is written from
+    // h_in_data where it would have been computed; t_out (l_out-<out_il>) is read back into the carry
+    struct lm_cut_state {
+        bool          on        = false;
+        int32_t       in_il     = -1;
+        int32_t       out_il    = -1;
+        const float * h_in_data = nullptr;
+        ggml_tensor * t_in      = nullptr;
+        ggml_tensor * t_out     = nullptr;
+    };
+    lm_cut_state lm_cut;
+
+    // process_ubatch time during a layer-major sweep (nullptr: not timed)
+    struct lm_timing {
+        int64_t build_us   = 0; // apply, build and alloc
+        int64_t inputs_us  = 0;
+        int64_t compute_us = 0;
+    };
+    lm_timing * lm_time = nullptr;
 
     // perf
     mutable int64_t t_start_us  = 0;

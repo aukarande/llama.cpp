@@ -345,6 +345,7 @@ extern "C" {
         bool pshard_delegate_compute; // tensor overrides choose storage; scheduler chooses compute backends
         bool pshard_cache_skip_load; // skip loading plan cache (rebuild from scratch, then overwrite)
         size_t max_vram_alloc; // VRAM budget in MiB for the unified preload buffer (0 = auto from free VRAM)
+        int64_t max_ram_alloc; // pshard: MiB of RAM for the expert store of a model larger than RAM (-1 = auto, 0 = off)
         struct llama_pshard_plan_registry * pshard_registry; // tier plan registry, caller-owned. populated by llama_params_fit_pshard
     };
 
@@ -625,6 +626,11 @@ extern "C" {
 
     // true when the loaded model runs under pshard (false after a silent stock fallback)
     LLAMA_API bool llama_model_pshard_active(const struct llama_model * model);
+
+    // pshard: the SSD reads of the RAM expert store (a model larger than RAM), measured on the model's largest file with
+    // the store's reader in about 3 s: GB/s of expert reads with many in flight, and ms a lone read takes beyond its bytes
+    // at that rate. false: no expert to read
+    LLAMA_API bool llama_pshard_ssd_measure(const char * path_model, double * sat_gbps, double * lat_ms);
 
     LLAMA_API int64_t llama_time_us(void);
 

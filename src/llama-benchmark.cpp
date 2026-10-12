@@ -264,28 +264,61 @@ const char * llama_benchmark_profile_path(bool gpu) {
     return env ? env : (gpu ? "gpu_profile.txt" : "cpu_profile.txt");
 }
 
+static const char LLAMA_BENCHMARK_SSD_PREFIX[] = "#   SSD_Read:";
+
+static bool llama_benchmark_read_file(const char * path, std::string & out) {
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+    }
+    fclose(f);
+    return true;
+}
+
 uint64_t llama_benchmark_profile_hash() {
     uint64_t h = 0xcbf29ce484222325ULL;
     bool any = false;
     for (bool gpu : { false, true }) {
         const char * path = llama_benchmark_profile_path(gpu);
-        FILE * f = fopen(path, "rb");
-        if (!f) {
+        std::string data;
+        if (!llama_benchmark_read_file(path, data)) {
             LLAMA_LOG_WARN("%s: profile %s is not readable here - a plan priced from it will not match\n", __func__, path);
             continue;
         }
         any = true;
-        unsigned char buf[4096];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-            for (size_t i = 0; i < n; i++) {
-                h ^= buf[i];
-                h *= 0x100000001b3ULL;
+        // every byte but the SSD_Read line: measuring it re-plans only the models the RAM expert store serves
+        for (size_t b = 0; b < data.size(); ) {
+            const size_t nl = data.find('\n', b);
+            const size_t e  = nl == std::string::npos ? data.size() : nl + 1;
+            if (data.compare(b, sizeof(LLAMA_BENCHMARK_SSD_PREFIX) - 1, LLAMA_BENCHMARK_SSD_PREFIX) != 0) {
+                for (size_t i = b; i < e; i++) {
+                    h ^= (unsigned char) data[i];
+                    h *= 0x100000001b3ULL;
+                }
             }
+            b = e;
         }
-        fclose(f);
     }
     return any ? h : 0;
+}
+
+std::string llama_benchmark_ssd_line() {
+    std::string data;
+    if (!llama_benchmark_read_file(llama_benchmark_profile_path(false), data)) {
+        return "";
+    }
+    const size_t b = data.find(std::string("\n") + LLAMA_BENCHMARK_SSD_PREFIX);
+    return b == std::string::npos ? "" : data.substr(b + 1, data.find_first_of("\r\n", b + 1) - b - 1);
+}
+
+bool llama_benchmark_store::parse_ssd(const std::string & line) {
+    // a rate of 0 would price the reads as free
+    return sscanf(line.c_str(), "#   SSD_Read: sat=%lf GB/s lat=%lf ms", &sat_gbps, &lat_ms) == 2 && sat_gbps > 0.0 && lat_ms >= 0.0;
 }
 
 double llama_benchmark_host_pin_ceiling_gb() {
@@ -1014,6 +1047,34 @@ double llama_benchmark_predictor::sliced_expert_copy_ms(double bytes, double sha
     return ms;
 }
 
+double llama_benchmark_predictor::store_misses(double rows, double n_used) const {
+    if (store == nullptr || store->n_ram >= store->n_expert) {
+        return 0.0;
+    }
+    const double e = (double) store->n_expert;
+    if (workload != nullptr && workload->share_n_expert == store->n_expert) {
+        // one row: the routes outside the resident experts at the fitted (split-half) Zipf exponent; the rows model may
+        // have set the histogram aside for uniform routing
+        if (rows <= 1.0 && workload->zipf_alpha >= 0.0) {
+            return n_used * (1.0 - llama_pshard_workload::zipf_h(workload->zipf_alpha, store->n_ram, store->n_expert));
+        }
+        const double m = workload->pool_misses(rows, store->n_ram);
+        if (m >= 0.0) {
+            return m;
+        }
+    }
+    return e * llama_expert_distinct_share(nullptr, rows, n_used, e) * (e - store->n_ram) / e;
+}
+
+double llama_benchmark_predictor::store_read_ms(double m, double e_bytes, int n_waits) const {
+    if (store == nullptr || m <= 0.0 || e_bytes <= 0.0) {
+        return 0.0;
+    }
+    // the bytes at the rate with many reads in flight, and per wait what a lone read takes beyond that rate (a wait
+    // with m expected reads waits for at least one with probability 1 - e^-m)
+    return m * e_bytes / 1e6 / store->sat_gbps + n_waits * (1.0 - std::exp(-m)) * store->lat_ms;
+}
+
 double llama_benchmark_predictor::predict_tps(
         ggml_backend_sched_t sched,
         int cpu_backend_id,
@@ -1102,6 +1163,8 @@ double llama_benchmark_predictor::predict_tps(
     // split stands in for it
     const bool pool_sched = ggml_backend_sched_has_copy_overrides(sched);
     const int  lookahead  = pool_sched ? 1 : ggml_backend_sched_get_prefetch_lookahead();
+    // the RAM expert store serves the experts (an expert pool uploads its own)
+    const llama_benchmark_store * st = pool_sched ? nullptr : store;
     std::vector<int>  target_of(n_splits, -1);
     std::vector<char> is_target(n_splits, 0);
     {
@@ -1231,6 +1294,28 @@ double llama_benchmark_predictor::predict_tps(
             }
         }
 
+        // the store's SSD reads for the split's expert uploads, waited for tensor by tensor at consume time (the store
+        // refuses a prefetch with a miss): a stack whose router runs in this split reads every expert not in RAM, one
+        // whose ids an earlier split computed is copied sliced and reads the experts its rows route to. The copies of
+        // the experts in RAM this split pays for run while the reads are in flight
+        double ssd_ms = 0.0;
+        if (st != nullptr && is_gpu && si.input_moe_bytes > 0 &&
+                (si.input_expert_n_expert == 0 || si.input_expert_n_expert == (int64_t) st->n_expert)) {
+            const double e       = (double) st->n_expert;
+            const double sliced  = (double) (si.input_weight_sliced_bytes + si.input_expert_bytes);
+            const double whole   = std::max(0.0, (double) si.input_moe_bytes - sliced);
+            const int    n_sl    = si.input_weight_sliced_n + si.input_expert_n;
+            const int    n_wh    = std::max(0, si.input_moe_n - n_sl);
+            const double rows    = std::max(1.0, std::round((double) si.input_expert_n_rows * token_scale));
+            const double n_used  = (double) si.input_expert_n_used;
+            const double m       = store_misses(rows, n_used);
+            const double read_ms = store_read_ms(e - st->n_ram, whole / e, n_wh) + store_read_ms(m, sliced / e, n_sl);
+            const double hits    = std::max(0.0, e * llama_expert_distinct_share(workload, rows, n_used, e) - m);
+            const double hit_b   = (double) si.input_weight_sliced_bytes / e * hits +
+                (copy_prefetched ? 0.0 : (double) si.input_expert_bytes / e * hits + whole / e * st->n_ram);
+            ssd_ms = std::max(0.0, read_ms - (weight_bw > 0.0 ? hit_b / 1e9 / weight_bw * 1000.0 : 0.0));
+        }
+
         // the outstanding prefetch arrives here: what the compute of the splits since its trigger did not hide is
         // exposed at this split
         double exposed_ms = 0.0;
@@ -1273,6 +1358,30 @@ double llama_benchmark_predictor::predict_tps(
         struct ggml_tensor ** nodes = ggml_graph_nodes(si.graph);
         int n_nodes = ggml_graph_n_nodes(si.graph);
         llama_split_timing t = predict_split(nodes, n_nodes, is_gpu, batch_size, async_copy, &timing_cache, token_scale);
+
+        // the store's SSD reads for the split's CPU expert matmuls: a layer's tensors share its routing, and the layer
+        // waits once for the experts its rows use that are not in RAM
+        if (st != nullptr && !is_gpu) {
+            std::vector<std::pair<const ggml_tensor *, double>> lay;   // ids -> one expert's bytes
+            for (int j = 0; j < n_nodes; j++) {
+                const ggml_tensor * w   = nodes[j]->src[0];
+                const ggml_tensor * ids = nodes[j]->src[2];
+                if (nodes[j]->op != GGML_OP_MUL_MAT_ID || w == nullptr || ids == nullptr ||
+                        w->ne[2] != (int64_t) st->n_expert || strstr(w->name, "_exps.weight") == nullptr) {
+                    continue;
+                }
+                auto it = std::find_if(lay.begin(), lay.end(), [&](const auto & l) { return l.first == ids; });
+                if (it == lay.end()) {
+                    lay.push_back({ ids, 0.0 });
+                    it = lay.end() - 1;
+                }
+                it->second += (double) w->nb[2];
+            }
+            for (const auto & l : lay) {
+                const double rows = std::max(1.0, std::round((double) l.first->ne[1] * token_scale));
+                ssd_ms += store_read_ms(store_misses(rows, (double) l.first->ne[0]), l.second, 1);
+            }
+        }
 
         // output scaling: use the output rows in the reserved graph, then scale to
         // the runtime number of logits. This keeps the memory-probe graph as the
@@ -1344,8 +1453,9 @@ double llama_benchmark_predictor::predict_tps(
                 pending_wb[c] = std::max(0.0, pending_wb[c] - wb_use / 1000.0 * 1e9 * wb_bw);
             }
         }
-        const double split_ms = input_copy_ms + activ_copy_ms + exposed_ms + staged_serial_ms + comp_ms;
+        const double split_ms = input_copy_ms + activ_copy_ms + exposed_ms + staged_serial_ms + comp_ms + ssd_ms;
         if (bd != nullptr) {
+            (is_gpu ? bd->ssd_up_ms : bd->ssd_cpu_ms) += ssd_ms;
             bd->compute_ms       += t.time_ms;
             bd->cpu_ms           += is_gpu ? 0.0 : t.time_ms;
             bd->weight_upload_ms += input_copy_weight_ms + exposed_ms + staged_serial_ms;
@@ -1368,7 +1478,7 @@ double llama_benchmark_predictor::predict_tps(
         total_ms += split_ms;
 
         double dl_bytes = is_gpu ? (double)si.writeback_kv_bytes * kv_ratio + (double)si.writeback_rs_bytes : 0.0;
-        LLAMA_LOG_DEBUG("%s:   split %d/%d [%s] input_copy=%.3f (%.2f MiB) compute=%.3f kv_dl=%.3f (%.2f MiB) prefetch exposed=%.3f -> split %d activ=%.3f (%.2f MiB) -> %.3f ms"
+        LLAMA_LOG_DEBUG("%s:   split %d/%d [%s] input_copy=%.3f (%.2f MiB) compute=%.3f kv_dl=%.3f (%.2f MiB) prefetch exposed=%.3f -> split %d activ=%.3f (%.2f MiB) ssd=%.3f -> %.3f ms"
             " (exact=%d near=%d fall=%d cache=%d)\n",
             __func__, i, n_splits, is_gpu ? "GPU" : "CPU",
             input_copy_ms, input_copy_bytes / (1024.0 * 1024.0),
@@ -1376,7 +1486,7 @@ double llama_benchmark_predictor::predict_tps(
             kv_dl_ms, dl_bytes / (1024.0 * 1024.0),
             exposed_ms, target_of[i],
             activ_copy_ms, (double)si.input_activ_bytes / (1024.0 * 1024.0),
-            split_ms,
+            ssd_ms, split_ms,
             t.n_exact, t.n_nearest, t.n_fallback, t.n_cache_hit);
     }
 

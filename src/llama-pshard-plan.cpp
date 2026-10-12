@@ -1,5 +1,6 @@
 #include "llama-pshard-plan.h"
 #include "llama-expert-pool.h"
+#include "llama-expert-store.h"
 #include "llama-pshard-workload.h"
 
 #include <cmath>
@@ -293,6 +294,8 @@ struct llama_pshard_hybrid_costs {
     double  t_gpu_ffn    = 0.0;
     double  t_attn       = 0.0;
     double  t_gpu        = 0.0;
+    double  t_ssd_cpu    = 0.0;
+    double  t_ssd_up     = 0.0;
     int32_t slice_tokens = -1;
 };
 
@@ -351,6 +354,11 @@ struct llama_pshard_search_ctx {
     uint32_t                                   tier_from = 0;
     // HYBRID_ATTNPRIO_FFNBALANCE: per-layer costs shared by the tier's searches (nullptr: each search prices its own)
     llama_pshard_hybrid_costs                * hybrid_costs = nullptr;
+    // the RAM expert store's SSD reads are priced and a prompt of several ubatches runs layer-major (one sequence, a
+    // memory that rewinds): such a prompt reads the experts once, not per ubatch
+    bool                                       store_lm = false;
+    // the tier searched runs such prompts: its choices rank the prices without the SSD reads (rank_compute)
+    bool                                       rank_compute = false;
 };
 
 // accumulate tensor bytes from a gguf tensor table: routed experts per layer
@@ -359,7 +367,8 @@ struct llama_pshard_search_ctx {
 // (per_layer_all), the attention-priority resident set of llama_pshard_generate_overrides
 // (the layer minus its FFN pattern set patterns_layer_ffn: attention, norms, routers,
 // anything that is not ffn_(up|gate|down). or an expert tensor: per_layer_attn), the
-// output head (output*) and the token embeddings (the head when the embeddings are tied)
+// output head (output*), the token embeddings (the head when the embeddings are tied) and
+// the RAM expert store's slot of one expert in every expert tensor (store_slot_bytes)
 std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * wl, uint32_t n_layers, uint32_t pool_slots) {
     std::vector<double> share(n_layers, 1.0);
     if (wl == nullptr || pool_slots == 0) {
@@ -388,7 +397,7 @@ std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * 
 static void pshard_scan_tensor_bytes(const struct gguf_context * g, uint32_t n_expert,
         std::vector<size_t> & per_layer, size_t & per_expert, size_t & total_weights, uint32_t & tensors_per_layer,
         std::vector<size_t> & per_layer_all, std::vector<size_t> & per_layer_attn, size_t & head_bytes, size_t & tok_embd_bytes,
-        bool & has_output_weight, std::vector<size_t> & per_layer_pad) {
+        bool & has_output_weight, std::vector<size_t> & per_layer_pad, size_t & store_slot_bytes) {
     const int64_t n = gguf_get_n_tensors(g);
     std::vector<size_t>   row_this(per_layer.size(), 0);
     std::vector<uint32_t> cnt_this(per_layer.size(), 0);
@@ -441,6 +450,7 @@ static void pshard_scan_tensor_bytes(const struct gguf_context * g, uint32_t n_e
         }
         if (n_expert > 0) {
             row_this[il] += bytes / n_expert;
+            store_slot_bytes += llama_expert_store_stride(bytes / n_expert);
         }
     }
     for (size_t r : row_this) {
@@ -497,7 +507,16 @@ static bool pshard_hybrid_ids_cross_wins(const struct llama_pshard_search_ctx & 
                             + (st->pool_serve_us + st->engine_switch_us) / 1000.0;
     // cover the full upload could hide behind: the paired CPU-FFN's DRAM-bound expert reads
     const double cover_ms   = b_slice / 1e9 / dram * 1000.0;
-    return t_slice_ms < std::max(0.0, t_full_ms - cover_ms);
+    // the RAM expert store's SSD reads, in no cover: the full upload reads every expert not in RAM, the sliced one
+    // those the rows route to (a tier that ranks without them reads them once per prompt)
+    double ssd_full_ms  = 0.0;
+    double ssd_slice_ms = 0.0;
+    if (const auto * store = ctx.predictor->store; store != nullptr && !ctx.rank_compute) {
+        const int n_t = (int) std::max<uint32_t>(1, ctx.exps_tensors_per_layer);
+        ssd_full_ms  = ctx.predictor->store_read_ms((double) store->n_expert - store->n_ram, (double) ctx.exps_row_bytes, n_t);
+        ssd_slice_ms = ctx.predictor->store_read_ms(ctx.predictor->store_misses(bs, ctx.n_expert_used), (double) ctx.exps_row_bytes, n_t);
+    }
+    return t_slice_ms + ssd_slice_ms < std::max(0.0, t_full_ms - cover_ms) + ssd_full_ms;
 }
 
 struct llama_pshard_tps_hook_data {
@@ -512,6 +531,7 @@ struct llama_pshard_tps_hook_data {
     std::vector<llama_benchmark_predictor::breakdown> * out_piece_bd = nullptr; // the same per piece of the curve
     bool     price_slice = true;    // false: the expert pool serves the experts, the probe's classification stays
     uint32_t n_kv_stream = 1;       // KV cache streams: one per sequence unless the cache is unified
+    bool     compute_only = false;  // the slice crossover leaves the RAM expert store's upload reads out (rank_compute)
 };
 
 // a split the prefetch pass serves holds expert tensors whose ids an earlier split computed: the slice crossover
@@ -546,6 +566,17 @@ static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
             d->has_rs, bd, s, d->n_kv_stream);
         return tps > 0.0 ? (double) n * 1000.0 / tps : 0.0;
     };
+    // the RAM expert store's SSD reads are priced: kept apart in the plan (an expert pool's re-price drops them)
+    const bool ssd = d->predictor->store != nullptr && d->price_slice;
+    // the same, without the upload reads when the crossover ranks the prices without them
+    auto rank_ms = [&](int32_t n, int32_t s) -> double {
+        if (!ssd) {
+            return ubatch_ms(n, s, nullptr);
+        }
+        llama_benchmark_predictor::breakdown bd;
+        const double ms = ubatch_ms(n, s, &bd);
+        return d->compute_only ? ms - bd.ssd_up_ms : ms;
+    };
 
     // the slice crossover: the fewest tokens at which copying only the used experts after the router stops beating
     // the whole-tensor prefetch, whose part under the previous split's compute is hidden
@@ -555,7 +586,7 @@ static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
         int32_t hi = d->batch_size + 1;
         while (lo < hi) {
             const int32_t mid = lo + (hi - lo) / 2;
-            if (ubatch_ms(mid, mid + 1, nullptr) < ubatch_ms(mid, 0, nullptr)) {
+            if (rank_ms(mid, mid + 1) < rank_ms(mid, 0)) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -564,8 +595,13 @@ static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
         plan.expert_slice_tokens = lo;
     }
 
+    llama_benchmark_predictor::breakdown bd_full;
     plan.tps = (float) d->predictor->predict_tps(sched, d->cpu_backend_id, d->kv_size, d->batch_size, n_tokens_graph,
-        d->n_outputs, d->has_rs, d->out_bd, plan.expert_slice_tokens, d->n_kv_stream);
+        d->n_outputs, d->has_rs, d->out_bd != nullptr ? d->out_bd : ssd ? &bd_full : nullptr, plan.expert_slice_tokens,
+        d->n_kv_stream);
+    const auto & bd_plan = d->out_bd != nullptr ? *d->out_bd : bd_full;
+    plan.ssd_up_ms  = ssd ? (float) bd_plan.ssd_up_ms  : 0.0f;
+    plan.ssd_cpu_ms = ssd ? (float) bd_plan.ssd_cpu_ms : 0.0f;
 
     // the piece curve: ubatches of 1, 2, 4, ... tokens below the tier's batch on the same graph, their experts copied
     // as the tier's batch copies them (ggml_backend_sched_set_expert_slice_rows)
@@ -573,6 +609,7 @@ static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
         ? 0 : plan.expert_slice_tokens;
     plan.piece_n.clear();
     plan.piece_ms.clear();
+    plan.piece_ssd_up.clear();
     if (d->out_piece_bd) {
         d->out_piece_bd->clear();
     }
@@ -584,6 +621,9 @@ static void pshard_tps_probe_hook(llama_context * ctx, void * user_data) {
         }
         plan.piece_n.push_back((uint32_t) n);
         plan.piece_ms.push_back((float) ms);
+        if (ssd) {
+            plan.piece_ssd_up.push_back((float) bd.ssd_up_ms);
+        }
         if (d->out_piece_bd) {
             d->out_piece_bd->push_back(bd);
         }
@@ -648,7 +688,7 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_final(
         std::vector<llama_benchmark_predictor::breakdown> * piece_bd = nullptr) {
     llama_pshard_tps_hook_data tps_data = { ctx.predictor, ctx.layout.cpu, ctx.kv_size, (int32_t) cparams.n_batch,
         cparams.n_seq_max, ctx.has_rs, &plan, bd, piece_bd, plan.strategy != LLAMA_PSHARD_EXPERT_POOL,
-        cparams.kv_unified ? 1u : std::max<uint32_t>(1, cparams.n_seq_max) };
+        cparams.kv_unified ? 1u : std::max<uint32_t>(1, cparams.n_seq_max), ctx.rank_compute };
     auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
     auto * hookdata = ctx.predictor ? (void *) &tps_data     : nullptr;
     plan.expert_slice_tokens = -1;
@@ -890,7 +930,18 @@ static llama_pshard_plan llama_pshard_search_strategy(
     return plan;
 }
 
-static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current, uint32_t from);
+static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current, uint32_t from,
+        bool compute_only);
+
+static bool pshard_prompt_tier(const llama_pshard_plan_registry * registry, const llama_pshard_search_ctx & ctx,
+        const llama_context_params & cparams, size_t t);
+
+// a prompt tier that runs the prompts of several ubatches, which run layer-major (the context raises n_batch to n_ctx
+// only when n_ctx is above the top tier): it ranks its prices without the RAM expert store's upload reads (find_cut
+// prices such a prompt with one read of the experts not in RAM)
+static bool pshard_tier_ranks_compute(const llama_pshard_plan_registry * registry, const llama_pshard_search_ctx & ctx, size_t t) {
+    return ctx.store_lm && registry->cache_ubatch < ctx.kv_size && pshard_prompt_tier(registry, ctx, *ctx.cparams, t);
+}
 
 static llama_pshard_plan llama_pshard_search_attn_pin(
         const llama_pshard_search_ctx & ctx,
@@ -933,6 +984,10 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
     double t_gpu_ffn = 0.0;   // ms per FFN computed on the GPU
     double t_attn    = 0.0;   // ms per streamed attention layer
     double t_gpu     = 0.0;   // ms of GPU compute per layer
+    // the RAM expert store's SSD reads per FFN on the CPU and per FFN streamed: serial, nothing hides them (t_ssd_up 0
+    // when the tier ranks without the upload reads)
+    double t_ssd_cpu = 0.0;
+    double t_ssd_up  = 0.0;
     int32_t slice_tokens = -1;   // the tier's slice crossover (pricing probe, then the final plan)
     // the tier classifies its expert copies at its batch (ggml_backend_sched_set_expert_slice_rows), in rows rounded
     // to the sequences as the probe reserves them
@@ -986,7 +1041,7 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
                     }
                 }
             }
-            return (double) (n_ffn - k) * t_cpu + (double) k * (t_copy + t_gpu_ffn) - hidden;
+            return (double) (n_ffn - k) * (t_cpu + t_ssd_cpu) + (double) k * (t_copy + t_ssd_up + t_gpu_ffn) - hidden;
         };
         uint32_t best = n_ffn;
         for (uint32_t k = 0; k < n_ffn; k++) {
@@ -1058,6 +1113,8 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
         t_gpu_ffn    = ctx.hybrid_costs->t_gpu_ffn;
         t_attn       = ctx.hybrid_costs->t_attn;
         t_gpu        = ctx.hybrid_costs->t_gpu;
+        t_ssd_cpu    = ctx.hybrid_costs->t_ssd_cpu;
+        t_ssd_up     = ctx.hybrid_costs->t_ssd_up;
         slice_tokens = ctx.hybrid_costs->slice_tokens;
     } else if (hybrid && ctx.predictor != nullptr && n_ffn_at(0) >= 2) {
         llama_pshard_plan pre = plan;
@@ -1070,6 +1127,8 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
             t_gpu_ffn = bd.gpu_ffn_ms / pre.n_ffn_gpu;
             t_attn    = bd.stream_copy_ms / n_trunk;
             t_gpu     = std::max(0.0, bd.compute_ms - bd.cpu_ms) / n_trunk;
+            t_ssd_cpu = bd.ssd_cpu_ms / (n_ffn_at(0) - pre.n_ffn_gpu);
+            t_ssd_up  = ctx.rank_compute ? 0.0 : bd.ssd_up_ms / pre.n_ffn_gpu;
             slice_tokens = pre.expert_slice_tokens;
             if (ctx.hybrid_costs != nullptr) {
                 ctx.hybrid_costs->valid        = true;
@@ -1078,6 +1137,8 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
                 ctx.hybrid_costs->t_gpu_ffn    = t_gpu_ffn;
                 ctx.hybrid_costs->t_attn       = t_attn;
                 ctx.hybrid_costs->t_gpu        = t_gpu;
+                ctx.hybrid_costs->t_ssd_cpu    = t_ssd_cpu;
+                ctx.hybrid_costs->t_ssd_up     = t_ssd_up;
                 ctx.hybrid_costs->slice_tokens = slice_tokens;
             }
             LLAMA_LOG_INFO("%s: [%s] bs=%u: %.3f ms per FFN on the CPU, %.3f ms per FFN streamed "
@@ -1299,6 +1360,10 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
         t_gpu_ffn = n_gpu + nf > 0 && chains.gpu_ffn_ms > 0.0 ? chains.gpu_ffn_ms / (n_gpu + nf) : t_gpu_ffn;
         t_attn    = n_stream > 0 ? chains.stream_copy_ms / n_stream : t_attn;
         t_gpu     = n_trunk > 0 ? std::max(0.0, chains.compute_ms - chains.cpu_ms) / n_trunk : t_gpu;
+        t_ssd_cpu = n_gpu < n_ffn ? chains.ssd_cpu_ms / (n_ffn - n_gpu) : t_ssd_cpu;
+        if (!ctx.rank_compute) {
+            t_ssd_up = n_gpu > 0 ? chains.ssd_up_ms / n_gpu : t_ssd_up;
+        }
         slice_tokens = pl.expert_slice_tokens;
         uint32_t n_gpu_r = n_gpu;
         const uint32_t n_gpu_b   = n_ffn_gpu_rank(nf, n_attn, &n_gpu_r);
@@ -1350,7 +1415,7 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
                     alt.is_viable ? "" : " (does not fit)");
             }
         }
-        if (alt.is_viable && pshard_plan_is_better(alt, pl, ctx.tier_from)) {
+        if (alt.is_viable && pshard_plan_is_better(alt, pl, ctx.tier_from, ctx.rank_compute)) {
             pl = alt;
         }
     };
@@ -1378,7 +1443,7 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
             LLAMA_LOG_INFO("%s: [%s] bs=%u: head on the GPU n_full=%u %.1f t/s, on the CPU "
                 "n_full=%u %.1f t/s%s\n", __func__, lt, cparams->n_batch, plan.n_pinned, plan.tps, b.n_pinned, b.tps,
                 b.is_viable ? "" : " (does not fit)");
-            if (b.is_viable && pshard_plan_is_better(b, plan, ctx.tier_from)) {
+            if (b.is_viable && pshard_plan_is_better(b, plan, ctx.tier_from, ctx.rank_compute)) {
                 plan = b;
             }
         }
@@ -1519,7 +1584,7 @@ static llama_pshard_plan llama_pshard_search_hybrid(const llama_pshard_search_ct
         z.n_attn_pinned, z.n_pinned, z.n_ffn_gpu, z.tps, z.is_viable ? "" : " (does not fit)");
     llama_pshard_plan best = d;
     for (llama_pshard_plan * p : { &w, &z }) {
-        if (p->is_viable && (!best.is_viable || pshard_plan_is_better(*p, best, ctx.tier_from))) {
+        if (p->is_viable && (!best.is_viable || pshard_plan_is_better(*p, best, ctx.tier_from, ctx.rank_compute))) {
             best = *p;
         }
     }
@@ -1749,13 +1814,18 @@ bool pshard_registry_save(
 
     // trailing fields after cache_ubatch are ignored by older parsers (sscanf assigns
     // the two %u before the literal ']' mismatch and still returns 2)
-    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.4f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu kernel_cap_mb=%.0f machine=%016llx]\n",
+    char store_buf[96] = "";
+    if (registry->store_slots > 0) {
+        snprintf(store_buf, sizeof(store_buf), " store_slots=%u store_experts=%u ssd_expert_ms=%.3f",
+            registry->store_slots, registry->store_experts, registry->ssd_expert_ms);
+    }
+    fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.4f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu kernel_cap_mb=%.0f machine=%016llx%s]\n",
         budget_mib, cache_ubatch,
         registry->switch_layer_mb, registry->switch_attn_frac,
         registry->switch_head_mb, registry->switch_pcie_gb_s,
         registry->mtp_head_cpu ? 1 : 0, registry->mtp_head_extra_mb,
         (size_t) ((registry->union_bytes + 1024 * 1024 - 1) / (1024 * 1024)),  // whole MiB, rounded up
-        registry->kernel_copy_cap_mb, (unsigned long long) registry->machine_hash);
+        registry->kernel_copy_cap_mb, (unsigned long long) registry->machine_hash, store_buf);
     if (registry->pshard_disabled) {
         fprintf(f, "pshard_disabled=1 baseline_vram=%.1f\n", registry->baseline_vram_req / (1024.0 * 1024.0));
     } else {
@@ -1798,11 +1868,27 @@ bool pshard_registry_save(
                 fprintf(f, " ffn_gpu=%u", plan.n_ffn_gpu);
             }
             fprintf(f, " slice_tokens=%d", plan.expert_slice_tokens);
+            if (plan.compute_spill) {
+                fprintf(f, " compute_spill=1");
+            }
             if (!plan.piece_n.empty()) {
                 fprintf(f, " piece=");
                 for (size_t i = 0; i < plan.piece_n.size(); i++) {
                     fprintf(f, "%s%u:%.3f", i > 0 ? "," : "", plan.piece_n[i], plan.piece_ms[i]);
                 }
+            }
+            if (plan.ssd_up_ms > 0.0f) {
+                // the upload SSD reads inside tps and the pieces
+                fprintf(f, " ssd_up=%.3f", plan.ssd_up_ms);
+                if (plan.piece_ssd_up.size() == plan.piece_n.size() && !plan.piece_ssd_up.empty()) {
+                    fprintf(f, " piece_ssd_up=");
+                    for (size_t i = 0; i < plan.piece_ssd_up.size(); i++) {
+                        fprintf(f, "%s%.3f", i > 0 ? "," : "", plan.piece_ssd_up[i]);
+                    }
+                }
+            }
+            if (plan.ssd_cpu_ms > 0.0f) {
+                fprintf(f, " ssd_cpu=%.3f", plan.ssd_cpu_ms);
             }
             fprintf(f, "\n");
             fprintf(f, "ot=%s\n", pshard_plan_to_ot(plan, host_buft).c_str());
@@ -1855,8 +1941,12 @@ bool pshard_registry_load(
         float pool_keep = 0.0f;
         float pool_ab_scale = 1.0f;
         int32_t expert_slice_tokens = -1;
+        bool compute_spill = false;
         std::vector<uint32_t> piece_n;
         std::vector<float>    piece_ms;
+        float                 ssd_up_ms  = 0.0f;
+        std::vector<float>    piece_ssd_up;
+        float                 ssd_cpu_ms = 0.0f;
         std::string ot_line;
         std::vector<llama_pshard_candidate> cands;
     };
@@ -1874,6 +1964,9 @@ bool pshard_registry_load(
         bool  mtp_head_cpu     = false;
         uint32_t mtp_head_extra_mb = 0;
         size_t union_bytes     = 0;
+        uint32_t store_slots   = 0;
+        uint32_t store_experts = 0;
+        float    ssd_expert_ms = 0.0f;
         std::vector<tier_data> tiers;
     };
     std::vector<variant_data> variants;
@@ -1911,6 +2004,9 @@ bool pshard_registry_load(
             if ((p = strstr(s.c_str(), "mtp_head_cpu=")) != NULL) cur_variant->mtp_head_cpu = atoi(p + 13) != 0;
             if ((p = strstr(s.c_str(), "mtp_head_extra_mb=")) != NULL) cur_variant->mtp_head_extra_mb = (uint32_t) atoi(p + 18);
             if ((p = strstr(s.c_str(), "union_mb="))    != NULL) cur_variant->union_bytes = (size_t)(atof(p + 9) * 1024.0 * 1024.0);
+            if ((p = strstr(s.c_str(), "store_slots=")) != NULL) cur_variant->store_slots = (uint32_t) atoi(p + 12);
+            if ((p = strstr(s.c_str(), "store_experts=")) != NULL) cur_variant->store_experts = (uint32_t) atoi(p + 14);
+            if ((p = strstr(s.c_str(), "ssd_expert_ms=")) != NULL) cur_variant->ssd_expert_ms = (float) atof(p + 14);
             continue;
         }
         if (!cur_variant) continue;
@@ -1988,6 +2084,8 @@ bool pshard_registry_load(
             td.n_ffn_gpu = pfg ? (uint32_t) atoi(pfg + 8) : 0;
             const char * pst = strstr(s.c_str(), "slice_tokens=");
             td.expert_slice_tokens = pst ? (int32_t) atoi(pst + 13) : -1;
+            const char * pcs = strstr(s.c_str(), "compute_spill=");
+            td.compute_spill = pcs ? atoi(pcs + 14) != 0 : false;
             if (const char * pc = strstr(s.c_str(), " piece=")) {
                 // n:ms pairs separated by commas, ascending n
                 const char * q = pc + 7;
@@ -2000,6 +2098,25 @@ bool pshard_registry_load(
                     }
                     td.piece_n.push_back(n);
                     td.piece_ms.push_back(ms);
+                    q += used;
+                    if (*q != ',') {
+                        break;
+                    }
+                    q++;
+                }
+            }
+            if (const char * pd = strstr(s.c_str(), " ssd_up=")) {
+                td.ssd_up_ms = (float) atof(pd + 8);
+            }
+            if (const char * pd = strstr(s.c_str(), " ssd_cpu=")) {
+                td.ssd_cpu_ms = (float) atof(pd + 9);
+            }
+            if (const char * pd = strstr(s.c_str(), " piece_ssd_up=")) {
+                const char * q = pd + 14;
+                float ms   = 0.0f;
+                int   used = 0;
+                while (sscanf(q, "%f%n", &ms, &used) == 1) {
+                    td.piece_ssd_up.push_back(ms);
                     q += used;
                     if (*q != ',') {
                         break;
@@ -2080,8 +2197,12 @@ bool pshard_registry_load(
         plan.pool_ab_applied  = td.pool_ab_scale > 0.0f && td.pool_ab_scale < 1.0f;
         plan.pool_keep_est    = plan.pool_ab_applied ? td.pool_keep : 0.0f;
         plan.expert_slice_tokens = td.expert_slice_tokens;
+        plan.compute_spill    = td.compute_spill;
         plan.piece_n          = td.piece_n;
         plan.piece_ms         = td.piece_ms;
+        plan.ssd_up_ms        = td.ssd_up_ms;
+        plan.piece_ssd_up     = td.piece_ssd_up.size() == td.piece_n.size() ? td.piece_ssd_up : std::vector<float>();
+        plan.ssd_cpu_ms       = td.ssd_cpu_ms;
 
         if (!td.ot_line.empty()) {
             std::string remaining = td.ot_line;
@@ -2247,6 +2368,9 @@ bool pshard_registry_load(
         registry->mtp_head_cpu     = best_whole->mtp_head_cpu;
         registry->mtp_head_extra_mb = best_whole->mtp_head_extra_mb;
         registry->union_bytes      = best_whole->union_bytes;
+        registry->store_slots      = best_whole->store_slots;
+        registry->store_experts    = best_whole->store_experts;
+        registry->ssd_expert_ms    = best_whole->ssd_expert_ms;
     }
 
     for (auto & item : selected) {
@@ -2389,6 +2513,7 @@ static void pshard_enforce_union_budget(
         cp_tier.n_ubatch = cp_tier.n_batch;
         ctx_t.cparams = &cp_tier;
         ctx_t.tier_from = t > 0 ? registry->tier_sizes[t - 1] : 0;
+        ctx_t.rank_compute = pshard_tier_ranks_compute(registry, ctx, t);
         llama_pshard_tier_prune prune;
         prune.init();
         // a repair step: keep the tier's strategy and re-place it within the reduced budget; when
@@ -2557,34 +2682,54 @@ static void pshard_enforce_union_budget(
 }
 
 // the mean predicted ms of a tier's ubatches above `from` tokens: one per doubling from its piece curve, and the
-// full batch. A tier runs every ubatch between the next smaller tier and its own batch, not only full ones
-static double pshard_tier_cost_ms(const llama_pshard_plan & p, uint32_t from) {
+// full batch. A tier runs every ubatch between the next smaller tier and its own batch, not only full ones.
+// compute_only: without the RAM expert store's upload reads (a layer-major prompt reads them once, not per ubatch)
+static double pshard_tier_cost_ms(const llama_pshard_plan & p, uint32_t from, bool compute_only = false) {
     double sum = (double) p.batch_size * 1000.0 / (double) p.tps;
+    if (compute_only) {
+        sum -= p.ssd_up_ms;
+    }
     int    n   = 1;
     for (size_t i = 0; i < p.piece_n.size() && i < p.piece_ms.size(); i++) {
         if (p.piece_n[i] > from) {
             sum += p.piece_ms[i];
+            if (compute_only && i < p.piece_ssd_up.size()) {
+                sum -= p.piece_ssd_up[i];
+            }
             n++;
         }
     }
     return sum / n;
 }
 
+// a plan's tokens/sec at its full batch, without the upload reads when compute_only
+static double pshard_plan_tps(const llama_pshard_plan & p, bool compute_only) {
+    if (!compute_only || p.ssd_up_ms <= 0.0f || p.tps <= 0.0f) {
+        return p.tps;
+    }
+    const double ms = (double) p.batch_size * 1000.0 / (double) p.tps - p.ssd_up_ms;
+    return ms > 0.0 ? (double) p.batch_size * 1000.0 / ms : 0.0;
+}
+
 // from: the next smaller tier's batch (0 = none); with it and priced piece curves on both sides, plans are ranked
-// by their mean ubatch time over the sizes the tier runs, else by the full batch rate
-static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current, uint32_t from) {
+// by their mean ubatch time over the sizes the tier runs, else by the full batch rate. compute_only: see
+// pshard_tier_cost_ms
+static bool pshard_plan_is_better(const llama_pshard_plan & candidate, const llama_pshard_plan & current, uint32_t from,
+        bool compute_only) {
     if (!current.is_viable) return true;
     const bool candidate_has_tps = candidate.tps > 0.0f;
     const bool current_has_tps   = current.tps   > 0.0f;
     if (from > 0 && candidate_has_tps && current_has_tps && !candidate.piece_n.empty() && !current.piece_n.empty() &&
             candidate.batch_size == current.batch_size) {
-        const double c_ms = pshard_tier_cost_ms(candidate, from);
-        const double b_ms = pshard_tier_cost_ms(current, from);
+        const double c_ms = pshard_tier_cost_ms(candidate, from, compute_only);
+        const double b_ms = pshard_tier_cost_ms(current, from, compute_only);
         if (c_ms != b_ms) return c_ms < b_ms;
     }
     if (candidate_has_tps || current_has_tps) {
         if (candidate_has_tps != current_has_tps) return candidate_has_tps;
-        if (candidate.tps != current.tps) return candidate.tps > current.tps;
+        const double c_tps = pshard_plan_tps(candidate, compute_only);
+        const double b_tps = pshard_plan_tps(current, compute_only);
+        if (c_tps != b_tps) return c_tps > b_tps;
     }
     if (candidate.n_pinned != current.n_pinned) return candidate.n_pinned > current.n_pinned;
     if (candidate.n_attn_pinned != current.n_attn_pinned) return candidate.n_attn_pinned > current.n_attn_pinned;
@@ -2741,6 +2886,11 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     if (!ctx.is_moe || ctx.n_expert == 0 || ctx.n_expert_used == 0 ||
             ctx.model_size <= 0 || n_layers == 0) {
         return plan; // dense models: the pool is not a candidate
+    }
+    if (ctx.predictor != nullptr && ctx.predictor->store != nullptr) {
+        // the pool reads its experts from the mapping, not through the RAM expert store: its SSD reads are not priced
+        LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u not a candidate: the RAM expert store serves this model\n", __func__, cparams->n_batch);
+        return plan;
     }
 
     // output head ON the GPU: with it on the CPU every pass (target token AND draft
@@ -3172,7 +3322,7 @@ static llama_pshard_plan llama_pshard_search_tier(
             }
         }
 
-        if (plan.is_viable && pshard_plan_is_better(plan, best, ctx.tier_from)) {
+        if (plan.is_viable && pshard_plan_is_better(plan, best, ctx.tier_from, ctx.rank_compute)) {
             best = plan;
         }
     }
@@ -3223,6 +3373,7 @@ static llama_pshard_plan llama_pshard_search_one_tier(
     ctx.cparams = &cp_tier;
     // a strategy's own variants are ranked like the tiers: over the ubatch sizes the tier runs
     ctx.tier_from = t > 0 ? registry.tier_sizes[t - 1] : 0;
+    ctx.rank_compute = pshard_tier_ranks_compute(&registry, ctx, t);
     memo.tier(cp_tier.n_batch);
 
     const llama_pshard_strategy strat = (llama_pshard_strategy)strategy;
@@ -3419,9 +3570,14 @@ void llama_params_fit_pshard_plan(
 
     llama_model_params mparams_probe = *mparams;
     mparams_probe.pshard = false;
+    // whether the context's memory can rewind: a layer-major prefill needs it
+    bool can_rewind = false;
+    auto rewind_hook = [](llama_context * c, void * ud) {
+        *(bool *) ud = c->get_memory() != nullptr && c->get_memory()->get_can_rewind();
+    };
     const auto dmds = llama_get_device_memory_data(
         path_model, &mparams_probe, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_nr, GGML_LOG_LEVEL_ERROR,
-        nullptr, nullptr, 0, 0, -1, false, &meta_cache);
+        rewind_hook, &can_rewind, 0, 0, -1, false, &meta_cache);
 
     if (devs.empty()) {
         LLAMA_LOG_ERROR("%s: no GPU devices found\n", __func__);
@@ -3555,7 +3711,11 @@ void llama_params_fit_pshard_plan(
 #endif
         fclose(mf);
     }
-    const uint64_t fp = pshard_registry_fingerprint(mparams, cparams, model_file_size);
+
+    // a model larger than RAM gets the RAM expert store: its SSD reads are priced from the CPU profile's SSD_Read line,
+    // which the registry fingerprints
+    const llama_pshard_store_info store_info = llama_pshard_store_info_for(path_model, mparams);
+    const uint64_t fp = pshard_registry_fingerprint(mparams, cparams, model_file_size, store_info);
 
     // per-mapping upload pricing: split files past the driver's host pin ceiling
     // cannot be page-locked, and their streamed copies go through the pinned
@@ -3577,6 +3737,7 @@ void llama_params_fit_pshard_plan(
     std::vector<size_t> all_per_layer(n_layers, 0), attn_per_layer(n_layers, 0);
     size_t head_bytes = 0, tok_embd_bytes = 0;
     bool   has_output_weight = false;
+    size_t store_slot_bytes  = 0;
     {
         std::vector<int64_t> map_sizes;
         map_sizes.push_back(model_file_size);
@@ -3588,7 +3749,7 @@ void llama_params_fit_pshard_plan(
                 n_split = (int) gguf_get_val_u16(g, ks);
             }
             pshard_scan_tensor_bytes(g, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors,
-                all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pad_per_layer);
+                all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pad_per_layer, store_slot_bytes);
             gguf_free(g);
             if (n_split > 1) {
                 char prefix[1024];
@@ -3607,7 +3768,8 @@ void llama_params_fit_pshard_plan(
                             fclose(sf);
                             if (struct gguf_context * gs = gguf_init_from_file(split_path, gip_s)) {
                                 pshard_scan_tensor_bytes(gs, hp_nex, exps_per_layer, exps_per_expert, exps_weights, exps_tensors,
-                                    all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pad_per_layer);
+                                    all_per_layer, attn_per_layer, head_bytes, tok_embd_bytes, has_output_weight, exps_pad_per_layer,
+                                    store_slot_bytes);
                                 gguf_free(gs);
                             }
                         } else {
@@ -3730,6 +3892,28 @@ void llama_params_fit_pshard_plan(
             __func__, ctx.n_expert, ctx.n_expert_used, (long long)(total_file_size / (1024 * 1024)));
     }
 
+    // the RAM expert store as the loader decides it: the slots per layer its budget holds (the store's own sizing; the
+    // runtime logs the slots it gets) and the CPU profile's SSD_Read line. Without the line its reads are not priced
+    llama_benchmark_store store;   // outlives the sweep: the predictor reads it
+    if (store_info.on && predictor && hp_nex > 0) {
+        store.n_expert = hp_nex;
+        store.n_ram    = llama_expert_store_slots(store_info.budget, store_slot_bytes, hp_nex);
+        if (store.n_ram < ctx.n_expert_used) {
+            LLAMA_LOG_WARN("%s: expert store: %.1f GiB hold %u slots per layer, below the %u routed experts - the store stays off, its reads are not priced\n",
+                __func__, store_info.budget / 1073741824.0, store.n_ram, ctx.n_expert_used);
+        } else if (!store.parse_ssd(store_info.line)) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LLAMA_LOG_WARN("%s: expert store: the CPU profile has %s%s - its SSD reads are not priced. To measure it: "
+                    "llama-profiler-cpu --splice %s --ssd %s\n", __func__,
+                    store_info.line.empty() ? "no SSD_Read line" : "an SSD_Read line that does not parse: ", store_info.line.c_str(),
+                    llama_benchmark_profile_path(false), path_model);
+            }
+        } else {
+            predictor->store = &store;
+        }
+    }
+
     // routing workload: the Zipf exponent the pool's hit-rate model h(s) uses. From <model>.pshard_workload
     // (pool runs accumulate their route histograms into it at exit), else calibrated now: a CPU-only sampled
     // generation (256 tokens, seed 1234, temperature 1) whose router top-k ids are histogrammed - a sampled
@@ -3758,12 +3942,39 @@ void llama_params_fit_pshard_plan(
         ctx.zipf_alpha  = wl.zipf_alpha;
         ctx.zipf_source = wl.source;
         wl.load_distinct(llama_pshard_workload::distinct_path_for(path_model), hp_nex);
-        // the pool table covers the EXPERT_POOL cache tiers (bs * top_k < n_expert); whole-stack tiers price streaming
-        const uint32_t pool_rows = ctx.n_expert_used > 0 ? (hp_nex + ctx.n_expert_used - 1) / ctx.n_expert_used : 0;
+        // the pool table covers the EXPERT_POOL cache tiers (bs * top_k < n_expert); whole-stack tiers price streaming.
+        // The RAM expert store's misses take it at every row count a pass has
+        const uint32_t pool_rows = predictor && predictor->store != nullptr ? n_ctx_plan
+            : ctx.n_expert_used > 0 ? (hp_nex + ctx.n_expert_used - 1) / ctx.n_expert_used : 0;
         wl.build_share_table(hp_nex, ctx.n_expert_used, n_ctx_plan, pool_rows);
         if (predictor && !wl.share_table.empty()) {
             predictor->workload = &wl;
         }
+    }
+
+    // the store's reads with the misses from the routing workload. A prompt of several ubatches runs layer-major unless a
+    // runtime refusal the fingerprinted configuration settles applies (llama_context::layer_major_init and
+    // layer_major_refusal; speculative decoding asks the target for embeddings or layer inputs)
+    float store_expert_ms = 0.0f;
+    if (predictor && predictor->store != nullptr) {
+        const char * bm_why = !can_rewind ? "the memory cannot rewind" : cparams->n_seq_max != 1 ? "more than one sequence"
+            : cparams->n_outputs_max_per_seq > 1 || mparams->load_mtp ? "speculative decoding" : nullptr;
+        ctx.store_lm = bm_why == nullptr;
+        const double m1 = predictor->store_misses(1.0, ctx.n_expert_used);
+        double   tok_ms   = 0.0;
+        double   exp_ms   = 0.0;
+        uint32_t n_layers_store = 0;
+        for (size_t b : exps_per_layer) {
+            if (b > 0) {
+                tok_ms += predictor->store_read_ms(m1, (double) b / hp_nex, 1);
+                exp_ms += predictor->store_read_ms(1.0, (double) b / hp_nex, 0);
+                n_layers_store++;
+            }
+        }
+        store_expert_ms = n_layers_store > 0 ? (float) (exp_ms / n_layers_store) : 0.0f;
+        LLAMA_LOG_INFO("%s: expert store: %u of %u experts per layer in RAM (%.1f GiB), %.2f misses per layer per token (%.1f ms "
+            "per token on the CPU path), %.1f ms to read one expert of every layer%s%s\n", __func__, store.n_ram, hp_nex,
+            store_info.budget / 1073741824.0, m1, tok_ms, exp_ms, bm_why ? "; prompts run batch-major: " : "", bm_why ? bm_why : "");
     }
 
     llama_pshard_plan_registry * registry  = mparams->pshard_registry;
@@ -3784,6 +3995,9 @@ void llama_params_fit_pshard_plan(
         registry->budget_mib = pshard_bytes_to_mib_ceil(vram_free);
         registry->cache_ubatch = registry->tier_sizes.empty() ? 0 : registry->tier_sizes.back();
         ctx.cache_ubatch = registry->cache_ubatch;
+        registry->store_slots   = predictor && predictor->store != nullptr ? store.n_ram : 0;
+        registry->store_experts = predictor && predictor->store != nullptr ? store.n_expert : 0;
+        registry->ssd_expert_ms = store_expert_ms;
 
         // save requested tiers before load (load overwrites tier_sizes)
         std::vector<uint32_t> requested_tiers = registry->tier_sizes;
@@ -4012,6 +4226,7 @@ void llama_params_fit_pshard_plan(
                     : ctx.kv_size / std::max<uint32_t>(1, cparams->n_seq_max);
                 const double per_switch = t + 1 == n_tiers && n_ctx_seq > 0
                     ? std::max(1.0, (double) n_ctx_seq / (2.0 * registry->tier_sizes[t])) : 1.0;
+                const bool rank_compute = pshard_tier_ranks_compute(registry, ctx, t);
                 llama_pshard_plan best;
                 double best_cost = 0.0;
                 for (int s = 0; s < LLAMA_PSHARD_COUNT; s++) {
@@ -4024,15 +4239,15 @@ void llama_params_fit_pshard_plan(
                     if (rest != nullptr && p.tps > 0.0f) {
                         const double sw_in  = registry->switch_cost_ms(*rest, p);
                         const double sw_out = registry->switch_cost_ms(p, *rest);
-                        const double cost   = pshard_tier_cost_ms(p, from) + (sw_in + sw_out) / per_switch;
+                        const double cost   = pshard_tier_cost_ms(p, from, rank_compute) + (sw_in + sw_out) / per_switch;
                         LLAMA_LOG_INFO("%s: [tier %zu bs=%-5u] %-28s ubatch %.1f + (switch in %.1f + back %.1f) / %.1f = %.1f ms\n",
                             __func__, t, registry->tier_sizes[t], llama_pshard_strategy_name((llama_pshard_strategy) s),
-                            pshard_tier_cost_ms(p, from), sw_in, sw_out, per_switch, cost);
+                            pshard_tier_cost_ms(p, from, rank_compute), sw_in, sw_out, per_switch, cost);
                         if (!best.is_viable || best.tps <= 0.0f || cost < best_cost) {
                             best      = p;
                             best_cost = cost;
                         }
-                    } else if (rest == nullptr ? pshard_plan_is_better(p, best, from) : !best.is_viable) {
+                    } else if (rest == nullptr ? pshard_plan_is_better(p, best, from, rank_compute) : !best.is_viable) {
                         best = p;
                     }
                 }
@@ -4054,6 +4269,13 @@ void llama_params_fit_pshard_plan(
                         __func__, t, registry->tier_sizes[t], llama_pshard_strategy_name((llama_pshard_strategy) s),
                         p.is_viable ? "viable  " : "unviable", p.n_pinned, p.n_attn_pinned, p.pool_slots, p.tps,
                         p.total_vram_req / (1024.0 * 1024.0), picked ? "  <- picked" : "");
+                }
+                if (best.is_viable && best.tps > 0.0f && (best.ssd_up_ms > 0.0f || best.ssd_cpu_ms > 0.0f)) {
+                    const double ms = (double) best.batch_size * 1000.0 / best.tps;
+                    LLAMA_LOG_INFO("%s: [tier %zu bs=%-5u] SSD reads per ubatch: uploads %.1f ms + CPU %.1f ms of %.1f ms: %.1f t/s, "
+                        "%.1f t/s without%s\n", __func__, t, registry->tier_sizes[t], best.ssd_up_ms, best.ssd_cpu_ms, ms, best.tps,
+                        best.batch_size * 1000.0 / std::max(1e-3, ms - best.ssd_up_ms - best.ssd_cpu_ms),
+                        rank_compute ? " (layer-major prompts: ranked without the upload reads)" : "");
                 }
             }
 

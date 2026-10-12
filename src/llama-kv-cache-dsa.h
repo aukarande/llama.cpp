@@ -47,6 +47,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool get_can_rewind() const override { return kv_mla->get_can_rewind() && kv_lid->get_can_rewind(); }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -119,6 +121,9 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool layer_major_begin() override;
+    void rewind() override;
+
     //
     // llama_kv_cache_dsa_context specific API
     //
@@ -131,6 +136,8 @@ private:
 
     // the index of the next ubatch to process
     size_t i_next = 0;
+
+    bool layer_major = false;
 
     std::vector<llama_ubatch> ubatches;
 

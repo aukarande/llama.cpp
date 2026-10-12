@@ -32,6 +32,10 @@ uint64_t llama_benchmark_profile_hash();
 // page-locks from it
 double llama_benchmark_host_pin_ceiling_gb();
 
+// the CPU profile's SSD_Read line without its line end ("" = none). The profile hash leaves it out: only the registry
+// fingerprint of a model the RAM expert store serves mixes it
+std::string llama_benchmark_ssd_line();
+
 // Per-op FLOPS/bytes metrics extracted from a ggml tensor node.
 // Used by roofline prediction to classify ops as compute-bound or memory-bound.
 struct llama_op_metrics {
@@ -200,6 +204,18 @@ struct llama_benchmark_stats {
     }
 };
 
+// the RAM expert store of a model larger than RAM (llama-expert-store.h) as the planner prices it: each layer keeps
+// n_ram of its n_expert routed experts in RAM, a pass reads every other expert it uses from the SSD and waits for it
+struct llama_benchmark_store {
+    uint32_t n_expert = 0;
+    uint32_t n_ram    = 0;
+    double   sat_gbps = 0.0;   // the SSD_Read line: GB/s of expert reads with many in flight
+    double   lat_ms   = 0.0;   // and ms a lone read takes beyond its bytes at that rate
+
+    // false: not an SSD_Read line
+    bool parse_ssd(const std::string & line);
+};
+
 // Aggregate timing prediction for a set of graph nodes (typically one sched split).
 struct llama_split_timing {
     double time_ms     = 0.0;
@@ -220,6 +236,14 @@ struct llama_benchmark_predictor {
     // routing workload of the planned model, set by the planner (nullptr = none): the distinct experts per
     // pass that sliced expert copies and MUL_MAT_ID expert reads are priced with
     const llama_pshard_workload * workload = nullptr;
+    // the RAM expert store of the planned model, set by the planner (nullptr = off): the SSD reads of a pass
+    const llama_benchmark_store * store = nullptr;
+
+    // experts of a layer outside the store's RAM slots that one pass of `rows` rows routes to: the workload's pool
+    // table (the n_ram most routed experts in RAM), else uniform routing
+    double store_misses(double rows, double n_used) const;
+    // ms to read m experts of e_bytes each from the SSD, waited for in n_waits batches
+    double store_read_ms(double m, double e_bytes, int n_waits) const;
 
     std::unordered_map<std::string, const llama_benchmark_entry *> cpu_map;
     std::unordered_map<std::string, const llama_benchmark_entry *> gpu_map;
@@ -292,6 +316,10 @@ struct llama_benchmark_predictor {
         // GPU (cpu_ms also holds the other CPU splits, e.g. a host output head)
         double cpu_ffn_ms       = 0.0;
         double gpu_ffn_ms       = 0.0;
+        // the RAM expert store's SSD reads, serial and in none of the terms above: of the GPU splits' expert uploads
+        // (what the copies from the RAM slots do not cover) and of the CPU splits' expert matmuls
+        double ssd_up_ms        = 0.0;
+        double ssd_cpu_ms       = 0.0;
     };
 
     // batch_size: tokens per step of the priced tier; n_tokens_graph: tokens the reserved

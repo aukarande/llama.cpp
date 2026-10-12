@@ -1485,6 +1485,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
+    // pshard can raise n_batch to n_ctx (a model larger than RAM): the tools then feed the whole prompt in one call
+    if (params.pshard && (int32_t) llama_n_batch(lctx) > params.n_batch) {
+        params.n_batch = (int32_t) llama_n_batch(lctx);
+    }
+
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
@@ -2296,6 +2301,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.pshard          = params.pshard;
     mparams.max_vram_alloc  = params.max_vram_alloc;
+    mparams.max_ram_alloc   = params.max_ram_alloc;
     return mparams;
 }
 

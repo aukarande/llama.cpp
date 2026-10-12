@@ -1651,6 +1651,13 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        if ((src0->flags & GGML_TENSOR_FLAG_EXPERT_TABLE) && src0->extra != NULL) {
+            // a RAM-resident expert: its rows are read from its slot
+            const void * p = ((const void * const *) src0->extra)[cur_a];
+            if (p != NULL) {
+                src0_cur = (const char *) p;
+            }
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

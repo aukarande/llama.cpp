@@ -1982,6 +1982,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"-mra", "--max-ram-alloc"}, "N",
+        "RAM in MiB for pshard's expert store, used only when the model is larger than RAM: the routed experts are read "
+        "from the GGUF files into a RAM cache of this size (-1 = auto, 0 = off; default: -1)",
+        [](common_params & params, int value) {
+            params.max_ram_alloc = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--pshard-tier-max"}, "N",
         "max tier batch size for pshard planning (0 = auto, capped by n_ctx)",
         [](common_params & params, int value) {

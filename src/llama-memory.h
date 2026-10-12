@@ -64,6 +64,13 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // layer-major prefill: each layer group runs all ubatches again from the first one
+    // call before the first apply(); return false if this memory type cannot rewind
+    virtual bool layer_major_begin() { return false; }
+
+    // restore the memory state from before the first ubatch and go back to the first ubatch
+    virtual void rewind() {}
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
@@ -99,6 +106,12 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    // layer-major prefill: its contexts can rewind (llama_memory_context_i::layer_major_begin)
+    virtual bool get_can_rewind() const { return false; }
+
+    // layer-major prefill: after a rewind, the ubatches that ran can run again batch-major and give the same memory
+    virtual bool get_can_rerun() const { return true; }
 
     //
     // ops

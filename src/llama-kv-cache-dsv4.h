@@ -126,6 +126,12 @@ public:
 
     bool get_can_shift() const override;
 
+    // the compressed caches apply no cells: only the raw halves rewind
+    bool get_can_rewind() const override { return kv_raw->get_base()->get_can_rewind() && kv_raw->get_swa()->get_can_rewind(); }
+
+    // the compressor state and the SWA rows of a layer that ran hold later tokens
+    bool get_can_rerun() const override { return false; }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -212,6 +218,9 @@ public:
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool layer_major_begin() override;
+    void rewind() override;
+
     uint32_t get_n_kv() const;
     uint32_t get_n_write() const;
 
@@ -248,6 +257,13 @@ private:
 
     uint32_t n_kv = 0;
 
+    // layer-major prefill: the SWA cells before the first ubatch, and the n_kv of each ubatch in the first pass
+    bool layer_major = false;
+
+    llama_kv_cache::cells_snapshot cells_lm;
+
+    std::vector<int32_t> n_kv_lm;
+
     const llama_memory_status status;
 };
 
@@ -265,6 +281,9 @@ public:
             std::vector<llama_ubatch> ubatches);
 
     bool next();
+
+    // layer-major prefill: back to the first ubatch
+    void rewind();
 
     uint32_t get_n_kv() const;
 
@@ -370,6 +389,9 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool layer_major_begin() override;
+    void rewind() override;
+
     //
     // llama_kv_cache_dsv4_context specific API
     //
@@ -392,6 +414,8 @@ public:
 
 private:
     size_t i_next = 0;
+
+    bool layer_major = false;
 
     std::vector<llama_ubatch> ubatches;
 

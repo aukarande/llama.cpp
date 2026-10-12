@@ -1,6 +1,8 @@
 #include "llama-context.h"
 
 #include "llama-expert-pool.h"
+#include "llama-expert-store.h"
+#include "llama-pshard-workload.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -26,6 +28,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 //
 // llama_context
@@ -260,8 +263,17 @@ llama_context::llama_context(
         cparams.auto_fhc  = false;
     }
 
+    // the RAM expert store is on: one call takes the whole prompt, so a layer-major prefill reads the experts once
+    // (layer_major_init lowers it again when the prefill cannot run layer-major)
+    uint32_t n_batch_req = params.n_batch;
+    if (cparams.pshard && cparams.causal_attn && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            model.expert_store() != nullptr && !hparams.no_alloc && cparams.n_ctx > n_batch_req) {
+        LLAMA_LOG_INFO("%s: pshard: n_batch raised to n_ctx = %u for a layer-major prefill\n", __func__, cparams.n_ctx);
+        n_batch_req = cparams.n_ctx;
+    }
+
     // with causal attention, the batch size is limited by the context size
-    cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+    cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, n_batch_req) : n_batch_req;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
@@ -513,6 +525,33 @@ llama_context::llama_context(
             throw;
         }
 
+        // the RAM expert store takes the RAM this context's buffers leave (the layer-major carry included); without
+        // the store and slots it can lend for the window rows there is no layer-major prefill
+        if (auto * store = model.expert_store(); store != nullptr && !model.hparams.no_alloc) {
+            const uint32_t w = layer_major_init(params.n_batch);
+
+            const bool was = store->active();
+            const bool ok  = store->allocate();
+            if (const auto * registry = model.get_plan_registry(); !was && ok && registry != nullptr && registry->store_slots > 0) {
+                // the plans priced the store's SSD reads at the slots its budget holds; the RAM free here may hold fewer
+                // (find_cut prices the uploads' reads at the live slots)
+                if (store->n_ram < registry->store_slots) {
+                    LLAMA_LOG_WARN("%s: pshard: expert store has %u slots per layer, the plans were priced at %u\n",
+                        __func__, store->n_ram, registry->store_slots);
+                } else {
+                    LLAMA_LOG_INFO("%s: pshard: expert store has %u slots per layer, the plans were priced at %u\n",
+                        __func__, store->n_ram, registry->store_slots);
+                }
+            }
+            const char * why = nullptr;
+            if (w > 0 && (!ok || store->sweep_bytes(lm_groups, &why) == 0)) {
+                if (ok) {
+                    LLAMA_LOG_WARN("%s: layer-major prefill off: %s\n", __func__, why);
+                }
+                layer_major_off(params.n_batch);
+            }
+        }
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -531,12 +570,29 @@ llama_context::llama_context(
     }
 }
 
+// a model larger than RAM: every context's CPU splits bring their routed experts into the model's RAM store first
+void llama_context::expert_store_attach() {
+    if (auto * store = model.expert_store()) {
+        ggml_backend_sched_set_host_experts_cb(sched.get(), llama_expert_store::host_experts_cb, store);
+        ggml_backend_sched_set_expert_upload_cb(sched.get(), llama_expert_store::expert_upload_cb, store);
+    }
+}
+
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
     if (expert_pool) {
         expert_pool->log_counters();
+    }
+    if (auto * store = model.expert_store()) {
+        store->detach();
+        store->log_counters();
+        // the pshard context folds (a draft or MTP context sharing the model does not); an expert pool counts the
+        // routes of its own layers
+        if (cparams.pshard && !expert_pool && !model.get_path_model().empty()) {
+            store->fold_workload(llama_pshard_workload::path_for(model.get_path_model()));
+        }
     }
     pshard_fold_workload();
     pshard_update_transfer_mode(nullptr);   // the kernel-copy flag and cap are process-wide: hand them back
@@ -669,6 +725,7 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    expert_store_attach();
 
     if (cparams.pshard) {
         pshard_setup_sched();
@@ -726,6 +783,7 @@ void llama_context::sched_reserve() {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                     cparams.pipeline_parallel = false;
                     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                    expert_store_attach();
                     gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
                 }
                 if (!gf) {
@@ -1447,6 +1505,8 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const int64_t t_lm_build_us = lm_time ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1460,7 +1520,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // a layer-major sweep computes a different part of every graph it builds, so none is reused
+    if (!graph_reuse_disable && !lm_cut.on && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1489,6 +1550,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        if (lm_cut.on && !layer_major_cut(res, gf, ubatch.n_tokens)) {
+            // as for a graph the arena cannot hold: the decode runs the batch batch-major
+            res->reset();
+            ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
 
@@ -1538,6 +1606,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const int64_t t_lm_inputs_us = lm_time ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1548,6 +1618,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // a sweep computes the group's nodes only; the carried hidden state lands where l_out-<in_il> would be computed
+    ggml_backend_sched_set_partial(sched.get(), lm_cut.on, lm_cut.t_in, lm_cut.h_in_data);
+
     if (cparams.pshard) {
         pshard_update_write_cells(mctx);
         if (expert_pool) {
@@ -1556,7 +1629,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const int64_t t_lm_compute_us = lm_time ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (lm_time) {
+        lm_time->build_us   += t_lm_inputs_us  - t_lm_build_us;
+        lm_time->inputs_us  += t_lm_compute_us - t_lm_inputs_us;
+        lm_time->compute_us += ggml_time_us()  - t_lm_compute_us;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1940,9 +2021,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (expert_pool) {
             expert_pool->layer_fill(fill);
         }
+        // a cut whose ubatches all run on one tier runs layer-major when nothing else refuses it (layer_major_check);
+        // without slots to lend, its groups read the experts not in RAM per ubatch, as batch-major does
+        llama_pshard_plan_registry::lm_price lm;
+        const char * lm_why = nullptr;   // why such a cut runs batch-major
+        if (auto * store = model.expert_store(); store != nullptr && store->active()) {
+            lm.n_ram  = store->n_ram;
+            lm.layers = store->n_layers();
+            if (lm_groups.empty()) {
+                lm_why = "layer-major prefill is off in this context";
+            } else if (layer_major_refusal(true, &lm_why) < 0) {
+                lm.reads  = store->sweep_reads(lm_groups);
+                lm.groups = lm.reads > 0 ? lm_groups.size() : 0;
+                lm_why    = lm.reads > 0 ? nullptr : "the expert store has no slots to lend";
+            }
+        }
         const auto cut = hold != SIZE_MAX ? llama_pshard_plan_registry::cut { hold, hold, 0.0 } :
             pshard_registry->find_cut(n_tokens_all, max_ubatch, min_ubatch, pshard_active_plan, &switch_state,
-                expert_pool ? &fill : nullptr);
+                expert_pool ? &fill : nullptr, &lm);
         if (cut.tier < pshard_registry->tier_sizes.size()) {
             pshard_cut_tier = cut.tier;
             pshard_cut_tail = cut.tail;
@@ -1955,9 +2051,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const uint32_t tier_bs = pshard_registry->tier_sizes[cut.tier];
             const uint32_t n_whole = n_tokens_all > tier_bs ? n_tokens_all / tier_bs : 0;
             const uint32_t n_rest  = n_tokens_all - n_whole * tier_bs;
-            LLAMA_LOG_INFO("%s: pshard cut: %u tokens = %u x bs=%u + %u on bs=%u, priced %.1f ms\n",
+            char lm_buf[128] = "";
+            if (lm.layers > 0 && n_whole > 0) {
+                // what layer_major_check sees once the cut's tier is active; find_cut prices it so with an SSD_Read line
+                if (lm.groups >= 2 && cut.tail == cut.tier &&
+                        pshard_registry->best_plans[cut.tier].strategy != LLAMA_PSHARD_EXPERT_POOL) {
+                    snprintf(lm_buf, sizeof(lm_buf), ", layer-major%s: %zu groups, %u reads per store layer",
+                        pshard_registry->ssd_expert_ms > 0.0f ? "" : " (reads not priced)", lm.groups, lm.reads);
+                } else {
+                    snprintf(lm_buf, sizeof(lm_buf), ", batch-major%s%s", lm_why ? ": " : "", lm_why ? lm_why : "");
+                }
+            }
+            LLAMA_LOG_INFO("%s: pshard cut: %u tokens = %u x bs=%u + %u on bs=%u, priced %.1f ms%s\n",
                 __func__, n_tokens_all, n_whole, tier_bs, n_rest,
-                n_whole > 0 && n_rest > 0 ? pshard_registry->tier_sizes[cut.tail] : tier_bs, cut.ms);
+                n_whole > 0 && n_rest > 0 ? pshard_registry->tier_sizes[cut.tail] : tier_bs, cut.ms, lm_buf);
         } else if (n_tokens_all >= 512) {
             n_ubatch_eff = pshard_registry->largest_viable_ubatch(max_ubatch);
         }
@@ -2060,8 +2167,119 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // layer-major prefill: each layer group runs every ubatch before the next group starts, so the RAM expert store
+    // serves a layer's experts while that layer is active; only the last group makes the outputs
+    const bool one_tier = pshard_cut_tail == SIZE_MAX || pshard_cut_tail == pshard_cut_tier;
+    bool lm = layer_major_check(n_tokens_all, n_ubatch_eff, one_tier, mctx.get());
+
+    size_t lm_g       = 0;     // the group that runs
+    size_t lm_iu      = 0;     // the ubatches of the group that ran
+    bool   lm_restart = false; // the batch runs again from its first ubatch, batch-major
+    bool   lm_failed  = false; // the batch cannot run again batch-major
+    std::pair<int32_t, int32_t> lm_range;     // the layers of the group that runs
+
+    lm_timing lm_t;
+    const int64_t  lm_t0_us    = lm ? ggml_time_us() : 0;
+    const uint64_t lm_wait0_us = lm ? model.expert_store()->wait_us() : 0;
+
+    // each graph computes the group's layers: after the previous group's last layer output, up to its own; the
+    // store's window holds the group's MoE experts not in RAM and reads the next group's ahead (the previous group's
+    // graphs were synchronized). false: the group cannot start
+    auto lm_set_group = [&](size_t g) {
+        lm_range = lm_groups[g];
+        lm_cut   = {};
+        // its graphs start from the alloc state batch-major starts the batch from, the tier's (restored with the cut
+        // off: it may reserve)
+        if (pshard_active_plan != nullptr && !pshard_restore_active_alloc()) {
+            LLAMA_LOG_WARN("%s: layer-major prefill: no alloc state for the graphs of layers [%d, %d)\n",
+                __func__, lm_range.first, lm_range.second);
+            return false;
+        }
+        lm_cut.on     = true;
+        lm_cut.in_il  = g > 0 ? lm_range.first - 1 : -1;
+        lm_cut.out_il = g + 1 < lm_groups.size() ? lm_range.second - 1 : -1;
+        model.expert_store()->window_end();
+        model.expert_store()->window_begin(lm_groups, g, ggml_backend_get_device(backends[pshard_layout.compute].get()));
+        return true;
+    };
+
+    // back to graphs that compute every node: the tier's alloc state replaces the reserves of the group graphs, and
+    // the store gets back the slots it lent to the window
+    auto lm_end = [&]() {
+        model.expert_store()->sweep_end();
+        lm_cut  = {};
+        lm_time = nullptr;
+        gf_res_prev->reset();
+        pshard_restore_active_alloc();
+    };
+
+    // a memory that cannot rerun keeps the batch in the state of the layers that ran, while its cells are rewound: the
+    // whole sequence goes, so no state of later tokens stays
+    auto lm_drop_seq = [&]() {
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (balloc->seq_pos_min(s) >= 0) {
+                LLAMA_LOG_WARN("%s: layer-major prefill failed: removed the whole sequence %d from the memory module\n", __func__, s);
+                memory->seq_rm(s, -1, -1);
+            }
+        }
+    };
+
+    // an exception must not leave the cut on, a graph that computes one group's nodes for reuse, or the slots lent
+    struct lm_scope {
+        llama_context * lctx;
+        bool            on;
+        ~lm_scope() {
+            if (on) {
+                lctx->model.expert_store()->sweep_end();
+                lctx->gf_res_prev->reset();
+                lctx->lm_cut  = {};
+                lctx->lm_time = nullptr;
+            }
+        }
+    } lm_guard = { this, lm };
+
+    if (lm) {
+        lm_time = &lm_t;
+        if (!lm_set_group(0)) {
+            lm_end();
+            lm = false;
+        }
+    }
+
+    // the cursor's next ubatch; after the last ubatch of a group, the next group starts again from the first one
+    auto next_ubatch = [&]() {
+        if (lm_restart) {
+            lm_restart = false;
+            return true;
+        }
+        if (mctx->next()) {
+            return true;
+        }
+        if (!lm || lm_g + 1 == lm_groups.size()) {
+            return false;
+        }
+        mctx->rewind();
+        if (!lm_set_group(++lm_g)) {
+            lm_end();
+            lm = false;
+            // the groups before ran every ubatch
+            lm_failed = !memory->get_can_rerun();
+        }
+        lm_iu          = 0;
+        n_outputs_prev = 0;
+        n_tokens_prev  = 0;
+        return !lm_failed;
+    };
+
     do {
+        lm_iu++;
+
         const auto & ubatch = mctx->get_ubatch();
+
+        // a group after the first takes the hidden state from the carry
+        if (lm && lm_g > 0) {
+            lm_cut.h_in_data = lm_carry + n_tokens_prev*lm_row;
+        }
 
         if (pshard_cut_tail < SIZE_MAX && pshard_cut_tail != pshard_cut_tier) {
             // the cut's remainder runs on its own tier, whole ubatches on the cut's tier
@@ -2100,6 +2318,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
+        if (!res && lm) {
+            // no ubatch is complete before the last group: the memory goes back to its state before the batch
+            ggml_backend_sched_synchronize(sched.get());
+            mctx->rewind();
+            lm_end();
+            lm = false;
+            // a restart runs the ubatches that ran again: only when no graph ran yet or the memory allows it
+            const bool rerun = (lm_g == 0 && lm_iu == 1) || memory->get_can_rerun();
+            if (status == GGML_STATUS_ALLOC_FAILED && rerun) {
+                LLAMA_LOG_WARN("%s: layer-major prefill: the graph of layers [%d, %d) did not run, the batch runs batch-major\n",
+                    __func__, lm_range.first, lm_range.second);
+                lm_restart     = true;
+                lm_iu          = 0;
+                n_outputs_prev = 0;
+                n_tokens_prev  = 0;
+                continue;
+            }
+            if (!rerun) {
+                lm_drop_seq();
+                return -3;
+            }
+            LLAMA_LOG_WARN("%s: layer-major prefill failed: removed the whole batch from the memory module\n", __func__);
+            return status == GGML_STATUS_ABORTED ? 2 : -3;
+        }
+
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
@@ -2129,6 +2372,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        if (lm && lm_g + 1 < lm_groups.size()) {
+            // the next group reads this output from the carry; the sync also orders the KV writeback before the next graph
+            const int64_t t_sync_us = ggml_time_us();
+            ggml_backend_sched_synchronize(sched.get());
+
+            const ggml_tensor * t_h = lm_cut.t_out;
+            GGML_ASSERT(t_h != nullptr && ggml_nbytes(t_h) == (size_t) (ubatch.n_tokens*lm_row)*sizeof(float));
+            ggml_backend_tensor_get(t_h, lm_carry + n_tokens_prev*lm_row, 0, ggml_nbytes(t_h));
+
+            lm_t.compute_us += ggml_time_us() - t_sync_us;
+            n_tokens_prev   += ubatch.n_tokens;
+            continue;
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -2252,7 +2509,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
-    } while (mctx->next());
+    } while (next_ubatch());
+
+    if (lm_failed) {
+        lm_drop_seq();
+        return -3;
+    }
+
+    if (lm) {
+        // the last graphs finish before the tier's alloc state comes back
+        const int64_t t_sync_us = ggml_time_us();
+        ggml_backend_sched_synchronize(sched.get());
+        lm_t.compute_us += ggml_time_us() - t_sync_us;
+
+        lm_end();
+        const size_t n_ub = lm_iu;
+        LLAMA_LOG_INFO("%s: layer-major prefill: %zu groups x %zu ubatches = %zu graphs in %.2f s: build+alloc %.2f s, set_inputs %.2f s, compute %.2f s, store SSD wait %.2f s\n",
+            __func__, lm_groups.size(), n_ub, lm_groups.size()*n_ub, (ggml_time_us() - lm_t0_us)/1e6,
+            lm_t.build_us/1e6, lm_t.inputs_us/1e6, lm_t.compute_us/1e6, (model.expert_store()->wait_us() - lm_wait0_us)/1e6);
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2685,6 +2960,8 @@ ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
+    // a reserve sizes the full graph
+    GGML_ASSERT(!lm_cut.on && "graph_reserve inside a layer-major sweep");
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
@@ -2765,6 +3042,367 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+}
+
+//
+// layer-major prefill
+//
+
+// the tensors a node reads: its sources and the tensor it views
+template <typename F>
+static void lm_reads(const ggml_tensor * t, F && f) {
+    for (const ggml_tensor * src : t->src) {
+        if (src != nullptr) {
+            f(src);
+        }
+    }
+    if (t->view_src != nullptr) {
+        f(t->view_src);
+    }
+}
+
+// the full graph of a ubatch by layers: every builder names layer il's output "l_out-<il>" or "l_last-<il>", with the
+// same floats per token in all layers; a node is activation-derived when it depends on the token or embedding input
+struct lm_graph_scan {
+    bool                                             rooted = false; // the graph has the token input
+    std::unordered_map<const ggml_tensor *, int32_t> pos;            // node -> index
+    std::vector<uint8_t>                             act;            // [n_nodes] activation-derived
+    std::vector<int32_t>                             last_use;       // [n_nodes] the last node that reads it
+    int64_t                                          row;            // floats per token of a layer output (0: the first one sets it)
+    std::vector<int32_t>                             l_out;          // [n_layer] the output of layer il, row*n_tokens floats, -1 = none
+
+    lm_graph_scan(ggml_cgraph * gf, const llm_graph_result * res, int32_t n_layer, int64_t n_tokens, int64_t n_row) : row(n_row) {
+        const int32_t n = ggml_graph_n_nodes(gf);
+        rooted = res->t_inp_embd != nullptr;
+        pos.reserve(n);
+        act.assign(n, 0);
+        last_use.assign(n, -1);
+        l_out.assign(n_layer, -1);
+        for (int32_t i = 0; i < n; ++i) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            bool a = t == res->t_inp_embd;
+            lm_reads(t, [&](const ggml_tensor * r) {
+                a = a || r == res->t_inp_tokens || r == res->t_inp_embd;
+                if (const auto it = pos.find(r); it != pos.end()) {
+                    a = a || act[it->second];
+                    last_use[it->second] = i;
+                }
+            });
+            act[i] = a;
+            pos.emplace(t, i);
+
+            const char * name  = ggml_get_name(t);
+            const int    n_pre = strncmp(name, "l_out-", 6) == 0 ? 6 : strncmp(name, "l_last-", 7) == 0 ? 7 : 0;
+            if (n_pre > 0 && t->type == GGML_TYPE_F32) {
+                char * end = nullptr;
+                const long    il = strtol(name + n_pre, &end, 10);
+                const int64_t ne = ggml_nelements(t);
+                if (end != name + n_pre && *end == '\0' && il >= 0 && il < n_layer) {
+                    if (row == 0 && ne % n_tokens == 0) {
+                        row = ne / n_tokens;
+                    }
+                    if (ne == row*n_tokens) {
+                        l_out[il] = i;
+                    }
+                }
+            }
+        }
+    }
+
+    // layer il can start a graph when no node after l_out-<il - 1> reads an activation-derived node from before it
+    std::vector<int32_t> starts() const {
+        std::vector<int32_t> res;
+        if (!rooted) {
+            return res;
+        }
+        // reach[c]: the last node that reads an activation-derived node before index c
+        std::vector<int32_t> reach(act.size() + 1, -1);
+        for (size_t i = 0; i < act.size(); ++i) {
+            reach[i + 1] = std::max(reach[i], act[i] ? last_use[i] : -1);
+        }
+        int32_t c_prev = -1;
+        for (int32_t il = 1; il < (int32_t) l_out.size(); ++il) {
+            const int32_t c = l_out[il - 1];
+            if (c > c_prev && reach[c] <= c) {
+                res.push_back(il);
+                c_prev = c;
+            }
+        }
+        return res;
+    }
+};
+
+uint32_t llama_context::layer_major_init(uint32_t n_batch_req) {
+    const auto & hparams = model.hparams;
+    auto * store = model.expert_store();
+
+    auto off = [&](const char * why) {
+        if (why != nullptr) {
+            LLAMA_LOG_WARN("%s: layer-major prefill off: %s\n", __func__, why);
+        }
+        layer_major_off(n_batch_req);
+        return 0u;
+    };
+
+    if (!cparams.pshard || store == nullptr || memory == nullptr || hparams.no_alloc ||
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !cparams.causal_attn || cparams.n_batch <= cparams.n_ubatch) {
+        return off(nullptr);
+    }
+
+    // refusals fixed for the context's life: no carry for a context that never uses it. A tier that pools experts is
+    // refused per batch; a registry of pool tiers alone never lands another one
+    const auto * registry = model.get_plan_registry();
+    bool streams = expert_pool == nullptr || registry == nullptr;
+    for (size_t t = 0; !streams && t < registry->best_plans.size(); ++t) {
+        streams = registry->best_plans[t].is_viable && registry->best_plans[t].strategy != LLAMA_PSHARD_EXPERT_POOL;
+    }
+    if (!memory->get_can_rewind()) {
+        return off("the memory cannot rewind");
+    }
+    if (cparams.cb_eval != nullptr) {
+        return off("an eval callback is set");
+    }
+    if (cparams.pipeline_parallel) {
+        return off("pipeline parallelism is on");
+    }
+    if (!streams) {
+        return off("every tier pools experts");
+    }
+
+    // where a group can start, from the full graph of one prefill ubatch as the builder makes it (a split would
+    // rewire the reads across backends to its copies); its backend hints reset the scheduler, as a reserve does
+    const int32_t n_layer = (int32_t) hparams.n_layer();
+    std::vector<int32_t> starts;
+    int64_t row = 0;
+    {
+        const auto mctx_full = memory->init_full();
+
+        llama_batch_allocr balloc_lm(hparams.n_pos_per_embd());
+        llama_ubatch ubatch = balloc_lm.ubatch_reserve(cparams.n_ubatch, 1);
+        ubatch_prepare_reserve(ubatch, 1, sampling.samplers, cparams.n_outputs_max_per_seq);
+
+        ggml_backend_sched_reset(sched.get());
+        gf_res_prev->reset();
+
+        auto * res = gf_res_reserve.get();
+        res->reset();
+
+        const auto save_n_outputs = n_outputs;
+        n_outputs = 1;
+        if (auto * gf = model.build_graph(graph_params(res, ubatch, mctx_full.get(), ctx_type_to_graph_type(cparams.ctx_type)))) {
+            const lm_graph_scan s(gf, res, n_layer, cparams.n_ubatch, 0);
+            starts = s.starts();
+            row    = s.row;
+        }
+        n_outputs = save_n_outputs;
+    }
+
+    // the runs between the starts; neighbour runs merge while a group holds no more MoE layers than the largest run
+    auto n_moe = [&](int32_t b, int32_t e) {
+        uint32_t n = 0;
+        for (int32_t il = b; il < e; ++il) {
+            n += store->has_layer(il) ? 1 : 0;
+        }
+        return n;
+    };
+    std::vector<std::pair<int32_t, int32_t>> runs;
+    for (size_t i = 0; i <= starts.size(); ++i) {
+        runs.emplace_back(i > 0 ? starts[i - 1] : 0, i < starts.size() ? starts[i] : n_layer);
+    }
+    uint32_t w = 0;
+    for (const auto & r : runs) {
+        w = std::max(w, n_moe(r.first, r.second));
+    }
+    std::vector<std::pair<int32_t, int32_t>> groups;
+    for (const auto & r : runs) {
+        if (!groups.empty() && n_moe(groups.back().first, r.second) <= w) {
+            groups.back().second = r.second;
+        } else {
+            groups.push_back(r);
+        }
+    }
+    if (groups.size() < 2 || w == 0) {
+        return off("the graph has no layer a group of MoE layers can start at");
+    }
+
+    // the carry holds a hidden state per token of a batch: n_batch stays where the carry fits the slots the store
+    // lends a sweep for its window rows
+    const char * why = nullptr;
+    const size_t row_bytes = (size_t) row * sizeof(float);
+    const size_t win_bytes = store->sweep_bytes(groups, &why);
+    if (win_bytes == 0) {
+        return off(why);
+    }
+    const uint32_t n_batch = (uint32_t) std::min<size_t>(cparams.n_batch, win_bytes / row_bytes);
+    if (n_batch <= cparams.n_ubatch || n_batch < std::min(cparams.n_batch, n_batch_req)) {
+        return off("the hidden-state carry would outgrow the expert store's window");
+    }
+    if (n_batch < cparams.n_batch) {
+        LLAMA_LOG_INFO("%s: layer-major prefill: n_batch capped at %u, the hidden-state carry stays within the %.0f MiB window\n",
+            __func__, n_batch, win_bytes / (1024.0 * 1024.0));
+        cparams.n_batch = n_batch;
+    }
+
+    // pinned, so the carry copies run at full speed; a refused page-lock falls back to pageable memory
+    const size_t carry_bytes = row_bytes * cparams.n_batch;
+    ggml_backend_dev_t         dev  = ggml_backend_get_device(backends[pshard_layout.compute].get());
+    ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    ggml_backend_buffer_t      buf  = buft != nullptr ? ggml_backend_buft_alloc_buffer(buft, carry_bytes) : nullptr;
+    if (buf == nullptr) {
+        buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend_cpu), carry_bytes);
+    }
+    if (buf == nullptr) {
+        return off("no RAM for the hidden-state carry");
+    }
+    if (ggml_backend_buffer_get_type(buf) != buft) {
+        LLAMA_LOG_WARN("%s: layer-major prefill: the hidden-state carry is pageable - the carry copies are slower\n", __func__);
+    }
+    lm_carry_buf.reset(buf);
+    lm_carry  = (float *) ggml_backend_buffer_get_base(buf);
+    lm_row    = row;
+    lm_groups = std::move(groups);
+
+    std::string list;
+    for (const auto & g : lm_groups) {
+        list += (list.empty() ? "" : ", ") + std::to_string(g.first);
+    }
+    LLAMA_LOG_INFO("%s: layer-major prefill: %zu layer groups of up to %u MoE layers starting at layers %s, %.0f MiB hidden-state carry\n",
+        __func__, lm_groups.size(), w, list.c_str(), carry_bytes / (1024.0 * 1024.0));
+
+    return w;
+}
+
+void llama_context::layer_major_off(uint32_t n_batch_req) {
+    lm_groups.clear();
+    lm_carry_buf.reset();
+    lm_carry = nullptr;
+    lm_row   = 0;
+    if (cparams.n_batch > n_batch_req) {
+        cparams.n_batch = n_batch_req;
+        LLAMA_LOG_INFO("%s: n_batch back to %u\n", __func__, cparams.n_batch);
+    }
+}
+
+int llama_context::layer_major_refusal(bool one_tier, const char ** why) const {
+    uint32_t n_seq = 0;
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        n_seq += balloc->seq_pos_min(s) >= 0 ? 1 : 0;
+    }
+
+    const auto & lin = cparams.embeddings_layer_inp;
+    const auto * store = model.expert_store();
+
+    struct check {
+        bool         refused;
+        const char * why;
+    };
+    const check checks[] = {
+        { store == nullptr || !store->active(),                 "the RAM expert store is not allocated" },
+        { expert_pool != nullptr && expert_pool->active,        "the tier pools experts" },
+        { !cparams.causal_attn,                                 "attention is not causal" },
+        { cparams.embeddings || cparams.embeddings_nextn,       "the batch asks for embeddings" },
+        { std::find(lin.begin(), lin.end(), true) != lin.end(), "the batch asks for layer inputs" },
+        { !sampling.samplers.empty(),                           "backend samplers are set" },
+        { n_seq != 1,                                           "the batch holds more than one sequence" },
+        { !one_tier,                                            "the cut runs its last ubatch on another tier" },
+    };
+    for (size_t i = 0; i < std::size(checks); ++i) {
+        if (checks[i].refused) {
+            *why = checks[i].why;
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+bool llama_context::layer_major_check(uint32_t n_tokens_all, uint32_t n_ubatch, bool one_tier, llama_memory_context_i * mctx) {
+    if (lm_groups.empty() || n_tokens_all <= n_ubatch) {
+        return false;
+    }
+
+    auto refuse = [&](int i, const char * why) {
+        if (!(lm_refused & (1u << i))) {
+            lm_refused |= 1u << i;
+            LLAMA_LOG_WARN("%s: layer-major prefill off: %s\n", __func__, why);
+        }
+        return false;
+    };
+
+    const char * why = nullptr;
+    if (const int i = layer_major_refusal(one_tier, &why); i >= 0) {
+        return refuse(i, why);
+    }
+
+    // last: this one snapshots the memory
+    if (!mctx->layer_major_begin()) {
+        return refuse(31, "the memory cannot rewind");
+    }
+
+    return true;
+}
+
+// the nodes after l_out-<in_il> up to l_out-<out_il> compute, and the nodes before them that depend on inputs only
+// (masks, positions), which every group computes again; every other node keeps its place and its planned memory but
+// does not run
+bool llama_context::layer_major_cut(llm_graph_result * res, ggml_cgraph * gf, uint32_t n_tokens) {
+    const lm_graph_scan s(gf, res, (int32_t) model.hparams.n_layer(), n_tokens, lm_row);
+
+    const int32_t n     = ggml_graph_n_nodes(gf);
+    const int32_t c_in  = lm_cut.in_il  >= 0 ? s.l_out[lm_cut.in_il]  : -1;
+    const int32_t c_out = lm_cut.out_il >= 0 ? s.l_out[lm_cut.out_il] : n - 1;
+    ggml_tensor * t_in  = c_in >= 0 ? ggml_graph_node(gf, c_in) : nullptr;
+    ggml_tensor * t_out = lm_cut.out_il >= 0 && c_out >= 0 ? ggml_graph_node(gf, c_out) : nullptr;
+
+    const char * why = nullptr;
+    if (!s.rooted) {
+        why = "the graph has no token input";
+    } else if ((lm_cut.in_il >= 0 && c_in < 0) || c_out <= c_in) {
+        why = "a group's layer output is missing";
+    } else if ((lm_cut.out_il >= 0 && !ggml_is_contiguous(t_out)) || (t_in != nullptr && !ggml_is_contiguous(t_in))) {
+        why = "a group's layer output is not contiguous";
+    } else if (t_in != nullptr && t_in->view_src != nullptr) {
+        why = "a group's layer output is a view";
+    }
+
+    std::vector<uint8_t> keep(n, 0);
+    std::vector<int32_t> stack;
+    for (int32_t i = c_in + 1; why == nullptr && i <= c_out; ++i) {
+        keep[i] = 1;
+        stack.push_back(i);
+    }
+    while (why == nullptr && !stack.empty()) {
+        const int32_t i = stack.back();
+        stack.pop_back();
+        lm_reads(ggml_graph_node(gf, i), [&](const ggml_tensor * r) {
+            const auto it = s.pos.find(r);
+            if (it == s.pos.end() || it->second == c_in || keep[it->second]) {
+                return;
+            }
+            if (s.act[it->second]) {
+                why = "a group reads an activation from before its input";
+                return;
+            }
+            keep[it->second] = 1;
+            stack.push_back(it->second);
+        });
+    }
+
+    if (why != nullptr) {
+        LLAMA_LOG_WARN("%s: layer-major prefill off: %s\n", __func__, why);
+        lm_groups.clear();
+        return false;
+    }
+
+    for (int32_t i = 0; i < n; ++i) {
+        if (!keep[i]) {
+            ggml_graph_node(gf, i)->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+        }
+    }
+
+    lm_cut.t_in  = t_in;
+    lm_cut.t_out = t_out;
+
+    return true;
 }
 
 ggml_status llama_context::graph_compute(

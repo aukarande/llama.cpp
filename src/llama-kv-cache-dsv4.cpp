@@ -1907,6 +1907,14 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     if (!ubatches_write.empty()) {
         kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
         n_kv = kv_swa->get_n_kv(sinfos_read[i_next]);
+
+        // a replayed ubatch must see the same cells as in the first pass
+        if (layer_major) {
+            if (n_kv_lm[i_next] < 0) {
+                n_kv_lm[i_next] = n_kv;
+            }
+            GGML_ASSERT(n_kv == (uint32_t) n_kv_lm[i_next]);
+        }
     }
 
     return res;
@@ -1920,6 +1928,30 @@ const llama_ubatch & llama_kv_cache_dsv4_raw_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_next];
+}
+
+// the base half rewinds through its own context; this context applies the SWA half, so it saves the SWA cells
+bool llama_kv_cache_dsv4_raw_context::layer_major_begin() {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || ubatches_write.empty() || i_next != 0 ||
+            !kv_swa->cells_save(cells_lm, sinfos_write) || !ctx_base_mem->layer_major_begin()) {
+        return false;
+    }
+
+    layer_major = true;
+    n_kv_lm.assign(ubatches_write.size(), -1);
+
+    return true;
+}
+
+void llama_kv_cache_dsv4_raw_context::rewind() {
+    if (!layer_major) {
+        return;
+    }
+
+    ctx_base_mem->rewind();
+    kv_swa->cells_restore(cells_lm);
+
+    i_next = 0;
 }
 
 uint32_t llama_kv_cache_dsv4_raw_context::get_n_kv() const {
@@ -2029,6 +2061,10 @@ bool llama_kv_cache_dsv4_comp_context::next() {
     }
 
     return true;
+}
+
+void llama_kv_cache_dsv4_comp_context::rewind() {
+    i_cur = 0;
 }
 
 uint32_t llama_kv_cache_dsv4_comp_context::get_n_kv() const {
@@ -2193,6 +2229,42 @@ const llama_ubatch & llama_kv_cache_dsv4_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_next];
+}
+
+// only the raw cells and the cursors go back: the plans are fixed for the batch, and a layer's compressed rows and
+// compressor state are written by its own group's graphs, except the rollback restore of a group's first layer, which
+// the previous group's graphs also run: it copies the same rows each time only if no ubatch after the first restores
+bool llama_kv_cache_dsv4_context::layer_major_begin() {
+    auto restores_first = [](const std::vector<comp_plan> & plans) {
+        for (size_t u = 1; u < plans.size(); ++u) {
+            if (plans[u].state_restore_src_idxs != plans[u].state_restore_dst_idxs) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || i_next != 0 ||
+            !restores_first(plans_csa) || !restores_first(plans_hca) || !restores_first(plans_lid)) {
+        return false;
+    }
+
+    layer_major = ctx_raw->layer_major_begin();
+
+    return layer_major;
+}
+
+void llama_kv_cache_dsv4_context::rewind() {
+    if (!layer_major) {
+        return;
+    }
+
+    ctx_raw->rewind();
+    ctx_csa->rewind();
+    ctx_hca->rewind();
+    ctx_lid->rewind();
+
+    i_next = 0;
 }
 
 const llama_kv_cache_dsv4_raw_context * llama_kv_cache_dsv4_context::get_raw() const {

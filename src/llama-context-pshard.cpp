@@ -568,6 +568,7 @@ void llama_context::pshard_setup_sched() {
         pshard_active_plan ? pshard_active_plan->expert_slice_tokens : probe_reserve.expert_slice_tokens);
     ggml_backend_sched_set_expert_slice_rows(sched.get(),
         pshard_active_plan ? (int) pshard_active_plan->batch_size : (int) probe_reserve.n_tokens);
+    ggml_backend_sched_set_allow_overflow(sched.get(), pshard_active_plan && pshard_active_plan->compute_spill);
     ggml_backend_sched_set_ids_observe_cb(sched.get(), pshard_ids_observe, this);
 
     g_split_ctx = {};
@@ -627,6 +628,7 @@ void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_
     ggml_backend_sched_set_expert_slice_tokens(sched.get(), plan.expert_slice_tokens);
     // every ubatch the tier runs copies experts as its reserved batch does, so it fits the tier's reserved allocation
     ggml_backend_sched_set_expert_slice_rows(sched.get(), (int) plan.batch_size);
+    ggml_backend_sched_set_allow_overflow(sched.get(), plan.compute_spill);
     ggml_backend_t gpu = backends[pshard_layout.compute].get();
     size_t scratch_off = const_cast<llama_model &>(model).pshard_apply_plan(plan, with_upload ? gpu : nullptr, force_upload);
 
@@ -814,7 +816,16 @@ void llama_context::pshard_reserve_and_save(const llama_pshard_plan & plan) {
         // chunks: real allocations outside the budgeted arena that outlive the reserve (the
         // saved alloc state points into them). That is not a fit - the arena IS the budget.
         // Release them and drop the tier.
-        if (gf) {
+        if (gf && plan.compute_spill) {
+            const int n_chunks = ggml_backend_sched_get_n_chunks(sched.get(), gpu);
+            size_t overflow = 0;
+            for (int c = 1; c < n_chunks; c++) {
+                overflow += ggml_backend_sched_get_chunk_max_size(sched.get(), gpu, c);
+            }
+            LLAMA_LOG_WARN("%s: tier bs=%u (%s): compute spill: %.1f MiB of the graph in %d overflow chunk(s) past the %.1f MiB scratch window\n",
+                __func__, plan.batch_size, llama_pshard_strategy_name(plan.strategy), overflow / (1024.0 * 1024.0),
+                n_chunks - 1, scratch_avail / (1024.0 * 1024.0));
+        } else if (gf) {
             const int n_chunks = ggml_backend_sched_get_n_chunks(sched.get(), gpu);
             if (n_chunks > 1) {
                 size_t overflow = 0;
@@ -951,6 +962,7 @@ void llama_context::pshard_warmup_plan_reserves() {
         ggml_backend_sched_set_prefetch_window(sched.get(), plan.overlap == 2);
         ggml_backend_sched_set_expert_slice_tokens(sched.get(), plan.expert_slice_tokens);
         ggml_backend_sched_set_expert_slice_rows(sched.get(), (int) plan.batch_size);
+        ggml_backend_sched_set_allow_overflow(sched.get(), plan.compute_spill);
 
         const_cast<llama_model &>(model).pshard_compute_scratch_off(plan); // see pshard_apply_plan
 
@@ -1059,6 +1071,14 @@ void llama_context::pshard_apply_initial_plan() {
         pshard_apply_plan(*initial, /*with_upload=*/true, /*force_upload=*/true);
         pshard_active_plan = initial;
         pshard_update_pool_mode(*initial);
+        // an empty cache would leave the first prompt's whole-stack pass nothing to reuse and decode to refill it.
+        // Only a decode tier that admits experts fills the cache (a cpu_exec one is priced empty)
+        // The SSD tier's RAM slots are seeded whatever tier landed
+        const llama_pshard_plan * dec = registry->get_best(0);
+        const bool gpu_seed = dec != nullptr && dec->strategy == LLAMA_PSHARD_EXPERT_POOL && dec->cold_ms > 0.0f;
+        if (expert_pool && (gpu_seed || expert_pool->ssd_active)) {
+            expert_pool->seed_from_workload(gpu_seed);
+        }
     }
     // ~llama_context compares each backend's sched buffer against these and pshard skips the
     // stock reserves that set them. Set them to the sizes after the warmup: a mismatch at exit

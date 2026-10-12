@@ -1,10 +1,12 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-pshard-plan.h"
 #include "llama-benchmark.h"
+#include "llama-expert-store.h"
 #include "llama-impl.h"
 #include "llama-model-loader.h"
 
 #include "ggml-backend.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <array>
@@ -218,10 +220,105 @@ static bool pshard_parse_variant_header(const std::string & line, uint32_t & bud
     return sscanf(line.c_str(), "[variant budget=%u]", &budget_mib) == 1;
 }
 
+// the loader's split of the weights (llama_model::load_tensors): the routed experts (expert_count experts per tensor,
+// row_b the largest expert of one tensor) and every other tensor it loads; the nextn layers load only with load_mtp
+static bool pshard_store_weight_bytes(const char * path_model, bool load_mtp, size_t & exps_b, size_t & other_b, size_t & row_b) {
+    uint32_t n_layer_load = UINT32_MAX;   // blk.N loads for N below it
+    uint32_t n_expert     = 0;
+    bool     first        = true;
+    for (const auto & path : llama_expert_store_files(path_model)) {
+        struct gguf_init_params gip = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };
+        struct gguf_context * g = gguf_init_from_file(path.c_str(), gip);
+        if (g == nullptr) {
+            return false;
+        }
+        if (first) {
+            first = false;
+            const int64_t ka = gguf_find_key(g, "general.architecture");
+            const std::string arch = ka >= 0 && gguf_get_kv_type(g, ka) == GGUF_TYPE_STRING ? gguf_get_val_str(g, ka) : "";
+            auto get_u32 = [&](const char * suffix) -> uint32_t {
+                const int64_t k = gguf_find_key(g, (arch + suffix).c_str());
+                return k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_UINT32 ? gguf_get_val_u32(g, k) : 0;
+            };
+            n_expert = get_u32(".expert_count");
+            const uint32_t n_block = get_u32(".block_count");
+            const uint32_t n_nextn = get_u32(".nextn_predict_layers");
+            if (!load_mtp && n_nextn > 0 && n_nextn < n_block) {
+                n_layer_load = n_block - n_nextn;
+            }
+        }
+        for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+            const char *    name = gguf_get_tensor_name(g, i);
+            const int64_t * ne   = gguf_get_tensor_ne(g, i);
+            const size_t    b    = gguf_get_tensor_size(g, i);
+            int il = -1;
+            const bool blk = sscanf(name, "blk.%d.", &il) == 1 && il >= 0;
+            if (blk && (uint32_t) il >= n_layer_load) {
+                continue;
+            }
+            const bool exps = blk && n_expert > 0 && ne[2] == (int64_t) n_expert && ne[3] == 1 && strstr(name, "_exps.weight") != nullptr;
+            (exps ? exps_b : other_b) += b;
+            row_b = exps ? std::max(row_b, b / n_expert) : row_b;
+        }
+        gguf_free(g);
+    }
+    return true;
+}
+
+llama_pshard_store_info llama_pshard_store_info_for(const char * path_model, const struct llama_model_params * mparams) {
+    llama_pshard_store_info info;
+    // the store reads the experts a pass misses from the mapping's files
+    const auto mode = mparams->load_mode;
+    const bool mmap = mode == LLAMA_LOAD_MODE_AUTO || mode == LLAMA_LOAD_MODE_MMAP || mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    if (path_model == nullptr || !mmap || mparams->max_ram_alloc == 0) {
+        return info;
+    }
+    if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        size_t ram_free = 0;
+        ggml_backend_dev_memory(cpu_dev, &ram_free, &info.ram_total);
+    }
+    const size_t reserve = (size_t) (LLAMA_PSHARD_HOST_PIN_RESERVE_GB * 1e9);
+    uint64_t files_b = 0;
+    llama_expert_store_largest_file(path_model, &files_b);
+    size_t exps_b  = 0;
+    size_t other_b = 0;
+    size_t row_b   = 0;
+    // the tensors are less than the files: a model whose files fit in RAM is decided without reading its tables
+    if (files_b + reserve <= info.ram_total || !pshard_store_weight_bytes(path_model, mparams->load_mtp, exps_b, other_b, row_b)) {
+        return info;
+    }
+    const auto dec = llama_expert_store_decide(exps_b, other_b, info.ram_total, reserve, mparams->max_ram_alloc);
+    info.on     = dec.on;
+    info.budget = dec.budget;
+    if (info.on) {
+        info.line = llama_benchmark_ssd_line();
+    }
+    return info;
+}
+
+bool llama_pshard_ssd_measure(const char * path_model, double * sat_gbps, double * lat_ms) {
+    size_t exps_b  = 0;
+    size_t other_b = 0;
+    size_t row_b   = 0;
+    const std::string file = path_model != nullptr ? llama_expert_store_largest_file(path_model) : "";
+    if (file.empty() || !pshard_store_weight_bytes(path_model, false, exps_b, other_b, row_b) || row_b == 0) {
+        return false;
+    }
+    // the store reads each expert of a tensor on its own: many such reads in flight (a pass with many misses), and
+    // what one alone takes beyond its bytes at that rate (priced at every read size)
+    const size_t s   = llama_expert_store_stride(row_b);
+    const double sat = llama_expert_store_read_gbps(file, s, 16, 1.5);
+    const double qd1 = llama_expert_store_read_gbps(file, s, 1, 1.5);
+    *sat_gbps = sat;
+    *lat_ms   = sat > 0.0 && qd1 > 0.0 ? std::max(0.0, (double) s / 1e6 / qd1 - (double) s / 1e6 / sat) : 0.0;
+    return sat > 0.0 && qd1 > 0.0;
+}
+
 uint64_t pshard_registry_fingerprint(
         const struct llama_model_params * mparams,
         const struct llama_context_params * cparams,
-        int64_t model_file_size) {
+        int64_t model_file_size,
+        const llama_pshard_store_info & store) {
 
     uint64_t h = 0xcbf29ce484222325ULL;
     auto mix = [&](uint64_t v) { h ^= v; h *= 0x100000001b3ULL; };
@@ -254,6 +351,19 @@ uint64_t pshard_registry_fingerprint(
     const int mp_env = pshard_miss_policy_from_env();
     if (mp_env >= 0) {
         mix((uint64_t)(mp_env + 1));
+    }
+    // a model the RAM expert store serves is priced from the store's RAM and the SSD_Read line, which the profile hash
+    // leaves out ("" = no line: priced without SSD reads); mixed only then, so the other models keep their fingerprints
+    if (store.on) {
+        mix((uint64_t) LLAMA_PSHARD_STORE_PRICING_VERSION);
+        mix((uint64_t) mparams->max_ram_alloc);
+        mix((uint64_t) (store.ram_total / (1024 * 1024)));
+        uint64_t hl = 0xcbf29ce484222325ULL;
+        for (const unsigned char c : store.line) {
+            hl ^= c;
+            hl *= 0x100000001b3ULL;
+        }
+        mix(hl);
     }
 
     return h;
@@ -500,12 +610,12 @@ void llama_params_fit_pshard(
         cparams_fp.n_ctx = n_ctx_plan;
     }
     const uint64_t fp = pshard_registry_fingerprint(
-        mparams, &cparams_fp, model_file_size);
+        mparams, &cparams_fp, model_file_size, llama_pshard_store_info_for(path_model, mparams));
 
     if (!pshard_registry_load(registry, fp, cache_path.c_str(), host_buft, vram_free, false)) {
         LLAMA_LOG_WARN("%s: no matching plan cache at %s (fingerprint=0x%016" PRIx64 "): pshard is off unless this configuration is planned\n",
             __func__, cache_path.c_str(), fp);
-        LLAMA_LOG_WARN("%s: fingerprint inputs (n_ctx, n_seq_max, kv_unified, n_threads, flash_attn, type_k/v, model file size, PSHARD_STRATEGY env, predictor version, the profile files' bytes) must match the planner invocation exactly\n", __func__);
+        LLAMA_LOG_WARN("%s: fingerprint inputs (n_ctx, n_seq_max, kv_unified, n_threads, flash_attn, type_k/v, model file size, PSHARD_STRATEGY env, predictor version, the profile files' bytes; for a model larger than RAM also -mra, the RAM and the profile's SSD_Read line) must match the planner invocation exactly\n", __func__);
         registry->cache_missed = true;
         mparams->pshard = false;
         cparams->pshard = false;

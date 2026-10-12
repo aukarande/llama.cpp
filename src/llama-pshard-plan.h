@@ -265,9 +265,40 @@ struct llama_pshard_plan {
     // larger ones prefetch the whole tensors (ggml_backend_sched_set_expert_slice_tokens); -1 = the scheduler's rule
     int32_t expert_slice_tokens = -1;
 
+    // the tier's graph scratch may grow past the arena into overflow chunks (outside the budget: the driver backs them
+    // with system memory once the device is full) instead of making the tier unviable
+    bool compute_spill = false;
+
     // predicted ms of one ubatch of piece_n[i] tokens on this plan (ascending, below batch_size)
     std::vector<uint32_t> piece_n;
     std::vector<float>    piece_ms;
+
+    // the RAM expert store's SSD reads inside tps and piece_ms (0 / empty = none). ssd_up_ms, piece_ssd_up: the reads
+    // of the device uploads, ms of one ubatch of batch_size tokens and of each piece; a layer-major prefill reads these
+    // experts once per batch instead of once per ubatch. ssd_cpu_ms: the reads of the CPU expert matmuls at batch_size
+    // tokens, paid per ubatch in both modes
+    float              ssd_up_ms  = 0.0f;
+    std::vector<float> piece_ssd_up;
+    float              ssd_cpu_ms = 0.0f;
+
+    // ys[i] at piece_n[i], full at batch_size tokens, linear between the points (n < batch_size, piece_n not empty)
+    double piece_at(const std::vector<float> & ys, double full, uint32_t n) const {
+        uint32_t x0 = piece_n[0];
+        double   y0 = ys[0];
+        if (n <= x0) {
+            return y0;
+        }
+        for (size_t i = 1; i <= piece_n.size(); i++) {
+            const uint32_t x1 = i < piece_n.size() ? piece_n[i] : batch_size;
+            const double   y1 = i < piece_n.size() ? ys[i]      : full;
+            if (n <= x1) {
+                return y0 + (y1 - y0) * (double) (n - x0) / (double) (x1 - x0);
+            }
+            x0 = x1;
+            y0 = y1;
+        }
+        return full;
+    }
 
     // predicted ms of one ubatch of n tokens: the piece curve, ending at batch_size tokens at the tier's rate
     // (linear between points); without a curve, n tokens at the tier's rate
@@ -279,21 +310,18 @@ struct llama_pshard_plan {
         if (piece_n.empty() || n >= batch_size) {
             return n == batch_size ? full_ms : (double) n * 1000.0 / (double) tps;
         }
-        uint32_t x0 = piece_n[0];
-        double   y0 = piece_ms[0];
-        if (n <= x0) {
-            return y0;
+        return piece_at(piece_ms, full_ms, n);
+    }
+
+    // the SSD reads of the device uploads inside ubatch_ms(n)
+    double ubatch_ssd_up_ms(uint32_t n) const {
+        if (ssd_up_ms <= 0.0f || batch_size == 0) {
+            return 0.0;
         }
-        for (size_t i = 1; i <= piece_n.size(); i++) {
-            const uint32_t x1 = i < piece_n.size() ? piece_n[i]  : batch_size;
-            const double   y1 = i < piece_n.size() ? piece_ms[i] : full_ms;
-            if (n <= x1) {
-                return y0 + (y1 - y0) * (double) (n - x0) / (double) (x1 - x0);
-            }
-            x0 = x1;
-            y0 = y1;
+        if (piece_n.empty() || piece_ssd_up.size() != piece_n.size() || n >= batch_size) {
+            return (double) ssd_up_ms * (double) n / (double) batch_size;
         }
-        return full_ms;
+        return piece_at(piece_ssd_up, ssd_up_ms, n);
     }
 
     // cached maps and offsets from first apply
@@ -377,15 +405,31 @@ struct llama_pshard_workload;
 // prices the page-lock ceiling with it, so the two agree on which bytes stay pageable
 std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * wl, uint32_t n_layers, uint32_t pool_slots);
 
+// the pricing of the RAM expert store's SSD reads. Bump it when that pricing changes: only the registries of models
+// the store serves re-plan
+constexpr uint32_t LLAMA_PSHARD_STORE_PRICING_VERSION = 6;
+
+// the RAM expert store as the loader decides it for a model (llama_expert_store_decide on the gguf tensor bytes, the
+// RAM and -mra), and the CPU profile's SSD_Read line
+struct llama_pshard_store_info {
+    bool        on        = false;
+    size_t      budget    = 0;      // bytes of RAM for the slots
+    size_t      ram_total = 0;
+    std::string line;               // "" = not in the CPU profile: the SSD reads are not priced
+};
+llama_pshard_store_info llama_pshard_store_info_for(const char * path_model, const struct llama_model_params * mparams);
+
 // plan cache serialization. fingerprint covers the runtime plan-compatibility params, the
 // predictor version and the profile files' hash, so the planner binary and the runtime binary
 // share the same cache file when they see the same profile files (working directory or
-// PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE).
+// PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE). A model the RAM expert store serves also mixes
+// the store's pricing inputs (store)
 // keep this in sync with planner save
 uint64_t pshard_registry_fingerprint(
         const struct llama_model_params * mparams,
         const struct llama_context_params * cparams,
-        int64_t model_file_size);
+        int64_t model_file_size,
+        const llama_pshard_store_info & store);
 
 bool pshard_registry_save(
         const struct llama_pshard_plan_registry * registry, uint64_t fingerprint,
@@ -448,6 +492,12 @@ struct llama_pshard_plan_registry {
     // by the planner's union enforcer, persisted as union_mb=. 0 = unknown (older registry,
     // or the enforcer did not converge) -> the arena takes the whole budget as before.
     size_t union_bytes     = 0;
+
+    // the RAM expert store the plans were priced with (0 = off): its RAM slots and experts per layer, and the ms to read
+    // one expert of a store layer with many reads in flight (mean over the layers; a layer-major sweep's reads)
+    uint32_t store_slots   = 0;
+    uint32_t store_experts = 0;
+    float    ssd_expert_ms = 0.0f;
 
     // device bytes the pshard arena is allocated with: the union plus a packing headroom
     // (the runtime's canonical packing rounds differently from the planner's metadata pass by
@@ -589,9 +639,10 @@ struct llama_pshard_plan_registry {
         }
 
         // prefill tiers: 512 and the 2048..8192 doublings, capped at n_ubatch; a context too
-        // small for 8192 ends the ladder at its own n_ubatch
-        for (uint32_t t : { 512u, 2048u, 4096u, 8192u }) {
-            if (t > n_ubatch) break;
+        // small for 8192 ends the ladder at its own n_ubatch. A tier max above the auto one (16384) also gets
+        // the 16384 and 32768 doublings
+        for (uint32_t t : { 512u, 2048u, 4096u, 8192u, 16384u, 32768u }) {
+            if (t > n_ubatch || (t > 8192 && n_ubatch <= 16384)) break;
             if (tier_sizes.empty() || tier_sizes.back() < t) {
                 tier_sizes.push_back(t);
             }
@@ -650,6 +701,16 @@ struct llama_pshard_plan_registry {
         double ms   = 0.0;
     };
 
+    // the RAM expert store at runtime: its slots per layer and its layers (0 = off). A decode runs layer-major when
+    // all its ubatches run on one tier (llama_context::layer_major_refusal): its layer groups and the experts per
+    // store layer its sweep reads (llama_expert_store::sweep_reads); groups < 2: none
+    struct lm_price {
+        size_t   groups = 0;
+        uint32_t reads  = 0;
+        uint32_t n_ram  = 0;
+        uint32_t layers = 0;
+    };
+
     // the cheapest cut of a decode of n_tokens: one ubatch on a tier that holds it, or whole ubatches of one tier
     // and the remainder on that tier or on a smaller viable tier that holds it. Each ubatch is priced from its
     // tier's piece curve; the switches are pairwise: from the active plan, between the two tiers, and back to the
@@ -657,8 +718,10 @@ struct llama_pshard_plan_registry {
     // each layer's switch moves (see switch_cost_ms)
     // fill: the runtime pool's per-layer slot fill in region order (llama_expert_pool::layer_fill; empty = pool off,
     // nullptr = unknown: from from_plan)
+    // lm: the RAM expert store at runtime (nullptr: every cut runs batch-major at the slots the plans were priced at)
     cut find_cut(uint32_t n_tokens, uint32_t max_ubatch, uint32_t min_ubatch, const llama_pshard_plan * from_plan,
-                 const llama_pshard_switch_state * st = nullptr, const std::vector<float> * fill = nullptr) const {
+                 const llama_pshard_switch_state * st = nullptr, const std::vector<float> * fill = nullptr,
+                 const lm_price * lm = nullptr) const {
         cut best;
         const llama_pshard_plan * decode_plan =
             (!best_plans.empty() && best_plans[0].is_viable) ? &best_plans[0] : nullptr;
@@ -680,6 +743,12 @@ struct llama_pshard_plan_registry {
                 best.ms   = ms;
             }
         };
+        // the plans priced the store's upload reads at store_slots per layer: a batch-major ubatch reads the experts
+        // the live slots miss
+        double ssd_f = 1.0;
+        if (lm != nullptr && lm->n_ram > 0 && store_slots > 0 && store_slots < store_experts) {
+            ssd_f = (double) (store_experts - std::min(lm->n_ram, store_experts)) / (double) (store_experts - store_slots);
+        }
         // the share of the cache's slots in place after p runs over `before`: a cache tier refills its own (its entry
         // pays), a cpu_exec cache tier neither fills nor empties them, a whole-stack pool tier keeps at most pool_keep
         // of what it found, a legacy tier empties them
@@ -687,9 +756,10 @@ struct llama_pshard_plan_registry {
             return p.strategy != LLAMA_PSHARD_EXPERT_POOL ? 0.0 : p.cold_ms > 0.0f ? 1.0
                  : p.pool_miss == LLAMA_PSHARD_MISS_CPU_EXEC ? before : std::min(before, (double) p.pool_keep);
         };
-        // a whole-stack pool tier priced over a kept layout (pool_ab_scale < 1) uploads what it finds missing
-        auto run_ms = [](const llama_pshard_plan & p, uint32_t n, double kept) -> double {
-            const double ms = p.ubatch_ms(n);
+        // a batch-major ubatch: its upload reads at the live slots; a whole-stack pool tier priced over a kept layout
+        // (pool_ab_scale < 1) uploads what it finds missing
+        auto run_ms = [&](const llama_pshard_plan & p, uint32_t n, double kept) -> double {
+            const double ms = p.ubatch_ms(n) + (ssd_f - 1.0) * p.ubatch_ssd_up_ms(n);
             if (p.strategy != LLAMA_PSHARD_EXPERT_POOL || p.cold_ms > 0.0f || p.pool_keep <= 0.0f ||
                     p.pool_ab_scale <= 0.0f || p.pool_ab_scale >= 1.0f) {
                 return ms;
@@ -720,6 +790,16 @@ struct llama_pshard_plan_registry {
             }
             return s / (double) n;
         };
+        // k ubatches of ts tokens and one of r on p, layer-major: their time without the store's per-ubatch upload
+        // reads (the CPU expert matmuls still read per ubatch), and one read of the experts not in RAM of every store
+        // layer, group by group ahead of the compute (the first group's waits)
+        const bool lm_on = lm != nullptr && lm->groups >= 2 && lm->layers > 0 && ssd_expert_ms > 0.0f;
+        auto lm_ms = [&](const llama_pshard_plan & p, uint32_t k, uint32_t ts, uint32_t r) -> double {
+            const double c  = (double) k * (p.ubatch_ms(ts) - p.ubatch_ssd_up_ms(ts)) + (r > 0 ? p.ubatch_ms(r) - p.ubatch_ssd_up_ms(r) : 0.0);
+            const double rd = (double) lm->reads * (double) lm->layers * (double) ssd_expert_ms;
+            const double g  = (double) lm->groups;
+            return c + rd / g + (g - 1.0) / g * std::max(0.0, rd - c);
+        };
 
         for (size_t t = 0; t < tier_sizes.size(); t++) {
             const uint32_t ts = tier_sizes[t];
@@ -739,12 +819,19 @@ struct llama_pshard_plan_registry {
             const uint32_t k = n_tokens / ts;
             const uint32_t r = n_tokens % ts;
             const double head_ms = sw(from_plan, plan, 0, kept0) + (double) k * run_ms(*plan, ts, kept1);
+            // the cut whose ubatches all run on this tier
+            const bool lm_tier = lm_on && plan->strategy != LLAMA_PSHARD_EXPERT_POOL;
+            if (lm_tier) {
+                consider(t, t, sw(from_plan, plan, 0, kept0) + lm_ms(*plan, k, ts, r) + sw(plan, decode_plan, n_tokens, kept1));
+            }
             if (r == 0) {
-                consider(t, t, head_ms + sw(plan, decode_plan, n_tokens, kept1));
+                if (!lm_tier) {
+                    consider(t, t, head_ms + sw(plan, decode_plan, n_tokens, kept1));
+                }
                 continue;
             }
             for (size_t u = 0; u <= t; u++) {
-                if (tier_sizes[u] < r || !priced(u)) {
+                if (tier_sizes[u] < r || !priced(u) || (lm_tier && u == t)) {
                     continue;
                 }
                 const llama_pshard_plan * tail = &best_plans[u];

@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -1330,6 +1331,57 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 }
 
+bool llama_kv_cache::cells_save(cells_snapshot & snap, const slot_info_vec_t & sinfos) const {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return false;
+    }
+
+    snap.v_heads = v_heads;
+
+    // with SWA, apply_ubatch can reuse occupied cells and purge cells outside the slots
+    if (swa_type != LLAMA_SWA_TYPE_NONE) {
+        snap.v_cells = v_cells;
+        snap.idxs.clear();
+
+        return true;
+    }
+
+    // without SWA, the slots hold only empty cells and apply_ubatch changes only them (as in prepare)
+    snap.idxs.assign(v_cells.size(), {});
+    for (const auto & sinfo : sinfos) {
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            auto & idxs = snap.idxs[sinfo.strm[s]];
+            idxs.insert(idxs.end(), sinfo.idxs[s].begin(), sinfo.idxs[s].end());
+        }
+    }
+
+    snap.v_cells.clear();
+    for (uint32_t s = 0; s < v_cells.size(); ++s) {
+        auto & idxs = snap.idxs[s];
+        std::sort(idxs.begin(), idxs.end());
+        idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
+
+        snap.v_cells.push_back(v_cells[s].cp(idxs));
+    }
+
+    return true;
+}
+
+void llama_kv_cache::cells_restore(const cells_snapshot & snap) {
+    GGML_ASSERT(other == nullptr);
+    GGML_ASSERT(snap.v_cells.size() == v_cells.size() && snap.v_heads.size() == v_heads.size());
+
+    if (snap.idxs.empty()) {
+        v_cells = snap.v_cells;
+    } else {
+        for (uint32_t s = 0; s < v_cells.size(); ++s) {
+            v_cells[s].set(snap.idxs[s], snap.v_cells[s]);
+        }
+    }
+    v_heads = snap.v_heads;
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
@@ -1694,6 +1746,10 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // the rows [tps0, tps1) of each stream
+    int64_t tps0;
+    int64_t tps1;
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1710,6 +1766,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const int64_t n_kv     = args.n_kv;
     const int64_t n_stream = args.n_stream;
     const int64_t n_tps    = args.n_tps;
+    const int64_t tps0     = args.tps0;
+    const int64_t tps1     = args.tps1;
 
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
@@ -1729,7 +1787,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
-        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+        for (uint32_t ii = (uint32_t) tps0; ii < tps1; ++ii) {
             const uint32_t i = s*n_tps + ii;
 
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -1909,12 +1967,34 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.tps0             =*/ 0,
+        /*.tps1             =*/ n_tps,
     };
 
-    if (dst->type == GGML_TYPE_F16) {
-        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+    auto fill = [&](const args_set_input_kq_mask & a) {
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_kq_mask_impl<ggml_fp16_t>(a, (ggml_fp16_t *) dst->data, causal_attn);
+        } else {
+            set_input_kq_mask_impl<float>(a, (float *) dst->data, causal_attn);
+        }
+    };
+
+    // a model larger than RAM (expert store): the GPU waits for the masks of its large prompt ubatches, so their
+    // rows are filled on several threads; each row is written by one thread, with the same values
+    const int64_t n_th = model.expert_store() != nullptr ? std::min<int64_t>(std::thread::hardware_concurrency(), n_tps / 64) : 1;
+    if (n_th <= 1) {
+        fill(args);
     } else {
-        set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+        std::vector<std::thread> workers;
+        for (int64_t t = 0; t < n_th; t++) {
+            args_set_input_kq_mask a = args;
+            a.tps0 = n_tps * t / n_th;
+            a.tps1 = n_tps * (t + 1) / n_th;
+            workers.emplace_back(fill, a);
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
     }
 
     //const int64_t t_end = ggml_time_us();
@@ -2728,6 +2808,14 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    // a replayed ubatch must see the same cells as in the first pass
+    if (layer_major) {
+        if (n_kv_lm[i_cur] < 0) {
+            n_kv_lm[i_cur] = n_kv;
+        }
+        GGML_ASSERT(n_kv == n_kv_lm[i_cur]);
+    }
+
     return true;
 }
 
@@ -2739,6 +2827,26 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_cur];
+}
+
+bool llama_kv_cache_context::layer_major_begin() {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || ubatches.empty() || i_cur != 0 || !kv->cells_save(cells_lm, sinfos)) {
+        return false;
+    }
+
+    layer_major = true;
+    n_kv_lm.assign(ubatches.size(), -1);
+
+    return true;
+}
+
+void llama_kv_cache_context::rewind() {
+    if (!layer_major) {
+        return;
+    }
+
+    kv->cells_restore(cells_lm);
+    i_cur = 0;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {

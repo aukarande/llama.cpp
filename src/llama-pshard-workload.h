@@ -72,6 +72,9 @@ struct llama_pshard_workload {
     // growth of a pass's misses from one row to `rows` rows with each layer's s most routed experts resident, at most
     // rows (a pass routes to at most rows times the experts of one row). false = no pool table
     bool   pool_miss_growth(double rows, uint32_t s, double & growth) const;
+    // expected distinct experts outside each layer's s most routed that one pass of `rows` rows routes to, averaged over
+    // the layers; -1 = no pool table
+    double pool_misses(double rows, uint32_t s) const;
 
     // fit alpha from per-layer expert use counts. h_obs(s) is a split-half top-s mass: each expert's routes are
     // split into two folds (deterministic binomial split), the experts are ranked on one fold and the cumulative

@@ -654,6 +654,7 @@ extern "C" {
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE   = 16, // ...must be computed
         GGML_TENSOR_FLAG_WRITEBACK = 32, // ...is stateful cache (KV/RS) needing GPU->CPU writeback
+        GGML_TENSOR_FLAG_EXPERT_TABLE = 64, // ...has its expert i's rows at ((const void **) extra)[i] when that entry is set (CPU MUL_MAT_ID)
     };
 
     enum ggml_tri_type {
