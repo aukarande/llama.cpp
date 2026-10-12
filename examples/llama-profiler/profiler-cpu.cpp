@@ -349,8 +349,7 @@ struct calib_results {
     double copy_setup_us = 0.0;                             // per copy of a back-to-back upload, beyond its bytes
     double pool_serve_us = 0.0, pool_split_us = 0.0;
     double pin_ceiling_gb = 0.0;
-    double ssd_sat = 0.0, ssd_lat = 0.0;                    // SSD_Read (--ssd): GB/s of expert reads with many in flight,
-                                                            // ms a lone read takes beyond its bytes at that rate
+    std::string ssd_lines;                                  // SSD_Read: one line per local storage unit
 };
 
 enum sliced_mode { SLICED_DMA = 0, SLICED_KERNEL = 1, SLICED_SEGS = 2 };
@@ -656,19 +655,31 @@ static double calibrate_staged_upload(pcie_stress_ctx * pcie) {
 }
 
 static void write_ssd_line(FILE * f, const calib_results & cr) {
-    if (cr.ssd_sat > 0.0) fprintf(f, "#   SSD_Read: sat=%.4g GB/s lat=%.4g ms\n", cr.ssd_sat, cr.ssd_lat);
+    fputs(cr.ssd_lines.c_str(), f);
 }
 
-// the SSD_Read line of an existing profile, which a run without --ssd keeps
-static void read_ssd_line(const char * path, double & sat, double & lat) {
-    FILE * f = fopen(path, "r");
-    if (!f) return;
-    char line[4096];
-    double s = 0.0, l = 0.0;
-    while (fgets(line, sizeof(line), f) && line[0] == '#') {
-        if (sscanf(line, "#   SSD_Read: sat=%lf GB/s lat=%lf ms", &s, &l) == 2) { sat = s; lat = l; break; }
+// the RAM expert store's SSD reads on every local storage unit (llama_pshard_ssd_profile), seconds per unit, followed
+// by the lines of the units the profile at keep_from has and this run did not measure (a disk unplugged or full now)
+static std::string measure_ssd_lines(const char * keep_from, bool & measured) {
+    printf("Measuring the SSD reads of every local disk...\n");
+    std::string lines(1 << 16, '\0');   // a line per disk, each well under 1 KiB; no size query, which would measure
+    lines.resize(std::min(llama_pshard_ssd_profile(lines.data(), lines.size()), lines.size() - 1));
+    measured = !lines.empty();
+    printf("%s\n", measured ? lines.c_str() : "  no disk measured\n");
+    FILE * f = keep_from ? fopen(keep_from, "r") : nullptr;
+    char buf[4096];
+    while (f && fgets(buf, sizeof(buf), f) && buf[0] == '#') {
+        const char * prefix = "#   SSD_Read: unit=";
+        if (strncmp(buf, prefix, strlen(prefix)) != 0) continue;
+        const std::string line = buf;
+        const std::string unit = line.substr(0, line.find(' ', strlen(prefix)) + 1);   // "#   SSD_Read: unit=<id> "
+        if (lines.find(unit) == std::string::npos) {
+            printf("  kept from %s: %s", keep_from, line.c_str());
+            lines += line.back() == '\n' ? line : line + "\n";
+        }
     }
-    fclose(f);
+    if (f) fclose(f);
+    return lines;
 }
 
 // the profile header: every calibrated machine number as one parseable line
@@ -1226,7 +1237,7 @@ int main(int argc, char ** argv) {
     bool    no_pin_ceiling = false;
     const char * splice_path = nullptr;
     const char * output_path = "cpu_profile.txt";
-    const char * ssd_model   = nullptr;
+    bool    ssd_only       = false;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
@@ -1244,8 +1255,8 @@ int main(int argc, char ** argv) {
             splice_path = argv[++i];
         } else if (!strcmp(argv[i], "--no-pin-ceiling")) {
             no_pin_ceiling = true;
-        } else if (!strcmp(argv[i], "--ssd") && i + 1 < argc) {
-            ssd_model = argv[++i];
+        } else if (!strcmp(argv[i], "--ssd")) {
+            ssd_only = true;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [options]\n", argv[0]);
             printf("\n");
@@ -1259,9 +1270,10 @@ int main(int argc, char ** argv) {
             printf("                      block in place, keeping its op tables (old file -> .bak)\n");
             printf("  --no-pin-ceiling    skip the host pin ceiling probe (registers RAM\n");
             printf("                      in 2 GiB chunks until the driver refuses)\n");
-            printf("  --ssd <model.gguf>  also measure the SSD reads of pshard's RAM expert store (a model\n");
-            printf("                      larger than RAM) on the model's files: the SSD_Read line (about 3 s).\n");
-            printf("                      With --splice, only that line is replaced. Without --ssd, a run keeps it\n");
+            printf("  --ssd               measure only the SSD reads of pshard's RAM expert store (a model larger\n");
+            printf("                      than RAM) on every local disk: the SSD_Read lines, about 7 s per disk and\n");
+            printf("                      up to 4 GiB of scratch space on it. With --splice, only those lines are replaced.\n");
+            printf("                      Every other run measures them too\n");
             printf("  --threads <n>       number of CPU threads (default: auto)\n");
             printf("  --output <path>     output file (default: cpu_profile.txt)\n");
             return 0;
@@ -1270,24 +1282,21 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // first, so a model path that does not read fails before the long run
-    double ssd_sat = 0.0, ssd_lat = 0.0;
-    if (ssd_model) {
-        printf("Measuring the SSD reads of %s...\n", ssd_model);
-        if (!llama_pshard_ssd_measure(ssd_model, &ssd_sat, &ssd_lat)) {
-            fprintf(stderr, "SSD read measurement of %s failed\n", ssd_model);
+    // first: with --ssd that is all
+    bool ssd_measured = false;
+    const std::string ssd_lines = measure_ssd_lines(splice_path ? splice_path : output_path, ssd_measured);
+    if (ssd_only) {
+        if (!ssd_measured) {
+            fprintf(stderr, "no disk measured\n");
             return 1;
         }
-        printf("  SSD: %.2f GB/s with many reads in flight, a lone read %.3f ms beyond its bytes at that rate\n\n", ssd_sat, ssd_lat);
         // the other header bytes stay, so only the models the store serves re-plan
         if (splice_path) {
             calib_results cr;
-            cr.ssd_sat = ssd_sat;
-            cr.ssd_lat = ssd_lat;
+            cr.ssd_lines = ssd_lines;
             return splice_profile_header(splice_path, cr, 0, true) ? 0 : 1;
         }
-    } else {
-        read_ssd_line(splice_path ? splice_path : output_path, ssd_sat, ssd_lat);
+        return 0;
     }
 
     int32_t default_threads = common_cpu_get_num_math();
@@ -1348,8 +1357,7 @@ int main(int argc, char ** argv) {
     calib_results cr;
     cr.has_gpu = has_gpu;
     cr.machine = identify_machine(has_gpu ? pcie.gpu_backend : nullptr);
-    cr.ssd_sat = ssd_sat;
-    cr.ssd_lat = ssd_lat;
+    cr.ssd_lines = ssd_lines;
     printf("Machine: gpu=\"%s\" (%zu MiB) cpu=\"%s\" os=%s\n\n",
         cr.machine.gpu.c_str(), cr.machine.vram_mib, cr.machine.cpu.c_str(), cr.machine.os.c_str());
 

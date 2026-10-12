@@ -407,14 +407,15 @@ std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * 
 
 // the pricing of the RAM expert store's SSD reads. Bump it when that pricing changes: only the registries of models
 // the store serves re-plan
-constexpr uint32_t LLAMA_PSHARD_STORE_PRICING_VERSION = 6;
+constexpr uint32_t LLAMA_PSHARD_STORE_PRICING_VERSION = 7;
 
 // the RAM expert store as the loader decides it for a model (llama_expert_store_decide on the gguf tensor bytes, the
-// RAM and -mra), and the CPU profile's SSD_Read line
+// RAM and -mra), and the CPU profile's SSD_Read line of the disk holding the model
 struct llama_pshard_store_info {
     bool        on        = false;
     size_t      budget    = 0;      // bytes of RAM for the slots
     size_t      ram_total = 0;
+    std::string unit;               // the storage unit of the model's largest file ("" = unknown)
     std::string line;               // "" = not in the CPU profile: the SSD reads are not priced
 };
 llama_pshard_store_info llama_pshard_store_info_for(const char * path_model, const struct llama_model_params * mparams);
@@ -705,10 +706,11 @@ struct llama_pshard_plan_registry {
     // all its ubatches run on one tier (llama_context::layer_major_refusal): its layer groups and the experts per
     // store layer its sweep reads (llama_expert_store::sweep_reads); groups < 2: none
     struct lm_price {
-        size_t   groups = 0;
-        uint32_t reads  = 0;
-        uint32_t n_ram  = 0;
-        uint32_t layers = 0;
+        size_t   groups  = 0;
+        uint32_t reads   = 0;
+        uint32_t n_ram   = 0;
+        uint32_t layers  = 0;
+        bool     overlap = true;   // the next group's reads run while this group computes (else before it)
     };
 
     // the cheapest cut of a decode of n_tokens: one ubatch on a tier that holds it, or whole ubatches of one tier
@@ -798,7 +800,7 @@ struct llama_pshard_plan_registry {
             const double c  = (double) k * (p.ubatch_ms(ts) - p.ubatch_ssd_up_ms(ts)) + (r > 0 ? p.ubatch_ms(r) - p.ubatch_ssd_up_ms(r) : 0.0);
             const double rd = (double) lm->reads * (double) lm->layers * (double) ssd_expert_ms;
             const double g  = (double) lm->groups;
-            return c + rd / g + (g - 1.0) / g * std::max(0.0, rd - c);
+            return lm->overlap ? c + rd / g + (g - 1.0) / g * std::max(0.0, rd - c) : c + rd;
         };
 
         for (size_t t = 0; t < tier_sizes.size(); t++) {

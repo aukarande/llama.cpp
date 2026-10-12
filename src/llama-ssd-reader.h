@@ -25,6 +25,7 @@
 struct llama_ssd_reader {
     static constexpr size_t sector = 4096;
 #ifdef _WIN32
+    static constexpr bool overlap = true;   // the reads of a batch are in flight together
     struct request {
         OVERLAPPED ov;
         size_t     need;   // bytes the caller uses: a read cut short at the end of the file may stop after them
@@ -45,7 +46,9 @@ struct llama_ssd_reader {
             CloseHandle(port);
         }
     }
-    bool open(const std::vector<std::string> & paths) {
+    // share_all: let others write and delete the files too (a scratch file held open for writing and delete on close);
+    // else a model file cannot be replaced while it is read
+    bool open(const std::vector<std::string> & paths, bool share_all = false) {
         for (size_t i = 0; i < paths.size(); i++) {
             // the paths are UTF-8, as ggml_fopen takes them
             const int wlen = MultiByteToWideChar(CP_UTF8, 0, paths[i].c_str(), -1, nullptr, 0);
@@ -54,8 +57,8 @@ struct llama_ssd_reader {
                 LLAMA_LOG_ERROR("%s: cannot convert %s to UTF-16\n", __func__, paths[i].c_str());
                 return false;
             }
-            HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+            HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | (share_all ? FILE_SHARE_WRITE | FILE_SHARE_DELETE : 0),
+                nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
             if (h == INVALID_HANDLE_VALUE) {
                 LLAMA_LOG_ERROR("%s: cannot open %s for unbuffered reads (error %lu)\n", __func__, paths[i].c_str(), GetLastError());
                 return false;
@@ -124,6 +127,7 @@ struct llama_ssd_reader {
         return ok;
     }
 #else
+    static constexpr bool overlap = false;
     std::vector<int> files;
     bool failed = false;
 
@@ -132,7 +136,8 @@ struct llama_ssd_reader {
             close(fd);
         }
     }
-    bool open(const std::vector<std::string> & paths) {
+    bool open(const std::vector<std::string> & paths, bool share_all = false) {
+        (void) share_all;
         for (const auto & p : paths) {
             int fd = -1;
 #ifdef O_DIRECT

@@ -35,8 +35,11 @@ std::vector<std::string> llama_expert_store_files(const std::string & path_model
 // the largest of them, which holds the most experts the store reads ("" = none is readable), and their total bytes
 std::string llama_expert_store_largest_file(const std::string & path_model, uint64_t * total_b = nullptr);
 // the store reader's rate in GB/s: unbuffered reads of read_bytes (a sector multiple) at random sector-aligned offsets
-// of path, n_inflight of them waited for together, for about `seconds` (0 = the file cannot be read)
+// of path (a scratch file: opened with every sharing mode), n_inflight of them waited for together, for about
+// `seconds` (0 = the file cannot be read)
 double llama_expert_store_read_gbps(const std::string & path, size_t read_bytes, int n_inflight, double seconds);
+// whether the store's reads of one wait are in flight together (else they run one after another)
+bool llama_expert_store_reads_overlap();
 
 // RAM expert store of a model larger than RAM: each MoE layer keeps n_ram of its routed experts in locked RAM slots,
 // read from the GGUF files with unbuffered reads, least recently used out first. The CPU expert matmul reads a

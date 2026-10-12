@@ -2026,8 +2026,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         llama_pshard_plan_registry::lm_price lm;
         const char * lm_why = nullptr;   // why such a cut runs batch-major
         if (auto * store = model.expert_store(); store != nullptr && store->active()) {
-            lm.n_ram  = store->n_ram;
-            lm.layers = store->n_layers();
+            lm.n_ram   = store->n_ram;
+            lm.layers  = store->n_layers();
+            lm.overlap = llama_expert_store_reads_overlap();
             if (lm_groups.empty()) {
                 lm_why = "layer-major prefill is off in this context";
             } else if (layer_major_refusal(true, &lm_why) < 0) {

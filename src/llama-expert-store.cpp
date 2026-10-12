@@ -71,26 +71,39 @@ std::vector<std::string> llama_expert_store_files(const std::string & path_model
 }
 
 static uint64_t file_bytes(const std::string & path) {
+#ifdef _WIN32
+    // links followed; attribute access only, which a file held open with other sharing (a scratch file) still allows
+    const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    std::wstring wpath(wlen > 0 ? (size_t) wlen : 0, L'\0');
+    if (wlen <= 0 || MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen) <= 0) {
+        return 0;
+    }
+    HANDLE h = CreateFileW(wpath.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    LARGE_INTEGER n = {};
+    const BOOL ok = GetFileSizeEx(h, &n);
+    CloseHandle(h);
+    return ok && n.QuadPart > 0 ? (uint64_t) n.QuadPart : 0;
+#else
     FILE * f = ggml_fopen(path.c_str(), "rb");
     if (f == nullptr) {
         return 0;
     }
-#ifdef _WIN32
-    _fseeki64(f, 0, SEEK_END);
-    const int64_t n = _ftelli64(f);
-#else
     fseeko(f, 0, SEEK_END);
     const int64_t n = ftello(f);
-#endif
     fclose(f);
     return n > 0 ? (uint64_t) n : 0;
+#endif
 }
 
 double llama_expert_store_read_gbps(const std::string & path, size_t read_bytes, int n_inflight, double seconds) {
     constexpr size_t sector = llama_ssd_reader::sector;
     const uint64_t size = file_bytes(path);
     llama_ssd_reader rd;
-    if (read_bytes == 0 || read_bytes % sector != 0 || size < 2 * (uint64_t) read_bytes || !rd.open({ path })) {
+    if (read_bytes == 0 || read_bytes % sector != 0 || size < 2 * (uint64_t) read_bytes || !rd.open({ path }, true)) {
         return 0.0;
     }
     std::vector<char> buf((size_t) n_inflight * read_bytes + sector);
@@ -113,6 +126,10 @@ double llama_expert_store_read_gbps(const std::string & path, size_t read_bytes,
         t1 = ggml_time_us();
     } while ((double) (t1 - t0) < seconds * 1e6);
     return (double) bytes / ((double) (t1 - t0) / 1e6) / 1e9;
+}
+
+bool llama_expert_store_reads_overlap() {
+    return llama_ssd_reader::overlap;
 }
 
 std::string llama_expert_store_largest_file(const std::string & path_model, uint64_t * total_b) {

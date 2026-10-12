@@ -3893,21 +3893,22 @@ void llama_params_fit_pshard_plan(
     }
 
     // the RAM expert store as the loader decides it: the slots per layer its budget holds (the store's own sizing; the
-    // runtime logs the slots it gets) and the CPU profile's SSD_Read line. Without the line its reads are not priced
+    // runtime logs the slots it gets) and the CPU profile's SSD_Read line of the model's disk. Without it the reads are not priced
     llama_benchmark_store store;   // outlives the sweep: the predictor reads it
     if (store_info.on && predictor && hp_nex > 0) {
         store.n_expert = hp_nex;
         store.n_ram    = llama_expert_store_slots(store_info.budget, store_slot_bytes, hp_nex);
+        store.overlap  = llama_expert_store_reads_overlap();
         if (store.n_ram < ctx.n_expert_used) {
             LLAMA_LOG_WARN("%s: expert store: %.1f GiB hold %u slots per layer, below the %u routed experts - the store stays off, its reads are not priced\n",
                 __func__, store_info.budget / 1073741824.0, store.n_ram, ctx.n_expert_used);
         } else if (!store.parse_ssd(store_info.line)) {
             static std::atomic<bool> warned{false};
             if (!warned.exchange(true)) {
-                LLAMA_LOG_WARN("%s: expert store: the CPU profile has %s%s - its SSD reads are not priced. To measure it: "
-                    "llama-profiler-cpu --splice %s --ssd %s\n", __func__,
+                LLAMA_LOG_WARN("%s: expert store: the CPU profile has %s%s for the disk holding %s (unit %s) - its SSD reads are not "
+                    "priced. To measure every disk: llama-profiler-cpu --splice %s --ssd\n", __func__,
                     store_info.line.empty() ? "no SSD_Read line" : "an SSD_Read line that does not parse: ", store_info.line.c_str(),
-                    llama_benchmark_profile_path(false), path_model);
+                    path_model, store_info.unit.empty() ? "unknown" : store_info.unit.c_str(), llama_benchmark_profile_path(false));
             }
         } else {
             predictor->store = &store;
@@ -3964,10 +3965,11 @@ void llama_params_fit_pshard_plan(
         double   tok_ms   = 0.0;
         double   exp_ms   = 0.0;
         uint32_t n_layers_store = 0;
+        const int n_t = (int) std::max<uint32_t>(1, ctx.exps_tensors_per_layer);   // one read per expert tensor
         for (size_t b : exps_per_layer) {
             if (b > 0) {
-                tok_ms += predictor->store_read_ms(m1, (double) b / hp_nex, 1);
-                exp_ms += predictor->store_read_ms(1.0, (double) b / hp_nex, 0);
+                tok_ms += predictor->store_read_ms(m1, (double) b / hp_nex, 1, n_t);
+                exp_ms += predictor->store_read_ms(1.0, (double) b / hp_nex, 0, n_t);
                 n_layers_store++;
             }
         }

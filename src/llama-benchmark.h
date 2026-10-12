@@ -32,9 +32,9 @@ uint64_t llama_benchmark_profile_hash();
 // page-locks from it
 double llama_benchmark_host_pin_ceiling_gb();
 
-// the CPU profile's SSD_Read line without its line end ("" = none). The profile hash leaves it out: only the registry
-// fingerprint of a model the RAM expert store serves mixes it
-std::string llama_benchmark_ssd_line();
+// the CPU profile's SSD_Read line of a storage unit (llama-ssd-unit.h) without its line end ("" = none). The profile
+// hash leaves the SSD_Read lines out: only the registry fingerprint of a model the RAM expert store serves mixes its line
+std::string llama_benchmark_ssd_line(const std::string & unit);
 
 // Per-op FLOPS/bytes metrics extracted from a ggml tensor node.
 // Used by roofline prediction to classify ops as compute-bound or memory-bound.
@@ -209,8 +209,10 @@ struct llama_benchmark_stats {
 struct llama_benchmark_store {
     uint32_t n_expert = 0;
     uint32_t n_ram    = 0;
-    double   sat_gbps = 0.0;   // the SSD_Read line: GB/s of expert reads with many in flight
-    double   lat_ms   = 0.0;   // and ms a lone read takes beyond its bytes at that rate
+    double   sat_gbps = 0.0;   // the SSD_Read line: GB/s of expert reads with many in flight,
+    double   qd1_gbps = 0.0;   // GB/s of one read at a time
+    double   lat_ms   = 0.0;   // and ms a lone read takes beyond its bytes at the qd1 rate
+    bool     overlap  = true;  // the reads of one wait are in flight together (else one after another)
 
     // false: not an SSD_Read line
     bool parse_ssd(const std::string & line);
@@ -242,8 +244,9 @@ struct llama_benchmark_predictor {
     // experts of a layer outside the store's RAM slots that one pass of `rows` rows routes to: the workload's pool
     // table (the n_ram most routed experts in RAM), else uniform routing
     double store_misses(double rows, double n_used) const;
-    // ms to read m experts of e_bytes each from the SSD, waited for in n_waits batches
-    double store_read_ms(double m, double e_bytes, int n_waits) const;
+    // ms to read m experts of e_bytes each from the SSD, waited for in n_waits batches, n_reads reads per expert
+    // (0 = n_waits, at least one)
+    double store_read_ms(double m, double e_bytes, int n_waits, int n_reads = 0) const;
 
     std::unordered_map<std::string, const llama_benchmark_entry *> cpu_map;
     std::unordered_map<std::string, const llama_benchmark_entry *> gpu_map;

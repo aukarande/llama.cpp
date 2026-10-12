@@ -4,6 +4,7 @@
 #include "llama-expert-store.h"
 #include "llama-impl.h"
 #include "llama-model-loader.h"
+#include "llama-ssd-unit.h"
 
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -279,7 +281,7 @@ llama_pshard_store_info llama_pshard_store_info_for(const char * path_model, con
     }
     const size_t reserve = (size_t) (LLAMA_PSHARD_HOST_PIN_RESERVE_GB * 1e9);
     uint64_t files_b = 0;
-    llama_expert_store_largest_file(path_model, &files_b);
+    const std::string largest = llama_expert_store_largest_file(path_model, &files_b);
     size_t exps_b  = 0;
     size_t other_b = 0;
     size_t row_b   = 0;
@@ -291,27 +293,68 @@ llama_pshard_store_info llama_pshard_store_info_for(const char * path_model, con
     info.on     = dec.on;
     info.budget = dec.budget;
     if (info.on) {
-        info.line = llama_benchmark_ssd_line();
+        // the store reads the largest file most: the line of the disk it is on
+        info.unit = llama_ssd_unit_of(largest);
+        info.line = llama_benchmark_ssd_line(info.unit);
     }
     return info;
 }
 
-bool llama_pshard_ssd_measure(const char * path_model, double * sat_gbps, double * lat_ms) {
-    size_t exps_b  = 0;
-    size_t other_b = 0;
-    size_t row_b   = 0;
-    const std::string file = path_model != nullptr ? llama_expert_store_largest_file(path_model) : "";
-    if (file.empty() || !pshard_store_weight_bytes(path_model, false, exps_b, other_b, row_b) || row_b == 0) {
-        return false;
+size_t llama_pshard_ssd_profile(char * buf, size_t buf_size) {
+    // the store reads each expert of a tensor on its own: the rate with many such reads in flight (a pass with many
+    // misses), and a lone read's latency and rate, fitted to a small and a large read (priced at every read size). The
+    // scratch file is larger than a drive's own cache (and fits FAT32); a slow drive writes for a few seconds only
+    constexpr uint64_t max_b   = (4ull << 30) - (16u << 20);
+    constexpr uint64_t min_b   = 256ull << 20;
+    constexpr double   write_s = 4.0;
+    constexpr size_t   small_b = 1u << 20;
+    constexpr size_t   large_b = 16u << 20;
+    std::string out;
+    for (const auto & u : llama_ssd_units()) {
+        std::unique_ptr<llama_ssd_scratch> scratch;
+        const char * why = "no directory on it takes a scratch file";
+        for (const auto & d : u.dirs) {
+            scratch = std::make_unique<llama_ssd_scratch>();
+            const bool ok = scratch->create(d, max_b, min_b, write_s);
+            // a directory that is a link elsewhere would measure another disk
+            if (ok && llama_ssd_unit_of(scratch->path) == u.id) {
+                break;
+            }
+            const bool slow = !ok && !scratch->path.empty();
+            scratch.reset();
+            if (slow) {
+                why = "it writes less than 256 MiB in 4 s";
+                break;
+            }
+        }
+        if (!scratch) {
+            LLAMA_LOG_WARN("%s: %s (%s): %s - not measured\n", __func__, u.id.c_str(), u.desc.c_str(), why);
+            continue;
+        }
+        const double sat   = llama_expert_store_read_gbps(scratch->path, large_b, 16, 1.5);
+        const double qd1_s = llama_expert_store_read_gbps(scratch->path, small_b, 1, 1.5);
+        const double qd1_l = llama_expert_store_read_gbps(scratch->path, large_b, 1, 1.5);
+        if (sat <= 0.0 || qd1_s <= 0.0 || qd1_l <= 0.0) {
+            LLAMA_LOG_WARN("%s: %s (%s): the scratch file did not read back - not measured\n", __func__, u.id.c_str(), u.desc.c_str());
+            continue;
+        }
+        // a lone read takes lat + bytes / qd1 (ms, with MB and GB/s): the line through both sizes
+        const double t_s = small_b / 1e6 / qd1_s;
+        const double t_l = large_b / 1e6 / qd1_l;
+        const double qd1 = t_l > t_s ? (large_b - small_b) / 1e6 / (t_l - t_s) : qd1_l;
+        const double lat = std::max(0.0, t_s - small_b / 1e6 / qd1);
+        LLAMA_LOG_INFO("%s: %s (%s): %.2f GB/s with 16 reads in flight; one at a time %.2f GB/s at 1 MiB, %.2f GB/s at 16 MiB (%.1f GiB file)\n",
+            __func__, u.id.c_str(), u.desc.c_str(), sat, qd1_s, qd1_l, scratch->bytes / 1073741824.0);
+        char nums[128];
+        snprintf(nums, sizeof(nums), " sat=%.4g GB/s qd1=%.4g GB/s lat=%.4g ms (", sat, qd1, lat);
+        out += "#   SSD_Read: unit=" + u.id + nums + u.desc + ")\n";
     }
-    // the store reads each expert of a tensor on its own: many such reads in flight (a pass with many misses), and
-    // what one alone takes beyond its bytes at that rate (priced at every read size)
-    const size_t s   = llama_expert_store_stride(row_b);
-    const double sat = llama_expert_store_read_gbps(file, s, 16, 1.5);
-    const double qd1 = llama_expert_store_read_gbps(file, s, 1, 1.5);
-    *sat_gbps = sat;
-    *lat_ms   = sat > 0.0 && qd1 > 0.0 ? std::max(0.0, (double) s / 1e6 / qd1 - (double) s / 1e6 / sat) : 0.0;
-    return sat > 0.0 && qd1 > 0.0;
+    if (buf != nullptr && buf_size > 0) {
+        const size_t n = std::min(out.size(), buf_size - 1);
+        memcpy(buf, out.data(), n);
+        buf[n] = '\0';
+    }
+    return out.size();
 }
 
 uint64_t pshard_registry_fingerprint(

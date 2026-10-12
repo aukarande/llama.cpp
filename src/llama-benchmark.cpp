@@ -307,18 +307,19 @@ uint64_t llama_benchmark_profile_hash() {
     return any ? h : 0;
 }
 
-std::string llama_benchmark_ssd_line() {
+std::string llama_benchmark_ssd_line(const std::string & unit) {
     std::string data;
-    if (!llama_benchmark_read_file(llama_benchmark_profile_path(false), data)) {
+    if (unit.empty() || !llama_benchmark_read_file(llama_benchmark_profile_path(false), data)) {
         return "";
     }
-    const size_t b = data.find(std::string("\n") + LLAMA_BENCHMARK_SSD_PREFIX);
+    const size_t b = data.find(std::string("\n") + LLAMA_BENCHMARK_SSD_PREFIX + " unit=" + unit + " ");
     return b == std::string::npos ? "" : data.substr(b + 1, data.find_first_of("\r\n", b + 1) - b - 1);
 }
 
 bool llama_benchmark_store::parse_ssd(const std::string & line) {
     // a rate of 0 would price the reads as free
-    return sscanf(line.c_str(), "#   SSD_Read: sat=%lf GB/s lat=%lf ms", &sat_gbps, &lat_ms) == 2 && sat_gbps > 0.0 && lat_ms >= 0.0;
+    return sscanf(line.c_str(), "#   SSD_Read: unit=%*s sat=%lf GB/s qd1=%lf GB/s lat=%lf ms", &sat_gbps, &qd1_gbps, &lat_ms) == 3 &&
+        sat_gbps > 0.0 && qd1_gbps > 0.0 && lat_ms >= 0.0;
 }
 
 double llama_benchmark_host_pin_ceiling_gb() {
@@ -1066,13 +1067,21 @@ double llama_benchmark_predictor::store_misses(double rows, double n_used) const
     return e * llama_expert_distinct_share(nullptr, rows, n_used, e) * (e - store->n_ram) / e;
 }
 
-double llama_benchmark_predictor::store_read_ms(double m, double e_bytes, int n_waits) const {
+double llama_benchmark_predictor::store_read_ms(double m, double e_bytes, int n_waits, int n_reads) const {
     if (store == nullptr || m <= 0.0 || e_bytes <= 0.0) {
         return 0.0;
     }
+    // e_bytes: one expert of the tensors read, one read per tensor
+    n_reads = n_reads > 0 ? n_reads : std::max(1, n_waits);
+    if (!store->overlap) {
+        // reads one after another: each its latency and its bytes at the rate of one at a time
+        return m * (e_bytes / 1e6 / store->qd1_gbps + n_reads * store->lat_ms);
+    }
     // the bytes at the rate with many reads in flight, and per wait what a lone read takes beyond that rate (a wait
-    // with m expected reads waits for at least one with probability 1 - e^-m)
-    return m * e_bytes / 1e6 / store->sat_gbps + n_waits * (1.0 - std::exp(-m)) * store->lat_ms;
+    // with m expected reads waits for at least one with probability 1 - e^-m): its latency and its tensor's bytes at the
+    // rate of one read at a time, less the same bytes at the rate with many in flight
+    const double lone_ms = store->lat_ms + e_bytes / n_reads / 1e6 * std::max(0.0, 1.0 / store->qd1_gbps - 1.0 / store->sat_gbps);
+    return m * e_bytes / 1e6 / store->sat_gbps + n_waits * (1.0 - std::exp(-m)) * lone_ms;
 }
 
 double llama_benchmark_predictor::predict_tps(
@@ -1362,7 +1371,8 @@ double llama_benchmark_predictor::predict_tps(
         // the store's SSD reads for the split's CPU expert matmuls: a layer's tensors share its routing, and the layer
         // waits once for the experts its rows use that are not in RAM
         if (st != nullptr && !is_gpu) {
-            std::vector<std::pair<const ggml_tensor *, double>> lay;   // ids -> one expert's bytes
+            struct ids_reads { const ggml_tensor * ids; double bytes; int n; };   // one expert's bytes over n tensors
+            std::vector<ids_reads> lay;
             for (int j = 0; j < n_nodes; j++) {
                 const ggml_tensor * w   = nodes[j]->src[0];
                 const ggml_tensor * ids = nodes[j]->src[2];
@@ -1370,16 +1380,17 @@ double llama_benchmark_predictor::predict_tps(
                         w->ne[2] != (int64_t) st->n_expert || strstr(w->name, "_exps.weight") == nullptr) {
                     continue;
                 }
-                auto it = std::find_if(lay.begin(), lay.end(), [&](const auto & l) { return l.first == ids; });
+                auto it = std::find_if(lay.begin(), lay.end(), [&](const auto & l) { return l.ids == ids; });
                 if (it == lay.end()) {
-                    lay.push_back({ ids, 0.0 });
+                    lay.push_back({ ids, 0.0, 0 });
                     it = lay.end() - 1;
                 }
-                it->second += (double) w->nb[2];
+                it->bytes += (double) w->nb[2];
+                it->n++;
             }
             for (const auto & l : lay) {
-                const double rows = std::max(1.0, std::round((double) l.first->ne[1] * token_scale));
-                ssd_ms += store_read_ms(store_misses(rows, (double) l.first->ne[0]), l.second, 1);
+                const double rows = std::max(1.0, std::round((double) l.ids->ne[1] * token_scale));
+                ssd_ms += store_read_ms(store_misses(rows, (double) l.ids->ne[0]), l.bytes, 1, l.n);
             }
         }
 

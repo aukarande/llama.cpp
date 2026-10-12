@@ -627,10 +627,13 @@ extern "C" {
     // true when the loaded model runs under pshard (false after a silent stock fallback)
     LLAMA_API bool llama_model_pshard_active(const struct llama_model * model);
 
-    // pshard: the SSD reads of the RAM expert store (a model larger than RAM), measured on the model's largest file with
-    // the store's reader in about 3 s: GB/s of expert reads with many in flight, and ms a lone read takes beyond its bytes
-    // at that rate. false: no expert to read
-    LLAMA_API bool llama_pshard_ssd_measure(const char * path_model, double * sat_gbps, double * lat_ms);
+    // pshard: the SSD reads of the RAM expert store (a model larger than RAM) on every local storage unit (a physical
+    // disk, or a volume that spans several), each measured with the store's reader on a scratch file written to it and
+    // removed, about 7 s per unit. One CPU profile line per unit:
+    //   "#   SSD_Read: unit=<id> sat=<GB/s> GB/s qd1=<GB/s> GB/s lat=<ms> ms (<description>)\n"
+    // sat: GB/s of reads with many in flight; a lone read takes lat + its bytes at qd1. Writes at most buf_size - 1
+    // bytes and a terminating 0, returns the length of all the lines
+    LLAMA_API size_t llama_pshard_ssd_profile(char * buf, size_t buf_size);
 
     LLAMA_API int64_t llama_time_us(void);
 
