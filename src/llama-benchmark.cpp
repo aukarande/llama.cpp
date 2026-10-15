@@ -405,6 +405,15 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                     stats.segs_kernel_idle_bw[0] = s0; stats.segs_kernel_idle_bw[1] = s1;
                     stats.segs_kernel_idle_bw[2] = s2; stats.segs_kernel_idle_bw[3] = s3;
                 }
+                double c[llama_benchmark_stats::n_copy_bw];
+                if (sscanf(line, "#   Kernel_Copy: 1MB=%lf 2MB=%lf 4MB=%lf 8MB=%lf 16MB=%lf 32MB=%lf 64MB=%lf 128MB=%lf 256MB=%lf GB/s",
+                           &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7], &c[8]) == llama_benchmark_stats::n_copy_bw) {
+                    std::copy(c, c + llama_benchmark_stats::n_copy_bw, stats.kernel_copy_bw);
+                }
+                if (sscanf(line, "#   Engine_Copy: 1MB=%lf 2MB=%lf 4MB=%lf 8MB=%lf 16MB=%lf 32MB=%lf 64MB=%lf 128MB=%lf 256MB=%lf GB/s",
+                           &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7], &c[8]) == llama_benchmark_stats::n_copy_bw) {
+                    std::copy(c, c + llama_benchmark_stats::n_copy_bw, stats.engine_copy_bw);
+                }
                 double v = 0.0;
                 if (sscanf(line, "#   PCIe_Staged: %lf GB/s", &v) == 1)   { stats.staged_bw          = v; }
                 if (sscanf(line, "#   Kernel_Copy_Cap_MB: %lf", &v) == 1) { stats.kernel_copy_cap_mb = v; }
@@ -489,10 +498,11 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                        stats.machine.cpu.c_str(), stats.machine.os.c_str(), stats.machine.threads);
         LLAMA_LOG_INFO("%s: kernel-copy measurements: sliced kernel 2MB=%.1f GB/s, segment kernel 2MB=%.1f GB/s loaded / %.1f idle,"
                        " staged %.1f GB/s, kernel-copy cap %.0f MB, engine switch %.1f us, pool serve %.1f us, split %.1f us,"
-                       " copy setup %.1f us\n",
+                       " copy setup %.1f us, 256MB kernel / engine %.1f / %.1f GB/s\n",
                        __func__, stats.sliced_kernel_bw[1], stats.segs_kernel_bw[1], stats.segs_kernel_idle_bw[1], stats.staged_bw,
                        stats.kernel_copy_cap_mb, stats.engine_switch_us, stats.pool_serve_us, stats.pool_split_us,
-                       stats.copy_setup_us);
+                       stats.copy_setup_us, stats.kernel_copy_bw[llama_benchmark_stats::n_copy_bw - 1],
+                       stats.engine_copy_bw[llama_benchmark_stats::n_copy_bw - 1]);
     }
 
     return !cpu_entries.empty();
@@ -1367,6 +1377,26 @@ double llama_benchmark_predictor::predict_tps(
         struct ggml_tensor ** nodes = ggml_graph_nodes(si.graph);
         int n_nodes = ggml_graph_n_nodes(si.graph);
         llama_split_timing t = predict_split(nodes, n_nodes, is_gpu, batch_size, async_copy, &timing_cache, token_scale);
+
+        // expert stacks the split reads in place from pinned host memory (ggml_backend_sched_set_read_in_place): a matmul
+        // waits for the experts its rows route to at the kernel read rate when that is slower than its compute
+        if (is_gpu && stats.host_read_bw(1.0) > 0.0) {
+            for (int j = 0; j < n_nodes; j++) {
+                const ggml_tensor * w   = nodes[j]->src[0];
+                const ggml_tensor * ids = nodes[j]->src[2];
+                const ggml_backend_buffer_t b = w != nullptr ? (w->view_src ? w->view_src->buffer : w->buffer) : nullptr;
+                if (nodes[j]->op != GGML_OP_MUL_MAT_ID || ids == nullptr || b == nullptr || !ggml_backend_buffer_is_host(b) ||
+                        ggml_backend_buffer_get_usage(b) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    continue;
+                }
+                const double rows    = std::max(1.0, std::round((double) ids->ne[1] * token_scale));
+                const double bytes   = (double) ggml_nbytes(w) *
+                    llama_expert_distinct_share(workload, rows, (double) ids->ne[0], (double) w->ne[2]);
+                const double read_ms = bytes / 1e9 / stats.host_read_bw(bytes) * 1000.0;
+                const double op_ms   = predict_split(&nodes[j], 1, true, batch_size, async_copy, &timing_cache, token_scale).time_ms;
+                t.time_ms += std::max(0.0, read_ms - op_ms);
+            }
+        }
 
         // the store's SSD reads for the split's CPU expert matmuls: a layer's tensors share its routing, and the layer
         // waits once for the experts its rows use that are not in RAM

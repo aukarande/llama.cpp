@@ -563,6 +563,8 @@ void llama_context::pshard_setup_sched() {
         (pshard_active_plan == nullptr || pshard_active_plan->overlap != 0));
     ggml_backend_sched_set_prefetch_window(sched.get(),
         pshard_active_plan ? pshard_active_plan->overlap == 2 : probe_reserve.prefetch_window);
+    ggml_backend_sched_set_read_in_place(sched.get(),
+        pshard_active_plan ? llama_pshard_strategy_reads_in_place(pshard_active_plan->strategy) : probe_reserve.read_in_place);
     // the active tier's slice crossover; a planner probe reserves under the one it measures
     ggml_backend_sched_set_expert_slice_tokens(sched.get(),
         pshard_active_plan ? pshard_active_plan->expert_slice_tokens : probe_reserve.expert_slice_tokens);
@@ -625,6 +627,7 @@ void llama_context::pshard_apply_plan(const llama_pshard_plan & plan, bool with_
     // per-tier transport mode: governs split_graph keepalives and the runtime prefetch scan
     ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
     ggml_backend_sched_set_prefetch_window(sched.get(), plan.overlap == 2);
+    ggml_backend_sched_set_read_in_place(sched.get(), llama_pshard_strategy_reads_in_place(plan.strategy));
     ggml_backend_sched_set_expert_slice_tokens(sched.get(), plan.expert_slice_tokens);
     // every ubatch the tier runs copies experts as its reserved batch does, so it fits the tier's reserved allocation
     ggml_backend_sched_set_expert_slice_rows(sched.get(), (int) plan.batch_size);
@@ -960,6 +963,7 @@ void llama_context::pshard_warmup_plan_reserves() {
         // the reserve must see the same prefetch/keepalive mode this tier will run with
         ggml_backend_sched_set_prefetch_weights(sched.get(), cparams.pshard_overlap && plan.overlap);
         ggml_backend_sched_set_prefetch_window(sched.get(), plan.overlap == 2);
+        ggml_backend_sched_set_read_in_place(sched.get(), llama_pshard_strategy_reads_in_place(plan.strategy));
         ggml_backend_sched_set_expert_slice_tokens(sched.get(), plan.expert_slice_tokens);
         ggml_backend_sched_set_expert_slice_rows(sched.get(), (int) plan.batch_size);
         ggml_backend_sched_set_allow_overflow(sched.get(), plan.compute_spill);

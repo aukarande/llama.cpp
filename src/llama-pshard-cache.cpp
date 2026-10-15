@@ -103,6 +103,7 @@ void llama_pshard_generate_overrides(
         if (patterns_layer_attn[il].empty()) { patterns_layer_attn[il] = "blk\\." + std::to_string(il) + "\\.attn_(q|k|v|output|q_norm|k_norm).*"; }
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
         if (patterns_layer_router[il].empty()) { patterns_layer_router[il] = "blk\\." + std::to_string(il) + "\\.(ffn_gate_inp|ffn_exp_probs_b).*"; }
+        if (patterns_layer_moe_exps[il].empty()) { patterns_layer_moe_exps[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate|gate_up)_exps\\..*"; }
 
         if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
             // MTP head layers: pinned whole, experts included, the placement the planner's copy prices
@@ -115,9 +116,6 @@ void llama_pshard_generate_overrides(
             }
             // fetch corner: routed experts live in host RAM (the pool's home);
             // everything else pins - see the planner copy for the rationale
-            if (patterns_layer_moe_exps[il].empty()) {
-                patterns_layer_moe_exps[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate|gate_up)_exps\\..*";
-            }
             emit(patterns_layer_moe_exps[il].c_str(), host_buft, overlap ? layout.shard(il) : layout.shard_a);
             emit(patterns_layer[il].c_str(), host_buft, layout.compute);
             continue;
@@ -184,6 +182,11 @@ void llama_pshard_generate_overrides(
                     }
                     break;
                 }
+                case LLAMA_PSHARD_GPUONLY_ATTNPRIO_FFNINPLACE:
+                    // routed experts read in place by their lane's split; the rest pinned (attention priority) or streamed
+                    emit(patterns_layer_moe_exps[il].c_str(), host_buft, shard_bid);
+                    emit(patterns_layer[il].c_str(), host_buft, il < n_attn_pinned ? layout.compute : shard_bid);
+                    break;
                 default: break;
             }
         }
@@ -442,6 +445,8 @@ uint64_t pshard_registry_fingerprint(
     mix((uint64_t)LLAMA_BENCHMARK_PREDICTOR_VERSION);
     mix(llama_benchmark_profile_hash());
     mix((uint64_t)pshard_strategy_from_env());
+    // mapped weights are not in the device's pinned host buffers: no tier reads them in place
+    mix((uint64_t)(llama_pshard_load_maps(mparams->load_mode) ? 1 : 0));
     // forced miss policy (QA override) plans differently; mixed only when set so
     // existing registries keep their fingerprints
     const int mp_env = pshard_miss_policy_from_env();

@@ -24,6 +24,8 @@ enum llama_pshard_strategy {
     // per-tier variables n_attn_pinned / K / miss_policy / prefill_mode; the
     // pool region serves the prefill ab_stream double buffer and decode LRU slots
     LLAMA_PSHARD_EXPERT_POOL                         = 3,
+    // attention pinned first, no whole layer pinned; the GPU reads the routed experts in place from pinned host memory
+    LLAMA_PSHARD_GPUONLY_ATTNPRIO_FFNINPLACE         = 4,
     LLAMA_PSHARD_COUNT
 };
 
@@ -34,12 +36,23 @@ inline const char * llama_pshard_strategy_name(llama_pshard_strategy s) {
         case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS:    return "STATIC_ATTNPRIO_ALLMODELS";
         case LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE:   return "HYBRID_ATTNPRIO_FFNBALANCE";
         case LLAMA_PSHARD_EXPERT_POOL:                  return "EXPERT_POOL";
+        case LLAMA_PSHARD_GPUONLY_ATTNPRIO_FFNINPLACE:  return "GPUONLY_ATTNPRIO_FFNINPLACE";
         default:                                        return "UNKNOWN";
     }
 }
 
 inline bool llama_pshard_strategy_delegates_compute(llama_pshard_strategy s) {
     return s == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS;
+}
+
+// the device reads host-resident expert stacks in place (ggml_backend_sched_set_read_in_place)
+inline bool llama_pshard_strategy_reads_in_place(llama_pshard_strategy s) {
+    return s == LLAMA_PSHARD_GPUONLY_ATTNPRIO_FFNINPLACE;
+}
+
+// the loader maps the model files (the host weights stay in the mapping, not in the device's pinned host buffers)
+inline bool llama_pshard_load_maps(enum llama_load_mode mode) {
+    return mode == LLAMA_LOAD_MODE_AUTO || mode == LLAMA_LOAD_MODE_MMAP || mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
 }
 
 // PSHARD_STRATEGY=ALL: the auto search includes the expert pool; unset = every strategy but the expert pool
@@ -388,7 +401,8 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         uint32_t probe_n_outputs = 0,
         int32_t  probe_expert_slice_tokens = -1,
         bool     probe_prefetch_window = false,
-        struct llama_model_meta_cache * meta_cache = nullptr);
+        struct llama_model_meta_cache * meta_cache = nullptr,
+        bool     probe_read_in_place = false);
 
 // fit params entry point used by pshard planning; upstream's generic fit lives in common/fit
 void llama_params_fit_impl(

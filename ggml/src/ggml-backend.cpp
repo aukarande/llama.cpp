@@ -857,6 +857,7 @@ struct ggml_backend_sched {
 
     bool prefetch_weights;
     bool prefetch_window;   // ggml_backend_sched_set_prefetch_window
+    bool read_in_place;     // ggml_backend_sched_set_read_in_place
     // ubatches below this many tokens copy only the used experts (ggml_backend_sched_set_expert_slice_tokens); -1 = default rule
     int  expert_slice_tokens;
     // ubatches are classified at no fewer tokens than this (ggml_backend_sched_set_expert_slice_rows)
@@ -980,6 +981,18 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
 // streamed layers: DeepSeek-V4 slices its hc_* scale/base vectors -> kernels read host memory)
 static inline ggml_backend_buffer_t ggml_backend_sched_tensor_buffer(const struct ggml_tensor * t) {
     return t->view_src ? t->view_src->buffer : t->buffer;
+}
+
+// with read_in_place on, a device split reads an expert stack in the device's own pinned host buffer in place: the
+// device's kernels read that memory directly, and a tensor its buffer type does not pad has no padding to clear
+static bool ggml_backend_sched_reads_in_place(ggml_backend_sched_t sched, const struct ggml_tensor * node, int j,
+        ggml_backend_buffer_t src_buf, int backend_id) {
+    if (!sched->read_in_place || node->op != GGML_OP_MUL_MAT_ID || j != 0) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[backend_id]);
+    return dev != NULL && src_buf->buft == ggml_backend_dev_host_buffer_type(dev) &&
+           ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], node->src[j]) == ggml_nbytes(node->src[j]);
 }
 
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
@@ -1855,7 +1868,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     cur_backend_id != sched->n_backends - 1 &&
                     src_buf != NULL &&
                     ggml_backend_buffer_get_usage(src_buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(src_buf)) {
+                    ggml_backend_buffer_is_host(src_buf) &&
+                    !ggml_backend_sched_reads_in_place(sched, node, j, src_buf, cur_backend_id)) {
                     need_copy = true;
                 }
 
@@ -3458,6 +3472,11 @@ void ggml_backend_sched_set_prefetch_window(ggml_backend_sched_t sched, bool ena
 bool ggml_backend_sched_get_prefetch_window(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->prefetch_window;
+}
+
+void ggml_backend_sched_set_read_in_place(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->read_in_place = enabled;
 }
 
 int ggml_backend_sched_get_prefetch_lookahead(void) {

@@ -80,7 +80,7 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         enum ggml_log_level log_level,
         llama_probe_hook_t probe_hook, void * probe_hook_data,
         uint32_t probe_n_tokens, uint32_t probe_n_outputs, int32_t probe_expert_slice_tokens, bool probe_prefetch_window,
-        llama_model_meta_cache * meta_cache) {
+        llama_model_meta_cache * meta_cache, bool probe_read_in_place) {
     probe_log_scope probe_log(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -94,7 +94,8 @@ std::vector<llama_device_memory_data> llama_get_device_memory_data(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context_probe_reserve probe_reserve = { probe_n_tokens, probe_n_outputs, probe_expert_slice_tokens, probe_prefetch_window };
+    llama_context_probe_reserve probe_reserve = { probe_n_tokens, probe_n_outputs, probe_expert_slice_tokens, probe_prefetch_window,
+        probe_read_in_place };
     llama_context * ctx = llama_init_from_model_internal(model, *cparams, probe_reserve);
     if (ctx == nullptr) {
         llama_model_free(model);

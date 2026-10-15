@@ -42,10 +42,11 @@ static std::vector<llama_device_memory_data> llama_get_device_memory_data_safe(
         uint32_t probe_n_outputs = 0,
         int32_t  probe_expert_slice_tokens = -1,
         bool     probe_prefetch_window = false,
-        llama_model_meta_cache * meta_cache = nullptr) {
+        llama_model_meta_cache * meta_cache = nullptr,
+        bool     probe_read_in_place = false) {
     return llama_get_device_memory_data(path_model, mparams, cparams, devs,
         hp_ngl, hp_n_ctx_train, hp_n_expert, hp_n_embd_r, log_level, probe_hook, probe_hook_data,
-        probe_n_tokens, probe_n_outputs, probe_expert_slice_tokens, probe_prefetch_window, meta_cache);
+        probe_n_tokens, probe_n_outputs, probe_expert_slice_tokens, probe_prefetch_window, meta_cache, probe_read_in_place);
 }
 
 
@@ -104,6 +105,7 @@ static void pshard_plan_generate_overrides(
         if (patterns_layer_attn[il].empty()) { patterns_layer_attn[il] = "blk\\." + std::to_string(il) + "\\.attn_(q|k|v|output|q_norm|k_norm).*"; }
         if (patterns_layer_ffn[il].empty())  { patterns_layer_ffn[il]  = "blk\\." + std::to_string(il) + "\\.ffn_((up|gate|down)\\.|(up|down|gate|gate_up)_(ch|)exps).*"; }
         if (patterns_layer_router[il].empty()) { patterns_layer_router[il] = "blk\\." + std::to_string(il) + "\\.(ffn_gate_inp|ffn_exp_probs_b).*"; }
+        if (patterns_layer_moe_exps[il].empty()) { patterns_layer_moe_exps[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate|gate_up)_exps\\..*"; }
 
         if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
             // MTP head layers: the draft context (a stock sched, no pool) reads them
@@ -119,9 +121,6 @@ static void pshard_plan_generate_overrides(
             // never arena-packed as bid-0 weights, never shard-slot-streamed);
             // everything else pins, which also covers the routers (ids_cross is
             // structural for the pool)
-            if (patterns_layer_moe_exps[il].empty()) {
-                patterns_layer_moe_exps[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate|gate_up)_exps\\..*";
-            }
             // shard bid: the expert MUL_MAT_IDs anchor on a redirected split (so the
             // router's ids exist before the pool's consume-time service runs) and the
             // host tensors stay out of the arena; the pool intercepts every upload path
@@ -196,6 +195,15 @@ static void pshard_plan_generate_overrides(
                     } else {
                         emit(patterns_layer[il].c_str(), host_buft, lane);
                     }
+                    break;
+                }
+
+                case LLAMA_PSHARD_GPUONLY_ATTNPRIO_FFNINPLACE: {
+                    // the routed experts stay in host memory, read in place by the split of their lane; the rest of the
+                    // layer is pinned for the first n_attn_pinned layers and streamed for the others
+                    const bool attn_gpu = il < n_attn_pinned;
+                    emit(patterns_layer_moe_exps[il].c_str(), host_buft, shard_bid);
+                    emit(patterns_layer[il].c_str(), attn_gpu ? gpu_buft : host_buft, attn_gpu ? layout.compute : shard_bid);
                     break;
                 }
 
@@ -643,7 +651,8 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
         llama_probe_hook_t              probe_hook = nullptr,
         void                          * probe_hook_data = nullptr,
         uint8_t                         overlap = 1,
-        int32_t                         expert_slice_tokens = -1) {
+        int32_t                         expert_slice_tokens = -1,
+        bool                            read_in_place = false) {
     std::vector<llama_device> devs;
     uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0, hp_n_embd_r = 0;
 
@@ -672,7 +681,7 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_memory(
         ctx.path_model, &mparams_probe_clean, &cparams_probe, devs,
         hp_ngl, hp_n_ctx_train, hp_n_expert, hp_n_embd_r,
         log_level, probe_hook, probe_hook_data,
-        probe_n_tokens, probe_n_outputs, expert_slice_tokens, overlap == 2, ctx.meta_cache);
+        probe_n_tokens, probe_n_outputs, expert_slice_tokens, overlap == 2, ctx.meta_cache, read_in_place);
 }
 
 // the final measurement of a candidate placement: device memory, price, slice crossover and piece curve. The probe
@@ -692,14 +701,15 @@ static std::vector<llama_device_memory_data> llama_pshard_probe_final(
     auto * hook     = ctx.predictor ? pshard_tps_probe_hook : nullptr;
     auto * hookdata = ctx.predictor ? (void *) &tps_data     : nullptr;
     plan.expert_slice_tokens = -1;
-    auto d = llama_pshard_probe_memory(ctx, mparams, cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, overlap);
+    const bool in_place = llama_pshard_strategy_reads_in_place(plan.strategy);
+    auto d = llama_pshard_probe_memory(ctx, mparams, cparams, GGML_LOG_LEVEL_ERROR, hook, hookdata, overlap, -1, in_place);
 
     const uint64_t n_seqs = std::max<uint32_t>(1, cparams.n_seq_max);
     const uint64_t rows   = ((uint64_t) cparams.n_batch + n_seqs - 1) / n_seqs * n_seqs;
     if (plan.expert_slice_tokens >= 0 &&
             (rows * 2 < ctx.n_expert) != (rows < (uint64_t) plan.expert_slice_tokens)) {
         d = llama_pshard_probe_memory(ctx, mparams, cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, overlap,
-            plan.expert_slice_tokens);
+            plan.expert_slice_tokens, in_place);
     }
     return d;
 }
@@ -967,6 +977,11 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
     plan.ids_cross  = (strategy == LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE) &&
                       pshard_hybrid_ids_cross_wins(ctx);
     const bool ids_cross = plan.ids_cross;
+    // GPUONLY_ATTNPRIO_FFNINPLACE pins no whole layer: a pinned expert saves its in-place read but is uploaded at every
+    // switch into the tier
+    if (llama_pshard_strategy_reads_in_place(strategy)) {
+        hi_full_hint = 0;
+    }
 
     // HYBRID_ATTNPRIO_FFNBALANCE: per pass the CPU computes its FFNs and the GPU computes the others after their
     // copies. A copy hides only when it can start early (a streamed attention layer, a whole expert copy; a sliced one
@@ -1076,7 +1091,8 @@ static llama_pshard_plan llama_pshard_search_attn_pin(
         mp.n_gpu_layers = n_layers + 1;
         mp.tensor_buft_overrides = tensor_buft_overrides;
 
-        const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, overlap);
+        const auto d = llama_pshard_probe_memory(ctx, mp, *cparams, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, overlap, -1,
+            llama_pshard_strategy_reads_in_place(strategy));
         return d[0].mb;
     };
 
@@ -3259,6 +3275,16 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     return plan;
 }
 
+// GPUONLY_ATTNPRIO_FFNINPLACE is searched where the GPU's kernels read pinned host memory faster than its copy engine
+// moves it, the experts load into the device's pinned host buffers (not a file mapping) and a batch of n_batch tokens
+// reads every expert (prompt tiers; a forced search covers every tier)
+static bool pshard_in_place_searched(const llama_pshard_search_ctx & ctx, int force_strategy, uint32_t n_batch) {
+    const bool wide = force_strategy == LLAMA_PSHARD_GPUONLY_ATTNPRIO_FFNINPLACE ||
+                      (ctx.n_expert > 0 && (uint64_t) n_batch * ctx.n_expert_used >= ctx.n_expert);
+    return ctx.is_moe && !llama_pshard_load_maps(ctx.mparams->load_mode) && wide && ctx.predictor != nullptr &&
+           ctx.predictor->stats.host_read_wins();
+}
+
 static llama_pshard_plan llama_pshard_search_tier(
         const llama_pshard_search_ctx & ctx,
         int force_strategy,
@@ -3282,13 +3308,16 @@ static llama_pshard_plan llama_pshard_search_tier(
         if (!pshard_strategy_allowed(force_strategy, s)) continue;
         if (prune.skip[s]) continue;
         llama_pshard_strategy strategy = (llama_pshard_strategy)s;
+        if (llama_pshard_strategy_reads_in_place(strategy) && !pshard_in_place_searched(ctx, force_strategy, ctx.cparams->n_batch)) {
+            continue;
+        }
         llama_pshard_plan plan;
 
         if (strategy == LLAMA_PSHARD_EXPERT_POOL) {
             plan = llama_pshard_search_pool(ctx);
         } else if (strategy == LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE) {
             plan = llama_pshard_search_hybrid(ctx);
-        } else if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS) {
+        } else if (strategy == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS || llama_pshard_strategy_reads_in_place(strategy)) {
             plan = llama_pshard_search_attn_pin(ctx, strategy);
         } else {
             plan = llama_pshard_search_strategy(ctx, strategy);
@@ -3300,6 +3329,7 @@ static llama_pshard_plan llama_pshard_search_tier(
         // HYBRID_ATTNPRIO_FFNBALANCE searches its transport without prefetch already)
         if (!plan.is_viable && strategy != LLAMA_PSHARD_EXPERT_POOL &&
                 strategy != LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE &&
+                !llama_pshard_strategy_reads_in_place(strategy) &&
                 !llama_pshard_strategy_delegates_compute(strategy)) {
             const llama_pshard_plan p2 = llama_pshard_search_strategy(ctx, strategy, UINT32_MAX,
                     0, /*overlap=*/0);
@@ -3342,7 +3372,8 @@ static llama_pshard_plan llama_pshard_search_tier(
         // and would return floor-unchecked "viable" plans) - straight to the fallback.
         // HYBRID_ATTNPRIO_FFNBALANCE searched its transport without prefetch already.
         llama_pshard_plan forced_noovl;
-        if (force_strategy != LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE) {
+        if (force_strategy != LLAMA_PSHARD_EXPERT_POOL && force_strategy != LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE &&
+                !llama_pshard_strategy_reads_in_place((llama_pshard_strategy) force_strategy)) {
             forced_noovl = llama_pshard_search_strategy(ctx, (llama_pshard_strategy)force_strategy,
                     UINT32_MAX, 0, /*overlap=*/false);
         }
@@ -3399,7 +3430,7 @@ static llama_pshard_plan llama_pshard_search_one_tier(
             plan = llama_pshard_search_pool(ctx);
             plan.batch_size = cp_tier.n_batch;
         } else if (strat == LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS ||
-            strat == LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE) {
+            strat == LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE || llama_pshard_strategy_reads_in_place(strat)) {
             plan = strat == LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE
                 ? llama_pshard_search_hybrid(ctx)
                 : llama_pshard_search_attn_pin(ctx, strat);
@@ -4195,11 +4226,15 @@ void llama_params_fit_pshard_plan(
             // STATIC_ATTNPRIO_ALLMODELS) and the larger tiers start first
             std::vector<std::pair<int, size_t>> jobs;
             const int order[] = { LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE, LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS,
-                LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM, LLAMA_PSHARD_EXPERT_POOL };
+                LLAMA_PSHARD_GPUONLY_ATTNPRIO_FFNINPLACE, LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM, LLAMA_PSHARD_EXPERT_POOL };
             static_assert(sizeof(order) / sizeof(order[0]) == LLAMA_PSHARD_COUNT, "every strategy has a place in the job order");
             for (const int s : order) {
                 if (!pshard_strategy_allowed(force_strategy, s)) continue;
                 for (size_t t = n_tiers; t-- > first_probe_tier; ) {
+                    if (llama_pshard_strategy_reads_in_place((llama_pshard_strategy) s) &&
+                            !pshard_in_place_searched(ctx, force_strategy, registry->tier_sizes[t])) {
+                        continue;
+                    }
                     jobs.push_back({ s, t });
                 }
             }

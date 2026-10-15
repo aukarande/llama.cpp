@@ -17,7 +17,7 @@ struct llama_pshard_workload;
 
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 17;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 18;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory
@@ -165,28 +165,46 @@ struct llama_benchmark_stats {
     double pool_split_us      = 0.0;    // a CPU route's handoff: activation download, host graph, partial upload, join
     double copy_setup_us      = 0.0;    // what each separate copy of a back-to-back upload adds beyond its bytes (0 = not in
                                         // the profile: copies priced by their bytes alone)
+    // one transfer ordered behind a kernel, by a copy kernel (the GPU reads pinned host memory) and by the copy engine,
+    // GB/s at copy_bw_mb sizes; 0 = not in the profile
+    static constexpr int    n_copy_bw = 9;
+    static constexpr double copy_bw_mb[n_copy_bw] = { 1, 2, 4, 8, 16, 32, 64, 128, 256 };
+    double kernel_copy_bw[n_copy_bw] = {};
+    double engine_copy_bw[n_copy_bw] = {};
 
-    // log-linear interpolation of a 4-point chunk-size curve (bandwidth ramps with transfer size);
+    // log-linear interpolation of a chunk-size curve over n sizes (bandwidth ramps with transfer size);
     // 0 when the curve is not in the profile
-    static double interp_curve(const double curve[n_sliced_bw], double chunk_bytes) {
+    static double interp_curve(const double * sizes_mb, const double * curve, int n, double chunk_bytes) {
         if (curve[0] <= 0.0) {
             return 0.0;
         }
         const double mb = chunk_bytes / (1024.0 * 1024.0);
-        if (mb <= sliced_bw_chunk_mb[0]) {
+        if (mb <= sizes_mb[0]) {
             return curve[0];
         }
-        for (int i = 1; i < n_sliced_bw; i++) {
+        for (int i = 1; i < n; i++) {
             if (curve[i] <= 0.0) {
                 return curve[i - 1];
             }
-            if (mb <= sliced_bw_chunk_mb[i]) {
-                const double t = (std::log(mb) - std::log(sliced_bw_chunk_mb[i - 1])) /
-                                 (std::log(sliced_bw_chunk_mb[i]) - std::log(sliced_bw_chunk_mb[i - 1]));
+            if (mb <= sizes_mb[i]) {
+                const double t = (std::log(mb) - std::log(sizes_mb[i - 1])) /
+                                 (std::log(sizes_mb[i]) - std::log(sizes_mb[i - 1]));
                 return curve[i - 1] + t * (curve[i] - curve[i - 1]);
             }
         }
-        return curve[n_sliced_bw - 1];
+        return curve[n - 1];
+    }
+    static double interp_curve(const double curve[n_sliced_bw], double chunk_bytes) {
+        return interp_curve(sliced_bw_chunk_mb, curve, n_sliced_bw, chunk_bytes);
+    }
+
+    // GB/s at which the GPU's kernels read `bytes` of pinned host memory in place; 0 = not in the profile
+    double host_read_bw(double bytes) const {
+        return interp_curve(copy_bw_mb, kernel_copy_bw, n_copy_bw, bytes);
+    }
+    // the GPU's kernels read pinned host memory faster than its copy engine moves it (largest size measured)
+    bool host_read_wins() const {
+        return kernel_copy_bw[n_copy_bw - 1] > engine_copy_bw[n_copy_bw - 1] && engine_copy_bw[n_copy_bw - 1] > 0.0;
     }
 
     // interpolated gathered-upload BW for a chunk size on the copy engine; falls back to the concurrent

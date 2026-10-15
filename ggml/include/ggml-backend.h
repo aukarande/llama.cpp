@@ -380,6 +380,9 @@ extern "C" {
     // is allocated after the previous streamed split's copies were freed and one streamed shard is live at a time
     GGML_API void                 ggml_backend_sched_set_prefetch_window(ggml_backend_sched_t sched, bool enabled);
     GGML_API bool                 ggml_backend_sched_get_prefetch_window(ggml_backend_sched_t sched);
+    // a device split reads the MUL_MAT_ID expert stacks in the device's pinned host buffers in place instead of copying
+    // them (the copy rule of host weights under compute redirects); default off
+    GGML_API void                 ggml_backend_sched_set_read_in_place(ggml_backend_sched_t sched, bool enabled);
     // splits after a trigger the prefetch scan looks at, and whether expert-pool copy overrides decide the prefetch
     GGML_API int                  ggml_backend_sched_get_prefetch_lookahead(void);
     GGML_API bool                 ggml_backend_sched_has_copy_overrides(ggml_backend_sched_t sched);
