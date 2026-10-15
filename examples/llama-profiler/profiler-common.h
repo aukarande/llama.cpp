@@ -67,7 +67,12 @@ struct bench_result {
 
 struct matmul_size { int32_t N; int32_t K; };
 struct moe_config  { int32_t N; int32_t K; int32_t n_experts; int32_t n_experts_used; };
-struct attn_config { const char * name; int32_t n_q_heads; int32_t n_kv_heads; int32_t head_dim; };
+struct attn_config {
+    const char * name; int32_t n_q_heads; int32_t n_kv_heads; int32_t head_dim;   // head_dim: the K head size
+    int32_t head_dim_v = 0;       // V head size, 0 = head_dim
+    bool    v_in_k     = false;   // V reads K's rows: K's first head_dim_v columns (MLA) or K itself
+    bool    masked     = false;   // pass a mask as the runtime does (some kernels need it for their fast path)
+};
 
 inline std::vector<matmul_size> get_matmul_sizes(bool fast) {
     if (fast) {

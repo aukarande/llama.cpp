@@ -17,7 +17,7 @@ struct llama_pshard_workload;
 
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 18;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 19;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory
@@ -294,8 +294,8 @@ struct llama_benchmark_predictor {
             timing_cache_t * timing_cache = nullptr, double token_scale = 1.0) const;
 
     // Nearest-neighbor search with weighted scoring (batch > dims > quant).
-    // For FLASH_ATTN queries, pass op_name="FLASH_ATTN" -- matches all FLASH_ATTN_* entries -- and the op's
-    // arithmetic intensity: the queries each KV head serves set it, not the KV head count.
+    // For FLASH_ATTN queries, pass op_name="FLASH_ATTN" and K = the K head size: only rows of the nearest profiled head size compete.
+    // Pass the op's arithmetic intensity too: the queries each KV head serves set it, not the KV head count.
     static const llama_benchmark_entry * find_nearest(
             const std::vector<llama_benchmark_entry> & entries,
             const char * op_name, const char * quant,

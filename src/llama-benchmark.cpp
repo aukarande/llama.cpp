@@ -145,14 +145,20 @@ llama_op_metrics llama_op_metrics_compute(const ggml_tensor * node, double token
             break;
         }
         case GGML_OP_FLASH_ATTN_EXT: {
-            m.head_dim  = node->ne[0];
+            const ggml_tensor * k = node->src[1];
+            const ggml_tensor * v = node->src[2];
+            m.head_dim  = k->ne[0];   // the K head size: profile rows are matched on it
             m.n_q_heads = node->ne[1];
             m.n_tokens  = tokens(node->ne[2]);
-            m.ctx_len   = node->src[1]->ne[1];
-            m.n_kv_heads = node->src[1]->ne[2];
-            m.ops  = 2.0 * m.n_tokens * m.head_dim * m.ctx_len * m.n_q_heads * 2.0;
-            m.bytes = act(node->src[0]) + ggml_nbytes(node->src[1])
-                    + ggml_nbytes(node->src[2]) + act(node);
+            m.ctx_len   = k->ne[1];
+            m.n_kv_heads = k->ne[2];
+            // QK^T over the K head size, then the V product over the V head size (the output's)
+            m.ops  = 2.0 * m.n_tokens * m.ctx_len * m.n_q_heads * (double) (k->ne[0] + node->ne[0]);
+            // a V that reads K's own rows (MLA: K's first columns; V = K) adds no bytes
+            const ggml_tensor * kb = k->view_src ? k->view_src : k;
+            const ggml_tensor * vb = v->view_src ? v->view_src : v;
+            const bool v_in_k = kb == vb && (k->view_src ? k->view_offs : 0) == (v->view_src ? v->view_offs : 0) && k->nb[1] == v->nb[1];
+            m.bytes = act(node->src[0]) + ggml_nbytes(k) + (v_in_k ? 0.0 : (double) ggml_nbytes(v)) + act(node);
             break;
         }
         case GGML_OP_ROPE:
@@ -754,7 +760,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                     match = find_nearest(entries, "MUL_MAT_ID", m.quant_type, m.N, m.K, 0, 0, 0.0, batch_size);
                     break;
                 case GGML_OP_FLASH_ATTN_EXT:
-                    match = find_nearest(entries, "FLASH_ATTN", nullptr, 0, 0, m.ctx_len, 0,
+                    match = find_nearest(entries, "FLASH_ATTN", nullptr, 0, m.head_dim, m.ctx_len, 0,
                         m.bytes > 0.0 ? m.ops / m.bytes : 0.0, batch_size);
                     break;
                 default:
@@ -929,9 +935,24 @@ const llama_benchmark_entry * llama_benchmark_predictor::find_nearest(
     const bool matmul_query = (strcmp(op_name, "MUL_MAT") == 0
                             || strcmp(op_name, "MUL_MAT_ID") == 0);
 
+    // attention: K is the head size, which picks the kernel; only rows of the nearest profiled head size compete
+    int64_t attn_head_dim = 0;
+    if (attn_query && K > 0) {
+        double best_hd = 1e20;
+        for (const auto & b : entries) {
+            if (b.op_name.compare(0, 10, "FLASH_ATTN") != 0 || b.head_dim <= 0) continue;
+            const double d = std::abs((double) b.head_dim - (double) K) / (double) K;
+            if (d < best_hd) {
+                best_hd = d;
+                attn_head_dim = b.head_dim;
+            }
+        }
+    }
+
     for (const auto & b : entries) {
         if (attn_query) {
             if (b.op_name.compare(0, 10, "FLASH_ATTN") != 0) continue;
+            if (attn_head_dim > 0 && b.head_dim != attn_head_dim) continue;
         } else {
             if (b.op_name != op_name) continue;
         }

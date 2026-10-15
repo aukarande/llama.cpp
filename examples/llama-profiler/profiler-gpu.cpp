@@ -141,18 +141,26 @@ static double benchmark_mul_mat_id_raw(
 
 static double benchmark_flash_attn_raw(
         ggml_backend_t be, int n_tokens, int ctx_len,
-        int n_q_heads, int n_kv_heads, int head_dim, ggml_type kv_quant,
+        const attn_config & cfg, ggml_type kv_quant,
         double * out_time_s, double * out_ops, double * out_bytes) {
 
     ggml_init_params params = { 8192ULL * 1024 * 1024, NULL, true };
     ggml_context * ctx = ggml_init(params);
 
+    const int n_q_heads  = cfg.n_q_heads;
+    const int n_kv_heads = cfg.n_kv_heads;
+    const int head_dim   = cfg.head_dim;
+    const int head_dim_v = cfg.head_dim_v > 0 ? cfg.head_dim_v : cfg.head_dim;
+
     ggml_tensor * Q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_tokens, n_q_heads, 1);
     ggml_tensor * K = ggml_new_tensor_4d(ctx, kv_quant, head_dim, ctx_len, n_kv_heads, 1);
-    ggml_tensor * V = ggml_new_tensor_4d(ctx, kv_quant, head_dim, ctx_len, n_kv_heads, 1);
+    ggml_tensor * V = cfg.v_in_k
+        ? ggml_view_4d(ctx, K, head_dim_v, ctx_len, n_kv_heads, 1, K->nb[1], K->nb[2], K->nb[3], 0)
+        : ggml_new_tensor_4d(ctx, kv_quant, head_dim_v, ctx_len, n_kv_heads, 1);
+    ggml_tensor * mask = cfg.masked ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, ctx_len, n_tokens, 1, 1) : nullptr;
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_tensor * out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, Q, K, V, mask, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
     ggml_build_forward_expand(gf, out);
 
     if ((int64_t)head_dim * n_tokens * n_q_heads > INT_MAX) {
@@ -160,9 +168,11 @@ static double benchmark_flash_attn_raw(
         ggml_free(ctx); return 0.0;
     }
 
+    // a V inside K reads no bytes of its own
+    const size_t v_bytes = cfg.v_in_k ? 0 : ggml_nbytes(V);
     size_t gpu_free = 0, gpu_total = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(be), &gpu_free, &gpu_total);
-    size_t need = ggml_nbytes(Q) + ggml_nbytes(K) + ggml_nbytes(V) + ggml_nbytes(out);
+    size_t need = ggml_nbytes(Q) + ggml_nbytes(K) + v_bytes + ggml_nbytes(out) + (mask ? ggml_nbytes(mask) : 0);
     if (need > gpu_free * 0.9) {
         printf("SKIPPED: FLASH_ATTN (need %.2f GB, free %.2f GB)\n", need / 1e9, gpu_free / 1e9);
         ggml_free(ctx); return 0.0;
@@ -173,17 +183,26 @@ static double benchmark_flash_attn_raw(
 
     std::vector<float> Q_data(ggml_nelements(Q), 1.0f);
     ggml_backend_tensor_set(Q, Q_data.data(), 0, ggml_nbytes(Q));
-    int64_t kv_elems = ggml_nelements(K);
-    std::vector<float> KV_float(kv_elems, 0.5f);
-    if (kv_quant == GGML_TYPE_F32) {
-        ggml_backend_tensor_set(K, KV_float.data(), 0, ggml_nbytes(K));
-        ggml_backend_tensor_set(V, KV_float.data(), 0, ggml_nbytes(V));
-    } else {
-        std::vector<uint8_t> Kq(ggml_nbytes(K)), Vq(ggml_nbytes(V));
-        ggml_quantize_chunk(kv_quant, KV_float.data(), Kq.data(), 0, kv_elems / ggml_blck_size(kv_quant), 1, nullptr);
-        ggml_quantize_chunk(kv_quant, KV_float.data(), Vq.data(), 0, kv_elems / ggml_blck_size(kv_quant), 1, nullptr);
-        ggml_backend_tensor_set(K, Kq.data(), 0, ggml_nbytes(K));
-        ggml_backend_tensor_set(V, Vq.data(), 0, ggml_nbytes(V));
+    // K and V are filled the same way, each with its own element count
+    auto fill_kv = [&](ggml_tensor * t) {
+        const int64_t n = ggml_nelements(t);
+        std::vector<float> f(n, 0.5f);
+        if (kv_quant == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+        } else {
+            std::vector<uint8_t> q(ggml_nbytes(t));
+            ggml_quantize_chunk(kv_quant, f.data(), q.data(), 0, n / ggml_blck_size(kv_quant), 1, nullptr);
+            ggml_backend_tensor_set(t, q.data(), 0, ggml_nbytes(t));
+        }
+    };
+    fill_kv(K);
+    if (!cfg.v_in_k) {
+        fill_kv(V);
+    }
+    if (mask) {
+        // all zero: every position attends, the dense work the runtime's masks leave
+        std::vector<uint8_t> z(ggml_nbytes(mask), 0);
+        ggml_backend_tensor_set(mask, z.data(), 0, z.size());
     }
 
     for (int i = 0; i < GPU_WARMUP_ITERS; ++i) ggml_backend_graph_compute(be, gf);
@@ -195,8 +214,9 @@ static double benchmark_flash_attn_raw(
     double total_time = t.stop();
 
     double time_per_iter = total_time / GPU_TIMED_ITERS;
-    double ops_total = 2.0 * n_tokens * head_dim * ctx_len * n_q_heads * 2;
-    double bytes_total = (double)(ggml_nbytes(Q) + ggml_nbytes(K) + ggml_nbytes(V) + ggml_nbytes(out));
+    // QK^T over the K head size, then the V product over the V head size
+    double ops_total = 2.0 * n_tokens * ctx_len * n_q_heads * (double)(head_dim + head_dim_v);
+    double bytes_total = (double)(ggml_nbytes(Q) + ggml_nbytes(K) + v_bytes + ggml_nbytes(out));
 
     if (out_time_s) *out_time_s = time_per_iter;
     if (out_ops)    *out_ops = ops_total;
@@ -288,13 +308,22 @@ static void run_attention_benchmarks(
         int32_t filter_batch, bool fast,
         std::vector<bench_result> & results) {
 
+    // shared-KV heads (MLA: V = the first 512 columns of a 576 K; V = K at 512), masked as the runtime calls them.
+    // They get every context length and their own token list (decode, MTP verify, prompt).
+    static const attn_config shared_kv[] = {
+        { "MLA",     64, 1, 576, 512, true, true },
+        { "KVS-512", 64, 1, 512, 512, true, true },
+    };
+    static const std::vector<int32_t> shared_kv_tokens = { 1, 4, 16, 64, 512, 2048 };
     auto configs  = get_attn_configs(fast);
-    auto ctx_lens = get_attn_ctx_lens(fast);
+    configs.insert(configs.end(), std::begin(shared_kv), std::end(shared_kv));
 
     printf("=== FLASH_ATTN Operations ===\n\n");
     for (const auto & cfg : configs) {
+        const bool shared = cfg.v_in_k;
+        const auto ctx_lens = get_attn_ctx_lens(fast && !shared);
         printf("--- %s (n_q=%d, n_kv=%d, head_dim=%d) ---\n", cfg.name, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim);
-        for (int32_t n_tok : batch_sizes) {
+        for (int32_t n_tok : shared ? shared_kv_tokens : batch_sizes) {
             if (filter_batch >= 0 && n_tok != filter_batch) continue;
             printf("  [n_tokens=%d]\n", n_tok);
             for (int32_t cl : ctx_lens) {
@@ -302,7 +331,7 @@ static void run_attention_benchmarks(
                 res.op_name = std::string("FLASH_ATTN_") + cfg.name;
                 res.quant_type = ggml_type_name(GGML_TYPE_F16);
                 res.n_tokens = n_tok; res.ctx_len = cl; res.n_heads = cfg.n_kv_heads; res.head_dim = cfg.head_dim;
-                benchmark_flash_attn_raw(be, n_tok, cl, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, GGML_TYPE_F16,
+                benchmark_flash_attn_raw(be, n_tok, cl, cfg, GGML_TYPE_F16,
                     &res.time_s, &res.ops, &res.bytes);
                 res.calculate_derived();
                 printf("%-20s quant=%-6s AI=%.3f BW=%.2f GB/s Perf=%.2f GFLOP/s",
