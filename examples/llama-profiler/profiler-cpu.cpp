@@ -1,4 +1,8 @@
 #define CPU_WARMUP_ITERS  2
+// warm-up lasts at least CPU_WARMUP_MIN_S: cores that idled while the operands were built run at a
+// low clock until the frequency governor raises it again, and passes timed inside that ramp price a
+// short op several times too slow
+#define CPU_WARMUP_MIN_S  0.100
 // timed passes: at least CPU_TIMED_ITERS, more until the timed work spans CPU_TIMED_MIN_S
 // or CPU_TIMED_ITERS_MAX passes, so a sub-millisecond op is averaged over dozens of samples;
 // under the PCIe stress loop the pass cap is lifted so the window holds whole stress transfers
@@ -67,11 +71,14 @@ static int bench_n_copies(size_t bytes_per_pass) {
 static std::atomic<uint32_t> * g_stress_window = nullptr;
 
 // prepare(pass) points a pass at operands no recent pass has read (a weight copy, a KV
-// block, an expert set) and returns the graph to run; the first CPU_WARMUP_ITERS passes are
-// not timed, a small op then repeats until its samples span the minimum duration
+// block, an expert set) and returns the graph to run; the warm-up passes (CPU_WARMUP_ITERS, and
+// CPU_WARMUP_MIN_S at least) are not timed, a small op then repeats until its samples span the
+// minimum duration
 static double time_op(ggml_backend_t be, const std::function<ggml_cgraph *(int)> & prepare) {
     int pass = 0;
-    for (; pass < CPU_WARMUP_ITERS; pass++) {
+    bench_timer warm;
+    warm.start();
+    for (; pass < CPU_WARMUP_ITERS || warm.stop() < CPU_WARMUP_MIN_S; pass++) {
         ggml_backend_graph_compute_async(be, prepare(pass));
     }
     std::atomic<uint32_t> * win = g_stress_window;
@@ -106,31 +113,52 @@ static double benchmark_cpu_dram_bandwidth(int threads) {
 
     std::vector<std::thread> workers;
     std::vector<double> thread_bytes(threads, 0.0);
-
-    bench_timer t;
-    t.start();
+    // every reader warms up on its chunk (see CPU_WARMUP_MIN_S), then all start together
+    std::atomic<int>  n_ready{0};
+    std::atomic<bool> go{false};
 
     for (int tid = 0; tid < threads; ++tid) {
-        workers.emplace_back([&pool, &thread_bytes, tid, chunk_per_thread, iterations, pool_bytes]() {
+        workers.emplace_back([&pool, &thread_bytes, &n_ready, &go, tid, chunk_per_thread, iterations, pool_bytes]() {
             const size_t start = tid * chunk_per_thread;
             const size_t end_pos = (tid == (int)(pool_bytes / chunk_per_thread) - 1) ? pool_bytes : (start + chunk_per_thread);
-            // four independent sums over every word: a streaming read, not one dependent
-            // load per line that waits on the previous one
-            uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-            double local_bytes = 0.0;
-            for (int iter = 0; iter < iterations; ++iter) {
+            uint64_t sum = 0;
+            auto read_chunk = [&]() {
                 const uint64_t * p   = (const uint64_t *) (pool.data() + start);
                 const uint64_t * end = (const uint64_t *) (pool.data() + (end_pos & ~(size_t) 31));
+                // four independent sums over every word: a streaming read, not one dependent
+                // load per line that waits on the previous one
+                uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
                 for (; p + 4 <= end; p += 4) {
                     s0 += p[0]; s1 += p[1]; s2 += p[2]; s3 += p[3];
                 }
-                local_bytes += (double) ((const uint8_t *) end - (pool.data() + start));
+                sum += s0 + s1 + s2 + s3;
+                return (double) ((const uint8_t *) end - (pool.data() + start));
+            };
+            bench_timer warm;
+            warm.start();
+            do {
+                read_chunk();
+            } while (warm.stop() < CPU_WARMUP_MIN_S);
+            n_ready.fetch_add(1);
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
             }
-            volatile uint64_t sink = s0 + s1 + s2 + s3;
+            double local_bytes = 0.0;
+            for (int iter = 0; iter < iterations; ++iter) {
+                local_bytes += read_chunk();
+            }
+            volatile uint64_t sink = sum;
             (void) sink;
             thread_bytes[tid] = local_bytes;
         });
     }
+    while (n_ready.load() < threads) {
+        std::this_thread::yield();
+    }
+
+    bench_timer t;
+    t.start();
+    go.store(true, std::memory_order_release);
     for (auto & w : workers) w.join();
 
     double elapsed = t.stop();
