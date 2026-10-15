@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cstring>
 
 bool llama_memory_pshard::init(
         const std::vector<tensor_spec>             & specs,

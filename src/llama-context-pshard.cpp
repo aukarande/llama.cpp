@@ -263,7 +263,7 @@ void llama_context::pshard_setup_expert_pool() {
             // nothing about whether the pool can exist
             continue;
         }
-        scratch_need = std::max(scratch_need, p->scratch_measured + (64ull << 20));
+        scratch_need = std::max<size_t>(scratch_need, p->scratch_measured + (64ull << 20));
         any   = true;
         slots = slots > 0 ? std::min(slots, p->pool_slots) : p->pool_slots;
     }
