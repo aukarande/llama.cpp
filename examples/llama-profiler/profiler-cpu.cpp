@@ -9,6 +9,10 @@
 #define CPU_TIMED_ITERS      2
 #define CPU_TIMED_ITERS_MAX  32
 #define CPU_TIMED_MIN_S      0.010
+// a timed window more than CPU_TIMED_RETRY_X slower than the warm-up's second half was disturbed (a core
+// taken by another thread for a few ms) and is timed again, up to CPU_TIMED_TRIES windows; the fastest counts
+#define CPU_TIMED_RETRY_X    2.0
+#define CPU_TIMED_TRIES      3
 // cold cache by rotation: consecutive passes read different copies of the operand (or a
 // different expert set) until at least BENCH_COLD_BYTES of traffic (operands read, outputs
 // written) lie between two reads of the same bytes, more than any CPU cache holds; no pass
@@ -52,6 +56,7 @@
 #define NOMINMAX
 #include <windows.h>
 #else
+#include <sched.h>
 #include <unistd.h>
 #include <cstdlib>
 #endif
@@ -72,33 +77,46 @@ static std::atomic<uint32_t> * g_stress_window = nullptr;
 
 // prepare(pass) points a pass at operands no recent pass has read (a weight copy, a KV
 // block, an expert set) and returns the graph to run; the warm-up passes (CPU_WARMUP_ITERS, and
-// CPU_WARMUP_MIN_S at least) are not timed, a small op then repeats until its samples span the
+// CPU_WARMUP_MIN_S at least) do not count, a small op then repeats until its samples span the
 // minimum duration
+static double median_of(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    return 0.5 * (v[(n - 1) / 2] + v[n / 2]);
+}
+
 static double time_op(ggml_backend_t be, const std::function<ggml_cgraph *(int)> & prepare) {
     int pass = 0;
-    bench_timer warm;
+    bench_timer warm, t;
+    std::vector<double> warm_samples;
     warm.start();
     for (; pass < CPU_WARMUP_ITERS || warm.stop() < CPU_WARMUP_MIN_S; pass++) {
-        ggml_backend_graph_compute_async(be, prepare(pass));
-    }
-    std::atomic<uint32_t> * win = g_stress_window;
-    double total_time = 0.0;
-    std::vector<double> samples;
-    bench_timer t;
-    if (win) win->fetch_add(1);   // open
-    while (samples.size() < CPU_TIMED_ITERS ||
-           (total_time < CPU_TIMED_MIN_S && (win != nullptr || samples.size() < CPU_TIMED_ITERS_MAX))) {
-        ggml_cgraph * gf = prepare(pass++);
+        ggml_cgraph * gf = prepare(pass);
         t.start();
         ggml_backend_graph_compute_async(be, gf);
-        samples.push_back(t.stop());
-        total_time += samples.back();
+        warm_samples.push_back(t.stop());
     }
-    if (win) win->fetch_add(1);   // closed
-    // the median once there are enough samples: one stalled pass must not price a fast op
-    std::sort(samples.begin(), samples.end());
-    const size_t n = samples.size();
-    return n >= 3 ? 0.5 * (samples[(n - 1) / 2] + samples[n / 2]) : total_time / n;
+    const double ref = median_of(std::vector<double>(warm_samples.begin() + warm_samples.size() / 2, warm_samples.end()));
+    std::atomic<uint32_t> * win = g_stress_window;
+    double best = 0.0;
+    for (int tries = 0; tries < CPU_TIMED_TRIES && (tries == 0 || best > CPU_TIMED_RETRY_X * ref); tries++) {
+        double total_time = 0.0;
+        std::vector<double> samples;
+        if (win) win->fetch_add(1);   // open
+        while (samples.size() < CPU_TIMED_ITERS ||
+               (total_time < CPU_TIMED_MIN_S && (win != nullptr || samples.size() < CPU_TIMED_ITERS_MAX))) {
+            ggml_cgraph * gf = prepare(pass++);
+            t.start();
+            ggml_backend_graph_compute_async(be, gf);
+            samples.push_back(t.stop());
+            total_time += samples.back();
+        }
+        if (win) win->fetch_add(1);   // closed
+        // the median once there are enough samples: one stalled pass must not price a fast op
+        const double r = samples.size() >= 3 ? median_of(samples) : total_time / samples.size();
+        best = tries == 0 ? r : std::min(best, r);
+    }
+    return best;
 }
 
 static double benchmark_cpu_dram_bandwidth(int threads) {
@@ -1098,8 +1116,26 @@ static double benchmark_flash_attn_raw(
     return ops_total / time_per_iter / 1e9;
 }
 
+// CPUs this process may run on (its affinity mask, e.g. under numactl)
+static int n_cpus_allowed() {
+#if defined(__linux__)
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        return CPU_COUNT(&set);
+    }
+#elif defined(_WIN32)
+    DWORD_PTR proc = 0, sys = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) {
+        int n = 0;
+        for (; proc; proc &= proc - 1) n++;
+        return n;
+    }
+#endif
+    return (int) std::thread::hardware_concurrency();
+}
+
 static bench_result_cpu run_concurrent(
-        std::function<double(double *, double *, double *)> bench_fn,
+        std::function<double(int, double *, double *, double *)> bench_fn,
         const std::string & op_name, const char * quant_name, int threads,
         pcie_stress_ctx * pcie) {
 
@@ -1109,7 +1145,7 @@ static bench_result_cpu run_concurrent(
     result.threads = threads;
     result.pcie_standalone_bw_gb_s = pcie ? (float)pcie->calibrated_bw_gb_s : 0.0f;
 
-    double standalone = bench_fn(&result.time_s, &result.ops, &result.bytes);
+    double standalone = bench_fn(threads, &result.time_s, &result.ops, &result.bytes);
     result.calculate_derived();
     result.standalone_gflops = result.effective_gflops;
 
@@ -1119,9 +1155,14 @@ static bench_result_cpu run_concurrent(
         std::thread pcie_thread(pcie_stress_loop, pcie);
         while (!pcie->active.load(std::memory_order_acquire)) std::this_thread::yield();
 
+        // the stress loop busy-waits on its copies; when the op has every allowed CPU, one op thread shares a core
+        // with the loop and the op waits on it. The runtime has no such thread: give the loop a core of its own
+        static const int n_allowed = n_cpus_allowed();
+        const int conc_threads = threads > 1 && threads >= n_allowed ? threads - 1 : threads;
+
         // the op's timed passes are the loop's accounting window
         g_stress_window = &pcie->window;
-        result.concurrent_gflops = (float)bench_fn(nullptr, nullptr, nullptr);
+        result.concurrent_gflops = (float)bench_fn(conc_threads, nullptr, nullptr, nullptr);
         g_stress_window = nullptr;
 
         pcie->stop.store(true, std::memory_order_release);
@@ -1156,8 +1197,8 @@ static void run_matmul_benchmarks(
                 if (qt == GGML_TYPE_Q2_K && (sz.K % 256 != 0)) continue;
 
                 auto res = run_concurrent(
-                    [&](double * t, double * o, double * b) {
-                        return benchmark_mul_mat_raw(be, sz.N, sz.K, bs, qt, threads, t, o, b);
+                    [&](int nt, double * t, double * o, double * b) {
+                        return benchmark_mul_mat_raw(be, sz.N, sz.K, bs, qt, nt, t, o, b);
                     }, "MUL_MAT", ggml_type_name(qt), threads, pcie);
                 res.N = sz.N; res.K = sz.K; res.B = bs;
                 res.print(pcie ? pcie->calibrated_bw_gb_s : 0.0);
@@ -1185,8 +1226,8 @@ static void run_moe_benchmarks(
                 if (qt == GGML_TYPE_Q2_K && (cfg.K % 256 != 0)) continue;
 
                 auto res = run_concurrent(
-                    [&](double * t, double * o, double * b) {
-                        return benchmark_mul_mat_id_raw(be, cfg.N, cfg.K, cfg.n_experts, cfg.n_experts_used, bs, qt, threads, t, o, b);
+                    [&](int nt, double * t, double * o, double * b) {
+                        return benchmark_mul_mat_id_raw(be, cfg.N, cfg.K, cfg.n_experts, cfg.n_experts_used, bs, qt, nt, t, o, b);
                     }, "MUL_MAT_ID", ggml_type_name(qt), threads, pcie);
                 res.N = cfg.N; res.K = cfg.K; res.B = bs;
                 res.n_tokens = cfg.n_experts_used; res.ctx_len = cfg.n_experts;
@@ -1213,8 +1254,8 @@ static void run_attention_benchmarks(
             printf("  [n_tokens=%d]\n", n_tok);
             for (int32_t cl : ctx_lens) {
                 auto res = run_concurrent(
-                    [&](double * t, double * o, double * b) {
-                        return benchmark_flash_attn_raw(be, n_tok, cl, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, GGML_TYPE_F16, threads, t, o, b);
+                    [&](int nt, double * t, double * o, double * b) {
+                        return benchmark_flash_attn_raw(be, n_tok, cl, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, GGML_TYPE_F16, nt, t, o, b);
                     }, std::string("FLASH_ATTN_") + cfg.name, ggml_type_name(GGML_TYPE_F16), threads, pcie);
                 res.n_tokens = n_tok; res.ctx_len = cl; res.n_heads = cfg.n_kv_heads; res.head_dim = cfg.head_dim;
                 res.print(pcie ? pcie->calibrated_bw_gb_s : 0.0);
@@ -1259,6 +1300,15 @@ static void save_results_cpu(
 }
 
 int main(int argc, char ** argv) {
+#ifdef __linux__
+    // libgomp workers that wait at a barrier sleep after 300000 spins; under a sampling governor (ondemand) the
+    // sleeping cores drop their clock, the op waits on them and the low clock can hold for the whole timed window.
+    // libgomp reads GOMP_SPINCOUNT only at load: set a longer spin and restart once
+    if (getenv("GOMP_SPINCOUNT") == nullptr && getenv("OMP_WAIT_POLICY") == nullptr) {
+        setenv("GOMP_SPINCOUNT", "3000000", 1);
+        execv("/proc/self/exe", argv);
+    }
+#endif
     int32_t fixed_threads = -1;
     bool    fast_mode     = true;
     bool    calibrate_only = false;
