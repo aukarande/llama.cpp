@@ -1653,6 +1653,10 @@ bool llama_pshard_registry_cache_missed(const struct llama_pshard_plan_registry 
     return registry != nullptr && registry->cache_missed;
 }
 
+uint32_t llama_pshard_registry_probe_budget_mib(const struct llama_pshard_plan_registry * registry) {
+    return registry ? registry->probe_budget_mib : 0;
+}
+
 bool llama_pshard_registry_store_stale(const struct llama_pshard_plan_registry * registry) {
     return registry != nullptr && registry->store_stale;
 }

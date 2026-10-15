@@ -621,6 +621,8 @@ extern "C" {
         struct llama_model_tensor_buft_override * out, size_t n_max);
     // true when llama_params_fit_pshard found no plan for this configuration in the cache
     LLAMA_API bool     llama_pshard_registry_cache_missed(const struct llama_pshard_plan_registry * registry);
+    // the device budget in MiB the last llama_params_fit_pshard probe used (-mva, or free - fit target); 0 = no probe
+    LLAMA_API uint32_t llama_pshard_registry_probe_budget_mib(const struct llama_pshard_plan_registry * registry);
     // true when the loaded plans run, but a run of them got fewer RAM expert store slots than they were priced at: planning
     // again prices them at those
     LLAMA_API bool     llama_pshard_registry_store_stale(const struct llama_pshard_plan_registry * registry);

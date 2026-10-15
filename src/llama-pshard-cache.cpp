@@ -680,6 +680,7 @@ void llama_params_fit_pshard(
     }
 
     registry->budget_mib = pshard_bytes_to_mib_ceil(vram_free);
+    registry->probe_budget_mib = pshard_bytes_to_mib_ceil(probe.vram_budget);
     const uint32_t runtime_n_batch = std::min(n_ctx_plan, cparams->n_batch);
     const uint32_t runtime_cache_ubatch = std::min(runtime_n_batch, cparams->n_ubatch == 0 ? runtime_n_batch : cparams->n_ubatch);
     registry->cache_ubatch = registry->cache_ubatch ? std::min(n_ctx_plan, registry->cache_ubatch) : runtime_cache_ubatch;

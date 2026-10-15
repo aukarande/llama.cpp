@@ -472,6 +472,7 @@ struct llama_pshard_plan_registry {
     std::vector<std::vector<llama_pshard_candidate>> candidates;  // per tier, every strategy the sweep priced
     llama_pshard_plan *                  active_plan = nullptr;
     uint32_t                             budget_mib = 0;
+    uint32_t                             probe_budget_mib = 0;  // the last probe's budget, before the reserve kept outside the arena
     uint32_t                             cache_ubatch = 0;
 
     // switch-cost estimate constants (written by the planner; 0 = not available).

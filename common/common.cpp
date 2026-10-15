@@ -1367,9 +1367,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             // tool's passes), then load against the fresh registry. --pshard-no-plan-on-miss keeps
             // the stock fallback (or the smaller budget's plan).
             LOG_INF("%s: no pshard plan for this configuration, planning it now\n", __func__);
+            // free VRAM shrinks a few MiB while planning (lazily loaded GPU code): without -mva / -fitb, plan and
+            // reload at the budget this probe saw, or the reload finds only a larger budget's plan and runs stock
+            const size_t probed_mib = mva_eff == 0 ? llama_pshard_registry_probe_budget_mib(mparams.pshard_registry) : 0;
             llama_pshard_registry_free(mparams.pshard_registry);
             mparams.pshard_registry = nullptr;
             common_params plan_params = params;
+            if (probed_mib > 0) {
+                mva_eff = probed_mib;   // the probe's budget already excludes the draft reserve; the planner subtracts it again
+                plan_params.max_vram_alloc = probed_mib + common_pshard_draft_reserve_mb(params, n_ctx_res);
+                LOG_INF("%s: planning and loading at the probed budget %zu MiB\n", __func__, probed_mib);
+            }
             const bool planned = common_pshard_plan(plan_params, n_ctx_res);
             // load again against whatever the planner wrote (a pshard plan, or a baseline-fits
             // variant); a refusal wrote nothing and the second probe takes the stock fallback
