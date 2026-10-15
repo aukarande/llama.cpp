@@ -1706,6 +1706,37 @@ size_t llama_pshard_registry_tier_overrides(const struct llama_pshard_plan_regis
     return n;
 }
 
+// one registry line without its line break, of any length (the ot= line of a deep model passes 8 KiB)
+static bool pshard_registry_read_line(FILE * f, std::string & s) {
+    s.clear();
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), f)) {
+        s += buf;
+        if (!s.empty() && s.back() == '\n') {
+            break;
+        }
+    }
+    if (s.empty()) {
+        return false;
+    }
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    return true;
+}
+
+// an ot= line cut short (older builds read lines in 8191-character pieces) ends inside its last pattern=buft:backend_id entry
+static bool pshard_registry_ot_cut(const std::string & ot) {
+    const std::string last  = ot.substr(ot.rfind(',') + 1);
+    const size_t      eq    = last.find('=');
+    const size_t      colon = last.rfind(':');
+    if (eq == std::string::npos || colon == std::string::npos || colon < eq) {
+        return true;
+    }
+    const char * bid = last.c_str() + colon + 1;
+    char       * end = nullptr;
+    strtol(bid, &end, 10);
+    return end == bid || *end != '\0';
+}
+
 bool pshard_registry_save(
         const llama_pshard_plan_registry * registry, uint64_t fingerprint,
         const char * cache_path, ggml_backend_buffer_type_t host_buft,
@@ -1720,11 +1751,9 @@ bool pshard_registry_save(
 
     FILE * existing = fopen(cache_path, "r");
     if (existing) {
-        char line[8192];
+        std::string s;
         cache_section * cur = nullptr;
-        while (fgets(line, sizeof(line), existing)) {
-            std::string s = line;
-            while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        while (pshard_registry_read_line(existing, s)) {
             if (s.compare(0, 13, "[fingerprint=") == 0) {
                 sections.push_back({s, {}});
                 cur = &sections.back();
@@ -1935,7 +1964,7 @@ bool pshard_registry_load(
     FILE * f = fopen(cache_path, "r");
     if (!f) return false;
 
-    char line[8192];
+    std::string s;
     bool in_section = false;
 
     char fp_header[64];
@@ -1991,6 +2020,7 @@ bool pshard_registry_load(
         uint32_t store_slots   = 0;
         uint32_t store_experts = 0;
         float    ssd_expert_ms = 0.0f;
+        bool     ot_cut        = false;
         std::vector<tier_data> tiers;
     };
     std::vector<variant_data> variants;
@@ -1999,10 +2029,7 @@ bool pshard_registry_load(
     const uint64_t current_machine_hash = llama_benchmark_stats::machine_hash(
         llama_benchmark_stats::machine_current(pshard_gpu_dev(), 0));
 
-    while (fgets(line, sizeof(line), f)) {
-        std::string s = line;
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-
+    while (pshard_registry_read_line(f, s)) {
         if (s.compare(0, 13, "[fingerprint=") == 0) {
             if (in_section) break; // hit next section, stop
             in_section = (s == fp_header);
@@ -2164,6 +2191,7 @@ bool pshard_registry_load(
             }
         } else if (s.compare(0, 3, "ot=") == 0 && !cur_variant->tiers.empty()) {
             cur_variant->tiers.back().ot_line = s.substr(3);
+            cur_variant->ot_cut = cur_variant->ot_cut || (s.size() > 3 && pshard_registry_ot_cut(s.substr(3)));
         } else if (s.compare(0, 5, "cand ") == 0 && !cur_variant->tiers.empty()) {
             llama_pshard_candidate c;
             char strat_name[64] = {};
@@ -2300,6 +2328,10 @@ bool pshard_registry_load(
         if (variant.machine_hash != 0 && variant.machine_hash != current_machine_hash) {
             LLAMA_LOG_WARN("%s: registry variant budget=%u was planned on another machine (%016llx, this machine %016llx) - ignored; re-plan here\n",
                 __func__, variant.budget_mib, (unsigned long long) variant.machine_hash, (unsigned long long) current_machine_hash);
+            continue;
+        }
+        if (variant.ot_cut) {
+            LLAMA_LOG_WARN("%s: registry variant budget=%u has a cut override line - ignored; re-plan here\n", __func__, variant.budget_mib);
             continue;
         }
         if (!cache_ubatch_ok(variant)) continue;
