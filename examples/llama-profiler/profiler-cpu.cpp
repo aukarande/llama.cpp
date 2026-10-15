@@ -38,6 +38,7 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -346,28 +347,44 @@ struct kernel_copy_scope {
 
 // concurrent host DRAM load (decode runs the CPU expert chain while the pool uploads): threads-1 readers
 struct dram_stress {
+    static const size_t BLOCK  = 64 * 1024;   // a reader counts its bytes once per block
+    static const size_t STRIDE = 8;           // counter slots per reader: one cache line each
     std::atomic<bool>        stop{false};
     std::vector<std::thread> workers;
     std::vector<uint8_t>     pool;
+    std::unique_ptr<std::atomic<uint64_t>[]> read;
+    int n = 0;
     void start(int threads) {
         const size_t pool_bytes = 512ULL * 1024 * 1024;
         pool.resize(pool_bytes);
         for (size_t i = 0; i < pool.size(); i += 4096) pool[i] = (uint8_t)(i & 0xFF);
-        const int n = std::max(1, threads - 1);   // one core stays with the enqueue thread
+        n = std::max(1, threads - 1);   // one core stays with the enqueue thread
+        read.reset(new std::atomic<uint64_t>[n * STRIDE]);
+        for (int i = 0; i < n; ++i) read[i * STRIDE].store(0);
         for (int tid = 0; tid < n; ++tid) {
-            workers.emplace_back([this, tid, n, pool_bytes]() {
+            workers.emplace_back([this, tid, pool_bytes]() {
                 const size_t chunk = pool_bytes / n;
                 const size_t start = tid * chunk;
                 const size_t limit = start + chunk - sizeof(uint64_t);
+                std::atomic<uint64_t> & bytes = read[tid * STRIDE];
                 volatile uint64_t sink = 0;
                 while (!stop.load(std::memory_order_acquire)) {
-                    for (size_t off = start; off + 64 <= limit; off += 64) {
-                        sink += *(const uint64_t *)(pool.data() + off);
+                    for (size_t blk = start; blk + BLOCK <= limit; blk += BLOCK) {
+                        for (size_t off = blk; off < blk + BLOCK; off += 64) {
+                            sink += *(const uint64_t *)(pool.data() + off);
+                        }
+                        bytes.fetch_add(BLOCK, std::memory_order_relaxed);
                     }
                 }
                 (void)sink;
             });
         }
+    }
+    // bytes the readers have read so far (whole cache lines)
+    uint64_t bytes_read() const {
+        uint64_t sum = 0;
+        for (int i = 0; i < n; ++i) sum += read[i * STRIDE].load(std::memory_order_relaxed);
+        return sum;
     }
     void finish() {
         stop.store(true, std::memory_order_release);
@@ -385,6 +402,8 @@ struct calib_results {
     double sliced_kernel_bw[4] = { 0.0, 0.0, 0.0, 0.0 };    // gathered uploads, one copy kernel per chunk
     double segs_kernel_bw[4]   = { 0.0, 0.0, 0.0, 0.0 };    // gathered uploads, one segment-batch launch per burst
     double segs_kernel_idle_bw[4] = { 0.0, 0.0, 0.0, 0.0 }; // the same with the CPU idle (fetch-only pool: no CPU chain)
+    double segs_cpu_read[4]    = { 0.0, 0.0, 0.0, 0.0 };    // the CPU readers' own rate during the segs_kernel_bw uploads
+    double segs_cpu_alone = 0.0;                            // the same readers with no upload
     double staged_bw = 0.0;                                 // pageable source through the staging ring
     static const int n_cross = 9;
     static constexpr double cross_mb[n_cross] = { 1, 2, 4, 8, 16, 32, 64, 128, 256 };
@@ -406,12 +425,28 @@ static const double sliced_chunk_mb[4] = { 0.5, 2.0, 8.0, 32.0 };
 // per split), under concurrent CPU DRAM load. Three paths: the copy engine (legacy sliced tiers), one copy
 // kernel per chunk, and the segment-batch kernel (the pool's per-layer upload). Small chunks run far below
 // peak PCIe; the predictor interpolates these curves to price sliced uploads.
-static void calibrate_pcie_sliced(pcie_stress_ctx * pcie, const gpu_procs & procs, int threads, int mode, bool loaded, double out_bw[4]) {
+// With cpu_read and cpu_alone (loaded only): the CPU side of the same contention, the readers' own rate during each chunk size's uploads and with no upload.
+static void calibrate_pcie_sliced(pcie_stress_ctx * pcie, const gpu_procs & procs, int threads, int mode, bool loaded, double out_bw[4],
+        double cpu_read[4] = nullptr, double * cpu_alone = nullptr) {
     static const char * names[3] = { "copy engine", "copy kernels", "segment-batch kernel" };
     printf("Calibrating gathered-slice upload bandwidth, %s (%s)...\n", names[mode], loaded ? "concurrent CPU load" : "CPU idle");
     kernel_copy_scope kc(procs, mode != SLICED_DMA);
     dram_stress stress;
-    if (loaded) stress.start(threads);
+    const bool count = loaded && cpu_read != nullptr && cpu_alone != nullptr;
+    // the readers' cores and this thread's reach full clock before anything is timed (see CPU_WARMUP_MIN_S);
+    // this thread spins, as it does when it waits on the uploads, so its core does not idle down
+    auto spin = [](double s) { bench_timer w; w.start(); while (w.stop() < s) {} };
+    if (loaded) {
+        stress.start(threads);
+        spin(CPU_WARMUP_MIN_S);
+    }
+    if (count) {
+        const uint64_t r0 = stress.bytes_read();
+        bench_timer t;
+        t.start();
+        spin(CPU_WARMUP_MIN_S);
+        *cpu_alone = (double)(stress.bytes_read() - r0) / t.stop() / 1e9;
+    }
     for (int c = 0; c < 4; c++) {
         const size_t chunk  = (size_t)(sliced_chunk_mb[c] * 1024.0 * 1024.0);
         const int    burst  = 24;                      // ~ top-k(8) experts x gate/up/down
@@ -422,6 +457,7 @@ static void calibrate_pcie_sliced(pcie_stress_ctx * pcie, const gpu_procs & proc
         bool taken = true;
         bench_timer t;
         t.start();
+        const uint64_t r0 = count ? stress.bytes_read() : 0;
         double bytes = 0.0;
         for (int it = 0; it < iters && taken; ++it) {
             for (int b = 0; b < burst; b++) {
@@ -441,8 +477,10 @@ static void calibrate_pcie_sliced(pcie_stress_ctx * pcie, const gpu_procs & proc
         }
         const double elapsed = t.stop();
         out_bw[c] = taken ? bytes / elapsed / 1e9 : 0.0;
+        if (count) cpu_read[c] = taken ? (double)(stress.bytes_read() - r0) / elapsed / 1e9 : 0.0;
         if (taken) printf("  %4.1fMB chunks: %.1f GB/s\n", sliced_chunk_mb[c], out_bw[c]);
         else       printf("  %4.1fMB chunks: segment kernel not taken\n", sliced_chunk_mb[c]);
+        if (count && taken) printf("    CPU reads: %.1f GB/s (alone %.1f GB/s)\n", cpu_read[c], *cpu_alone);
     }
     if (loaded) stress.finish();
     printf("\n");
@@ -760,6 +798,10 @@ static void write_profile_header(FILE * f, const calib_results & cr, int threads
     curve("PCIe_Sliced_Kernel", cr.sliced_kernel_bw);
     curve("PCIe_Segs_Kernel", cr.segs_kernel_bw);
     curve("PCIe_Segs_Kernel_Idle", cr.segs_kernel_idle_bw);
+    if (cr.segs_cpu_read[0] > 0.0) {
+        fprintf(f, "#   CPU_Read_Segs_Kernel: 0.5MB=%.1f 2MB=%.1f 8MB=%.1f 32MB=%.1f GB/s (alone %.1f GB/s)\n",
+            cr.segs_cpu_read[0], cr.segs_cpu_read[1], cr.segs_cpu_read[2], cr.segs_cpu_read[3], cr.segs_cpu_alone);
+    }
     if (cr.staged_bw > 0.0) fprintf(f, "#   PCIe_Staged: %.1f GB/s\n", cr.staged_bw);
     if (cr.kernel_cap_mb >= 0.0) {
         auto line = [&](const char * name, const double bw[]) {
@@ -1453,7 +1495,7 @@ int main(int argc, char ** argv) {
         if (procs.kernel_copies) {
             calibrate_pcie_sliced(&pcie, procs, threads, SLICED_KERNEL, true, cr.sliced_kernel_bw);
             if (procs.copy_segments) {
-                calibrate_pcie_sliced(&pcie, procs, threads, SLICED_SEGS, true,  cr.segs_kernel_bw);
+                calibrate_pcie_sliced(&pcie, procs, threads, SLICED_SEGS, true,  cr.segs_kernel_bw, cr.segs_cpu_read, &cr.segs_cpu_alone);
                 calibrate_pcie_sliced(&pcie, procs, threads, SLICED_SEGS, false, cr.segs_kernel_idle_bw);
             }
             calibrate_copy_crossover(&pcie, procs, cr);
