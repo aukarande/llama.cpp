@@ -3,6 +3,8 @@
 // low clock until the frequency governor raises it again, and passes timed inside that ramp price a
 // short op several times too slow
 #define CPU_WARMUP_MIN_S  0.100
+// an op that starts within CPU_HOT_GAP_S of the previous one finds the cores at full clock: its warm-up only fills the retry reference (CPU_TIMED_MIN_S)
+#define CPU_HOT_GAP_S     0.002
 // timed passes: at least CPU_TIMED_ITERS, more until the timed work spans CPU_TIMED_MIN_S
 // or CPU_TIMED_ITERS_MAX passes, so a sub-millisecond op is averaged over dozens of samples;
 // under the PCIe stress loop the pass cap is lifted so the window holds whole stress transfers
@@ -76,22 +78,27 @@ static int bench_n_copies(size_t bytes_per_pass) {
 // the loop: the epoch is odd while the timed passes run (see pcie_stress_loop)
 static std::atomic<uint32_t> * g_stress_window = nullptr;
 
-// prepare(pass) points a pass at operands no recent pass has read (a weight copy, a KV
-// block, an expert set) and returns the graph to run; the warm-up passes (CPU_WARMUP_ITERS, and
-// CPU_WARMUP_MIN_S at least) do not count, a small op then repeats until its samples span the
-// minimum duration
+// prepare(pass) points a pass at operands no recent pass has read (a weight copy, a KV block, an expert set) and returns the graph to run.
+// The warm-up passes do not count. They run CPU_WARMUP_ITERS passes, CPU_WARMUP_MIN_S (CPU_TIMED_MIN_S when the cores are hot) and, within CPU_WARMUP_MIN_S, one rotation of n_rot passes.
+// The rotation walk keeps a timed pass from reading a copy that an earlier op on the same operands left in cache.
+// A small op then repeats until its samples span the minimum duration.
 static double median_of(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     const size_t n = v.size();
     return 0.5 * (v[(n - 1) / 2] + v[n / 2]);
 }
 
-static double time_op(ggml_backend_t be, const std::function<ggml_cgraph *(int)> & prepare) {
+static bool g_op_ran = false;
+static bench_timer g_since_op;
+
+static double time_op(ggml_backend_t be, int n_rot, const std::function<ggml_cgraph *(int)> & prepare) {
+    const bool hot = g_op_ran && g_since_op.stop() < CPU_HOT_GAP_S;
+    const double warm_min_s = hot ? CPU_TIMED_MIN_S : CPU_WARMUP_MIN_S;
     int pass = 0;
     bench_timer warm, t;
     std::vector<double> warm_samples;
     warm.start();
-    for (; pass < CPU_WARMUP_ITERS || warm.stop() < CPU_WARMUP_MIN_S; pass++) {
+    for (; pass < CPU_WARMUP_ITERS || (pass < n_rot && warm.stop() < CPU_WARMUP_MIN_S) || warm.stop() < warm_min_s; pass++) {
         ggml_cgraph * gf = prepare(pass);
         t.start();
         ggml_backend_graph_compute_async(be, gf);
@@ -117,8 +124,41 @@ static double time_op(ggml_backend_t be, const std::function<ggml_cgraph *(int)>
         const double r = samples.size() >= 3 ? median_of(samples) : total_time / samples.size();
         best = tries == 0 ? r : std::min(best, r);
     }
+    g_op_ran = true;
+    g_since_op.start();
     return best;
 }
+
+// operands shared by every batch of one shape: n copies of one tensor, or of a K and V pair, in one buffer (all zeros, every page touched).
+// n is the rotation of the smallest batch; a larger batch walks fewer copies.
+struct bench_operands {
+    ggml_context *             ctx = nullptr;
+    ggml_backend_buffer_t      buf = nullptr;
+    std::vector<ggml_tensor *> a, b;
+    bench_operands() = default;
+    bench_operands(const bench_operands &) = delete;
+    bench_operands & operator=(const bench_operands &) = delete;
+    ~bench_operands() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+    }
+    bool init(ggml_backend_t be, int n, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, bool pair) {
+        ggml_init_params params = { ggml_tensor_overhead() * (size_t) n * 2 + 1024, NULL, true };
+        ctx = ggml_init(params);
+        for (int c = 0; c < n; c++) {
+            a.push_back(ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2));
+            if (pair) {
+                b.push_back(ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2));
+            }
+        }
+        buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        if (!buf) {
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);   // touch every page now, not inside a timed pass
+        return true;
+    }
+};
 
 static double benchmark_cpu_dram_bandwidth(int threads) {
     const size_t pool_bytes = 1024ULL * 1024 * 1024;
@@ -990,26 +1030,29 @@ struct bench_result_cpu : bench_result {
     }
 };
 
+// copies of a MUL_MAT weight for a batch: one per pass in rotation
+static int mul_mat_copies(int N, int K, int batch_size, ggml_type quant) {
+    return bench_n_copies(ggml_row_size(quant, K) * N + (size_t) N * batch_size * sizeof(float));
+}
+
 static double benchmark_mul_mat_raw(
-        ggml_backend_t be, int N, int K, int batch_size,
+        ggml_backend_t be, const bench_operands & w, int N, int K, int batch_size,
         ggml_type quant, int threads,
         double * out_time_s, double * out_ops, double * out_bytes) {
 
-    ggml_init_params params = { 4096ULL * 1024 * 1024, NULL, true };
+    // one weight copy per pass in rotation, each with its own graph
+    const int n_copies = std::min((int) w.a.size(), mul_mat_copies(N, K, batch_size, quant));
+    ggml_init_params params = { ggml_tensor_overhead() * (size_t) (n_copies + 1) + ggml_graph_overhead_custom(8, false) * (size_t) n_copies, NULL, true };
     ggml_context * ctx = ggml_init(params);
     ggml_backend_cpu_set_n_threads(be, threads);
 
     ggml_tensor * B_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, batch_size);
 
-    // one weight copy per pass in rotation, each with its own graph
-    const int n_copies = bench_n_copies(ggml_row_size(quant, K) * N + (size_t) N * batch_size * sizeof(float));
-    std::vector<ggml_tensor *> A(n_copies);
     std::vector<ggml_cgraph *> gf(n_copies);
     ggml_tensor * C = nullptr;
     for (int c = 0; c < n_copies; c++) {
-        A[c]  = ggml_new_tensor_2d(ctx, quant, K, N);
         gf[c] = ggml_new_graph_custom(ctx, 8, false);
-        C = ggml_mul_mat(ctx, A[c], B_tensor);
+        C = ggml_mul_mat(ctx, w.a[c], B_tensor);
         ggml_build_forward_expand(gf[c], C);
     }
 
@@ -1020,16 +1063,12 @@ static double benchmark_mul_mat_raw(
     }
     ggml_backend_buffer_clear(buffer, 0);   // touch every page now, not inside a timed pass
 
-    std::vector<uint8_t> A_data = create_quantized_data(quant, (int64_t)K * N);
-    std::vector<float> B_data(K * batch_size, 1.0f);
-    for (int c = 0; c < n_copies; c++) {
-        ggml_backend_tensor_set(A[c], A_data.data(), 0, ggml_nbytes(A[c]));
-    }
+    std::vector<float> B_data((size_t) K * batch_size, 1.0f);
     ggml_backend_tensor_set(B_tensor, B_data.data(), 0, ggml_nbytes(B_tensor));
 
-    double time_per_iter = time_op(be, [&](int pass) { return gf[pass % n_copies]; });
+    double time_per_iter = time_op(be, n_copies, [&](int pass) { return gf[pass % n_copies]; });
     double ops_total = 2.0 * N * K * batch_size;
-    double bytes_total = (double)(ggml_nbytes(A[0]) + ggml_nbytes(B_tensor) + ggml_nbytes(C));
+    double bytes_total = (double)(ggml_nbytes(w.a[0]) + ggml_nbytes(B_tensor) + ggml_nbytes(C));
 
     if (out_time_s) *out_time_s = time_per_iter;
     if (out_ops) *out_ops = ops_total;
@@ -1040,28 +1079,29 @@ static double benchmark_mul_mat_raw(
     return ops_total / time_per_iter / 1e9;
 }
 
+// copies of a MUL_MAT_ID expert stack for a batch: the rotation walks the copies and, once around, moves on to the next experts.
+static int mul_mat_id_copies(int N, int K, int n_experts, int n_experts_used, int batch_size, ggml_type quant) {
+    return bench_n_copies(ggml_row_size(quant, (int64_t) K * N * n_experts)
+                          + (size_t) N * batch_size * n_experts_used * sizeof(float));
+}
+
 static double benchmark_mul_mat_id_raw(
-        ggml_backend_t be, int N, int K, int n_experts, int n_experts_used,
+        ggml_backend_t be, const bench_operands & w, int N, int K, int n_experts, int n_experts_used,
         int batch_size, ggml_type quant, int threads,
         double * out_time_s, double * out_ops, double * out_bytes) {
 
-    ggml_init_params params = { 8192ULL * 1024 * 1024, NULL, true };
+    const int n_copies = std::min((int) w.a.size(), mul_mat_id_copies(N, K, n_experts, n_experts_used, batch_size, quant));
+    ggml_init_params params = { ggml_tensor_overhead() * (size_t) (n_copies + 2) + ggml_graph_overhead_custom(8, false) * (size_t) n_copies, NULL, true };
     ggml_context * ctx = ggml_init(params);
     ggml_backend_cpu_set_n_threads(be, threads);
 
     ggml_tensor * B   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, batch_size);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts_used, batch_size);
 
-    // a small expert stack gets copies too: the rotation walks the copies and, once around,
-    // moves on to the next experts, so no pass rereads bytes a recent pass touched
-    const int n_copies = bench_n_copies(ggml_row_size(quant, (int64_t) K * N * n_experts)
-                                        + (size_t) N * batch_size * n_experts_used * sizeof(float));
-    std::vector<ggml_tensor *> A(n_copies);
     std::vector<ggml_cgraph *> gf(n_copies);
     for (int c = 0; c < n_copies; c++) {
-        A[c]  = ggml_new_tensor_3d(ctx, quant, K, N, n_experts);
         gf[c] = ggml_new_graph_custom(ctx, 8, false);
-        ggml_build_forward_expand(gf[c], ggml_mul_mat_id(ctx, A[c], B, ids));
+        ggml_build_forward_expand(gf[c], ggml_mul_mat_id(ctx, w.a[c], B, ids));
     }
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, be);
@@ -1071,11 +1111,7 @@ static double benchmark_mul_mat_id_raw(
     }
     ggml_backend_buffer_clear(buffer, 0);   // touch every page now, not inside a timed pass
 
-    std::vector<uint8_t> A_data = create_quantized_data(quant, (int64_t)K * N * n_experts);
-    for (int c = 0; c < n_copies; c++) {
-        ggml_backend_tensor_set(A[c], A_data.data(), 0, ggml_nbytes(A[c]));
-    }
-    std::vector<float> B_data(K * batch_size, 1.0f);
+    std::vector<float> B_data((size_t) K * batch_size, 1.0f);
     ggml_backend_tensor_set(B, B_data.data(), 0, ggml_nbytes(B));
     // every token routes to its own experts until the stack is exhausted: the batch streams
     // min(B * used, E) distinct experts, the independent-token routing the planner prices
@@ -1091,9 +1127,9 @@ static double benchmark_mul_mat_id_raw(
         return gf[copy];
     };
 
-    double time_per_iter = time_op(be, prepare);
+    double time_per_iter = time_op(be, n_copies, prepare);
     double ops_total = 2.0 * N * K * batch_size * n_experts_used;
-    double bytes_total = (double) ggml_nbytes(A[0]) * n_distinct / n_experts + ggml_nbytes(B) + (double)(N * batch_size * n_experts_used * 4);
+    double bytes_total = (double) ggml_nbytes(w.a[0]) * n_distinct / n_experts + ggml_nbytes(B) + (double)(N * batch_size * n_experts_used * 4);
 
     if (out_time_s) *out_time_s = time_per_iter;
     if (out_ops) *out_ops = ops_total;
@@ -1104,29 +1140,31 @@ static double benchmark_mul_mat_id_raw(
     return ops_total / time_per_iter / 1e9;
 }
 
+// KV blocks for a token count: one per pass in rotation
+static int flash_attn_copies(int n_tokens, int ctx_len, int n_q_heads, int n_kv_heads, int head_dim, ggml_type kv_quant) {
+    return bench_n_copies(2 * ggml_row_size(kv_quant, (int64_t) head_dim * ctx_len * n_kv_heads)
+                          + (size_t) head_dim * n_tokens * n_q_heads * sizeof(float));
+}
+
 static double benchmark_flash_attn_raw(
-        ggml_backend_t be, int n_tokens, int ctx_len,
+        ggml_backend_t be, const bench_operands & kv, int n_tokens, int ctx_len,
         int n_q_heads, int n_kv_heads, int head_dim,
         ggml_type kv_quant, int threads,
         double * out_time_s, double * out_ops, double * out_bytes) {
 
-    ggml_init_params params = { 8192ULL * 1024 * 1024, NULL, true };
+    // one KV block per pass in rotation, each with its own graph
+    const int n_copies = std::min((int) kv.a.size(), flash_attn_copies(n_tokens, ctx_len, n_q_heads, n_kv_heads, head_dim, kv_quant));
+    ggml_init_params params = { ggml_tensor_overhead() * (size_t) (n_copies + 1) + ggml_graph_overhead_custom(8, false) * (size_t) n_copies, NULL, true };
     ggml_context * ctx = ggml_init(params);
     ggml_backend_cpu_set_n_threads(be, threads);
 
     ggml_tensor * Q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_tokens, n_q_heads, 1);
 
-    // one KV block per pass in rotation, each with its own graph
-    const int n_copies = bench_n_copies(2 * ggml_row_size(kv_quant, (int64_t) head_dim * ctx_len * n_kv_heads)
-                                        + (size_t) head_dim * n_tokens * n_q_heads * sizeof(float));
-    std::vector<ggml_tensor *> K(n_copies), V(n_copies);
     std::vector<ggml_cgraph *> gf(n_copies);
     ggml_tensor * out = nullptr;
     for (int c = 0; c < n_copies; c++) {
-        K[c]  = ggml_new_tensor_4d(ctx, kv_quant, head_dim, ctx_len, n_kv_heads, 1);
-        V[c]  = ggml_new_tensor_4d(ctx, kv_quant, head_dim, ctx_len, n_kv_heads, 1);
         gf[c] = ggml_new_graph_custom(ctx, 8, false);
-        out = ggml_flash_attn_ext(ctx, Q, K[c], V[c], nullptr, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+        out = ggml_flash_attn_ext(ctx, Q, kv.a[c], kv.b[c], nullptr, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
         ggml_build_forward_expand(gf[c], out);
     }
 
@@ -1139,15 +1177,10 @@ static double benchmark_flash_attn_raw(
 
     std::vector<float> Q_data(ggml_nelements(Q), 1.0f);
     ggml_backend_tensor_set(Q, Q_data.data(), 0, ggml_nbytes(Q));
-    std::vector<uint8_t> KV_data = create_quantized_data(kv_quant, ggml_nelements(K[0]));
-    for (int c = 0; c < n_copies; c++) {
-        ggml_backend_tensor_set(K[c], KV_data.data(), 0, ggml_nbytes(K[c]));
-        ggml_backend_tensor_set(V[c], KV_data.data(), 0, ggml_nbytes(V[c]));
-    }
 
-    double time_per_iter = time_op(be, [&](int pass) { return gf[pass % n_copies]; });
+    double time_per_iter = time_op(be, n_copies, [&](int pass) { return gf[pass % n_copies]; });
     double ops_total = 2.0 * n_tokens * head_dim * ctx_len * n_q_heads * 2;
-    double bytes_total = (double)(ggml_nbytes(Q) + ggml_nbytes(K[0]) + ggml_nbytes(V[0]) + ggml_nbytes(out));
+    double bytes_total = (double)(ggml_nbytes(Q) + ggml_nbytes(kv.a[0]) + ggml_nbytes(kv.b[0]) + ggml_nbytes(out));
 
     if (out_time_s) *out_time_s = time_per_iter;
     if (out_ops) *out_ops = ops_total;
@@ -1231,22 +1264,31 @@ static void run_matmul_benchmarks(
     auto quants = get_matmul_quants(fast);
 
     printf("=== MUL_MAT Operations ===\n\n");
+    const int32_t min_batch = *std::min_element(batch_sizes.begin(), batch_sizes.end());
     for (ggml_type qt : quants) {
         printf("--- Quantization: %s ---\n", ggml_type_name(qt));
-        for (int32_t bs : batch_sizes) {
-            printf("  [Batch=%d]\n", bs);
-            for (const auto & sz : sizes) {
-                if (qt == GGML_TYPE_Q2_K && (sz.K % 256 != 0)) continue;
+        row_order<bench_result_cpu> order;
+        for (size_t si = 0; si < sizes.size(); si++) {
+            const auto & sz = sizes[si];
+            if (qt == GGML_TYPE_Q2_K && (sz.K % 256 != 0)) continue;
 
+            bench_operands w;
+            if (!w.init(be, mul_mat_copies(sz.N, sz.K, min_batch, qt), qt, sz.K, sz.N, 1, false)) {
+                printf("SKIPPED: MUL_MAT N=%d K=%d %s (alloc failed)\n", sz.N, sz.K, ggml_type_name(qt));
+                continue;
+            }
+            for (size_t bi = 0; bi < batch_sizes.size(); bi++) {
+                const int32_t bs = batch_sizes[bi];
                 auto res = run_concurrent(
                     [&](int nt, double * t, double * o, double * b) {
-                        return benchmark_mul_mat_raw(be, sz.N, sz.K, bs, qt, nt, t, o, b);
+                        return benchmark_mul_mat_raw(be, w, sz.N, sz.K, bs, qt, nt, t, o, b);
                     }, "MUL_MAT", ggml_type_name(qt), threads, pcie);
                 res.N = sz.N; res.K = sz.K; res.B = bs;
                 res.print(pcie ? pcie->calibrated_bw_gb_s : 0.0);
-                results.push_back(res);
+                order.add(bi, si, res);
             }
         }
+        order.flush(results);
         printf("\n");
     }
 }
@@ -1260,23 +1302,32 @@ static void run_moe_benchmarks(
     auto quants  = get_matmul_quants(fast);
 
     printf("=== MUL_MAT_ID Operations (MoE) ===\n\n");
+    const int32_t min_batch = *std::min_element(batch_sizes.begin(), batch_sizes.end());
     for (ggml_type qt : quants) {
         printf("--- MoE Quantization: %s ---\n", ggml_type_name(qt));
-        for (int32_t bs : batch_sizes) {
-            printf("  [Batch=%d]\n", bs);
-            for (const auto & cfg : configs) {
-                if (qt == GGML_TYPE_Q2_K && (cfg.K % 256 != 0)) continue;
+        row_order<bench_result_cpu> order;
+        for (size_t si = 0; si < configs.size(); si++) {
+            const auto & cfg = configs[si];
+            if (qt == GGML_TYPE_Q2_K && (cfg.K % 256 != 0)) continue;
 
+            bench_operands w;
+            if (!w.init(be, mul_mat_id_copies(cfg.N, cfg.K, cfg.n_experts, cfg.n_experts_used, min_batch, qt), qt, cfg.K, cfg.N, cfg.n_experts, false)) {
+                printf("SKIPPED: MUL_MAT_ID N=%d K=%d %s (alloc failed)\n", cfg.N, cfg.K, ggml_type_name(qt));
+                continue;
+            }
+            for (size_t bi = 0; bi < batch_sizes.size(); bi++) {
+                const int32_t bs = batch_sizes[bi];
                 auto res = run_concurrent(
                     [&](int nt, double * t, double * o, double * b) {
-                        return benchmark_mul_mat_id_raw(be, cfg.N, cfg.K, cfg.n_experts, cfg.n_experts_used, bs, qt, nt, t, o, b);
+                        return benchmark_mul_mat_id_raw(be, w, cfg.N, cfg.K, cfg.n_experts, cfg.n_experts_used, bs, qt, nt, t, o, b);
                     }, "MUL_MAT_ID", ggml_type_name(qt), threads, pcie);
                 res.N = cfg.N; res.K = cfg.K; res.B = bs;
                 res.n_tokens = cfg.n_experts_used; res.ctx_len = cfg.n_experts;
                 res.print(pcie ? pcie->calibrated_bw_gb_s : 0.0);
-                results.push_back(res);
+                order.add(bi, si, res);
             }
         }
+        order.flush(results);
         printf("\n");
     }
 }
@@ -1290,20 +1341,30 @@ static void run_attention_benchmarks(
     auto ctx_lens = get_attn_ctx_lens(fast);
 
     printf("=== FLASH_ATTN Operations ===\n\n");
+    const int32_t min_tokens = *std::min_element(batch_sizes.begin(), batch_sizes.end());
     for (const auto & cfg : configs) {
         printf("--- %s (n_q=%d, n_kv=%d, head_dim=%d) ---\n", cfg.name, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim);
-        for (int32_t n_tok : batch_sizes) {
-            printf("  [n_tokens=%d]\n", n_tok);
-            for (int32_t cl : ctx_lens) {
+        row_order<bench_result_cpu> order;
+        for (size_t ci = 0; ci < ctx_lens.size(); ci++) {
+            const int32_t cl = ctx_lens[ci];
+            bench_operands kv;
+            if (!kv.init(be, flash_attn_copies(min_tokens, cl, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, GGML_TYPE_F16),
+                         GGML_TYPE_F16, cfg.head_dim, cl, cfg.n_kv_heads, true)) {
+                printf("SKIPPED: FLASH_ATTN ctx=%d (alloc failed)\n", cl);
+                continue;
+            }
+            for (size_t ti = 0; ti < batch_sizes.size(); ti++) {
+                const int32_t n_tok = batch_sizes[ti];
                 auto res = run_concurrent(
                     [&](int nt, double * t, double * o, double * b) {
-                        return benchmark_flash_attn_raw(be, n_tok, cl, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, GGML_TYPE_F16, nt, t, o, b);
+                        return benchmark_flash_attn_raw(be, kv, n_tok, cl, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim, GGML_TYPE_F16, nt, t, o, b);
                     }, std::string("FLASH_ATTN_") + cfg.name, ggml_type_name(GGML_TYPE_F16), threads, pcie);
                 res.n_tokens = n_tok; res.ctx_len = cl; res.n_heads = cfg.n_kv_heads; res.head_dim = cfg.head_dim;
                 res.print(pcie ? pcie->calibrated_bw_gb_s : 0.0);
-                results.push_back(res);
+                order.add(ti, ci, res);
             }
         }
+        order.flush(results);
         printf("\n");
     }
 }

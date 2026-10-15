@@ -65,6 +65,18 @@ struct bench_result {
     }
 };
 
+// rows are measured shape by shape (operands built once per shape) and written in the profile's batch-major order
+template <typename R>
+struct row_order {
+    std::vector<std::pair<std::pair<size_t, size_t>, R>> rows;
+    void add(size_t batch_i, size_t shape_i, const R & r) { rows.push_back({ { batch_i, shape_i }, r }); }
+    void flush(std::vector<R> & out) {
+        std::stable_sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.first < y.first; });
+        for (auto & r : rows) out.push_back(r.second);
+        rows.clear();
+    }
+};
+
 struct matmul_size { int32_t N; int32_t K; };
 struct moe_config  { int32_t N; int32_t K; int32_t n_experts; int32_t n_experts_used; };
 struct attn_config {
@@ -168,9 +180,4 @@ inline std::vector<ridge_result> compute_ridge_points(
         out.push_back({key, peak, measured_bw, ridge});
     }
     return out;
-}
-
-inline std::vector<uint8_t> create_quantized_data(ggml_type type, int64_t n_elements) {
-    size_t quant_size = ggml_row_size(type, n_elements);
-    return std::vector<uint8_t>(quant_size, 0);
 }

@@ -12,28 +12,74 @@
 #include <functional>
 #include <stdexcept>
 
+// operands shared by every batch of one shape, built once: a MUL_MAT / MUL_MAT_ID weight (a), or K (a) and V (v)
+struct gpu_operands {
+    ggml_context *        ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor *         a   = nullptr;
+    ggml_tensor *         v   = nullptr;
+    gpu_operands() {
+        ggml_init_params params = { ggml_tensor_overhead() * 4, NULL, true };
+        ctx = ggml_init(params);
+    }
+    gpu_operands(const gpu_operands &) = delete;
+    gpu_operands & operator=(const gpu_operands &) = delete;
+    ~gpu_operands() {
+        if (buf) ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+    // allocates the tensors on the device if they fit
+    bool alloc(ggml_backend_t be, const std::string & what) {
+        size_t need = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr) need += ggml_nbytes(t);
+        }
+        size_t gpu_free = 0, gpu_total = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &gpu_free, &gpu_total);
+        if (need > gpu_free * 0.9) {
+            printf("SKIPPED: %s (need %.2f GB, free %.2f GB)\n", what.c_str(), need / 1e9, gpu_free / 1e9);
+            return false;
+        }
+        buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        if (!buf) { fprintf(stderr, "Failed to allocate GPU buffer\n"); return false; }
+        return true;
+    }
+};
+
+// fills t from 0.5 floats as the rows always did (for a block quant this call writes only its first blocks)
+static void fill_half(ggml_tensor * t) {
+    const int64_t n = ggml_nelements(t);
+    std::vector<float> f(n, 0.5f);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
+    } else {
+        std::vector<uint8_t> q(ggml_nbytes(t));
+        ggml_quantize_chunk(t->type, f.data(), q.data(), 0, n / ggml_blck_size(t->type), 1, nullptr);
+        ggml_backend_tensor_set(t, q.data(), 0, ggml_nbytes(t));
+    }
+}
+
 static double benchmark_mul_mat_raw(
-        ggml_backend_t be, int N, int K, int batch_size, ggml_type quant,
+        ggml_backend_t be, ggml_tensor * A, int N, int K, int batch_size,
         double * out_time_s, double * out_ops, double * out_bytes) {
 
-    ggml_init_params params = { 4096ULL * 1024 * 1024, NULL, true };
+    if ((int64_t)N * batch_size > INT_MAX) {
+        printf("SKIPPED: MUL_MAT N=%d K=%d B=%d (output exceeds INT_MAX)\n", N, K, batch_size);
+        return 0.0;
+    }
+
+    ggml_init_params params = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), NULL, true };
     ggml_context * ctx = ggml_init(params);
 
-    ggml_tensor * A = ggml_new_tensor_2d(ctx, quant, K, N);
     ggml_tensor * B_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, batch_size);
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_tensor * C = ggml_mul_mat(ctx, A, B_tensor);
     ggml_build_forward_expand(gf, C);
 
-    if ((int64_t)N * batch_size > INT_MAX) {
-        printf("SKIPPED: MUL_MAT N=%d K=%d B=%d (output exceeds INT_MAX)\n", N, K, batch_size);
-        ggml_free(ctx); return 0.0;
-    }
-
     size_t gpu_free = 0, gpu_total = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(be), &gpu_free, &gpu_total);
-    size_t need = ggml_nbytes(A) + ggml_nbytes(B_tensor) + ggml_nbytes(C);
+    size_t need = ggml_nbytes(B_tensor) + ggml_nbytes(C);
     if (need > gpu_free * 0.9) {
         printf("SKIPPED: MUL_MAT N=%d K=%d B=%d (need %.2f GB, free %.2f GB)\n",
             N, K, batch_size, need / 1e9, gpu_free / 1e9);
@@ -43,15 +89,6 @@ static double benchmark_mul_mat_raw(
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!buffer) { fprintf(stderr, "Failed to allocate GPU buffer\n"); ggml_free(ctx); return 0.0; }
 
-    std::vector<float> A_float((size_t)K * N, 0.5f);
-    if (quant == GGML_TYPE_F32) {
-        ggml_backend_tensor_set(A, A_float.data(), 0, ggml_nbytes(A));
-    } else {
-        std::vector<uint8_t> A_q(ggml_nbytes(A));
-        ggml_quantize_chunk(quant, A_float.data(), A_q.data(), 0,
-            (int64_t)K * N / ggml_blck_size(quant), 1, nullptr);
-        ggml_backend_tensor_set(A, A_q.data(), 0, ggml_nbytes(A));
-    }
     std::vector<float> B_data((size_t)K * batch_size, 1.0f);
     ggml_backend_tensor_set(B_tensor, B_data.data(), 0, ggml_nbytes(B_tensor));
 
@@ -77,41 +114,38 @@ static double benchmark_mul_mat_raw(
 }
 
 static double benchmark_mul_mat_id_raw(
-        ggml_backend_t be, int N, int K, int n_experts, int n_experts_used,
-        int batch_size, ggml_type quant,
+        ggml_backend_t be, ggml_tensor * A, int N, int K, int n_experts, int n_experts_used,
+        int batch_size,
         double * out_time_s, double * out_ops, double * out_bytes) {
-
-    ggml_init_params params = { 8192ULL * 1024 * 1024, NULL, true };
-    ggml_context * ctx = ggml_init(params);
-    if (!ctx) { fprintf(stderr, "Failed to init context\n"); return 0.0; }
-
-    ggml_tensor * A   = ggml_new_tensor_3d(ctx, quant, K, N, n_experts);
-    ggml_tensor * B   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, batch_size);
-    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts_used, batch_size);
 
     if ((int64_t)N * batch_size * n_experts_used > INT_MAX) {
         printf("SKIPPED: MUL_MAT_ID N=%d K=%d B=%d (output exceeds INT_MAX)\n", N, K, batch_size);
-        ggml_free(ctx); return 0.0;
+        return 0.0;
     }
+
+    ggml_init_params params = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) { fprintf(stderr, "Failed to init context\n"); return 0.0; }
+
+    ggml_tensor * B   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, 1, batch_size);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_experts_used, batch_size);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_tensor * C = ggml_mul_mat_id(ctx, A, B, ids);
+    ggml_build_forward_expand(gf, C);
 
     size_t gpu_free = 0, gpu_total = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(be), &gpu_free, &gpu_total);
-    size_t need = ggml_nbytes(A) + ggml_nbytes(B) + ggml_nbytes(ids);
+    size_t need = ggml_nbytes(B) + ggml_nbytes(ids) + ggml_nbytes(C);
     if (need > gpu_free * 0.9) {
         printf("SKIPPED: MUL_MAT_ID N=%d K=%d B=%d (need %.2f GB, free %.2f GB)\n",
             N, K, batch_size, need / 1e9, gpu_free / 1e9);
         ggml_free(ctx); return 0.0;
     }
 
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_tensor * C = ggml_mul_mat_id(ctx, A, B, ids);
-    ggml_build_forward_expand(gf, C);
-
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!buffer) { fprintf(stderr, "Failed to allocate GPU buffer\n"); ggml_free(ctx); return 0.0; }
 
-    std::vector<uint8_t> A_data(ggml_nbytes(A), 0);
-    ggml_backend_tensor_set(A, A_data.data(), 0, ggml_nbytes(A));
     std::vector<float> B_data((size_t)K * batch_size, 1.0f);
     ggml_backend_tensor_set(B, B_data.data(), 0, ggml_nbytes(B));
     std::vector<int32_t> ids_data(n_experts_used * batch_size);
@@ -140,39 +174,34 @@ static double benchmark_mul_mat_id_raw(
 }
 
 static double benchmark_flash_attn_raw(
-        ggml_backend_t be, int n_tokens, int ctx_len,
-        const attn_config & cfg, ggml_type kv_quant,
+        ggml_backend_t be, ggml_tensor * K, ggml_tensor * V, int n_tokens, int ctx_len,
+        const attn_config & cfg,
         double * out_time_s, double * out_ops, double * out_bytes) {
 
-    ggml_init_params params = { 8192ULL * 1024 * 1024, NULL, true };
-    ggml_context * ctx = ggml_init(params);
-
     const int n_q_heads  = cfg.n_q_heads;
-    const int n_kv_heads = cfg.n_kv_heads;
     const int head_dim   = cfg.head_dim;
     const int head_dim_v = cfg.head_dim_v > 0 ? cfg.head_dim_v : cfg.head_dim;
 
+    if ((int64_t)head_dim * n_tokens * n_q_heads > INT_MAX) {
+        printf("SKIPPED: FLASH_ATTN (output exceeds INT_MAX)\n");
+        return 0.0;
+    }
+
+    ggml_init_params params = { ggml_tensor_overhead() * 4 + ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx = ggml_init(params);
+
     ggml_tensor * Q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_tokens, n_q_heads, 1);
-    ggml_tensor * K = ggml_new_tensor_4d(ctx, kv_quant, head_dim, ctx_len, n_kv_heads, 1);
-    ggml_tensor * V = cfg.v_in_k
-        ? ggml_view_4d(ctx, K, head_dim_v, ctx_len, n_kv_heads, 1, K->nb[1], K->nb[2], K->nb[3], 0)
-        : ggml_new_tensor_4d(ctx, kv_quant, head_dim_v, ctx_len, n_kv_heads, 1);
     ggml_tensor * mask = cfg.masked ? ggml_new_tensor_4d(ctx, GGML_TYPE_F16, ctx_len, n_tokens, 1, 1) : nullptr;
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, Q, K, V, mask, 1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
     ggml_build_forward_expand(gf, out);
 
-    if ((int64_t)head_dim * n_tokens * n_q_heads > INT_MAX) {
-        printf("SKIPPED: FLASH_ATTN (output exceeds INT_MAX)\n");
-        ggml_free(ctx); return 0.0;
-    }
-
     // a V inside K reads no bytes of its own
     const size_t v_bytes = cfg.v_in_k ? 0 : ggml_nbytes(V);
     size_t gpu_free = 0, gpu_total = 0;
     ggml_backend_dev_memory(ggml_backend_get_device(be), &gpu_free, &gpu_total);
-    size_t need = ggml_nbytes(Q) + ggml_nbytes(K) + v_bytes + ggml_nbytes(out) + (mask ? ggml_nbytes(mask) : 0);
+    size_t need = ggml_nbytes(Q) + ggml_nbytes(out) + (mask ? ggml_nbytes(mask) : 0);
     if (need > gpu_free * 0.9) {
         printf("SKIPPED: FLASH_ATTN (need %.2f GB, free %.2f GB)\n", need / 1e9, gpu_free / 1e9);
         ggml_free(ctx); return 0.0;
@@ -183,22 +212,6 @@ static double benchmark_flash_attn_raw(
 
     std::vector<float> Q_data(ggml_nelements(Q), 1.0f);
     ggml_backend_tensor_set(Q, Q_data.data(), 0, ggml_nbytes(Q));
-    // K and V are filled the same way, each with its own element count
-    auto fill_kv = [&](ggml_tensor * t) {
-        const int64_t n = ggml_nelements(t);
-        std::vector<float> f(n, 0.5f);
-        if (kv_quant == GGML_TYPE_F32) {
-            ggml_backend_tensor_set(t, f.data(), 0, ggml_nbytes(t));
-        } else {
-            std::vector<uint8_t> q(ggml_nbytes(t));
-            ggml_quantize_chunk(kv_quant, f.data(), q.data(), 0, n / ggml_blck_size(kv_quant), 1, nullptr);
-            ggml_backend_tensor_set(t, q.data(), 0, ggml_nbytes(t));
-        }
-    };
-    fill_kv(K);
-    if (!cfg.v_in_k) {
-        fill_kv(V);
-    }
     if (mask) {
         // all zero: every position attends, the dense work the runtime's masks leave
         std::vector<uint8_t> z(ggml_nbytes(mask), 0);
@@ -234,30 +247,39 @@ static void run_matmul_benchmarks(
 
     auto sizes  = get_matmul_sizes(fast);
     auto quants = get_matmul_quants(fast);
+    if (filter_batch >= 0 && std::find(batch_sizes.begin(), batch_sizes.end(), filter_batch) == batch_sizes.end()) return;
 
     printf("=== MUL_MAT Operations ===\n\n");
     for (ggml_type qt : quants) {
         printf("--- Quantization: %s ---\n", ggml_type_name(qt));
-        for (int32_t bs : batch_sizes) {
-            if (filter_batch >= 0 && bs != filter_batch) continue;
-            printf("  [Batch=%d]\n", bs);
-            for (const auto & sz : sizes) {
-                if (qt == GGML_TYPE_Q2_K && (sz.K % 256 != 0)) continue;
+        row_order<bench_result> order;
+        for (size_t si = 0; si < sizes.size(); si++) {
+            const auto & sz = sizes[si];
+            if (qt == GGML_TYPE_Q2_K && (sz.K % 256 != 0)) continue;
+
+            gpu_operands w;
+            w.a = ggml_new_tensor_2d(w.ctx, qt, sz.K, sz.N);
+            if (!w.alloc(be, "MUL_MAT N=" + std::to_string(sz.N) + " K=" + std::to_string(sz.K))) continue;
+            fill_half(w.a);
+            for (size_t bi = 0; bi < batch_sizes.size(); bi++) {
+                const int32_t bs = batch_sizes[bi];
+                if (filter_batch >= 0 && bs != filter_batch) continue;
 
                 bench_result res;
                 res.op_name = "MUL_MAT";
                 res.quant_type = ggml_type_name(qt);
                 res.N = sz.N; res.K = sz.K; res.B = bs;
-                benchmark_mul_mat_raw(be, sz.N, sz.K, bs, qt, &res.time_s, &res.ops, &res.bytes);
+                benchmark_mul_mat_raw(be, w.a, sz.N, sz.K, bs, &res.time_s, &res.ops, &res.bytes);
                 res.calculate_derived();
                 printf("%-20s quant=%-6s AI=%.3f BW=%.2f GB/s Perf=%.2f GFLOP/s",
                     res.op_name.c_str(), res.quant_type.c_str(),
                     res.arithmetic_intensity, res.effective_bw_gb_s, res.effective_gflops);
                 res.print_dims();
                 printf("\n");
-                results.push_back(res);
+                order.add(bi, si, res);
             }
         }
+        order.flush(results);
         printf("\n");
     }
 }
@@ -269,22 +291,30 @@ static void run_moe_benchmarks(
 
     auto configs = get_moe_configs(fast);
     auto quants  = get_matmul_quants(fast);
+    if (filter_batch >= 0 && std::find(batch_sizes.begin(), batch_sizes.end(), filter_batch) == batch_sizes.end()) return;
 
     printf("=== MUL_MAT_ID Operations (MoE) ===\n\n");
     for (ggml_type qt : quants) {
         printf("--- MoE Quantization: %s ---\n", ggml_type_name(qt));
-        for (int32_t bs : batch_sizes) {
-            if (filter_batch >= 0 && bs != filter_batch) continue;
-            printf("  [Batch=%d]\n", bs);
-            for (const auto & cfg : configs) {
-                if (qt == GGML_TYPE_Q2_K && (cfg.K % 256 != 0)) continue;
-                try {
+        row_order<bench_result> order;
+        for (size_t si = 0; si < configs.size(); si++) {
+            const auto & cfg = configs[si];
+            if (qt == GGML_TYPE_Q2_K && (cfg.K % 256 != 0)) continue;
+            try {
+                gpu_operands w;
+                w.a = ggml_new_tensor_3d(w.ctx, qt, cfg.K, cfg.N, cfg.n_experts);
+                if (!w.alloc(be, "MUL_MAT_ID N=" + std::to_string(cfg.N) + " K=" + std::to_string(cfg.K))) continue;
+                ggml_backend_buffer_clear(w.buf, 0);
+                for (size_t bi = 0; bi < batch_sizes.size(); bi++) {
+                    const int32_t bs = batch_sizes[bi];
+                    if (filter_batch >= 0 && bs != filter_batch) continue;
+
                     bench_result res;
                     res.op_name = "MUL_MAT_ID";
                     res.quant_type = ggml_type_name(qt);
                     res.N = cfg.N; res.K = cfg.K; res.B = bs;
                     res.n_tokens = cfg.n_experts_used; res.ctx_len = cfg.n_experts;
-                    double gflops = benchmark_mul_mat_id_raw(be, cfg.N, cfg.K, cfg.n_experts, cfg.n_experts_used, bs, qt,
+                    double gflops = benchmark_mul_mat_id_raw(be, w.a, cfg.N, cfg.K, cfg.n_experts, cfg.n_experts_used, bs,
                         &res.time_s, &res.ops, &res.bytes);
                     if (gflops == 0.0) continue;
                     res.calculate_derived();
@@ -293,12 +323,13 @@ static void run_moe_benchmarks(
                         res.arithmetic_intensity, res.effective_bw_gb_s, res.effective_gflops);
                     res.print_dims();
                     printf("\n");
-                    results.push_back(res);
-                } catch (const std::exception & e) {
-                    printf("SKIPPED: MUL_MAT_ID N=%d K=%d %s (%s)\n", cfg.N, cfg.K, ggml_type_name(qt), e.what());
+                    order.add(bi, si, res);
                 }
+            } catch (const std::exception & e) {
+                printf("SKIPPED: MUL_MAT_ID N=%d K=%d %s (%s)\n", cfg.N, cfg.K, ggml_type_name(qt), e.what());
             }
         }
+        order.flush(results);
         printf("\n");
     }
 }
@@ -322,26 +353,42 @@ static void run_attention_benchmarks(
     for (const auto & cfg : configs) {
         const bool shared = cfg.v_in_k;
         const auto ctx_lens = get_attn_ctx_lens(fast && !shared);
+        const auto & tokens = shared ? shared_kv_tokens : batch_sizes;
+        if (filter_batch >= 0 && std::find(tokens.begin(), tokens.end(), filter_batch) == tokens.end()) continue;
+        const int head_dim_v = cfg.head_dim_v > 0 ? cfg.head_dim_v : cfg.head_dim;
         printf("--- %s (n_q=%d, n_kv=%d, head_dim=%d) ---\n", cfg.name, cfg.n_q_heads, cfg.n_kv_heads, cfg.head_dim);
-        for (int32_t n_tok : shared ? shared_kv_tokens : batch_sizes) {
-            if (filter_batch >= 0 && n_tok != filter_batch) continue;
-            printf("  [n_tokens=%d]\n", n_tok);
-            for (int32_t cl : ctx_lens) {
+        row_order<bench_result> order;
+        for (size_t ci = 0; ci < ctx_lens.size(); ci++) {
+            const int32_t cl = ctx_lens[ci];
+            gpu_operands kv;
+            kv.a = ggml_new_tensor_4d(kv.ctx, GGML_TYPE_F16, cfg.head_dim, cl, cfg.n_kv_heads, 1);
+            kv.v = cfg.v_in_k
+                ? ggml_view_4d(kv.ctx, kv.a, head_dim_v, cl, cfg.n_kv_heads, 1, kv.a->nb[1], kv.a->nb[2], kv.a->nb[3], 0)
+                : ggml_new_tensor_4d(kv.ctx, GGML_TYPE_F16, head_dim_v, cl, cfg.n_kv_heads, 1);
+            if (!kv.alloc(be, "FLASH_ATTN ctx=" + std::to_string(cl))) continue;
+            fill_half(kv.a);
+            if (!cfg.v_in_k) {
+                fill_half(kv.v);
+            }
+            for (size_t ti = 0; ti < tokens.size(); ti++) {
+                const int32_t n_tok = tokens[ti];
+                if (filter_batch >= 0 && n_tok != filter_batch) continue;
+
                 bench_result res;
                 res.op_name = std::string("FLASH_ATTN_") + cfg.name;
                 res.quant_type = ggml_type_name(GGML_TYPE_F16);
                 res.n_tokens = n_tok; res.ctx_len = cl; res.n_heads = cfg.n_kv_heads; res.head_dim = cfg.head_dim;
-                benchmark_flash_attn_raw(be, n_tok, cl, cfg, GGML_TYPE_F16,
-                    &res.time_s, &res.ops, &res.bytes);
+                benchmark_flash_attn_raw(be, kv.a, kv.v, n_tok, cl, cfg, &res.time_s, &res.ops, &res.bytes);
                 res.calculate_derived();
                 printf("%-20s quant=%-6s AI=%.3f BW=%.2f GB/s Perf=%.2f GFLOP/s",
                     res.op_name.c_str(), res.quant_type.c_str(),
                     res.arithmetic_intensity, res.effective_bw_gb_s, res.effective_gflops);
                 res.print_dims();
                 printf("\n");
-                results.push_back(res);
+                order.add(ti, ci, res);
             }
         }
+        order.flush(results);
         printf("\n");
     }
 }
