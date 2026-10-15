@@ -420,6 +420,12 @@ struct llama_pshard_store_info {
 };
 llama_pshard_store_info llama_pshard_store_info_for(const char * path_model, const struct llama_model_params * mparams);
 
+// the store slots per layer the last run of the plans for (fingerprint, budget, top tier) got, kept next to the model:
+// the RAM the runtime's buffers, the system and other programs hold when the store allocates is not known at plan time.
+// Planning prices the store at it; a run that gets fewer than its plans were priced at marks them stale. 0 = no run yet
+uint32_t llama_pshard_store_slots_seen(const std::string & path_model, uint64_t fingerprint, uint32_t budget_mib, uint32_t cache_ubatch);
+void     llama_pshard_store_slots_record(const std::string & path_model, uint64_t fingerprint, uint32_t budget_mib, uint32_t cache_ubatch, uint32_t n_slots);
+
 // plan cache serialization. fingerprint covers the runtime plan-compatibility params, the
 // predictor version and the profile files' hash, so the planner binary and the runtime binary
 // share the same cache file when they see the same profile files (working directory or
@@ -598,6 +604,8 @@ struct llama_pshard_plan_registry {
     bool                                 pshard_disabled = false;
     // the load found no plan for this fingerprint and budget
     bool                                 cache_missed = false;
+    bool                                 store_stale  = false;   // llama_pshard_registry_store_stale
+    uint64_t                             fingerprint  = 0;       // of the loaded plans (0 = not loaded)
     size_t                               baseline_vram_req = 0;
 
     void init(uint32_t n_ubatch, uint32_t n_parallel = 1, uint32_t n_draft = 0) {

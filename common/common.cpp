@@ -1361,8 +1361,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         common_pshard_fit_one_budget(params, mparams, cparams, mva_eff, fit_target_eff, n_ctx_res,
             llama_params_fit_pshard,
             [&]() { return llama_pshard_registry_create(params.pshard_tier_max, cparams.n_seq_max, n_draft_tier); });
-        if (mparams.pshard_registry != nullptr &&
-                llama_pshard_registry_cache_missed(mparams.pshard_registry) && params.pshard_plan_on_miss) {
+        if (mparams.pshard_registry != nullptr && params.pshard_plan_on_miss &&
+                (llama_pshard_registry_cache_missed(mparams.pshard_registry) || llama_pshard_registry_store_stale(mparams.pshard_registry))) {
             // no plan for this configuration, or only a smaller budget's: plan it now (the plan
             // tool's passes), then load against the fresh registry. --pshard-no-plan-on-miss keeps
             // the stock fallback (or the smaller budget's plan).

@@ -2352,7 +2352,8 @@ int llama_bench(int argc, char ** argv) {
         mparams.pshard_registry = reg;
         llama_params_fit_pshard(inst.model.c_str(), &mparams, &cparams,
             overrides.data(), inst.max_vram_alloc, inst.fit_target);
-        const bool missed = llama_pshard_registry_cache_missed(reg);
+        // stale store slots plan here too; between timed tests the loaded plans run as they are
+        const bool missed = llama_pshard_registry_cache_missed(reg) || llama_pshard_registry_store_stale(reg);
         llama_pshard_registry_free(reg);
         if (!missed) {
             continue;

@@ -150,6 +150,20 @@ std::string llama_expert_store_largest_file(const std::string & path_model, uint
     return file;
 }
 
+// this process's committed bytes and working set (0 where the system does not say)
+static void process_memory(uint64_t & committed, uint64_t & working_set) {
+    committed   = 0;
+    working_set = 0;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc = {};
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &pmc, sizeof(pmc))) {
+        committed   = pmc.PrivateUsage;
+        working_set = pmc.WorkingSetSize;
+    }
+#endif
+}
+
 static uint64_t process_page_faults() {
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS pmc = {};
@@ -168,6 +182,21 @@ static size_t ram_available() {
     ms.dwLength = sizeof(ms);
     return GlobalMemoryStatusEx(&ms) ? (size_t) ms.ullAvailPhys : 0;
 #else
+#   ifdef __linux__
+    // MemAvailable counts the file cache the kernel can reclaim, as Windows' available memory does
+    if (FILE * f = fopen("/proc/meminfo", "r")) {
+        char line[256];
+        unsigned long long kb = 0;
+        bool found = false;
+        while (!found && fgets(line, sizeof(line), f) != nullptr) {
+            found = sscanf(line, "MemAvailable: %llu kB", &kb) == 1;
+        }
+        fclose(f);
+        if (found) {
+            return (size_t) kb * 1024;
+        }
+    }
+#   endif
     const long pages = sysconf(_SC_AVPHYS_PAGES);
     const long page  = sysconf(_SC_PAGE_SIZE);
     return pages > 0 && page > 0 ? (size_t) pages * (size_t) page : 0;
@@ -375,6 +404,13 @@ bool llama_expert_store::allocate() {
     const sizing sz = size_for();
     const size_t cap = sz.cap;
     uint32_t n = sz.n;
+    {
+        uint64_t committed = 0, ws = 0;
+        process_memory(committed, ws);
+        LLAMA_LOG_INFO("%s: RAM %.2f GiB available, this process %.2f GiB committed / %.2f GiB working set; budget %.2f GiB, "
+            "reserve %.2f GiB, cap %.2f GiB -> %u slots\n", __func__, ram_available() / 1073741824.0, committed / 1073741824.0,
+            ws / 1073741824.0, budget_b / 1073741824.0, reserve_b / 1073741824.0, cap / 1073741824.0, n);
+    }
 
     if (n < n_expert_used) {
         LLAMA_LOG_WARN("%s: expert store off: %.1f GiB of RAM hold %u slots per layer, below the %u routed experts\n",

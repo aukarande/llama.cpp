@@ -1653,6 +1653,10 @@ bool llama_pshard_registry_cache_missed(const struct llama_pshard_plan_registry 
     return registry != nullptr && registry->cache_missed;
 }
 
+bool llama_pshard_registry_store_stale(const struct llama_pshard_plan_registry * registry) {
+    return registry != nullptr && registry->store_stale;
+}
+
 bool llama_pshard_registry_stock_fit(const struct llama_pshard_plan_registry * registry) {
     return registry != nullptr && registry->pshard_disabled;
 }
@@ -3997,6 +4001,16 @@ void llama_params_fit_pshard_plan(
         registry->budget_mib = pshard_bytes_to_mib_ceil(vram_free);
         registry->cache_ubatch = registry->tier_sizes.empty() ? 0 : registry->tier_sizes.back();
         ctx.cache_ubatch = registry->cache_ubatch;
+        // the store slots the last run of this configuration got (the RAM its buffers, the system and other programs held
+        // when it allocated): price those
+        if (predictor && predictor->store != nullptr) {
+            const uint32_t seen = llama_pshard_store_slots_seen(path_model, fp, registry->budget_mib, registry->cache_ubatch);
+            if (seen >= ctx.n_expert_used && seen < store.n_ram) {
+                LLAMA_LOG_INFO("%s: expert store: priced at %u slots per layer, what the last run of these plans got (the budget holds %u)\n",
+                    __func__, seen, store.n_ram);
+                store.n_ram = seen;
+            }
+        }
         registry->store_slots   = predictor && predictor->store != nullptr ? store.n_ram : 0;
         registry->store_experts = predictor && predictor->store != nullptr ? store.n_expert : 0;
         registry->ssd_expert_ms = store_expert_ms;

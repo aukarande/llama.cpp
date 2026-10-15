@@ -533,14 +533,20 @@ llama_context::llama_context(
             const bool was = store->active();
             const bool ok  = store->allocate();
             if (const auto * registry = model.get_plan_registry(); !was && ok && registry != nullptr && registry->store_slots > 0) {
-                // the plans priced the store's SSD reads at the slots its budget holds; the RAM free here may hold fewer
-                // (find_cut prices the uploads' reads at the live slots)
+                // the plans priced the store's SSD reads at the slots the last run got, else the budget's; the RAM free here
+                // may hold fewer (find_cut prices the uploads' reads at the live slots). The slots are recorded for the next
+                // planning; fewer than priced make the next run plan again
                 if (store->n_ram < registry->store_slots) {
-                    LLAMA_LOG_WARN("%s: pshard: expert store has %u slots per layer, the plans were priced at %u\n",
-                        __func__, store->n_ram, registry->store_slots);
+                    LLAMA_LOG_WARN("%s: pshard: expert store has %u slots per layer, the plans were priced at %u: the next run plans at %u\n",
+                        __func__, store->n_ram, registry->store_slots, store->n_ram);
                 } else {
                     LLAMA_LOG_INFO("%s: pshard: expert store has %u slots per layer, the plans were priced at %u\n",
                         __func__, store->n_ram, registry->store_slots);
+                }
+                const std::string & path = model.get_path_model();
+                if (registry->fingerprint != 0 && !path.empty() &&
+                        llama_pshard_store_slots_seen(path, registry->fingerprint, registry->budget_mib, registry->cache_ubatch) != store->n_ram) {
+                    llama_pshard_store_slots_record(path, registry->fingerprint, registry->budget_mib, registry->cache_ubatch, store->n_ram);
                 }
             }
             const char * why = nullptr;

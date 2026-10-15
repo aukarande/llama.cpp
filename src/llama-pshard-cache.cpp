@@ -300,6 +300,59 @@ llama_pshard_store_info llama_pshard_store_info_for(const char * path_model, con
     return info;
 }
 
+static std::string pshard_store_slots_path(const std::string & path_model) {
+    return path_model + ".pshard_store_slots";
+}
+
+static bool pshard_store_slots_parse(const char * line, uint64_t fingerprint, uint32_t budget_mib, uint32_t cache_ubatch, uint32_t & n) {
+    unsigned long long fp = 0;
+    uint32_t b = 0, u = 0;
+    return sscanf(line, "fingerprint=%llx budget=%u cache_ubatch=%u slots=%u", &fp, &b, &u, &n) == 4 &&
+        fp == fingerprint && b == budget_mib && u == cache_ubatch;
+}
+
+uint32_t llama_pshard_store_slots_seen(const std::string & path_model, uint64_t fingerprint, uint32_t budget_mib, uint32_t cache_ubatch) {
+    FILE * f = ggml_fopen(pshard_store_slots_path(path_model).c_str(), "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    uint32_t seen = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        uint32_t n = 0;
+        if (pshard_store_slots_parse(line, fingerprint, budget_mib, cache_ubatch, n)) {
+            seen = n;
+        }
+    }
+    fclose(f);
+    return seen;
+}
+
+void llama_pshard_store_slots_record(const std::string & path_model, uint64_t fingerprint, uint32_t budget_mib, uint32_t cache_ubatch, uint32_t n_slots) {
+    const std::string path = pshard_store_slots_path(path_model);
+    std::vector<std::string> keep;
+    if (FILE * f = ggml_fopen(path.c_str(), "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), f) != nullptr) {
+            uint32_t n = 0;
+            if (!pshard_store_slots_parse(line, fingerprint, budget_mib, cache_ubatch, n)) {
+                keep.push_back(line);
+            }
+        }
+        fclose(f);
+    }
+    FILE * f = ggml_fopen(path.c_str(), "w");
+    if (f == nullptr) {
+        LLAMA_LOG_WARN("%s: cannot write %s\n", __func__, path.c_str());
+        return;
+    }
+    for (const auto & l : keep) {
+        fputs(l.c_str(), f);
+    }
+    fprintf(f, "fingerprint=%016llx budget=%u cache_ubatch=%u slots=%u\n", (unsigned long long) fingerprint, budget_mib, cache_ubatch, n_slots);
+    fclose(f);
+}
+
 size_t llama_pshard_ssd_profile(char * buf, size_t buf_size) {
     // the store reads each expert of a tensor on its own: the rate with many such reads in flight (a pass with many
     // misses), and a lone read's latency and rate, fitted to a small and a large read (priced at every read size). The
@@ -668,6 +721,16 @@ void llama_params_fit_pshard(
     if (!registry->pshard_disabled) {
         LLAMA_LOG_INFO("%s: loaded %zu tier plans from cache (variant budget=%u MiB cache_ubatch=%u)\n",
             __func__, registry->tier_sizes.size(), registry->budget_mib, registry->cache_ubatch);
+    }
+    registry->fingerprint = fp;
+    // the last run of these plans got fewer store slots than they were priced at: planning again prices them at those
+    // (the plans run until then). Only plans this configuration's planner writes: it plans up to its own tier max
+    const uint32_t plan_tier_max = std::min(requested_tier_max > 0 ? std::min(requested_tier_max, tier_max_auto) : tier_max_auto, n_ctx_plan);
+    if (const uint32_t seen = llama_pshard_store_slots_seen(path_model, fp, registry->budget_mib, registry->cache_ubatch);
+            seen > 0 && registry->store_slots > seen && registry->cache_ubatch <= plan_tier_max) {
+        LLAMA_LOG_WARN("%s: the last run of these plans got %u store slots per layer, they were priced at %u: they need planning again\n",
+            __func__, seen, registry->store_slots);
+        registry->store_stale = true;
     }
 
     // cached baseline fit for this budget
