@@ -577,9 +577,10 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
-    // a -1 id (skipped route) computes against expert 0 and writes zeros
+    // a -1 id (skipped route) reads no weights and writes zeros
     const int32_t id_val = ncols_dst == 1 && ids ? ids[channel_dst] : 0;
     const bool skip_row  = id_val < 0;
+    const int  kbx_end   = skip_row ? 0 : blocks_per_row_x;
     channel_x  = ncols_dst == 1 && ids ? (skip_row ? 0u : (uint32_t) id_val) : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
@@ -658,7 +659,7 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = tid / (qi/vdr); kbx < kbx_end; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
@@ -804,9 +805,10 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    // a -1 id (skipped route) computes against expert 0 and writes zeros
+    // a -1 id (skipped route) reads no weights and writes zeros
     const int32_t  id_val    = ids[channel_dst + token_idx * ids_stride];
     const bool     skip_row  = id_val < 0;
+    const int      kbx_end   = skip_row ? 0 : blocks_per_row_x;
     const uint32_t channel_x = skip_row ? 0u : (uint32_t) id_val;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
@@ -816,7 +818,7 @@ static __global__ void mul_mat_vec_q_moe(
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < kbx_end; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
