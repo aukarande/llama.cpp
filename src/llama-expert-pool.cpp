@@ -4,248 +4,12 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
-#include "llama-ssd-reader.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
-
-bool llama_expert_pool::init_ssd(const llama_model & model, size_t ram_bytes) {
-    constexpr size_t sector = llama_ssd_reader::sector;
-    if (ram_bytes == 0 || backend_router == nullptr) {
-        return false;
-    }
-    // the files: the main path and its splits, in mapping order
-    const size_t n_split = model.pshard_n_splits();
-    std::vector<std::string> paths;
-    if (n_split <= 1) {
-        paths.push_back(model.get_path_model());
-    } else {
-        char prefix[1024];
-        if (llama_split_prefix(prefix, sizeof(prefix), model.get_path_model().c_str(), 0, (int) n_split) <= 0) {
-            LLAMA_LOG_WARN("%s: expert pool: SSD tier off - the model path does not follow the split naming\n", __func__);
-            return false;
-        }
-        for (size_t i = 0; i < n_split; i++) {
-            char path[1024];
-            llama_split_path(path, sizeof(path), prefix, (int) i, (int) n_split);
-            paths.push_back(path);
-        }
-    }
-    size_t slot_all = 0;      // one RAM slot in every pooled layer
-    size_t experts_all = 0;
-    for (auto & L : layers) {
-        for (auto & e : L.tensors) {
-            if (!model.pshard_file_pos(e.host->data, e.file_split, e.file_off) || e.file_split >= paths.size()) {
-                LLAMA_LOG_WARN("%s: expert pool: SSD tier off - %s is not mmap-backed\n", __func__, e.host->name);
-                return false;
-            }
-            e.ram_stride = GGML_PAD(e.row_bytes + sector - 1, sector);
-            slot_all    += e.ram_stride;
-            experts_all += e.row_bytes * n_expert;
-        }
-    }
-    if (slot_all == 0) {
-        return false;
-    }
-    if (ram_bytes >= experts_all) {
-        LLAMA_LOG_INFO("%s: expert pool: the experts (%.1f GiB) fit the RAM budget - SSD tier off\n", __func__, experts_all / 1073741824.0);
-        return false;
-    }
-    uint32_t want = (uint32_t) std::min<size_t>(n_expert, ram_bytes / slot_all);
-    if (want < n_expert_used) {
-        LLAMA_LOG_WARN("%s: expert pool: SSD tier off - %.1f MiB of RAM hold %u slots per layer, below the %u routed experts\n",
-            __func__, ram_bytes / 1048576.0, want, n_expert_used);
-        return false;
-    }
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend_router);
-    ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
-    if (buft == nullptr) {
-        LLAMA_LOG_WARN("%s: expert pool: SSD tier off - the device has no pinned host buffer type\n", __func__);
-        return false;
-    }
-    // pinned memory: the reads land there and the uploads are kernel copies from it. A refused size steps down
-    while (ram_arena == nullptr && want >= n_expert_used) {
-        ram_arena = ggml_backend_buft_alloc_buffer(buft, (size_t) want * slot_all + sector);
-        if (ram_arena != nullptr && ggml_backend_buffer_get_type(ram_arena) != buft) {
-            // a refused page-lock falls back to a pageable buffer: kernel copies cannot read it
-            ggml_backend_buffer_free(ram_arena);
-            ram_arena = nullptr;
-        }
-        if (ram_arena == nullptr) {
-            want = std::min<uint32_t>(want * 3 / 4, want - 1);
-        }
-    }
-    if (ram_arena == nullptr) {
-        LLAMA_LOG_WARN("%s: expert pool: SSD tier off - no pinned RAM arena\n", __func__);
-        return false;
-    }
-    reader = new llama_ssd_reader();
-    if (!reader->open(paths)) {
-        delete reader;
-        reader = nullptr;
-        ggml_backend_buffer_free(ram_arena);
-        ram_arena = nullptr;
-        return false;
-    }
-    char * base = (char *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(ram_arena), sector);
-    size_t off = 0;
-    for (auto & L : layers) {
-        if (L.tensors.empty()) {
-            continue;
-        }
-        for (auto & e : L.tensors) {
-            e.ram_base = base + off;
-            off += (size_t) want * e.ram_stride;
-        }
-        L.ram_slot.assign(n_expert, -1);
-        L.ram_expert.assign(want, -1);
-        L.ram_stamp.assign(want, 0);
-        L.ram_clock = 0;
-    }
-    n_ram      = want;
-    ssd_active = true;
-    LLAMA_LOG_WARN("%s: expert pool: SSD tier on - %u RAM slots per layer (%.1f GiB pinned) for %.1f GiB of experts in %zu file(s)\n",
-        __func__, n_ram, (double) n_ram * slot_all / 1073741824.0, experts_all / 1073741824.0, paths.size());
-    return true;
-}
-
-void llama_expert_pool::ram_fetch(layer_state & L, const int32_t * experts, size_t n, bool scan) {
-    constexpr size_t   sector = llama_ssd_reader::sector;
-    constexpr uint64_t held   = UINT64_MAX;
-    GGML_ASSERT(n <= n_ram);
-    // the requested experts stay out of the victims picked below: hits take the newest stamps. A scan (a whole-stack
-    // fill that streams every expert) holds them for this call only and keeps the RAM recency as it was; its own
-    // reads end up oldest, so the scan's next batch reuses their slots instead of the hot set's
-    std::vector<std::pair<uint32_t, uint64_t>> restore;
-    for (size_t i = 0; i < n; i++) {
-        const int32_t s = L.ram_slot[experts[i]];
-        if (s >= 0) {
-            if (scan) {
-                restore.push_back({ (uint32_t) s, L.ram_stamp[s] });
-                L.ram_stamp[s] = held;
-            } else {
-                L.ram_stamp[s] = ++L.ram_clock;
-            }
-            ram_hits++;
-        }
-    }
-    bool issued = false;
-    for (size_t i = 0; i < n; i++) {
-        const int32_t x = experts[i];
-        if (L.ram_slot[x] >= 0) {
-            continue;
-        }
-        if (!issued && admit_backend != nullptr) {
-            ggml_backend_synchronize(admit_backend);   // background admissions may still read the victims' RAM slots
-        }
-        uint32_t v = 0;
-        for (uint32_t s = 1; s < n_ram; s++) {
-            if (L.ram_stamp[s] < L.ram_stamp[v]) {
-                v = s;
-            }
-        }
-        if (L.ram_expert[v] >= 0) {
-            L.ram_slot[L.ram_expert[v]] = -1;
-        }
-        L.ram_expert[v] = x;
-        L.ram_slot[x]   = (int32_t) v;
-        L.ram_stamp[v]  = scan ? held : ++L.ram_clock;
-        if (scan) {
-            restore.push_back({ v, 0 });
-        }
-        for (const auto & te : L.tensors) {
-            const size_t off = te.file_off + (size_t) x * te.row_bytes;
-            const size_t beg = off & ~(sector - 1);
-            const size_t end = GGML_PAD(off + te.row_bytes, sector);
-            reader->read(te.file_split, beg, end - beg, te.ram_base + (size_t) v * te.ram_stride, off + te.row_bytes - beg);
-            ssd_bytes += end - beg;
-        }
-        ssd_reads++;
-        issued = true;
-    }
-    if (issued) {
-        const int64_t t0 = ggml_time_us();
-        if (!reader->wait_all()) {
-            GGML_ABORT("expert pool: an SSD tier read failed");
-        }
-        ssd_wait_us += ggml_time_us() - t0;
-    }
-    for (const auto & r : restore) {
-        L.ram_stamp[r.first] = r.second;
-    }
-}
-
-const char * llama_expert_pool::ram_ptr(const layer_state & L, size_t ti, int32_t e) const {
-    const auto & te = L.tensors[ti];
-    const int32_t s = L.ram_slot[e];
-    GGML_ASSERT(s >= 0);
-    const size_t off = te.file_off + (size_t) e * te.row_bytes;
-    return te.ram_base + (size_t) s * te.ram_stride + (off & (llama_ssd_reader::sector - 1));
-}
-
-void llama_expert_pool::fill_ab_ssd(layer_state & L, ggml_backend_t backend) {
-    // device copies of the experts the kept cache layout holds; every other expert from a RAM slot, n_ram at a time
-    const bool use_slots = keep_ab && !L.ab_lost && copy_segments_d2d != nullptr && !L.expert_slot.empty();
-    std::vector<int32_t> from_ram;
-    ab_segs.clear();
-    bool aligned = true;
-    for (uint32_t x = 0; x < n_expert; x++) {
-        const int32_t s = use_slots ? L.expert_slot[x] : -1;
-        if (s < 0) {
-            from_ram.push_back((int32_t) x);
-            continue;
-        }
-        for (const auto & e : L.tensors) {
-            ab_segs.push_back({ (char *) e.view_ab->data + (size_t) x * e.row_bytes,
-                                (const char *) e.view_slots->data + (size_t) s * e.row_bytes, e.row_bytes });
-            const auto & sg = ab_segs.back();
-            aligned = aligned && (((uintptr_t) sg.src | (uintptr_t) sg.dst | (uintptr_t) sg.size) & 15) == 0;
-        }
-    }
-    if (!ab_segs.empty() && (!aligned || !copy_segments_d2d(backend, ab_segs.data(), (int) ab_segs.size()))) {
-        // the batched device copy needs 16-byte aligned rows: take those experts from RAM too
-        from_ram.clear();
-        for (uint32_t x = 0; x < n_expert; x++) {
-            from_ram.push_back((int32_t) x);
-        }
-    }
-    const uint32_t n_dev = n_expert - (uint32_t) from_ram.size();
-    // a scan through half the RAM slots at a time: the other half keeps the decode working set
-    const size_t win = std::max<size_t>(1, n_ram / 2);
-    for (size_t c = 0; c < from_ram.size(); c += win) {
-        const size_t n = std::min<size_t>(win, from_ram.size() - c);
-        if (c > 0) {
-            ggml_backend_synchronize(backend);   // the previous batch's uploads read the RAM slots reused now
-        }
-        ram_fetch(L, from_ram.data() + c, n, /*scan=*/true);
-        upload_segs.clear();
-        for (size_t i = 0; i < n; i++) {
-            const int32_t x = from_ram[c + i];
-            for (size_t ti = 0; ti < L.tensors.size(); ti++) {
-                const auto & te = L.tensors[ti];
-                upload_segs.push_back({ te.view_ab, (size_t) x * te.row_bytes, ram_ptr(L, ti, x), te.row_bytes });
-            }
-        }
-        bool batched = false;
-        if (copy_segments != nullptr && kernel_copies) {
-            std::vector<ggml_backend_copy_segment> segs(upload_segs.size());
-            for (size_t i = 0; i < upload_segs.size(); i++) {
-                segs[i] = { (char *) upload_segs[i].view->data + upload_segs[i].off, upload_segs[i].src, upload_segs[i].size };
-            }
-            batched = copy_segments(backend, segs.data(), (int) segs.size());
-        }
-        if (!batched) {
-            for (const auto & sg : upload_segs) {
-                ggml_backend_tensor_set_async(backend, sg.view, sg.src, sg.off, sg.size);
-            }
-        }
-        upload_segs.clear();
-    }
-    ab_note(L, n_dev, (uint32_t) from_ram.size());
-}
 
 llama_expert_pool::~llama_expert_pool() {
     if (admit_backend != nullptr) {
@@ -269,12 +33,6 @@ llama_expert_pool::~llama_expert_pool() {
     }
     if (ctx_views != nullptr) {
         ggml_free(ctx_views);
-    }
-    delete reader;
-    reader = nullptr;
-    if (ram_arena != nullptr) {
-        ggml_backend_buffer_free(ram_arena);
-        ram_arena = nullptr;
     }
 }
 
@@ -566,9 +324,9 @@ uint32_t llama_expert_pool::seed_from_workload(bool gpu) {
     if (workload_path.empty() || backend_router == nullptr) {
         return 0;
     }
-    // the GPU slots exist while the pool is engaged and outside a whole-stack overlay; the SSD tier's RAM slots always
+    // the GPU slots exist while the pool is engaged and outside a whole-stack overlay
     const bool gpu_ok = gpu && active && n_slots > 0 && !(ab_mode && !keep_ab);
-    if (!gpu_ok && !ssd_active) {
+    if (!gpu_ok) {
         return 0;
     }
     llama_pshard_workload wl;
@@ -583,7 +341,6 @@ uint32_t llama_expert_pool::seed_from_workload(bool gpu) {
     std::vector<int32_t> order(n_expert);
     uint32_t n_seeded = 0;
     uint32_t n_layers = 0;
-    uint32_t n_ram_seeded = 0;
     size_t   bytes    = 0;
     for (auto & L : layers) {
         const auto it = counts.find((uint32_t) L.il);
@@ -597,18 +354,6 @@ uint32_t llama_expert_pool::seed_from_workload(bool gpu) {
         std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
             return cnt[a] + L.use_count[a] > cnt[b] + L.use_count[b];
         });
-        if (ssd_active) {
-            // the RAM slots take the layer's n_ram most routed experts, read from the files; the most routed is
-            // fetched last so it holds the newest stamp
-            const uint32_t r = std::min(n_ram, n_expert);
-            std::vector<int32_t> top(order.begin(), order.begin() + r);
-            std::reverse(top.begin(), top.end());
-            ram_fetch(L, top.data(), r);
-            n_ram_seeded += r;
-        }
-        if (!gpu_ok) {
-            continue;
-        }
         // a layer under the whole-stack overlay holds the tier's halves; on a padded model the dirty prefix is zeroed
         // on the return to cache mode, so nothing below it may be mapped
         bool covered = ab_mode && L.ab_lost;
@@ -618,8 +363,7 @@ uint32_t llama_expert_pool::seed_from_workload(bool gpu) {
         if (covered) {
             continue;
         }
-        // with the SSD tier the GPU slots are filled from the RAM slots
-        const uint32_t k = std::min(std::min(L.n_slots_l, n_expert), ssd_active ? n_ram : n_expert);
+        const uint32_t k = std::min(L.n_slots_l, n_expert);
         std::fill(L.expert_slot.begin(), L.expert_slot.end(), -1);
         std::fill(L.slot_expert.begin(), L.slot_expert.end(), -1);
         std::fill(L.slot_stamp.begin(),  L.slot_stamp.end(),  0);
@@ -632,7 +376,7 @@ uint32_t llama_expert_pool::seed_from_workload(bool gpu) {
             for (size_t ti = 0; ti < L.tensors.size(); ti++) {
                 const auto & te = L.tensors[ti];
                 upload_segs.push_back({ te.view_slots, (size_t) s * te.row_bytes,
-                    ssd_active ? ram_ptr(L, ti, x) : (const char *) te.host->data + (size_t) x * te.row_bytes, te.row_bytes });
+                    (const char *) te.host->data + (size_t) x * te.row_bytes, te.row_bytes });
                 bytes += te.row_bytes;
             }
         }
@@ -640,12 +384,8 @@ uint32_t llama_expert_pool::seed_from_workload(bool gpu) {
         n_seeded += k;
         n_layers++;
     }
-    if (n_ram_seeded > 0) {
-        LLAMA_LOG_WARN("%s: expert pool: SSD tier seeded %u experts into RAM slots in %.1f s (%.1f GB/s)\n", __func__,
-            n_ram_seeded, (ggml_time_us() - t0) / 1e6, ssd_bytes / 1e9 / std::max(1e-6, (ggml_time_us() - t0) / 1e6));
-    }
     if (upload_segs.empty()) {
-        return n_ram_seeded;
+        return 0;
     }
     // the fetches' upload path
     bool batched = false;
@@ -716,10 +456,6 @@ bool llama_expert_pool::set_overlay(size_t delta) {
 }
 
 void llama_expert_pool::fill_ab(layer_state & L, ggml_backend_t backend) {
-    if (ssd_active) {
-        fill_ab_ssd(L, backend);
-        return;
-    }
     // at most this many host upload runs per tensor: short gaps of resident experts ride along with the upload
     // instead of costing one copy-engine transfer each (a cap of 16 re-uploaded about half of the residents)
     constexpr size_t max_runs = 64;
@@ -1499,9 +1235,6 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                     // same-pass hit must never be one
                     L.slot_stamp[L.expert_slot[e]] = ++L.stamp;
                     n_hit++;
-                    if (ssd_active && L.ram_slot[e] >= 0) {
-                        L.ram_stamp[L.ram_slot[e]] = ++L.ram_clock;   // a GPU hit keeps its RAM copy recent too
-                    }
                     if (!L.slot_pf_gen.empty() && L.slot_pf_gen[L.expert_slot[e]] == generation) {
                         L.pf_used++;   // a prefetch from this pass paid off
                     }
@@ -1616,31 +1349,12 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             }
             upload_segs.clear();
         };
-        // SSD tier: the admitted misses come from RAM slots, read from the files first, n_ram experts at a time;
-        // a further batch reuses the slots only after the previous batch's uploads ran
-        std::vector<int32_t> ram_batch;
-        size_t ram_next = 0;
         for (size_t i = 0; i < miss_list.size(); i++) {
             const int32_t e = miss_list[i];
             L.expert_last_gen[e] = generation;
             if (!admit[i]) {
                 L.misses++;
                 continue;
-            }
-            if (ssd_active && i >= ram_next) {
-                if (ram_next > 0) {
-                    issue_uploads();
-                    ggml_backend_synchronize(up_backend);
-                }
-                ram_batch.clear();
-                size_t j = i;
-                for (; j < miss_list.size() && ram_batch.size() < n_ram; j++) {
-                    if (admit[j]) {
-                        ram_batch.push_back(miss_list[j]);
-                    }
-                }
-                ram_fetch(L, ram_batch.data(), ram_batch.size());
-                ram_next = j;
             }
             int32_t slot = 0;
             for (uint32_t s = 1; s < L.n_slots_l; s++) {
@@ -1659,7 +1373,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                 const auto & te = L.tensors[ti];
                 // collected: the pass's rows go up in one launch below (per-tensor set_async fallback)
                 upload_segs.push_back({ te.view_slots, (size_t) slot * te.row_bytes,
-                    ssd_active ? ram_ptr(L, ti, e) : (const char *) te.host->data + (size_t) e * te.row_bytes, te.row_bytes });
+                    (const char *) te.host->data + (size_t) e * te.row_bytes, te.row_bytes });
             }
             if (background) {
                 L.expert_pending[e] = generation;   // CPU route this pass, GPU hit from the next
@@ -1729,8 +1443,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         //    hits once the split stream has waited on the admit event (top of serve()).
         //    The victim is safe: the target layer's previous pass has completed (the
         //    drain above) and nothing reads its slots before its own service.
-        // (not with the SSD tier: its reads would sit on the critical path of this layer)
-        if (predict_k > 0 && prefetch_on && n_ids_1 <= 8 && !ssd_active) {   // decode and small verify batches
+        if (predict_k > 0 && prefetch_on && n_ids_1 <= 8) {   // decode and small verify batches
             const int32_t tgt = L.il + predict_k;
             if (layer_pooled(tgt) && layers[tgt].ids_pred != nullptr) {
                 layer_state & T = layers[tgt];
@@ -1823,12 +1536,6 @@ void llama_expert_pool::reset_slots() {
 void llama_expert_pool::log_counters() const {
     // the headline lines print at WARN so runs without -lv still report them (the pricing model is
     // calibrated from these); per-layer detail stays at INFO
-    if (ssd_active) {
-        LLAMA_LOG_WARN("%s: expert pool SSD tier: %u RAM slots per layer; %llu experts found in RAM, %llu read from the files "
-            "(%.2f GB, %.1f s waited, %.2f GB/s while waiting)\n", __func__, n_ram,
-            (unsigned long long) ram_hits, (unsigned long long) ssd_reads, ssd_bytes / 1e9, ssd_wait_us / 1e6,
-            ssd_wait_us > 0 ? ssd_bytes / 1e3 / (double) ssd_wait_us : 0.0);
-    }
     uint64_t hits = 0, misses = 0, passes = 0;
     uint64_t hits_1 = 0, misses_1 = 0, passes_1 = 0, evicted = 0;
     std::string per_layer;

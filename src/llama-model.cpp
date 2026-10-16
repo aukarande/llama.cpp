@@ -2836,23 +2836,6 @@ llama_expert_store * llama_model::expert_store() const {
     return pimpl->expert_store.get();
 }
 
-size_t llama_model::pshard_n_splits() const {
-    return pimpl->mappings.size();
-}
-
-bool llama_model::pshard_file_pos(const void * data, size_t & split, size_t & offset) const {
-    // each mapping covers its whole file from offset 0
-    for (size_t i = 0; i < pimpl->mappings.size(); i++) {
-        const char * base = (const char *) pimpl->mappings[i]->addr();
-        if ((const char *) data >= base && (const char *) data < base + pimpl->mappings[i]->size()) {
-            split  = i;
-            offset = (size_t) ((const char *) data - base);
-            return true;
-        }
-    }
-    return false;
-}
-
 bool llama_model_pshard_active(const struct llama_model * model) {
     return model != nullptr && model->is_pshard();
 }

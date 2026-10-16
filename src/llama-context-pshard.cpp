@@ -1076,10 +1076,9 @@ void llama_context::pshard_apply_initial_plan() {
         pshard_update_pool_mode(*initial);
         // an empty cache would leave the first prompt's whole-stack pass nothing to reuse and decode to refill it.
         // Only a decode tier that admits experts fills the cache
-        // The SSD tier's RAM slots are seeded whatever tier landed
         const llama_pshard_plan * dec = registry->get_best(0);
         const bool gpu_seed = dec != nullptr && dec->strategy == LLAMA_PSHARD_EXPERT_POOL && dec->cold_ms > 0.0f;
-        if (expert_pool && (gpu_seed || expert_pool->ssd_active)) {
+        if (expert_pool && gpu_seed) {
             expert_pool->seed_from_workload(gpu_seed);
         }
     }
