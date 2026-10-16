@@ -1956,6 +1956,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
             }
+            // a pinned host buffer that fell back to pageable memory cannot be read in place: the plans that would read
+            // it run their unpinned part on the CPU instead (STATIC_ATTNPRIO_ALLMODELS places only that part on the
+            // shard lanes)
+            if (buf != nullptr && !ml.no_alloc && pimpl->plan_registry != nullptr && ggml_backend_buffer_get_type(buf) != buft &&
+                    buft == ggml_backend_dev_host_buffer_type(dev)) {
+                const pshard_dev_layout layout = pshard_dev_layout::for_device(0,
+                    pshard_dev_layout::compute_cpu_backend_id(devices.size()));
+                for (auto & plan : pimpl->plan_registry->best_plans) {
+                    if (plan.in_place == 0) {
+                        continue;
+                    }
+                    LLAMA_LOG_WARN("%s: %s is not page-locked: tier bs=%u runs its unpinned part on the CPU, not in place\n",
+                        __func__, ggml_backend_buft_name(buft), plan.batch_size);
+                    for (auto & ov : plan.overrides) {
+                        if (ov.backend_id == layout.shard_a || ov.backend_id == layout.shard_b) {
+                            ov.backend_id = layout.cpu;
+                        }
+                    }
+                    plan.in_place     = 0;
+                    plan.maps_cached  = false;
+                    plan.addrs_cached = false;
+                }
+            }
             if (buf != nullptr && use_mlock && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
@@ -2156,7 +2179,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                             }
                             llama_pshard_generate_overrides(plan.n_pinned, n_layers_plan, nullptr, nullptr, ovs.data(),
                                 (llama_layer_fraction) plan.overflow, plan.strategy, layout, plan.pin_from_back,
-                                plan.output_on_gpu, plan.n_attn_pinned, plan.overlap, plan.ids_cross, plan.n_ffn_gpu);
+                                plan.output_on_gpu, plan.n_attn_pinned, plan.overlap, plan.ids_cross, plan.n_ffn_gpu, plan.in_place);
                             std::vector<std::regex> res;
                             for (const auto * ov = ovs.data(); ov->pattern; ++ov) {
                                 res.emplace_back(ov->pattern);
@@ -3183,7 +3206,7 @@ void llama_model::pshard_set_backend_maps(const llama_pshard_plan & plan) {
 }
 
 size_t llama_model::pshard_apply_plan(const llama_pshard_plan & plan, ggml_backend_t gpu, bool force_upload) {
-    params.pshard_delegate_compute = llama_pshard_strategy_delegates_compute(plan.strategy);
+    params.pshard_delegate_compute = llama_pshard_strategy_delegates_compute(plan.strategy, plan.in_place);
     pshard_set_backend_maps(plan);
 
     LLAMA_LOG_DEBUG("%s: rebuilt maps: %zu tensors, %zu layers (cached=%d)\n",

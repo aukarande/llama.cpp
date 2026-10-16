@@ -63,7 +63,8 @@ void llama_pshard_generate_overrides(
         uint32_t n_attn_pinned,
         bool overlap,
         bool ids_cross,
-        uint32_t n_ffn_gpu) {
+        uint32_t n_ffn_gpu,
+        uint8_t in_place) {
     GGML_UNUSED(gpu_buft);
 
     thread_local std::array<std::string, 1000> patterns_layer;
@@ -147,14 +148,17 @@ void llama_pshard_generate_overrides(
                 case LLAMA_PSHARD_GPUONLY_LAYERPIN_LAYERSTREAM:
                     emit(patterns_layer[il].c_str(), host_buft, shard_bid);
                     break;
-                case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS:
+                case LLAMA_PSHARD_STATIC_ATTNPRIO_ALLMODELS: {
+                    // the unpinned part runs on the CPU, or on the GPU reading its weights in place (in_place)
+                    const int32_t rest = in_place ? shard_bid : layout.cpu;
                     if (n_attn_pinned > 0 && il < n_attn_pinned) {
-                        emit(patterns_layer_ffn[il].c_str(), host_buft, layout.cpu);
+                        emit(patterns_layer_ffn[il].c_str(), host_buft, rest);
                         emit(patterns_layer[il].c_str(), host_buft, layout.compute);
                     } else {
-                        emit(patterns_layer[il].c_str(), host_buft, layout.cpu);
+                        emit(patterns_layer[il].c_str(), host_buft, rest);
                     }
                     break;
+                }
                 case LLAMA_PSHARD_HYBRID_ATTNPRIO_FFNBALANCE: {
                     // n_ffn_gpu of the unpinned FFNs stream to the GPU, spread evenly, the rest compute on the CPU;
                     // attention is pinned for the first n_attn_pinned layers and streamed for the rest. Consecutive
@@ -182,11 +186,6 @@ void llama_pshard_generate_overrides(
                     }
                     break;
                 }
-                case LLAMA_PSHARD_GPUONLY_ATTNPRIO_FFNINPLACE:
-                    // routed experts read in place by their lane's split; the rest pinned (attention priority) or streamed
-                    emit(patterns_layer_moe_exps[il].c_str(), host_buft, shard_bid);
-                    emit(patterns_layer[il].c_str(), host_buft, il < n_attn_pinned ? layout.compute : shard_bid);
-                    break;
                 default: break;
             }
         }
@@ -802,7 +801,7 @@ void llama_params_fit_pshard(
     // and scheduler reserves are built un-delegated - a different scheduling
     // regime than the one the planner's probes priced (first plan apply would
     // correct the model flag, but the early reserve graphs are already shaped)
-    mparams->pshard_delegate_compute = llama_pshard_strategy_delegates_compute(best->strategy);
+    mparams->pshard_delegate_compute = llama_pshard_strategy_delegates_compute(best->strategy, best->in_place);
 
     // the variant records whether the union enforcer demoted the MTP head to CPU;
     // regenerate the load overrides under the placement the plans were priced with
@@ -816,7 +815,7 @@ void llama_params_fit_pshard(
         (llama_layer_fraction)best->overflow,
         best->strategy, layout,
         best->pin_from_back, best->output_on_gpu, best->n_attn_pinned,
-        best->overlap, best->ids_cross, best->n_ffn_gpu);
+        best->overlap, best->ids_cross, best->n_ffn_gpu, best->in_place);
 
     for (size_t i = 0; tensor_buft_overrides[i].pattern; i++) {
         if (tensor_buft_overrides[i].backend_id == layout.compute) {

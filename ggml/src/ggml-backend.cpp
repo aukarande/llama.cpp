@@ -857,7 +857,7 @@ struct ggml_backend_sched {
 
     bool prefetch_weights;
     bool prefetch_window;   // ggml_backend_sched_set_prefetch_window
-    bool read_in_place;     // ggml_backend_sched_set_read_in_place
+    int  read_in_place;     // ggml_backend_sched_set_read_in_place
     // ubatches below this many tokens copy only the used experts (ggml_backend_sched_set_expert_slice_tokens); -1 = default rule
     int  expert_slice_tokens;
     // ubatches are classified at no fewer tokens than this (ggml_backend_sched_set_expert_slice_rows)
@@ -983,11 +983,12 @@ static inline ggml_backend_buffer_t ggml_backend_sched_tensor_buffer(const struc
     return t->view_src ? t->view_src->buffer : t->buffer;
 }
 
-// with read_in_place on, a device split reads an expert stack in the device's own pinned host buffer in place: the
+// a device split reads a weight of a class in read_in_place from the device's own pinned host buffer in place: the
 // device's kernels read that memory directly, and a tensor its buffer type does not pad has no padding to clear
 static bool ggml_backend_sched_reads_in_place(ggml_backend_sched_t sched, const struct ggml_tensor * node, int j,
         ggml_backend_buffer_t src_buf, int backend_id) {
-    if (!sched->read_in_place || node->op != GGML_OP_MUL_MAT_ID || j != 0) {
+    const int cls = node->op == GGML_OP_MUL_MAT_ID && j == 0 ? GGML_BACKEND_SCHED_IN_PLACE_EXPERTS : GGML_BACKEND_SCHED_IN_PLACE_WEIGHTS;
+    if (!(sched->read_in_place & cls)) {
         return false;
     }
     ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[backend_id]);
@@ -3474,9 +3475,9 @@ bool ggml_backend_sched_get_prefetch_window(ggml_backend_sched_t sched) {
     return sched->prefetch_window;
 }
 
-void ggml_backend_sched_set_read_in_place(ggml_backend_sched_t sched, bool enabled) {
+void ggml_backend_sched_set_read_in_place(ggml_backend_sched_t sched, int classes) {
     GGML_ASSERT(sched);
-    sched->read_in_place = enabled;
+    sched->read_in_place = classes;
 }
 
 int ggml_backend_sched_get_prefetch_lookahead(void) {

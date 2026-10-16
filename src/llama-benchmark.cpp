@@ -263,6 +263,7 @@ static void build_entry_map(
 void llama_benchmark_predictor::build_maps() {
     build_entry_map(cpu_map, cpu_entries);
     build_entry_map(gpu_map, gpu_entries);
+    build_entry_map(gpu_host_map, gpu_host_entries);
 }
 
 const char * llama_benchmark_profile_path(bool gpu) {
@@ -411,15 +412,6 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                     stats.segs_kernel_idle_bw[0] = s0; stats.segs_kernel_idle_bw[1] = s1;
                     stats.segs_kernel_idle_bw[2] = s2; stats.segs_kernel_idle_bw[3] = s3;
                 }
-                double c[llama_benchmark_stats::n_copy_bw];
-                if (sscanf(line, "#   Kernel_Copy: 1MB=%lf 2MB=%lf 4MB=%lf 8MB=%lf 16MB=%lf 32MB=%lf 64MB=%lf 128MB=%lf 256MB=%lf GB/s",
-                           &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7], &c[8]) == llama_benchmark_stats::n_copy_bw) {
-                    std::copy(c, c + llama_benchmark_stats::n_copy_bw, stats.kernel_copy_bw);
-                }
-                if (sscanf(line, "#   Engine_Copy: 1MB=%lf 2MB=%lf 4MB=%lf 8MB=%lf 16MB=%lf 32MB=%lf 64MB=%lf 128MB=%lf 256MB=%lf GB/s",
-                           &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7], &c[8]) == llama_benchmark_stats::n_copy_bw) {
-                    std::copy(c, c + llama_benchmark_stats::n_copy_bw, stats.engine_copy_bw);
-                }
                 double v = 0.0;
                 if (sscanf(line, "#   PCIe_Staged: %lf GB/s", &v) == 1)   { stats.staged_bw          = v; }
                 if (sscanf(line, "#   Kernel_Copy_Cap_MB: %lf", &v) == 1) { stats.kernel_copy_cap_mb = v; }
@@ -504,11 +496,10 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                        stats.machine.cpu.c_str(), stats.machine.os.c_str(), stats.machine.threads);
         LLAMA_LOG_INFO("%s: kernel-copy measurements: sliced kernel 2MB=%.1f GB/s, segment kernel 2MB=%.1f GB/s loaded / %.1f idle,"
                        " staged %.1f GB/s, kernel-copy cap %.0f MB, engine switch %.1f us, pool serve %.1f us, split %.1f us,"
-                       " copy setup %.1f us, 256MB kernel / engine %.1f / %.1f GB/s\n",
+                       " copy setup %.1f us\n",
                        __func__, stats.sliced_kernel_bw[1], stats.segs_kernel_bw[1], stats.segs_kernel_idle_bw[1], stats.staged_bw,
                        stats.kernel_copy_cap_mb, stats.engine_switch_us, stats.pool_serve_us, stats.pool_split_us,
-                       stats.copy_setup_us, stats.kernel_copy_bw[llama_benchmark_stats::n_copy_bw - 1],
-                       stats.engine_copy_bw[llama_benchmark_stats::n_copy_bw - 1]);
+                       stats.copy_setup_us);
     }
 
     return !cpu_entries.empty();
@@ -517,6 +508,9 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
 bool llama_benchmark_predictor::load_gpu(const char * filepath) {
     gpu_entries.clear();
     gpu_map.clear();
+    gpu_host_entries.clear();
+    gpu_host_map.clear();
+    stats.host_read_bw = 0.0;
 
     FILE * f = fopen(filepath, "r");
     if (!f) {
@@ -553,21 +547,33 @@ bool llama_benchmark_predictor::load_gpu(const char * filepath) {
                 &e.n_heads, &e.head_dim, &e.n_elements);
 
         if (parsed == 14) {
+            // an in-place row keeps its op name without the suffix, so the lookups match it like a device row
+            char * host = strstr(op_name, "@host");
+            if (host != nullptr) {
+                *host = '\0';
+            }
             e.op_name     = op_name;
             e.quant       = quant;
             e.threads     = -1;
             e.eff_gflops  = e.peak_gflops;
             e.eff_pcie_bw = 0.0;
-            gpu_entries.push_back(std::move(e));
+            if (host != nullptr) {
+                if (e.ai < e.ridge) {
+                    stats.host_read_bw = std::max(stats.host_read_bw, e.bw_gb_s);
+                }
+                gpu_host_entries.push_back(std::move(e));
+            } else {
+                gpu_entries.push_back(std::move(e));
+            }
         }
     }
     fclose(f);
 
     build_maps();
 
-    LLAMA_LOG_INFO("%s: loaded %zu GPU entries (mem_bw=%.1f GB/s, compute=%.1f GFLOP/s)\n",
+    LLAMA_LOG_INFO("%s: loaded %zu GPU entries (mem_bw=%.1f GB/s, compute=%.1f GFLOP/s), %zu in place (read %.1f GB/s)\n",
                    __func__, gpu_entries.size(),
-                   stats.peak_gpu_mem_bw, stats.peak_gpu_compute);
+                   stats.peak_gpu_mem_bw, stats.peak_gpu_compute, gpu_host_entries.size(), stats.host_read_bw);
 
     return !gpu_entries.empty();
 }
@@ -675,6 +681,43 @@ static double llama_benchmark_series_gflops(const std::vector<llama_benchmark_en
     return std::exp(std::log(r0) + t * (std::log(r1) - std::log(r0)));
 }
 
+// bits per weight of a type (0: a removed type)
+static double llama_benchmark_type_bpw(ggml_type t) {
+    return ggml_blck_size(t) > 0 ? 8.0 * (double) ggml_type_size(t) / (double) ggml_blck_size(t) : 0.0;
+}
+
+// bits per weight of the type a profile row names (0: unknown)
+static double llama_benchmark_quant_bpw(const std::string & quant) {
+    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+        if (ggml_blck_size((ggml_type) i) > 0 && quant == ggml_type_name((ggml_type) i)) {
+            return llama_benchmark_type_bpw((ggml_type) i);
+        }
+    }
+    return 0.0;
+}
+
+// the quant of the rows nearest in bits per weight to type t (nullptr: no matmul rows)
+static const char * llama_benchmark_nearest_quant(const std::vector<llama_benchmark_entry> & entries, ggml_type t) {
+    const double bpw = llama_benchmark_type_bpw(t);
+    const char * best   = nullptr;
+    double       best_d = 1e20;
+    for (int i = 0; i < GGML_TYPE_COUNT; i++) {
+        const ggml_type ti = (ggml_type) i;
+        if (ggml_blck_size(ti) <= 0) {
+            continue;
+        }
+        const char * name = ggml_type_name(ti);
+        const bool profiled = std::any_of(entries.begin(), entries.end(),
+            [&](const llama_benchmark_entry & b) { return b.quant == name; });
+        const double d = std::abs(llama_benchmark_type_bpw(ti) - bpw);
+        if (profiled && d < best_d) {
+            best_d = d;
+            best   = name;
+        }
+    }
+    return best;
+}
+
 llama_split_timing llama_benchmark_predictor::predict_split(
         struct ggml_tensor ** nodes, int n_nodes,
         bool is_gpu, int32_t batch_size, bool async_copy,
@@ -684,9 +727,6 @@ llama_split_timing llama_benchmark_predictor::predict_split(
     timing_cache_t local_timing_cache;
     timing_cache_t & cache = timing_cache ? *timing_cache : local_timing_cache;
 
-    const auto & map     = is_gpu ? gpu_map : cpu_map;
-    const auto & entries = is_gpu ? gpu_entries : cpu_entries;
-
     double pcie_sum = 0.0;
 
     for (int i = 0; i < n_nodes; i++) {
@@ -694,6 +734,16 @@ llama_split_timing llama_benchmark_predictor::predict_split(
         llama_op_metrics m = llama_op_metrics_compute(node, token_scale, workload);
 
         if (m.ops == 0.0 && m.bytes == 0.0) continue;
+
+        // a GPU matmul whose weight stays in pinned host memory (the scheduler left it uncopied: it reads it in
+        // place) is priced from the profile's in-place rows
+        const ggml_backend_buffer_t wbuf = (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0]
+            ? (node->src[0]->view_src ? node->src[0]->view_src->buffer : node->src[0]->buffer) : nullptr;
+        const bool in_place = is_gpu && has_host_rows() && wbuf != nullptr && ggml_backend_buffer_is_host(wbuf) &&
+            ggml_backend_buffer_get_usage(wbuf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+        const auto & map     = in_place ? gpu_host_map : is_gpu ? gpu_map : cpu_map;
+        const auto & entries = in_place ? gpu_host_entries : is_gpu ? gpu_entries : cpu_entries;
+        const double gpu_bw  = in_place ? stats.host_read_bw : stats.peak_gpu_mem_bw;
 
         const char * op_name = ggml_op_name(node->op);
         double op_time_ms  = 0.0;
@@ -703,7 +753,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
         // so every node shows its matched entry, bytes, and chosen roofline branch)
         static const bool dump_nodes = getenv("LLAMA_BENCH_PREDICT_NODES") != nullptr;
 
-        std::string tkey = make_timing_key(is_gpu, async_copy, op_name, m, batch_size);
+        std::string tkey = (in_place ? "H|" : "") + make_timing_key(is_gpu, async_copy, op_name, m, batch_size);
         auto cache_it = dump_nodes ? cache.end() : cache.find(tkey);
         if (cache_it != cache.end()) {
             op_time_ms   = cache_it->second.first;
@@ -767,6 +817,13 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                     match = find_nearest(entries, op_name, nullptr, 0, 0, 0, m.n_elements, 0.0, batch_size);
                     break;
             }
+            if (!match && in_place && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+                // a quant the in-place rows lack (IQ): the rows of the profiled quant nearest in bits per weight
+                const char * q = llama_benchmark_nearest_quant(entries, node->src[0]->type);
+                if (q != nullptr) {
+                    match = find_nearest(entries, op_name, q, m.N, m.K, 0, 0, 0.0, batch_size);
+                }
+            }
             if (match) {
                 result.n_nearest++;
             }
@@ -796,6 +853,26 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                     op_time_ms = (m.ops / 1e9) / gflops * 1000.0;
                     price_branch = "exact-comp";
                 }
+            } else if (in_place && node->op == GGML_OP_MUL_MAT_ID) {
+                // an in-place expert matmul runs at its series' measured rate at its rows per expert: the rows count
+                // one token's experts as their bytes, so their bandwidth column holds at one token only
+                const double n_expert = (double) ggml_backend_sched_weight_n_expert(node->src[0]);
+                const double x = n_expert > 0.0 ? (double) m.M * (double) m.n_experts_used / n_expert : 0.0;
+                double x_min = 0.0;
+                double rate = x > 0.0 ? llama_benchmark_series_gflops(entries, *match, x, LLAMA_SERIES_EXPERTS, x_min) : 0.0;
+                if (rate <= 0.0) {
+                    rate = gflops;
+                }
+                if (rate > 0.0) {
+                    op_time_ms = (m.ops / 1e9) / rate * 1000.0;
+                    // rows of another quant read other bytes: the read scales with the weight's bits
+                    const double bpw_w = llama_benchmark_type_bpw(node->src[0]->type);
+                    const double bpw_m = llama_benchmark_quant_bpw(match->quant);
+                    if (bpw_w > 0.0 && bpw_m > 0.0) {
+                        op_time_ms *= bpw_w / bpw_m;
+                    }
+                    price_branch = "in-place";
+                }
             } else {
                 const double ai = m.bytes > 0.0 ? (m.ops / m.bytes) : 0.0;
                 if (ai < match->ridge) {
@@ -805,7 +882,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                     // the op far too slow, hiding plans that pin it from the search
                     double mem_bw = match->bw_gb_s;
                     if (match->ai >= match->ridge || mem_bw <= 0.0) {
-                        mem_bw = is_gpu ? stats.peak_gpu_mem_bw
+                        mem_bw = is_gpu ? gpu_bw
                                         : (async_copy ? stats.eff_system_bw : stats.peak_system_bw);
                     }
                     if (mem_bw > 0.0) {
@@ -847,7 +924,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
         } else {
             result.n_fallback++;
             if (m.bytes > 0.0) {
-                const double bw = is_gpu ? stats.peak_gpu_mem_bw
+                const double bw = is_gpu ? gpu_bw
                                          : (async_copy ? stats.eff_system_bw : stats.peak_system_bw);
                 if (bw > 0.0) {
                     op_time_ms = (m.bytes / 1e9) / bw * 1000.0;
@@ -1398,26 +1475,6 @@ double llama_benchmark_predictor::predict_tps(
         struct ggml_tensor ** nodes = ggml_graph_nodes(si.graph);
         int n_nodes = ggml_graph_n_nodes(si.graph);
         llama_split_timing t = predict_split(nodes, n_nodes, is_gpu, batch_size, async_copy, &timing_cache, token_scale);
-
-        // expert stacks the split reads in place from pinned host memory (ggml_backend_sched_set_read_in_place): a matmul
-        // waits for the experts its rows route to at the kernel read rate when that is slower than its compute
-        if (is_gpu && stats.host_read_bw(1.0) > 0.0) {
-            for (int j = 0; j < n_nodes; j++) {
-                const ggml_tensor * w   = nodes[j]->src[0];
-                const ggml_tensor * ids = nodes[j]->src[2];
-                const ggml_backend_buffer_t b = w != nullptr ? (w->view_src ? w->view_src->buffer : w->buffer) : nullptr;
-                if (nodes[j]->op != GGML_OP_MUL_MAT_ID || ids == nullptr || b == nullptr || !ggml_backend_buffer_is_host(b) ||
-                        ggml_backend_buffer_get_usage(b) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-                    continue;
-                }
-                const double rows    = std::max(1.0, std::round((double) ids->ne[1] * token_scale));
-                const double bytes   = (double) ggml_nbytes(w) *
-                    llama_expert_distinct_share(workload, rows, (double) ids->ne[0], (double) w->ne[2]);
-                const double read_ms = bytes / 1e9 / stats.host_read_bw(bytes) * 1000.0;
-                const double op_ms   = predict_split(&nodes[j], 1, true, batch_size, async_copy, &timing_cache, token_scale).time_ms;
-                t.time_ms += std::max(0.0, read_ms - op_ms);
-            }
-        }
 
         // the store's SSD reads for the split's CPU expert matmuls: a layer's tensors share its routing, and the layer
         // waits once for the experts its rows use that are not in RAM
