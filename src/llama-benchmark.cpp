@@ -925,8 +925,9 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                 // between two profiled batches a GPU expert matmul or attention runs at a rate between theirs,
                 // not at the nearer one's: the nearer row prices a small prompt's expert matmuls at the
                 // bandwidth of a far larger batch, and its attention at the decode rate. Expert matmuls go by
-                // rows per expert and only rise to this rate (below it they stay memory-bound); attention
-                // takes it inside the series, the decode row itself keeps its price
+                // rows per expert: compute-bound they take this rate (the smaller row's would price more rows
+                // above the larger batch), memory-bound they only rise to it; attention takes it inside the
+                // series, the decode row itself keeps its price
                 const bool attn = node->op == GGML_OP_FLASH_ATTN_EXT;
                 if (is_gpu && m.ops > 0.0 && (attn || node->op == GGML_OP_MUL_MAT_ID)) {
                     const double n_expert = attn ? 0.0 : (double) ggml_backend_sched_weight_n_expert(node->src[0]);
@@ -937,7 +938,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                         attn ? LLAMA_SERIES_ATTN : LLAMA_SERIES_EXPERTS, x_min) : 0.0;
                     if (rate > 0.0) {
                         const double series_ms = (m.ops / 1e9) / rate * 1000.0;
-                        if (attn ? x > x_min : series_ms > op_time_ms) {
+                        if (attn ? x > x_min : (ai >= match->ridge || series_ms > op_time_ms)) {
                             op_time_ms   = series_ms;
                             price_branch = "series";
                         }
