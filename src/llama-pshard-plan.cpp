@@ -3190,6 +3190,12 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         const pass_routes routes = routes_at(bs);
         const double misses = routes.misses;
         const double hits   = routes.hits;
+        // a layer's CPU chain runs after the GPU ran the layer before alone, slower by the CPU's cold factor
+        const double gpu_layer_ms = std::max(0.0, bd.compute_ms - bd.cpu_ms) / n_layers_exp;
+        auto cpu_chain_ms = [&](double experts) {
+            const double ms = experts * t_cpu;
+            return ms + st->split_cold_ms(ms, gpu_layer_ms);
+        };
         // the CPU chain of a layer runs while the GPU chain uploads and computes the fetched
         // experts (the scheduler overlaps the CPU split; the fetched rows arrive by kernel
         // copies on the GPU's own stream), so a hybrid layer pays the longer of the two chains
@@ -3200,7 +3206,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
                     // q* fetched, capped by the free slots (hits + q resident at once);
                     // the rest run on the CPU chain, overlapped with the upload
                     const double q = std::min(std::round(plan.pool_hybrid_frac * r.misses), std::max(0.0, s - r.hits));
-                    return std::max(q * t_fetch_loaded, (r.misses - q) * t_cpu) + t_split;
+                    return std::max(q * t_fetch_loaded, cpu_chain_ms(r.misses - q)) + t_split;
                 }
                 case LLAMA_PSHARD_MISS_CPU_ADMIT: {
                     // misses run on the CPU chain this pass, their rows upload on the pool's
@@ -3208,7 +3214,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
                     // is far shorter than the CPU chain at decode, so the CPU time is
                     // visible whole; the background upload leaves the critical path as
                     // long as the copy engine keeps up with the layer.
-                    const double cpu_ms    = r.misses * t_cpu;
+                    const double cpu_ms    = cpu_chain_ms(r.misses);
                     const double upload_ms = r.misses * t_fetch_loaded;
                     const double excess_up = std::max(0.0, upload_ms - (cpu_ms + t_split));
                     return cpu_ms + excess_up + t_split;

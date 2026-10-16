@@ -17,7 +17,7 @@ struct llama_pshard_workload;
 
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 23;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 24;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory
@@ -163,6 +163,13 @@ struct llama_benchmark_stats {
                                         // -1 = not in the profile (0.0 is legitimate where the driver imposes no copy-engine transition fence)
     double pool_serve_us      = 0.0;    // a pooled layer's host round trip: ids readback, sync, decision, upload, launch
     double pool_split_us      = 0.0;    // a CPU route's handoff: activation download, host graph, partial upload, join
+    // a CPU split between GPU splits (CPU_Split): a pass of expert matmuls of split_pass_us back to back takes
+    // split_cold[i] times as long after the GPU ran alone for split_gap_ms[i] (0 = not in the profile)
+    double split_pass_us      = 0.0;
+    double split_gap_ms[3]    = { 0.0, 0.0, 0.0 };
+    double split_cold[3]      = { 0.0, 0.0, 0.0 };
+    // what a CPU split of cpu_ms adds after a GPU gap of gap_ms
+    double split_cold_ms(double cpu_ms, double gap_ms) const;
     double copy_setup_us      = 0.0;    // what each separate copy of a back-to-back upload adds beyond its bytes (0 = not in
                                         // the profile: copies priced by their bytes alone)
     // the best rate of the GPU profile's memory-bound in-place rows (weights read in place from pinned host memory),
@@ -225,6 +232,7 @@ struct llama_benchmark_store {
 struct llama_split_timing {
     double time_ms     = 0.0;
     double eff_pcie_bw = 0.0;   // time-weighted avg PCIe BW (CPU splits only)
+    double link_ms     = 0.0;   // GPU splits: the time their in-place reads hold the host link
     int    op_count    = 0;
     int    n_cache_hit = 0;     // timing cache reuses
     int    n_exact     = 0;     // exact benchmark hash hits

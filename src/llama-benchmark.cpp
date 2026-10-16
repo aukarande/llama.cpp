@@ -419,6 +419,11 @@ bool llama_benchmark_predictor::load_cpu(const char * filepath, int n_threads) {
                 if (sscanf(line, "#   Pool_Serve_us: %lf", &v) == 1)      { stats.pool_serve_us      = v; }
                 if (sscanf(line, "#   Pool_Split_us: %lf", &v) == 1)      { stats.pool_split_us      = v; }
                 if (sscanf(line, "#   Copy_Setup_us: %lf", &v) == 1)      { stats.copy_setup_us      = v; }
+                if (strncmp(line, "#   CPU_Split:", 14) == 0 && sscanf(line, "#   CPU_Split: pass_us=%lf cold=%lf:%lf,%lf:%lf,%lf:%lf",
+                        &stats.split_pass_us, &stats.split_gap_ms[0], &stats.split_cold[0], &stats.split_gap_ms[1],
+                        &stats.split_cold[1], &stats.split_gap_ms[2], &stats.split_cold[2]) != 7) {
+                    stats.split_pass_us = 0.0;
+                }
                 char gpu[160] = { 0 }, cpu[160] = { 0 }, os[32] = { 0 };
                 unsigned long long vram = 0;
                 int mt = 0, schema = 0;
@@ -722,6 +727,27 @@ static const char * llama_benchmark_nearest_quant(const std::vector<llama_benchm
     return best;
 }
 
+double llama_benchmark_stats::split_cold_ms(double cpu_ms, double gap_ms) const {
+    if (split_pass_us <= 0.0 || split_gap_ms[0] <= 0.0 || gap_ms <= 0.0) {
+        return 0.0;
+    }
+    // the factor: from 1 at no gap to the first point, log-linear between points, the last one beyond
+    double k = split_cold[2];
+    if (gap_ms <= split_gap_ms[0]) {
+        k = 1.0 + (split_cold[0] - 1.0) * gap_ms / split_gap_ms[0];
+    } else {
+        for (int i = 1; i < 3; i++) {
+            if (gap_ms <= split_gap_ms[i]) {
+                k = split_cold[i - 1] + (split_cold[i] - split_cold[i - 1]) *
+                    std::log(gap_ms / split_gap_ms[i - 1]) / std::log(split_gap_ms[i] / split_gap_ms[i - 1]);
+                break;
+            }
+        }
+    }
+    // over at most one pass: a longer split runs on warm
+    return std::max(0.0, k - 1.0) * std::min(cpu_ms, split_pass_us / 1000.0);
+}
+
 llama_split_timing llama_benchmark_predictor::predict_split(
         struct ggml_tensor ** nodes, int n_nodes,
         bool is_gpu, int32_t batch_size, bool async_copy,
@@ -732,6 +758,10 @@ llama_split_timing llama_benchmark_predictor::predict_split(
     timing_cache_t & cache = timing_cache ? *timing_cache : local_timing_cache;
 
     double pcie_sum = 0.0;
+    // an in-place read holds the host link for its bytes at the in-place rate, at most for the op's time
+    auto link_ms = [&](const llama_op_metrics & m, double op_ms) {
+        return stats.host_read_bw > 0.0 ? std::min(op_ms, m.bytes / 1e9 / stats.host_read_bw * 1000.0) : op_ms;
+    };
 
     for (int i = 0; i < n_nodes; i++) {
         ggml_tensor * node = nodes[i];
@@ -763,6 +793,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
             op_time_ms   = cache_it->second.first;
             pcie_contrib = cache_it->second.second;
             result.time_ms += op_time_ms;
+            result.link_ms += in_place ? link_ms(m, op_time_ms) : 0.0;
             pcie_sum       += pcie_contrib;
             result.n_cache_hit++;
             result.op_count++;
@@ -992,6 +1023,7 @@ llama_split_timing llama_benchmark_predictor::predict_split(
         }
 
         result.time_ms += op_time_ms;
+        result.link_ms += in_place ? link_ms(m, op_time_ms) : 0.0;
         pcie_sum       += pcie_contrib;
         result.op_count++;
 
@@ -1360,6 +1392,7 @@ double llama_benchmark_predictor::predict_tps(
     double pending_wb[2] = { 0.0, 0.0 };
     double pending_su[2] = { 0.0, 0.0 };   // ms of its copies' setup still to run
     int    pending_to    = -1;
+    double gpu_ms_since_cpu = 0.0;   // the GPU's time since the last CPU split: the CPU's gap
 
     for (int i = 0; i < n_splits; i++) {
         if (!have_info[i]) continue;
@@ -1570,24 +1603,30 @@ double llama_benchmark_predictor::predict_tps(
         if (si.input_activ_bytes > 0 && pcie_bw > 0.0) {
             activ_copy_ms = ((double)si.input_activ_bytes / 1e9 / pcie_bw) * 1000.0;
         }
-        // a CPU split's handoff: its inputs come down and its result goes up as copies ordered against the GPU's
-        // kernels, each a copy-engine transition (the expert pool prices its CPU routes' handoff itself)
+        // a CPU split entered from a GPU split: the round trip of a CPU route by kernel copies (Pool_Split_us:
+        // activations down, host graph, result up; the expert pool prices its own routes so), else each copy a
+        // copy-engine transition; and the CPU's compute slower after the GPU ran alone (CPU_Split)
         double handoff_ms = 0.0;
-        if (!is_gpu && !pool_sched && stats.engine_switch_us > 0.0) {
-            const bool down = si.input_activ_bytes > 0;
-            const bool up   = i + 1 < n_splits && have_info[i + 1] && infos[i + 1].backend_id != cpu_backend_id;
-            handoff_ms = ((down ? 1 : 0) + (up ? 1 : 0)) * stats.engine_switch_us / 1000.0;
+        if (!is_gpu && !pool_sched) {
+            if (stats.pool_split_us > 0.0 && stats.kernel_copy_cap_mb != 0.0) {
+                handoff_ms = gpu_ms_since_cpu > 0.0 ? stats.pool_split_us / 1000.0 : 0.0;
+            } else if (stats.engine_switch_us > 0.0) {
+                const bool down = si.input_activ_bytes > 0;
+                const bool up   = i + 1 < n_splits && have_info[i + 1] && infos[i + 1].backend_id != cpu_backend_id;
+                handoff_ms = ((down ? 1 : 0) + (up ? 1 : 0)) * stats.engine_switch_us / 1000.0;
+            }
+            t.time_ms += stats.split_cold_ms(t.time_ms, gpu_ms_since_cpu);
             activ_copy_ms += handoff_ms;
         }
 
         // the outstanding prefetch moves under this split's compute (the link is the split's own after its input
-        // copies)
+        // copies), but not while the split's in-place reads hold the link
         const double comp_ms = t.time_ms + kv_dl_ms;
         if (pending_to >= 0 && comp_ms > 0.0) {
             double w_bw[2], wb_bw;
             prefetch_rates(is_gpu, t.eff_pcie_bw, w_bw, wb_bw);
             for (int c = 0; c < 2; c++) {
-                double cap_ms = comp_ms;
+                double cap_ms = std::max(0.0, comp_ms - t.link_ms);
                 const double su_use = std::min(cap_ms, pending_su[c]);
                 pending_su[c] -= su_use;
                 cap_ms -= su_use;
@@ -1621,6 +1660,7 @@ double llama_benchmark_predictor::predict_tps(
             }
         }
         total_ms += split_ms;
+        gpu_ms_since_cpu = is_gpu ? gpu_ms_since_cpu + split_ms : 0.0;
 
         double dl_bytes = is_gpu ? (double)si.writeback_kv_bytes * kv_ratio + (double)si.writeback_rs_bytes : 0.0;
         LLAMA_LOG_DEBUG("%s:   split %d/%d [%s] input_copy=%.3f (%.2f MiB) compute=%.3f kv_dl=%.3f (%.2f MiB) prefetch exposed=%.3f -> split %d activ=%.3f (%.2f MiB) ssd=%.3f -> %.3f ms"
