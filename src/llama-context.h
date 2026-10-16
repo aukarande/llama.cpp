@@ -302,8 +302,8 @@ private:
     // true: this batch runs layer-major and mctx holds the memory snapshot; false: the reason is logged once
     bool layer_major_check(uint32_t n_tokens_all, uint32_t n_ubatch, bool one_tier, llama_memory_context_i * mctx);
     // the first reason the batch in balloc cannot run layer-major, without the memory snapshot: its index, and why
-    // (-1: none). find_cut prices the cuts by it
-    int layer_major_refusal(bool one_tier, const char ** why) const;
+    // (-1: none). find_cut prices the cuts by it (pricing: before the switch, so a pool tier landed now does not count)
+    int layer_major_refusal(bool one_tier, const char ** why, bool pricing = false) const;
     // marks the nodes of the full graph of a ubatch of n_tokens outside lm_cut's layers as not computed; false: it
     // cannot be cut (logged)
     bool layer_major_cut(llm_graph_result * res, ggml_cgraph * gf, uint32_t n_tokens);

@@ -79,6 +79,13 @@ struct llama_expert_store {
     bool upload(const ggml_tensor * src, ggml_tensor * dst, const ggml_backend_expert_upload * ups, int n, bool ram_only,
                 ggml_backend_t backend);
 
+    // an expert pool over the store, one pass of t's layer: its VRAM hits take the newest stamps, then its misses
+    // become resident (those not in a slot are read from the files) and their tables point at the slots; reader (may
+    // be nullptr) copies from the slots until a later read into the layer's slots waits for it. false: t is not
+    // served, or the misses exceed the layer's slots (nothing read: the pool copies from the mapping)
+    bool acquire(const ggml_tensor * t, const int32_t * hits, size_t n_hits, const int32_t * misses, size_t n_misses,
+                 ggml_backend_t reader);
+
     // before a context frees its backends: waits for every copy the store queued on them
     void detach();
 
@@ -110,10 +117,11 @@ struct llama_expert_store {
     uint64_t wait_us();
 
     void log_counters();
-    // routes the hook saw since the last fold go into <model>.pshard_workload (when no expert pool counted them)
+    // routes the hook saw since the last fold go into <model>.pshard_workload
     void fold_workload(const std::string & workload_path);
 
     uint32_t n_ram = 0;
+    bool     count_routes = true;   // false while an expert pool tier runs: the pool counts its own routes
 
 private:
     struct entry {
@@ -150,7 +158,7 @@ private:
     sizing size_for() const;
 
     // counters: [0] one-row passes (decode), [1] multi-row passes, [2] device uploads, [3] device uploads of experts
-    // not in a slot while their layer's group runs in a sweep
+    // not in a slot while their layer's group runs in a sweep, [4] an expert pool's misses
     struct counters {
         uint64_t passes = 0, requests = 0, hits = 0, reads = 0, bytes = 0, wait_us = 0, fallbacks = 0;
     };
@@ -182,7 +190,7 @@ private:
     llama_ssd_reader * reader = nullptr; // owned
     std::mutex mtx;
 
-    counters cnt[4];
+    counters cnt[5];
 
     // layer-major sweep: the pinned window, or the slots lent per layer merged where adjacent, are cut into two halves
     // of equal bytes. A half holds one group's experts not in a slot as a byte stream: the rows of an expert in one

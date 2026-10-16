@@ -12,6 +12,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-pipe-shard.h"
 #include "llama-model.h"
+#include "llama-expert-store.h"
 #include "llama-pshard-plan.h"
 
 #include "ggml-backend.h"
@@ -297,6 +298,7 @@ void llama_context::pshard_setup_expert_pool() {
     // reserved scratch): pool + scratch is constant, so decode tiers turn the
     // prefill scratch delta into slots
     pool->backend_router = backends[pshard_layout.compute].get();
+    pool->store          = model.expert_store();
     expert_pool = std::move(pool);
 }
 
@@ -527,6 +529,9 @@ void llama_context::pshard_update_pool_mode(const llama_pshard_plan & plan) {
         expert_pool_bytes = 0;
     }
     expert_pool->set_active(on, sched.get());
+    if (auto * store = model.expert_store()) {
+        store->count_routes = !on;   // a pool tier counts its own routes
+    }
     expert_pool->set_policy(plan.pool_miss, plan.pool_hybrid_frac, sched.get());
     const bool ab = (uint64_t) plan.batch_size * expert_pool->n_expert_used >= expert_pool->n_expert;
     expert_pool->set_ab_mode(on && ab, sched.get());
@@ -1078,7 +1083,8 @@ void llama_context::pshard_apply_initial_plan() {
         // Only a decode tier that admits experts fills the cache
         const llama_pshard_plan * dec = registry->get_best(0);
         const bool gpu_seed = dec != nullptr && dec->strategy == LLAMA_PSHARD_EXPERT_POOL && dec->cold_ms > 0.0f;
-        if (expert_pool && gpu_seed) {
+        // (not over a RAM expert store: the seed reads the mapping)
+        if (expert_pool && gpu_seed && expert_pool->store == nullptr) {
             expert_pool->seed_from_workload(gpu_seed);
         }
     }

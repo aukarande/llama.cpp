@@ -594,9 +594,9 @@ llama_context::~llama_context() {
     if (auto * store = model.expert_store()) {
         store->detach();
         store->log_counters();
-        // the pshard context folds (a draft or MTP context sharing the model does not); an expert pool counts the
-        // routes of its own layers
-        if (cparams.pshard && !expert_pool && !model.get_path_model().empty()) {
+        // the pshard context folds (a draft or MTP context sharing the model does not); an expert pool folds the
+        // routes of its own tiers
+        if (cparams.pshard && !model.get_path_model().empty()) {
             store->fold_workload(llama_pshard_workload::path_for(model.get_path_model()));
         }
     }
@@ -2037,7 +2037,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             lm.overlap = llama_expert_store_reads_overlap();
             if (lm_groups.empty()) {
                 lm_why = "layer-major prefill is off in this context";
-            } else if (layer_major_refusal(true, &lm_why) < 0) {
+            } else if (layer_major_refusal(true, &lm_why, /*pricing=*/true) < 0) {
                 lm.reads  = store->sweep_reads(lm_groups);
                 lm.groups = lm.reads > 0 ? lm_groups.size() : 0;
                 lm_why    = lm.reads > 0 ? nullptr : "the expert store has no slots to lend";
@@ -3290,7 +3290,7 @@ void llama_context::layer_major_off(uint32_t n_batch_req) {
     }
 }
 
-int llama_context::layer_major_refusal(bool one_tier, const char ** why) const {
+int llama_context::layer_major_refusal(bool one_tier, const char ** why, bool pricing) const {
     uint32_t n_seq = 0;
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         n_seq += balloc->seq_pos_min(s) >= 0 ? 1 : 0;
@@ -3305,7 +3305,7 @@ int llama_context::layer_major_refusal(bool one_tier, const char ** why) const {
     };
     const check checks[] = {
         { store == nullptr || !store->active(),                 "the RAM expert store is not allocated" },
-        { expert_pool != nullptr && expert_pool->active,        "the tier pools experts" },
+        { !pricing && expert_pool != nullptr && expert_pool->active, "the tier pools experts" },
         { !cparams.causal_attn,                                 "attention is not causal" },
         { cparams.embeddings || cparams.embeddings_nextn,       "the batch asks for embeddings" },
         { std::find(lin.begin(), lin.end(), true) != lin.end(), "the batch asks for layer inputs" },

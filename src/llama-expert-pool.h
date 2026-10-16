@@ -28,6 +28,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_expert_store;
 
 // bytes a pool view of this expert tensor needs past its last row: a quantized tensor whose ne0 is not a multiple of
 // 512 gets the CUDA backend's MMQ row padding, zeroed by the kernels on every call. The planner reserves the same tail
@@ -225,6 +226,11 @@ struct llama_expert_pool {
     // fill every slot that lies outside a whole-stack overlay with the layer's most routed experts from the
     // routing workload ledger (load time: the cache starts warm instead of empty); returns the experts seeded
     uint32_t seed_from_workload(bool gpu = true);
+
+    // the model's RAM expert store (nullptr: off): the misses are made RAM-resident through it and copied from their
+    // slots; map_rows counts the rows copied from the mapping instead
+    llama_expert_store * store = nullptr;
+    uint64_t map_rows = 0;
 
     std::vector<layer_state> layers;   // dense by il; tensors empty for non-moe layers
     ggml_context * ctx_views = nullptr;

@@ -1,6 +1,7 @@
 #include "llama-expert-pool.h"
 #include "llama-pshard-plan.h"
 #include "llama-pshard-workload.h"
+#include "llama-expert-store.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -10,6 +11,11 @@
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
+
+// expert x's rows in its RAM expert store slot (nullptr: not in a slot)
+static const void * store_row(const ggml_tensor * t, int32_t x) {
+    return (t->flags & GGML_TENSOR_FLAG_EXPERT_TABLE) && t->extra != nullptr ? ((const void * const *) t->extra)[x] : nullptr;
+}
 
 llama_expert_pool::~llama_expert_pool() {
     if (admit_backend != nullptr) {
@@ -1217,6 +1223,7 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         //    by the tier's miss policy (all of an expert's routes go the same way)
         seen_gen.assign(n_expert, 0);
         std::vector<int32_t> miss_list;
+        std::vector<int32_t> hit_list;   // with a RAM expert store: their RAM copies stay recent too
         uint32_t n_hit = 0;
         for (int64_t i1 = 0; i1 < n_ids_1; i1++) {
             for (int64_t i0 = 0; i0 < n_ids_0; i0++) {
@@ -1235,6 +1242,9 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                     // same-pass hit must never be one
                     L.slot_stamp[L.expert_slot[e]] = ++L.stamp;
                     n_hit++;
+                    if (store != nullptr) {
+                        hit_list.push_back(e);
+                    }
                     if (!L.slot_pf_gen.empty() && L.slot_pf_gen[L.expert_slot[e]] == generation) {
                         L.pf_used++;   // a prefetch from this pass paid off
                     }
@@ -1349,6 +1359,11 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             }
             upload_segs.clear();
         };
+        // with a RAM expert store every miss of the pass becomes RAM-resident first (one wait for the reads): the
+        // uploads copy from the slots and the CPU chain finds its experts there
+        const bool any_admit  = std::find(admit.begin(), admit.end(), 1) != admit.end();
+        const bool from_store = store != nullptr && store->acquire(L.tensors[0].host, hit_list.data(), hit_list.size(),
+            miss_list.data(), miss_list.size(), any_admit ? up_backend : nullptr);
         for (size_t i = 0; i < miss_list.size(); i++) {
             const int32_t e = miss_list[i];
             L.expert_last_gen[e] = generation;
@@ -1372,8 +1387,12 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             for (size_t ti = 0; ti < L.tensors.size(); ti++) {
                 const auto & te = L.tensors[ti];
                 // collected: the pass's rows go up in one launch below (per-tensor set_async fallback)
-                upload_segs.push_back({ te.view_slots, (size_t) slot * te.row_bytes,
-                    (const char *) te.host->data + (size_t) e * te.row_bytes, te.row_bytes });
+                const void * src = from_store ? store_row(te.host, e) : nullptr;
+                if (src == nullptr) {
+                    src = (const char *) te.host->data + (size_t) e * te.row_bytes;
+                    map_rows += store != nullptr ? 1 : 0;
+                }
+                upload_segs.push_back({ te.view_slots, (size_t) slot * te.row_bytes, src, te.row_bytes });
             }
             if (background) {
                 L.expert_pending[e] = generation;   // CPU route this pass, GPU hit from the next
@@ -1443,7 +1462,8 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         //    hits once the split stream has waited on the admit event (top of serve()).
         //    The victim is safe: the target layer's previous pass has completed (the
         //    drain above) and nothing reads its slots before its own service.
-        if (predict_k > 0 && prefetch_on && n_ids_1 <= 8) {   // decode and small verify batches
+        // (not over a RAM expert store: the prefetch reads the mapping)
+        if (predict_k > 0 && prefetch_on && n_ids_1 <= 8 && store == nullptr) {   // decode and small verify batches
             const int32_t tgt = L.il + predict_k;
             if (layer_pooled(tgt) && layers[tgt].ids_pred != nullptr) {
                 layer_state & T = layers[tgt];
@@ -1588,6 +1608,10 @@ void llama_expert_pool::log_counters() const {
     // is per pass (= per token at bs=1), summed over the pooled layers
     LLAMA_LOG_WARN("%s: expert pool: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
         __func__, (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) passes, h, mpt, n_slots);
+    if (store != nullptr) {
+        LLAMA_LOG_WARN("%s: expert pool over the RAM expert store: %llu expert rows copied from the mapping\n",
+            __func__, (unsigned long long) map_rows);
+    }
     LLAMA_LOG_INFO("%s: expert pool h per layer:%s\n", __func__, per_layer.c_str());
     LLAMA_LOG_INFO("%s: expert pool admission: %llu residents evicted\n",
         __func__, (unsigned long long) evicted);

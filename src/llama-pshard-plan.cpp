@@ -367,6 +367,8 @@ struct llama_pshard_search_ctx {
     bool                                       host_readable = false;
     // the tier searched runs such prompts: its choices rank the prices without the SSD reads (rank_compute)
     bool                                       rank_compute = false;
+    // the RAM expert store serves the model (its reads are priced only when predictor->store is set)
+    bool                                       store_on = false;
 };
 
 // accumulate tensor bytes from a gguf tensor table: routed experts per layer
@@ -2951,10 +2953,19 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             ctx.model_size <= 0 || n_layers == 0) {
         return plan; // dense models: the pool is not a candidate
     }
-    if (ctx.predictor != nullptr && ctx.predictor->store != nullptr) {
-        // the pool reads its experts from the mapping, not through the RAM expert store: its SSD reads are not priced
-        LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u not a candidate: the RAM expert store serves this model\n", __func__, cparams->n_batch);
-        return plan;
+    if (ctx.store_on) {
+        // over the RAM expert store a cache tier's misses are read into RAM slots and copied from there; a whole-stack
+        // tier would read every expert not in RAM per pass
+        const llama_benchmark_store * store = ctx.predictor != nullptr ? ctx.predictor->store : nullptr;
+        const uint64_t pass_experts = (uint64_t) cparams->n_batch * ctx.n_expert_used;
+        const char * why = store == nullptr ? "the RAM expert store's SSD reads are not priced"
+            : pass_experts >= ctx.n_expert ? "a whole-stack tier over the RAM expert store"
+            : store->n_ram < pass_experts ? "one pass's experts exceed the RAM expert store's slots per layer"
+            : nullptr;
+        if (why != nullptr) {
+            LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u not a candidate: %s\n", __func__, cparams->n_batch, why);
+            return plan;
+        }
     }
 
     // output head ON the GPU: with it on the CPU every pass (target token AND draft
@@ -3075,6 +3086,8 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             if (st->cpu_matmul_floor_gflops <= 0.0)        missing += " MUL_MAT-batch-entries";
             if (st->pool_serve_us <= 0.0)                  missing += " Pool_Serve_us";
             if (st->pool_split_us <= 0.0)                  missing += " Pool_Split_us";
+            if (ctx.store_on && st->staged_bw <= 0.0)      missing += " PCIe_Staged";
+            if (ctx.store_on && st->engine_switch_us < 0.0) missing += " Engine_Switch_us";
         }
         if (ctx.exps_total_weights == 0 || ctx.n_expert == 0) {
             missing += " expert-weight-count(gguf)";
@@ -3099,10 +3112,16 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
                                     2.0 * w_expert / 1e9 / cpu_gflops * 1000.0);   // ms per CPU-computed expert
     const double t_serve = st->pool_serve_us / 1000.0;   // ms per layer, all policies
     const double t_split = st->pool_split_us / 1000.0;   // ms per layer with CPU routes
+    // over the RAM expert store a miss is copied from its RAM slot, pageable memory: through the staging ring, one
+    // copy per tensor, the copies of a layer ordered against its kernels by one copy-engine transition
+    const llama_benchmark_store * store = ctx.store_on ? ctx.predictor->store : nullptr;
+    const int    n_t  = (int) std::max<uint32_t>(1, ctx.exps_tensors_per_layer);
+    const double t_up = store ? b_expert / 1e9 / st->staged_bw * 1000.0 + n_t * st->copy_setup_us / 1000.0 : 0.0;
+    const double t_sw = store ? st->engine_switch_us / 1000.0 : 0.0;
     // hybrid q* share = B_P / B_H (design 4b): the FreeToken balance for concurrent chains, at the upload
     // rate the two chains actually share (the loaded kernel curve); serial chains cap the fetched share by
     // the free slots anyway
-    plan.pool_hybrid_frac = (float) std::min(1.0, std::max(0.05, bp_loaded / cpu_gbs));
+    plan.pool_hybrid_frac = (float) std::min(1.0, std::max(0.05, (store ? st->staged_bw : bp_loaded) / cpu_gbs));
 
     if (ab_tier) {
         // whole-stack tier: one resident chain over the A/B half, so the pair must
@@ -3171,6 +3190,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             double distinct;
             double misses;
             double hits;
+            double ssd = 0.0;   // of the misses, those not in the RAM expert store's slots
         };
         const llama_pshard_workload * wl = ctx.predictor ? ctx.predictor->workload : nullptr;
         auto routes_at = [&](uint32_t rows) -> pass_routes {
@@ -3184,6 +3204,10 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
                 r.distinct = E * wl->distinct_share(rows);
                 r.hits     = std::min(s, std::max(0.0, r.distinct - k * (1.0 - h) * miss_growth));
                 r.misses   = r.distinct - r.hits;
+            }
+            if (store != nullptr) {
+                // inclusive: the RAM slots hold the VRAM residents too, so a VRAM miss reads the SSD when it misses RAM
+                r.ssd = std::min(r.misses, ctx.predictor->store_misses(rows, k));
             }
             return r;
         };
@@ -3201,6 +3225,27 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         // copies on the GPU's own stream), so a hybrid layer pays the longer of the two chains
         // plus the handoff, not their sum
         auto miss_ms_layer = [&](int pol, const pass_routes & r) -> double {
+            if (store != nullptr) {
+                // the layer's SSD reads land first (one wait); a staged upload's host copy runs before the GPU split's
+                // kernels, so a hybrid layer pays its two chains one after the other
+                const double t_ssd = ctx.predictor->store_read_ms(r.ssd, b_expert, 1, n_t);
+                auto switch_ms = [&](double n) { return (1.0 - std::exp(-n)) * t_sw; };
+                switch (pol) {
+                    case LLAMA_PSHARD_MISS_HYBRID: {
+                        // the runtime admits at least one miss of a layer that has one
+                        const double q = std::min(std::max(std::round(plan.pool_hybrid_frac * r.misses), std::min(1.0, r.misses)),
+                                                  std::max(0.0, s - r.hits));
+                        return t_ssd + q * t_up + switch_ms(q) + cpu_chain_ms(r.misses - q) + t_split;
+                    }
+                    case LLAMA_PSHARD_MISS_CPU_ADMIT: {
+                        const double cpu_ms    = cpu_chain_ms(r.misses);
+                        const double excess_up = std::max(0.0, r.misses * t_up - (cpu_ms + t_split));
+                        return t_ssd + cpu_ms + excess_up + t_split;
+                    }
+                    default:
+                        return t_ssd + r.misses * t_up + switch_ms(r.misses);
+                }
+            }
             switch (pol) {
                 case LLAMA_PSHARD_MISS_HYBRID: {
                     // q* fetched, capped by the free slots (hits + q resident at once);
@@ -3282,6 +3327,13 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             }
             if (priced) {
                 plan.tps = best_tps;
+                if (store != nullptr) {
+                    // the SSD reads inside tps (logs and the registry)
+                    plan.ssd_cpu_ms = (float) (ctx.predictor->store_read_ms(routes.ssd, b_expert, 1, n_t) * n_layers_exp);
+                    LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u over the RAM expert store (%u slots/layer): %.2f misses/layer from RAM, "
+                        "%.2f from the SSD (%.2f ms/layer), staged upload %.3f ms/expert\n", __func__, bs, store->n_ram,
+                        routes.misses - routes.ssd, routes.ssd, plan.ssd_cpu_ms / n_layers_exp, t_up);
+                }
                 // the pieces the same way: their own compute and the misses of their own rows
                 for (size_t i = 0; i < plan.piece_n.size() && i < piece_bd.size(); i++) {
                     plan.piece_ms[i] = (float) (piece_bd[i].compute_ms + piece_bd[i].other_ms +
@@ -3977,6 +4029,7 @@ void llama_params_fit_pshard_plan(
             (ceiling_gb <= 0.0 || (double) total_file_size <= (ceiling_gb - LLAMA_PSHARD_HOST_PIN_RESERVE_GB) * 1e9);
         ctx.host_readable = !store_info.on && (props.caps.host_pageable || pinned);
     }
+    ctx.store_on = store_info.on;
 
     // MoE geometry + model size for the per-tier ids-cross decision
     ctx.model_size = total_file_size;

@@ -522,7 +522,7 @@ void llama_expert_store::serve(layer & L, const ggml_tensor * ids) {
             if (x < 0 || (uint32_t) x >= n_expert) {
                 continue;   // a -1 route computes nothing
             }
-            L.routes[x]++;
+            L.routes[x] += count_routes ? 1 : 0;
             if (!used[x]) {
                 used[x] = 1;
                 want.push_back(x);
@@ -561,6 +561,50 @@ void llama_expert_store::serve(layer & L, const ggml_tensor * ids) {
         return;
     }
     fetch(L, want.data(), n_miss, c);
+}
+
+bool llama_expert_store::acquire(const ggml_tensor * t, const int32_t * hits, size_t n_hits, const int32_t * misses,
+        size_t n_misses, ggml_backend_t reader) {
+    std::lock_guard<std::mutex> lk(mtx);
+    const auto it = layer_of.find(t);
+    if (arena == nullptr || it == layer_of.end()) {
+        return false;
+    }
+    layer & L = layers[it->second];
+    auto & c = cnt[4];
+    if (!pf_have) {
+        pf_decode0 = process_page_faults();
+        pf_have    = true;
+    }
+    c.passes++;
+    // the hits first, then the misses: with n_misses <= the live slots, fetch's victims are slots this pass does not
+    // use, or the RAM copies of VRAM hits, never a miss
+    for (size_t i = 0; i < n_hits; i++) {
+        if (const int32_t s = L.slot_of[hits[i]]; s >= 0) {
+            L.stamp[s] = ++L.clock;
+        }
+    }
+    c.requests += n_misses;
+    if (n_misses > n_ram - L.lent.size() - L.n_out) {
+        c.fallbacks += n_misses;
+        return false;
+    }
+    want.clear();
+    for (size_t i = 0; i < n_misses; i++) {
+        if (const int32_t s = L.slot_of[misses[i]]; s >= 0) {
+            L.stamp[s] = ++L.clock;
+            c.hits++;
+        } else {
+            want.push_back(misses[i]);
+        }
+    }
+    if (!want.empty()) {
+        fetch(L, want.data(), want.size(), c);
+    }
+    if (reader != nullptr && std::find(L.gpu_readers.begin(), L.gpu_readers.end(), reader) == L.gpu_readers.end()) {
+        L.gpu_readers.push_back(reader);
+    }
+    return true;
 }
 
 bool llama_expert_store::ensure_stage(ggml_backend_dev_t dev, size_t stride) {
@@ -1297,10 +1341,10 @@ void llama_expert_store::seed() {
 
 void llama_expert_store::log_counters() {
     std::lock_guard<std::mutex> lk(mtx);
-    static const char * names[3] = { "one-row passes", "multi-row passes", "device uploads" };
-    for (int i = 0; i < 3; i++) {
+    static const char * names[5] = { "one-row passes", "multi-row passes", "device uploads", nullptr, "expert pool misses" };
+    for (int i = 0; i < 5; i++) {
         const auto & c = cnt[i];
-        if (c.passes == 0) {
+        if (names[i] == nullptr || c.passes == 0) {
             continue;
         }
         const double wait_s = c.wait_us / 1e6;
