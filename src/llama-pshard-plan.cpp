@@ -362,8 +362,9 @@ struct llama_pshard_search_ctx {
     // the RAM expert store's SSD reads are priced and a prompt of several ubatches runs layer-major (one sequence, a
     // memory that rewinds): such a prompt reads the experts once, not per ubatch
     bool                                       store_lm = false;
-    // the host weights load into the device's pinned host buffer, which its kernels can read in place
-    bool                                       host_pinned = false;
+    // the GPU's kernels can read the host weights in place: the device reads its host memory as it is, or the
+    // weights load page-locked into its pinned host buffer
+    bool                                       host_readable = false;
     // the tier searched runs such prompts: its choices rank the prices without the SSD reads (rank_compute)
     bool                                       rank_compute = false;
 };
@@ -3309,9 +3310,9 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     return plan;
 }
 
-// a placement may read weights in place where the profile prices it and the host weights are page-locked
+// a placement may read weights in place where the profile prices it and the GPU can read the host weights
 static bool pshard_in_place_offered(const llama_pshard_search_ctx & ctx) {
-    return ctx.host_pinned && ctx.predictor != nullptr && ctx.predictor->has_host_rows();
+    return ctx.host_readable && ctx.predictor != nullptr && ctx.predictor->has_host_rows();
 }
 
 // STATIC_ATTNPRIO_ALLMODELS with its unpinned part on the CPU, and where offered on the GPU reading in place the routed
@@ -3960,15 +3961,17 @@ void llama_params_fit_pshard_plan(
         }
     }
 
-    // the host weights are page-locked in the device's host buffer: not a file mapping or the RAM expert store, the
-    // device pins host memory, and the model fits under the profile's pin ceiling (every weight a tier does not pin
-    // keeps its host copy, and the tiers are not known yet)
+    // the GPU can read the host weights in place: not the RAM expert store (its slots are found through a table), and
+    // either the device reads ordinary host memory (mapped weights included), or the weights are page-locked in its
+    // host buffer: not a file mapping, the device pins host memory, and the model fits under the profile's pin
+    // ceiling (every weight a tier does not pin keeps its host copy, and the tiers are not known yet)
     {
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(ggml_backend_buft_get_device(gpu_buft), &props);
         const double ceiling_gb = predictor ? predictor->stats.host_pin_ceiling_gb : 0.0;
-        ctx.host_pinned = !llama_pshard_load_maps(mparams->load_mode) && !store_info.on && props.caps.host_buffer &&
+        const bool   pinned     = !llama_pshard_load_maps(mparams->load_mode) && props.caps.host_buffer &&
             (ceiling_gb <= 0.0 || (double) total_file_size <= (ceiling_gb - LLAMA_PSHARD_HOST_PIN_RESERVE_GB) * 1e9);
+        ctx.host_readable = !store_info.on && (props.caps.host_pageable || pinned);
     }
 
     // MoE geometry + model size for the per-tier ids-cross decision

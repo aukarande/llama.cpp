@@ -1956,11 +1956,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
             }
-            // a pinned host buffer that fell back to pageable memory cannot be read in place: the plans that would read
-            // it run their unpinned part on the CPU instead (STATIC_ATTNPRIO_ALLMODELS places only that part on the
-            // shard lanes)
+            // a pinned host buffer that fell back to pageable memory cannot be read in place by a device that reads only
+            // pinned memory: the plans that would read it run their unpinned part on the CPU instead
+            // (STATIC_ATTNPRIO_ALLMODELS places only that part on the shard lanes)
+            ggml_backend_dev_props dev_props;
+            ggml_backend_dev_get_props(dev, &dev_props);
             if (buf != nullptr && !ml.no_alloc && pimpl->plan_registry != nullptr && ggml_backend_buffer_get_type(buf) != buft &&
-                    buft == ggml_backend_dev_host_buffer_type(dev)) {
+                    buft == ggml_backend_dev_host_buffer_type(dev) && !dev_props.caps.host_pageable) {
                 const pshard_dev_layout layout = pshard_dev_layout::for_device(0,
                     pshard_dev_layout::compute_cpu_backend_id(devices.size()));
                 for (auto & plan : pimpl->plan_registry->best_plans) {

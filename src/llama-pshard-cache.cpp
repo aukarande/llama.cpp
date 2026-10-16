@@ -444,8 +444,18 @@ uint64_t pshard_registry_fingerprint(
     mix((uint64_t)LLAMA_BENCHMARK_PREDICTOR_VERSION);
     mix(llama_benchmark_profile_hash());
     mix((uint64_t)pshard_strategy_from_env());
-    // mapped weights are not in the device's pinned host buffers: no tier reads them in place
+    // mapped weights are not in the device's pinned host buffers: only a GPU that reads ordinary host memory reads
+    // them in place (mixed only when one does, so other machines keep their fingerprints)
     mix((uint64_t)(llama_pshard_load_maps(mparams->load_mode) ? 1 : 0));
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && props.caps.host_pageable) {
+            mix(0x70616765ull);
+            break;
+        }
+    }
     // forced miss policy (QA override) plans differently; mixed only when set so
     // existing registries keep their fingerprints
     const int mp_env = pshard_miss_policy_from_env();
