@@ -1404,11 +1404,11 @@ static void save_results_cpu(
 
 int main(int argc, char ** argv) {
 #ifdef __linux__
-    // libgomp workers that wait at a barrier sleep after 300000 spins; under a sampling governor (ondemand) the
-    // sleeping cores drop their clock, the op waits on them and the low clock can hold for the whole timed window.
-    // libgomp reads GOMP_SPINCOUNT only at load: set a longer spin and restart once
+    // libgomp workers that wait at a barrier sleep after a short spin; under a sampling governor (ondemand) the sleeping cores drop their clock.
+    // In an op split one chunk per thread the others then wait on that core, sleep in turn, and the low clock can hold for the whole timed window.
+    // No finite spin covers those waits: make the workers spin (libgomp reads OMP_WAIT_POLICY only at load, so set it and restart once).
     if (getenv("GOMP_SPINCOUNT") == nullptr && getenv("OMP_WAIT_POLICY") == nullptr) {
-        setenv("GOMP_SPINCOUNT", "3000000", 1);
+        setenv("OMP_WAIT_POLICY", "active", 1);
         execv("/proc/self/exe", argv);
     }
 #endif
@@ -1560,12 +1560,15 @@ int main(int argc, char ** argv) {
                 calibrate_pcie_sliced(&pcie, procs, threads, SLICED_SEGS, false, cr.segs_kernel_idle_bw);
             }
             calibrate_copy_crossover(&pcie, procs, cr);
+        }
+        // before the first CPU graph: the OpenMP workers spin on after it (OMP_WAIT_POLICY=active) beside the DRAM readers
+        cr.pcie_concurrent = calibrate_pcie_concurrent(&pcie, threads);
+        if (procs.kernel_copies) {
             calibrate_pool_latencies(&pcie, cpu_be, threads, procs, cr);
         } else {
             printf("Kernel copies not available on this backend - kernel-copy lines omitted\n\n");
         }
         cr.staged_bw = calibrate_staged_upload(&pcie);
-        cr.pcie_concurrent = calibrate_pcie_concurrent(&pcie, threads);
         if (!no_pin_ceiling) cr.pin_ceiling_gb = calibrate_pin_ceiling(&pcie);
     }
 
