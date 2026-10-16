@@ -858,6 +858,9 @@ struct ggml_backend_sched {
     bool prefetch_weights;
     bool prefetch_window;   // ggml_backend_sched_set_prefetch_window
     int  read_in_place;     // ggml_backend_sched_set_read_in_place
+    // the backend's device reads ordinary (pageable, mapped) host memory in place; set with the first in-place mask
+    bool read_pageable[GGML_SCHED_MAX_BACKENDS];
+    bool read_pageable_set;
     // ubatches below this many tokens copy only the used experts (ggml_backend_sched_set_expert_slice_tokens); -1 = default rule
     int  expert_slice_tokens;
     // ubatches are classified at no fewer tokens than this (ggml_backend_sched_set_expert_slice_rows)
@@ -983,8 +986,9 @@ static inline ggml_backend_buffer_t ggml_backend_sched_tensor_buffer(const struc
     return t->view_src ? t->view_src->buffer : t->buffer;
 }
 
-// a device split reads a weight of a class in read_in_place from the device's own pinned host buffer in place: the
-// device's kernels read that memory directly, and a tensor its buffer type does not pad has no padding to clear
+// a device split reads a weight of a class in read_in_place from host memory in place: the device's own pinned host
+// buffer, or any host buffer on a device that reads pageable memory; a tensor its buffer type does not pad has no
+// padding to clear
 static bool ggml_backend_sched_reads_in_place(ggml_backend_sched_t sched, const struct ggml_tensor * node, int j,
         ggml_backend_buffer_t src_buf, int backend_id) {
     const int cls = node->op == GGML_OP_MUL_MAT_ID && j == 0 ? GGML_BACKEND_SCHED_IN_PLACE_EXPERTS : GGML_BACKEND_SCHED_IN_PLACE_WEIGHTS;
@@ -992,8 +996,9 @@ static bool ggml_backend_sched_reads_in_place(ggml_backend_sched_t sched, const 
         return false;
     }
     ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[backend_id]);
-    return dev != NULL && src_buf->buft == ggml_backend_dev_host_buffer_type(dev) &&
-           ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], node->src[j]) == ggml_nbytes(node->src[j]);
+    const bool readable = dev != NULL && (src_buf->buft == ggml_backend_dev_host_buffer_type(dev) ||
+                                          (sched->read_pageable[backend_id] && ggml_backend_buffer_is_host(src_buf)));
+    return readable && ggml_backend_buft_get_alloc_size(sched->bufts[backend_id], node->src[j]) == ggml_nbytes(node->src[j]);
 }
 
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
@@ -3478,6 +3483,17 @@ bool ggml_backend_sched_get_prefetch_window(ggml_backend_sched_t sched) {
 void ggml_backend_sched_set_read_in_place(ggml_backend_sched_t sched, int classes) {
     GGML_ASSERT(sched);
     sched->read_in_place = classes;
+    if (classes != 0 && !sched->read_pageable_set) {
+        for (int b = 0; b < sched->n_backends; b++) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+            ggml_backend_dev_props props;
+            if (dev != NULL) {
+                ggml_backend_dev_get_props(dev, &props);
+            }
+            sched->read_pageable[b] = dev != NULL && props.caps.host_pageable;
+        }
+        sched->read_pageable_set = true;
+    }
 }
 
 int ggml_backend_sched_get_prefetch_lookahead(void) {

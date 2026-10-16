@@ -419,6 +419,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].supports_cooperative_launch = false;
 #endif // !(GGML_USE_MUSA)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        int host_page_tables = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&host_page_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, physical_id));
+        info.devices[id].host_page_tables = !!host_page_tables;
+#endif
+
 #if defined(GGML_USE_HIP)
         info.devices[id].smpbo = prop.sharedMemPerBlock;
 
@@ -5724,6 +5730,7 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .events                = */ events,
         /* .mmap_support          = */ props->type != GGML_BACKEND_DEVICE_TYPE_IGPU,
         /* .copy_stream           = */ true,
+        /* .host_pageable         = */ ggml_cuda_info().devices[ctx->device].host_page_tables,
     };
 }
 

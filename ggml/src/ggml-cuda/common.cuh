@@ -1144,6 +1144,7 @@ struct ggml_cuda_device_info {
         size_t  smpb;                           // max. shared memory per block
         size_t  smpbo;                          // max. shared memory per block (with opt-in)
         bool    integrated;                     // Device is integrated as opposed to discrete
+        bool    host_page_tables;               // kernels read pageable host memory through the host's page tables
         bool    vmm;                            // virtual memory support
         size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;

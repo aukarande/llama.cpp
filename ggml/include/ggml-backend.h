@@ -159,6 +159,8 @@ extern "C" {
         bool mmap_support;
         // separate copy stream for compute/transfer overlap
         bool copy_stream;
+        // kernels read ordinary (pageable or file-mapped) host memory in place
+        bool host_pageable;
     };
 
     // all the device properties
