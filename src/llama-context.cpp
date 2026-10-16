@@ -530,9 +530,16 @@ llama_context::llama_context(
         if (auto * store = model.expert_store(); store != nullptr && !model.hparams.no_alloc) {
             const uint32_t w = layer_major_init(params.n_batch);
 
+            // pinned slots serve only an expert pool's uploads: plans without a pool tier keep every slot locked
+            const auto * plans = model.get_plan_registry();
+            const uint32_t n_pin = cparams.pshard && plans != nullptr && plans->has_pool() ? plans->store_pinned : 0;
             const bool was = store->active();
-            const bool ok  = store->allocate();
-            if (const auto * registry = model.get_plan_registry(); !was && ok && registry != nullptr && registry->store_slots > 0) {
+            const bool ok  = store->allocate(n_pin > 0 ? ggml_backend_get_device(backends[pshard_layout.compute].get()) : nullptr, n_pin);
+            if (!was && ok && store->n_rp < n_pin) {
+                LLAMA_LOG_WARN("%s: pshard: expert store pinned %u slots per layer, the plans were priced at %u\n",
+                    __func__, store->n_rp, n_pin);
+            }
+            if (const auto * registry = plans; !was && ok && registry != nullptr && registry->store_slots > 0) {
                 // the plans priced the store's SSD reads at the slots the last run got, else the budget's; the RAM free here
                 // may hold fewer (find_cut prices the uploads' reads at the live slots). The slots are recorded for the next
                 // planning; fewer than priced make the next run plan again

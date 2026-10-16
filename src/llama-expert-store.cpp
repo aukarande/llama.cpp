@@ -1,4 +1,5 @@
 #include "llama-expert-store.h"
+#include "llama-pshard-plan.h"
 #include "llama-pshard-workload.h"
 #include "llama-ssd-reader.h"
 
@@ -50,6 +51,17 @@ size_t llama_expert_store_stride(size_t row_bytes) {
 
 uint32_t llama_expert_store_slots(size_t cap, size_t slot_all, uint32_t n_expert) {
     return slot_all > 0 ? (uint32_t) std::min<size_t>(n_expert, cap / slot_all) : 0;
+}
+
+size_t llama_expert_store_stage_bytes(size_t stride) {
+    constexpr size_t sector = llama_ssd_reader::sector;
+    // two halves, each holding enough experts to keep several reads in flight
+    return 2 * GGML_PAD(std::max<size_t>(16 * stride, 256ull << 20), sector) + sector;
+}
+
+uint32_t llama_expert_store_pinned_slots(size_t pin_b, size_t slot_all, uint32_t n_ram) {
+    // a buffer per slot index, padded to a sector
+    return slot_all > 0 ? (uint32_t) std::min<size_t>(n_ram, pin_b / (slot_all + llama_ssd_reader::sector)) : 0;
 }
 
 std::vector<std::string> llama_expert_store_files(const std::string & path_model) {
@@ -282,6 +294,9 @@ llama_expert_store::~llama_expert_store() {
     }
     delete ahead;
     delete reader;
+    for (ggml_backend_buffer_t b : pin_bufs) {
+        ggml_backend_buffer_free(b);
+    }
     if (arena != nullptr) {
         free_locked(arena, arena_bytes);
     }
@@ -383,7 +398,7 @@ size_t llama_expert_store::sweep_bytes(const layer_groups & groups, const char *
         return 0;
     }
     // before allocate: the slots it would take now
-    const uint32_t k = lend_for(groups, arena != nullptr ? n_ram : size_for().n, why);
+    const uint32_t k = lend_for(groups, on ? n_ram : size_for().n, why);
     return (size_t) k * slot_all;
 }
 
@@ -391,14 +406,15 @@ uint32_t llama_expert_store::sweep_reads(const layer_groups & groups) {
     std::lock_guard<std::mutex> lk(mtx);
     const char * why = nullptr;
     // sweep_start lends nothing once a slot is out of service
-    const uint32_t k = arena != nullptr && slots_out == 0 ? lend_for(groups, n_ram, &why) : 0;
+    const uint32_t k = on && slots_out == 0 ? lend_for(groups, n_ram, &why) : 0;
     return k > 0 ? n_expert - n_ram + k : 0;
 }
 
-bool llama_expert_store::allocate() {
+bool llama_expert_store::allocate(ggml_backend_dev_t dev, uint32_t n_pin) {
+    constexpr size_t sector = llama_ssd_reader::sector;
     std::lock_guard<std::mutex> lk(mtx);
-    if (arena != nullptr || failed) {
-        return arena != nullptr;
+    if (on || failed) {
+        return on;
     }
     failed = true;
     const sizing sz = size_for();
@@ -418,30 +434,78 @@ bool llama_expert_store::allocate() {
         return false;
     }
     const int64_t t0 = ggml_time_us();
-    while (arena == nullptr && n >= n_expert_used) {
-        arena = alloc_locked((size_t) n * slot_all, arena_locked);
-        if (arena == nullptr) {
-            n = std::min<uint32_t>(n * 3 / 4, n - 1);
+    // the pinned slots first, one buffer per slot index, so a refusal only lowers their count
+    ggml_backend_buffer_type_t buft = n_pin > 0 && dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (buft != nullptr) {
+        size_t stride_max = 0;
+        for (const auto & e : ents) {
+            stride_max = std::max(stride_max, e.stride);
+        }
+        ensure_stage(dev, stride_max);   // the store's staging buffer comes before the slots
+        bool refused = false;
+        while (!refused && pin_bufs.size() < std::min(n_pin, n)) {
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, slot_all + sector);
+            // a refused page-lock falls back to a pageable buffer
+            refused = b == nullptr || ggml_backend_buffer_get_type(b) != buft;
+            if (refused && b != nullptr) {
+                ggml_backend_buffer_free(b);
+            } else if (!refused) {
+                pin_bufs.push_back(b);
+            }
+        }
+        // at the driver's ceiling: the pinned buffers the runtime allocates later get the reserve back
+        for (double back = 0.0; refused && back < LLAMA_PSHARD_HOST_PIN_RESERVE_GB * 1e9 && !pin_bufs.empty(); back += (double) (slot_all + sector)) {
+            ggml_backend_buffer_free(pin_bufs.back());
+            pin_bufs.pop_back();
         }
     }
-    if (arena == nullptr) {
+    n_rp = (uint32_t) pin_bufs.size();
+    const int64_t t1 = ggml_time_us();
+    n_lk = n - n_rp;
+    while (arena == nullptr && n_lk > 0 && n_rp + n_lk >= n_expert_used) {
+        arena = alloc_locked((size_t) n_lk * slot_all, arena_locked);
+        if (arena == nullptr) {
+            n_lk = std::min<uint32_t>(n_lk * 3 / 4, n_lk - 1);
+        }
+    }
+    n_lk = arena != nullptr ? n_lk : 0;
+    auto release = [&]() {
+        for (ggml_backend_buffer_t b : pin_bufs) {
+            ggml_backend_buffer_free(b);
+        }
+        pin_bufs.clear();
+        n_rp = 0;
+        if (arena != nullptr) {
+            free_locked(arena, arena_bytes);
+            arena = nullptr;
+        }
+        n_lk = 0;
+    };
+    arena_bytes = (size_t) n_lk * slot_all;
+    if (n_rp + n_lk < n_expert_used) {
+        release();
         LLAMA_LOG_WARN("%s: expert store off: no locked RAM for %u slots per layer\n", __func__, n_expert_used);
         return false;
     }
-    arena_bytes = (size_t) n * slot_all;
-    n_ram = n;
     reader = new llama_ssd_reader();
     if (!reader->open(file_paths)) {
-        free_locked(arena, arena_bytes);
-        arena = nullptr;
+        delete reader;
+        reader = nullptr;
+        release();
         return false;
     }
-    size_t off = 0;
+    n_ram = n_rp + n_lk;
+    for (ggml_backend_buffer_t b : pin_bufs) {
+        pin_slot.push_back((char *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(b), sector));
+    }
+    size_t off = 0, poff = 0;
     for (auto & L : layers) {
         for (uint32_t ei : L.ents) {
             auto & e = ents[ei];
-            e.base = arena + off;
-            off += (size_t) n_ram * e.stride;
+            e.base    = arena != nullptr ? arena + off : nullptr;
+            e.pin_off = poff;
+            off  += (size_t) n_lk * e.stride;
+            poff += e.stride;
             e.tbl.assign(n_expert, nullptr);
             e.t->extra  = e.tbl.data();
             e.t->flags |= GGML_TENSOR_FLAG_EXPERT_TABLE;
@@ -453,8 +517,13 @@ bool llama_expert_store::allocate() {
     }
     used.assign(n_expert, 0);
     failed = false;
+    on     = true;
+    if (n_pin > 0) {
+        LLAMA_LOG_WARN("%s: expert store: %u of %u slots per layer pinned (%.1f GiB in %.1f s)\n", __func__, n_rp, n_pin,
+            n_rp * (double) (slot_all + sector) / 1073741824.0, (t1 - t0) / 1e6);
+    }
     LLAMA_LOG_WARN("%s: expert store on: %u of %u experts per layer in RAM (%.1f GiB locked in %.1f s%s) for %.1f GiB of routed experts in %zu layers, %zu file(s)\n",
-        __func__, n_ram, n_expert, arena_bytes / 1073741824.0, (ggml_time_us() - t0) / 1e6,
+        __func__, n_ram, n_expert, arena_bytes / 1073741824.0, (ggml_time_us() - t1) / 1e6,
         budget_auto ? ", auto budget" : ", -mra budget", experts_all / 1073741824.0, layers.size(), file_paths.size());
     seed();
     return true;
@@ -490,7 +559,7 @@ void llama_expert_store::fetch(layer & L, const int32_t * experts, size_t n, cou
             const size_t off = e.file_off + (size_t) x * e.row_bytes;
             const size_t beg = off & ~(sector - 1);
             const size_t end = GGML_PAD(off + e.row_bytes, sector);
-            reader->read(e.split, beg, end - beg, e.base + (size_t) v * e.stride, off + e.row_bytes - beg);
+            reader->read(e.split, beg, end - beg, slot(e, v), off + e.row_bytes - beg);
             c.bytes += end - beg;
         }
         c.reads++;
@@ -507,7 +576,7 @@ void llama_expert_store::fetch(layer & L, const int32_t * experts, size_t n, cou
         for (uint32_t ei : L.ents) {
             auto & e = ents[ei];
             const size_t off = e.file_off + (size_t) x * e.row_bytes;
-            e.tbl[x] = e.base + v * e.stride + (off & (sector - 1));
+            e.tbl[x] = slot(e, (uint32_t) v) + (off & (sector - 1));
         }
     }
 }
@@ -564,10 +633,10 @@ void llama_expert_store::serve(layer & L, const ggml_tensor * ids) {
 }
 
 bool llama_expert_store::acquire(const ggml_tensor * t, const int32_t * hits, size_t n_hits, const int32_t * misses,
-        size_t n_misses, ggml_backend_t reader) {
+        size_t n_misses, ggml_backend_t reader, uint8_t * pinned) {
     std::lock_guard<std::mutex> lk(mtx);
     const auto it = layer_of.find(t);
-    if (arena == nullptr || it == layer_of.end()) {
+    if (!on || it == layer_of.end()) {
         return false;
     }
     layer & L = layers[it->second];
@@ -601,6 +670,13 @@ bool llama_expert_store::acquire(const ggml_tensor * t, const int32_t * hits, si
     if (!want.empty()) {
         fetch(L, want.data(), want.size(), c);
     }
+    for (size_t i = 0; i < n_misses; i++) {
+        const bool p = (uint32_t) L.slot_of[misses[i]] >= n_lk;
+        c.pinned += p ? 1 : 0;
+        if (pinned != nullptr) {
+            pinned[i] = p ? 1 : 0;
+        }
+    }
     if (reader != nullptr && std::find(L.gpu_readers.begin(), L.gpu_readers.end(), reader) == L.gpu_readers.end()) {
         L.gpu_readers.push_back(reader);
     }
@@ -625,8 +701,7 @@ bool llama_expert_store::ensure_stage(ggml_backend_dev_t dev, size_t stride) {
         stage_buf = nullptr;
         stage     = nullptr;
     }
-    // a half holds enough experts to keep several reads in flight
-    const size_t half = GGML_PAD(std::max<size_t>(16 * stride, 256ull << 20), sector);
+    const size_t half = (llama_expert_store_stage_bytes(stride) - sector) / 2;
     ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
     if (buft != nullptr) {
         stage_buf = ggml_backend_buft_alloc_buffer(buft, 2 * half + sector);
@@ -674,7 +749,7 @@ bool llama_expert_store::upload(const ggml_tensor * src, ggml_tensor * dst, cons
     std::lock_guard<std::mutex> lk(mtx);
     const auto ie = ent_of.find(src);
     const auto il = layer_of.find(src);
-    if (arena == nullptr || ie == ent_of.end() || il == layer_of.end()) {
+    if (!on || ie == ent_of.end() || il == layer_of.end()) {
         return false;
     }
     const entry & e = ents[ie->second];
@@ -889,7 +964,7 @@ bool llama_expert_store::sweep_start(const layer_groups & groups, ggml_backend_d
         for (const auto & L : layers) {
             for (uint32_t v : L.lent) {
                 for (uint32_t ei : L.ents) {
-                    areas.push_back({ ents[ei].base + (size_t) v * ents[ei].stride, ents[ei].stride });
+                    areas.push_back({ slot(ents[ei], v), ents[ei].stride });
                 }
             }
         }
@@ -1007,7 +1082,8 @@ char * llama_expert_store::window_pin(ggml_backend_dev_t dev, size_t bytes) {
     ggml_backend_buffer_type_t buft = nullptr;
     GGML_UNUSED(dev);
 #endif
-    if (buft == nullptr || pin_refused) {
+    // with pinned slots the pin budget is theirs: the lent slots hold the window rows in place
+    if (buft == nullptr || pin_refused || n_rp > 0) {
         return nullptr;
     }
     GGML_ASSERT(win_buf == nullptr);
@@ -1044,8 +1120,9 @@ bool llama_expert_store::slot_pages(const layer & L, uint32_t v, bool lock) cons
     bool ok = true;
 #ifdef _WIN32
     constexpr size_t page = 4096;
+    GGML_ASSERT(v < n_lk);   // only locked slots are decommitted (a pinned window needs no pinned slots)
     for (uint32_t ei : L.ents) {
-        char * p = ents[ei].base + (size_t) v * ents[ei].stride;
+        char * p = slot(ents[ei], v);
         const size_t n = ents[ei].stride;
         // whole pages: the arena comes from VirtualAlloc and every stride is a multiple of the sector
         GGML_ASSERT(((uintptr_t) p | n) % page == 0);
@@ -1151,7 +1228,7 @@ void llama_expert_store::window_plan(int h, const layer_groups & groups, size_t 
 void llama_expert_store::window_begin(const layer_groups & groups, size_t g, ggml_backend_dev_t dev) {
     std::lock_guard<std::mutex> lk(mtx);
     window_close();
-    if (arena == nullptr || g >= groups.size()) {
+    if (!on || g >= groups.size()) {
         return;
     }
     if (g == 0 || !sweep_on) {
@@ -1261,7 +1338,7 @@ int llama_expert_store::host_experts_cb(struct ggml_cgraph * g, int j0, void * u
 int llama_expert_store::host_experts(struct ggml_cgraph * g, int j0) {
     std::lock_guard<std::mutex> lk(mtx);
     const int n = ggml_graph_n_nodes(g);
-    if (arena == nullptr) {
+    if (!on) {
         return n;   // not allocated yet: every expert is read from the mapping
     }
     const ggml_tensor * served_ids   = nullptr;
@@ -1352,6 +1429,10 @@ void llama_expert_store::log_counters() {
             __func__, names[i], (unsigned long long) c.passes, (unsigned long long) c.requests,
             c.requests > 0 ? 100.0 * c.hits / c.requests : 0.0, (unsigned long long) c.reads, c.bytes / 1e9,
             wait_s > 0 ? c.bytes / 1e9 / wait_s : 0.0, wait_s, (unsigned long long) c.fallbacks);
+    }
+    if (const auto & c = cnt[4]; c.passes > 0 && n_rp > 0) {
+        LLAMA_LOG_WARN("%s: expert store expert pool misses: %.1f%% in pinned slots (%u of %u slots per layer pinned)\n",
+            __func__, c.requests > c.fallbacks ? 100.0 * c.pinned / (c.requests - c.fallbacks) : 0.0, n_rp, n_ram);
     }
     if (const auto & c = cnt[3]; c.passes > 0) {
         LLAMA_LOG_WARN("%s: expert store layer-major window: %llu uploads, %llu experts not in RAM: %llu (%.1f%%) from the window rows, %llu through the staging buffer\n",

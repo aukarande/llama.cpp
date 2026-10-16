@@ -188,7 +188,7 @@ struct llama_expert_pool {
     ggml_backend_copy_segments_async_t copy_segments = nullptr;   // batched upload proc (CUDA), else per-tensor
     bool   procs_looked_up = false;
     void lookup_backend_procs();
-    struct upload_seg { ggml_tensor * view; size_t off; const void * src; size_t size; };
+    struct upload_seg { ggml_tensor * view; size_t off; const void * src; size_t size; bool staged = false; };
     std::vector<upload_seg> upload_segs;   // one pass's admitted rows, issued as one launch
     char * read_ids  = nullptr;
     char * read_pred = nullptr;
@@ -228,9 +228,12 @@ struct llama_expert_pool {
     uint32_t seed_from_workload(bool gpu = true);
 
     // the model's RAM expert store (nullptr: off): the misses are made RAM-resident through it and copied from their
-    // slots; map_rows counts the rows copied from the mapping instead
+    // slots; map_rows counts the rows copied from the mapping instead. Rows in pinned slots go up as kernel copies,
+    // the others (page-locked, not the device's) through the staging ring
     llama_expert_store * store = nullptr;
-    uint64_t map_rows = 0;
+    uint64_t map_rows   = 0;
+    uint64_t up_kernel  = 0;
+    uint64_t up_staged  = 0;
 
     std::vector<layer_state> layers;   // dense by il; tensors empty for non-moe layers
     ggml_context * ctx_views = nullptr;

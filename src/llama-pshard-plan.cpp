@@ -1865,10 +1865,10 @@ bool pshard_registry_save(
 
     // trailing fields after cache_ubatch are ignored by older parsers (sscanf assigns
     // the two %u before the literal ']' mismatch and still returns 2)
-    char store_buf[96] = "";
+    char store_buf[128] = "";
     if (registry->store_slots > 0) {
-        snprintf(store_buf, sizeof(store_buf), " store_slots=%u store_experts=%u ssd_expert_ms=%.3f",
-            registry->store_slots, registry->store_experts, registry->ssd_expert_ms);
+        snprintf(store_buf, sizeof(store_buf), " store_slots=%u store_experts=%u ssd_expert_ms=%.3f store_pinned=%u",
+            registry->store_slots, registry->store_experts, registry->ssd_expert_ms, registry->store_pinned);
     }
     fprintf(f, "\n[variant budget=%u cache_ubatch=%u switch_mb=%.1f attn_frac=%.4f head_mb=%.1f pcie=%.1f mtp_head_cpu=%d mtp_head_extra_mb=%u union_mb=%zu kernel_cap_mb=%.0f machine=%016llx%s]\n",
         budget_mib, cache_ubatch,
@@ -2022,6 +2022,7 @@ bool pshard_registry_load(
         uint32_t store_slots   = 0;
         uint32_t store_experts = 0;
         float    ssd_expert_ms = 0.0f;
+        uint32_t store_pinned  = 0;
         bool     ot_cut        = false;
         std::vector<tier_data> tiers;
     };
@@ -2060,6 +2061,7 @@ bool pshard_registry_load(
             if ((p = strstr(s.c_str(), "store_slots=")) != NULL) cur_variant->store_slots = (uint32_t) atoi(p + 12);
             if ((p = strstr(s.c_str(), "store_experts=")) != NULL) cur_variant->store_experts = (uint32_t) atoi(p + 14);
             if ((p = strstr(s.c_str(), "ssd_expert_ms=")) != NULL) cur_variant->ssd_expert_ms = (float) atof(p + 14);
+            if ((p = strstr(s.c_str(), "store_pinned=")) != NULL) cur_variant->store_pinned = (uint32_t) atoi(p + 13);
             continue;
         }
         if (!cur_variant) continue;
@@ -2437,6 +2439,7 @@ bool pshard_registry_load(
         registry->store_slots      = best_whole->store_slots;
         registry->store_experts    = best_whole->store_experts;
         registry->ssd_expert_ms    = best_whole->ssd_expert_ms;
+        registry->store_pinned     = best_whole->store_pinned;
     }
 
     for (auto & item : selected) {
@@ -3118,10 +3121,23 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     const int    n_t  = (int) std::max<uint32_t>(1, ctx.exps_tensors_per_layer);
     const double t_up = store ? b_expert / 1e9 / st->staged_bw * 1000.0 + n_t * st->copy_setup_us / 1000.0 : 0.0;
     const double t_sw = store ? st->engine_switch_us / 1000.0 : 0.0;
+    // the share of the misses found in RAM that sit in pinned slots: the seed puts each layer's most routed experts in
+    // the pinned slots and the VRAM pool holds the s most routed, so RAM hits come from ranks [s, n_ram), pinned ones
+    // from [s, n_pinned)
+    double p_pin = 0.0;
+    if (store != nullptr && store->n_pinned > 0) {
+        const uint32_t E  = ctx.n_expert;
+        const uint32_t sv = std::min<uint32_t>(plan.pool_slots, E);
+        const double   zs = llama_pshard_workload::zipf_h(ctx.zipf_alpha, sv, E);
+        const double   zp = llama_pshard_workload::zipf_h(ctx.zipf_alpha, std::max(sv, store->n_pinned), E);
+        const double   zr = llama_pshard_workload::zipf_h(ctx.zipf_alpha, store->n_ram, E);
+        p_pin = store->n_pinned >= store->n_ram ? 1.0 : zr > zs ? std::min(1.0, std::max(0.0, (zp - zs) / (zr - zs))) : 0.0;
+    }
     // hybrid q* share = B_P / B_H (design 4b): the FreeToken balance for concurrent chains, at the upload
     // rate the two chains actually share (the loaded kernel curve); serial chains cap the fetched share by
     // the free slots anyway
-    plan.pool_hybrid_frac = (float) std::min(1.0, std::max(0.05, (store ? st->staged_bw : bp_loaded) / cpu_gbs));
+    const double bp_store = store ? 1.0 / (p_pin / bp_loaded + (1.0 - p_pin) / st->staged_bw) : bp_loaded;
+    plan.pool_hybrid_frac = (float) std::min(1.0, std::max(0.05, bp_store / cpu_gbs));
 
     if (ab_tier) {
         // whole-stack tier: one resident chain over the A/B half, so the pair must
@@ -3227,23 +3243,29 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         auto miss_ms_layer = [&](int pol, const pass_routes & r) -> double {
             if (store != nullptr) {
                 // the layer's SSD reads land first (one wait); a staged upload's host copy runs before the GPU split's
-                // kernels, so a hybrid layer pays its two chains one after the other
+                // kernels, so a hybrid layer pays its staged rows and its CPU chain one after the other. Misses found in
+                // pinned slots (p_pin of the RAM hits; an SSD read lands in the least recently used, locked slot) go up
+                // as kernel copies
                 const double t_ssd = ctx.predictor->store_read_ms(r.ssd, b_expert, 1, n_t);
+                const double m_p   = p_pin * std::max(0.0, r.misses - r.ssd);
                 auto switch_ms = [&](double n) { return (1.0 - std::exp(-n)) * t_sw; };
                 switch (pol) {
                     case LLAMA_PSHARD_MISS_HYBRID: {
                         // the runtime admits at least one miss of a layer that has one
                         const double q = std::min(std::max(std::round(plan.pool_hybrid_frac * r.misses), std::min(1.0, r.misses)),
                                                   std::max(0.0, s - r.hits));
-                        return t_ssd + q * t_up + switch_ms(q) + cpu_chain_ms(r.misses - q) + t_split;
+                        const double q_p = r.misses > 0.0 ? q * m_p / r.misses : 0.0;
+                        const double q_s = q - q_p;
+                        return t_ssd + std::max(q_p * t_fetch_loaded, cpu_chain_ms(r.misses - q)) + q_s * t_up + switch_ms(q_s) + t_split;
                     }
                     case LLAMA_PSHARD_MISS_CPU_ADMIT: {
                         const double cpu_ms    = cpu_chain_ms(r.misses);
-                        const double excess_up = std::max(0.0, r.misses * t_up - (cpu_ms + t_split));
+                        const double up_ms     = m_p * t_fetch_loaded + (r.misses - m_p) * t_up;
+                        const double excess_up = std::max(0.0, up_ms - (cpu_ms + t_split));
                         return t_ssd + cpu_ms + excess_up + t_split;
                     }
                     default:
-                        return t_ssd + r.misses * t_up + switch_ms(r.misses);
+                        return t_ssd + m_p * t_fetch_idle + (r.misses - m_p) * t_up + switch_ms(r.misses - m_p);
                 }
             }
             switch (pol) {
@@ -3330,9 +3352,9 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
                 if (store != nullptr) {
                     // the SSD reads inside tps (logs and the registry)
                     plan.ssd_cpu_ms = (float) (ctx.predictor->store_read_ms(routes.ssd, b_expert, 1, n_t) * n_layers_exp);
-                    LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u over the RAM expert store (%u slots/layer): %.2f misses/layer from RAM, "
-                        "%.2f from the SSD (%.2f ms/layer), staged upload %.3f ms/expert\n", __func__, bs, store->n_ram,
-                        routes.misses - routes.ssd, routes.ssd, plan.ssd_cpu_ms / n_layers_exp, t_up);
+                    LLAMA_LOG_INFO("%s: [EXPERT_POOL] bs=%u over the RAM expert store (%u slots/layer, %u pinned): %.2f misses/layer from RAM (%.0f%% pinned), "
+                        "%.2f from the SSD (%.2f ms/layer), staged upload %.3f ms/expert\n", __func__, bs, store->n_ram, store->n_pinned,
+                        routes.misses - routes.ssd, 100.0 * p_pin, routes.ssd, plan.ssd_cpu_ms / n_layers_exp, t_up);
                 }
                 // the pieces the same way: their own compute and the misses of their own rows
                 for (size_t i = 0; i < plan.piece_n.size() && i < piece_bd.size(); i++) {
@@ -4202,6 +4224,24 @@ void llama_params_fit_pshard_plan(
                 store.n_ram = seen;
             }
         }
+        // the pinned slots (an expert pool's kernel-copy source): what the profile's pin ceiling leaves after its reserve,
+        // the other weights the loader page-locks and the store's staging buffer, when a kernel copy of an expert
+        // tensor's rows beats the staged rate
+        if (predictor && predictor->store != nullptr) {
+            const auto &   ps  = predictor->stats;
+            const double   row = (double) ctx.exps_row_bytes / std::max<uint32_t>(1, ctx.exps_tensors_per_layer);
+            if (ps.host_pin_ceiling_gb > 0.0 && ps.staged_bw > 0.0 && ps.slice_bw_kernel(row, true) > ps.staged_bw) {
+                double room = (ps.host_pin_ceiling_gb - LLAMA_PSHARD_HOST_PIN_RESERVE_GB) * 1e9 - (double) head_bytes
+                            - (double) llama_expert_store_stage_bytes(llama_expert_store_stride((size_t) row));
+                for (uint32_t il = 0; il < n_layers; il++) {
+                    room -= (double) (all_per_layer[il] - std::min(all_per_layer[il], exps_per_layer[il]));
+                }
+                store.n_pinned = room > 0.0 ? llama_expert_store_pinned_slots((size_t) room, store_slot_bytes, store.n_ram) : 0;
+                LLAMA_LOG_INFO("%s: expert store: %u of %u slots per layer priced as pinned (%.1f GB under the pin ceiling)\n",
+                    __func__, store.n_pinned, store.n_ram, std::max(0.0, room) / 1e9);
+            }
+        }
+        registry->store_pinned  = predictor && predictor->store != nullptr ? store.n_pinned : 0;
         registry->store_slots   = predictor && predictor->store != nullptr ? store.n_ram : 0;
         registry->store_experts = predictor && predictor->store != nullptr ? store.n_expert : 0;
         registry->ssd_expert_ms = store_expert_ms;

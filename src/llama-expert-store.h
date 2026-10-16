@@ -29,6 +29,10 @@ llama_expert_store_decision llama_expert_store_decide(size_t exps_b, size_t othe
 size_t llama_expert_store_stride(size_t row_bytes);
 // slots per layer that cap bytes of RAM hold, at slot_all bytes for one slot in every layer
 uint32_t llama_expert_store_slots(size_t cap, size_t slot_all, uint32_t n_expert);
+// of n_ram slots per layer, those pin_b bytes of pinned host memory hold (one host buffer per slot index)
+uint32_t llama_expert_store_pinned_slots(size_t pin_b, size_t slot_all, uint32_t n_ram);
+// bytes of the pinned staging buffer the store allocates for experts of stride bytes per tensor
+size_t llama_expert_store_stage_bytes(size_t stride);
 
 // the model's files in split order, from the split naming of path_model (just it when it does not follow it)
 std::vector<std::string> llama_expert_store_files(const std::string & path_model);
@@ -63,8 +67,9 @@ struct llama_expert_store {
 
     // once, after the first context has allocated its buffers: locks the slots, opens the files, seeds each layer
     // with its most routed experts in <model>.pshard_workload and sets the tensors' tables. false: every expert
-    // keeps being read from the mapping (logged)
-    bool allocate();
+    // keeps being read from the mapping (logged). n_pin of each layer's slots (the top indices, which the seed fills
+    // with the most routed experts) come from dev's pinned host buffers: device uploads from them are kernel copies
+    bool allocate(ggml_backend_dev_t dev = nullptr, uint32_t n_pin = 0);
 
     // the scheduler's host-experts hook (ggml_backend_sched_host_experts_cb)
     static int host_experts_cb(struct ggml_cgraph * g, int j0, void * user_data);
@@ -82,9 +87,10 @@ struct llama_expert_store {
     // an expert pool over the store, one pass of t's layer: its VRAM hits take the newest stamps, then its misses
     // become resident (those not in a slot are read from the files) and their tables point at the slots; reader (may
     // be nullptr) copies from the slots until a later read into the layer's slots waits for it. false: t is not
-    // served, or the misses exceed the layer's slots (nothing read: the pool copies from the mapping)
+    // served, or the misses exceed the layer's slots (nothing read: the pool copies from the mapping). pinned (may be
+    // nullptr): per miss, whether its slot is a pinned one
     bool acquire(const ggml_tensor * t, const int32_t * hits, size_t n_hits, const int32_t * misses, size_t n_misses,
-                 ggml_backend_t reader);
+                 ggml_backend_t reader, uint8_t * pinned = nullptr);
 
     // before a context frees its backends: waits for every copy the store queued on them
     void detach();
@@ -108,7 +114,7 @@ struct llama_expert_store {
     uint32_t sweep_reads(const layer_groups & groups);
 
     // the slots are allocated: the store serves the experts
-    bool active() const { return arena != nullptr; }
+    bool active() const { return on; }
     // the store holds the routed experts of layer il
     bool has_layer(int32_t il) const;
     // the layers whose routed experts it holds
@@ -121,6 +127,7 @@ struct llama_expert_store {
     void fold_workload(const std::string & workload_path);
 
     uint32_t n_ram = 0;
+    uint32_t n_rp  = 0;             // the top n_rp slots of every layer are pinned
     bool     count_routes = true;   // false while an expert pool tier runs: the pool counts its own routes
 
 private:
@@ -130,7 +137,8 @@ private:
         size_t        file_off;
         size_t        row_bytes;
         size_t        stride;                // bytes per slot: the rows plus the sector rounding on both ends
-        char *        base = nullptr;        // this tensor's n_ram slots
+        char *        base = nullptr;        // this tensor's locked slots
+        size_t        pin_off = 0;           // this tensor's slot inside a pinned slot buffer
         std::vector<const void *> tbl;       // [n_expert] the rows in a slot, NULL = read the mapping
         uint32_t      lay_k   = 0;           // index among its layer's tensors
     };
@@ -160,7 +168,7 @@ private:
     // counters: [0] one-row passes (decode), [1] multi-row passes, [2] device uploads, [3] device uploads of experts
     // not in a slot while their layer's group runs in a sweep, [4] an expert pool's misses
     struct counters {
-        uint64_t passes = 0, requests = 0, hits = 0, reads = 0, bytes = 0, wait_us = 0, fallbacks = 0;
+        uint64_t passes = 0, requests = 0, hits = 0, reads = 0, bytes = 0, wait_us = 0, fallbacks = 0, pinned = 0;
     };
 
     // reads the experts (all misses, n <= the slots not lent) into the least recently used slots
@@ -184,9 +192,16 @@ private:
     bool     failed        = false;
     size_t   slot_all      = 0;          // one slot in every layer
     size_t   experts_all   = 0;
-    char *   arena         = nullptr;
+    bool     on            = false;      // the slots are allocated
+    char *   arena         = nullptr;    // the locked slots [0, n_lk) of every layer
     size_t   arena_bytes   = 0;
     bool     arena_locked  = false;
+    uint32_t n_lk          = 0;
+    std::vector<ggml_backend_buffer_t> pin_bufs;   // the pinned slots [n_lk, n_ram): one buffer per slot index
+    std::vector<char *>                pin_slot;   // their sector-aligned bases
+    char * slot(const entry & e, uint32_t v) const {
+        return v < n_lk ? e.base + (size_t) v * e.stride : pin_slot[v - n_lk] + e.pin_off;
+    }
     llama_ssd_reader * reader = nullptr; // owned
     std::mutex mtx;
 

@@ -1344,26 +1344,33 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
             if (upload_segs.empty()) {
                 return;
             }
+            // staged rows take one copy each: the others go first, in one launch
+            const size_t n_k = std::stable_partition(upload_segs.begin(), upload_segs.end(),
+                [](const upload_seg & sg) { return !sg.staged; }) - upload_segs.begin();
             bool batched = false;
-            if (copy_segments != nullptr && kernel_copies) {
-                std::vector<ggml_backend_copy_segment> segs(upload_segs.size());
-                for (size_t i = 0; i < upload_segs.size(); i++) {
+            if (copy_segments != nullptr && kernel_copies && n_k > 0) {
+                std::vector<ggml_backend_copy_segment> segs(n_k);
+                for (size_t i = 0; i < n_k; i++) {
                     segs[i] = { (char *) upload_segs[i].view->data + upload_segs[i].off, upload_segs[i].src, upload_segs[i].size };
                 }
-                batched = copy_segments(up_backend, segs.data(), (int) segs.size());
+                batched = copy_segments(up_backend, segs.data(), (int) n_k);
             }
-            if (!batched) {
-                for (const auto & sg : upload_segs) {
-                    ggml_backend_tensor_set_async(up_backend, sg.view, sg.src, sg.off, sg.size);
-                }
+            for (size_t i = batched ? n_k : 0; i < upload_segs.size(); i++) {
+                const auto & sg = upload_segs[i];
+                ggml_backend_tensor_set_async(up_backend, sg.view, sg.src, sg.off, sg.size);
+            }
+            if (store != nullptr) {
+                up_kernel += batched ? n_k : 0;
+                up_staged += upload_segs.size() - (batched ? n_k : 0);
             }
             upload_segs.clear();
         };
         // with a RAM expert store every miss of the pass becomes RAM-resident first (one wait for the reads): the
         // uploads copy from the slots and the CPU chain finds its experts there
         const bool any_admit  = std::find(admit.begin(), admit.end(), 1) != admit.end();
+        std::vector<uint8_t> pinned(miss_list.size(), 0);
         const bool from_store = store != nullptr && store->acquire(L.tensors[0].host, hit_list.data(), hit_list.size(),
-            miss_list.data(), miss_list.size(), any_admit ? up_backend : nullptr);
+            miss_list.data(), miss_list.size(), any_admit ? up_backend : nullptr, pinned.data());
         for (size_t i = 0; i < miss_list.size(); i++) {
             const int32_t e = miss_list[i];
             L.expert_last_gen[e] = generation;
@@ -1392,7 +1399,9 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
                     src = (const char *) te.host->data + (size_t) e * te.row_bytes;
                     map_rows += store != nullptr ? 1 : 0;
                 }
-                upload_segs.push_back({ te.view_slots, (size_t) slot * te.row_bytes, src, te.row_bytes });
+                // a store model's mapping is not page-locked either
+                upload_segs.push_back({ te.view_slots, (size_t) slot * te.row_bytes, src, te.row_bytes,
+                    store != nullptr && !(from_store && pinned[i]) });
             }
             if (background) {
                 L.expert_pending[e] = generation;   // CPU route this pass, GPU hit from the next
@@ -1609,8 +1618,8 @@ void llama_expert_pool::log_counters() const {
     LLAMA_LOG_WARN("%s: expert pool: %llu hits / %llu misses over %llu passes: h=%.3f misses/token=%.1f (s=%u)\n",
         __func__, (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) passes, h, mpt, n_slots);
     if (store != nullptr) {
-        LLAMA_LOG_WARN("%s: expert pool over the RAM expert store: %llu expert rows copied from the mapping\n",
-            __func__, (unsigned long long) map_rows);
+        LLAMA_LOG_WARN("%s: expert pool over the RAM expert store: %llu expert rows copied from the mapping; %llu kernel copies, "
+            "%llu staged\n", __func__, (unsigned long long) map_rows, (unsigned long long) up_kernel, (unsigned long long) up_staged);
     }
     LLAMA_LOG_INFO("%s: expert pool h per layer:%s\n", __func__, per_layer.c_str());
     LLAMA_LOG_INFO("%s: expert pool admission: %llu residents evicted\n",

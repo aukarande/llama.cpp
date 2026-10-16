@@ -219,6 +219,7 @@ struct llama_benchmark_stats {
 struct llama_benchmark_store {
     uint32_t n_expert = 0;
     uint32_t n_ram    = 0;
+    uint32_t n_pinned = 0;     // of the n_ram, the slots in pinned host memory (an expert pool copies them by kernel)
     double   sat_gbps = 0.0;   // the SSD_Read line: GB/s of expert reads with many in flight,
     double   qd1_gbps = 0.0;   // GB/s of one read at a time
     double   lat_ms   = 0.0;   // and ms a lone read takes beyond its bytes at the qd1 rate
