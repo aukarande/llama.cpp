@@ -89,8 +89,6 @@ pool_block() { # model mva prompt  -> the 11 pool perf variants (pred/warm varia
     add perf $M $B $PR none pool:hybrid    1 0 0
     add perf $M $B $PR none pool:cpu_admit 0 0 0
     add perf $M $B $PR none pool:cpu_admit 1 0 0
-    add perf $M $B $PR none pool:cpu_exec  0 0 0
-    add perf $M $B $PR none pool:fetch_on_2nd_miss 0 0 0
     add perf $M $B $PR none pool:plan      0 0 0
     add perf $M $B $PR none poolauto       0 0 0
 }
@@ -110,7 +108,7 @@ plain_set() { # model mva prompt stock_ok pool_ok
             add gate $M $B $PR none pool:fetch 0 0 0
             add gate $M $B $PR none pool:fetch 1 0 0
             add gate $M $B $PR none pool:fetch 1 1 0
-            for p in hybrid cpu_admit cpu_exec fetch_on_2nd_miss; do add gate $M $B $PR none pool:$p 0 0 0; done
+            for p in hybrid cpu_admit; do add gate $M $B $PR none pool:$p 0 0 0; done
         else
             add gate $M $B $PR none pool:fetch 0 0 0
         fi
@@ -123,7 +121,7 @@ plain_set() { # model mva prompt stock_ok pool_ok
             add ppl $M $B $PR none pool:fetch 0 0 0
             # CPU-route policies are certified by PPL parity, not the token hash (design 6a): their
             # DSv4 gates were the only hashes stock never produced (2026-09-06 grid analysis)
-            for p in hybrid cpu_admit cpu_exec fetch_on_2nd_miss; do add ppl $M $B $PR none pool:$p 0 0 0; done
+            for p in hybrid cpu_admit; do add ppl $M $B $PR none pool:$p 0 0 0; done
         fi
     fi
 }

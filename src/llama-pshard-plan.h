@@ -94,10 +94,8 @@ inline const char * pshard_forced_strategy_name(int force_strategy) {
 // all values planner-priced - no per-strategy allowed-sets)
 enum llama_pshard_miss_policy {
     LLAMA_PSHARD_MISS_FETCH        = 0,  // copy the expert RAM -> LRU victim slot, compute on GPU
-    LLAMA_PSHARD_MISS_CPU_EXEC     = 1,  // compute the miss on CPU from host weights (split-op)
-    LLAMA_PSHARD_MISS_FETCH_ON_2ND = 2,  // first miss cpu_exec (no admit), repeat miss fetches
-    LLAMA_PSHARD_MISS_HYBRID       = 3,  // q* split: fetch m*B_P/B_H by recency, CPU runs the rest
-    LLAMA_PSHARD_MISS_CPU_ADMIT    = 4,  // every miss computes on CPU THIS pass while its rows upload
+    LLAMA_PSHARD_MISS_HYBRID       = 1,  // q* split: fetch m*B_P/B_H by recency, CPU runs the rest
+    LLAMA_PSHARD_MISS_CPU_ADMIT    = 2,  // every miss computes on CPU THIS pass while its rows upload
                                          // on the copy stream into a slot (background admission):
                                          // a GPU hit from the next pass on (RFC #24528 execution)
     LLAMA_PSHARD_MISS_COUNT
@@ -113,8 +111,6 @@ enum llama_pshard_prefill_mode {
 inline const char * llama_pshard_miss_policy_name(llama_pshard_miss_policy p) {
     switch (p) {
         case LLAMA_PSHARD_MISS_FETCH:        return "fetch";
-        case LLAMA_PSHARD_MISS_CPU_EXEC:     return "cpu_exec";
-        case LLAMA_PSHARD_MISS_FETCH_ON_2ND: return "fetch_on_2nd_miss";
         case LLAMA_PSHARD_MISS_HYBRID:       return "hybrid";
         case LLAMA_PSHARD_MISS_CPU_ADMIT:    return "cpu_admit";
         default:                             return "unknown";
@@ -130,8 +126,7 @@ inline const char * llama_pshard_prefill_mode_name(llama_pshard_prefill_mode m) 
 }
 
 // parse a policy/mode name at the head of s (registry token: delimited by
-// space / eol). "fetch" is a prefix of "fetch_on_2nd_miss", so require the
-// terminator, not just the prefix.
+// space / eol): the whole token must match. -1 = a policy this build does not have
 inline int pshard_miss_policy_from_name(const char * s) {
     for (int i = LLAMA_PSHARD_MISS_COUNT - 1; i >= 0; i--) {
         const char * n = llama_pshard_miss_policy_name((llama_pshard_miss_policy)i);
@@ -140,7 +135,7 @@ inline int pshard_miss_policy_from_name(const char * s) {
             return i;
         }
     }
-    return 0;
+    return -1;
 }
 
 inline int pshard_prefill_mode_from_name(const char * s) {
@@ -155,12 +150,10 @@ inline int pshard_prefill_mode_from_name(const char * s) {
 }
 
 // PSHARD_MISS_POLICY accepts a name or numeric id (QA override for EXPERT_POOL
-// tiers, same pattern as PSHARD_STRATEGY); "second" = fetch_on_2nd_miss alias.
-// Mixed into the registry fingerprint only when set.
+// tiers, same pattern as PSHARD_STRATEGY). Mixed into the registry fingerprint only when set.
 inline int pshard_miss_policy_from_env() {
     const char * env = getenv("PSHARD_MISS_POLICY");
     if (!env || !*env) return -1;
-    if (strcmp(env, "second") == 0) return LLAMA_PSHARD_MISS_FETCH_ON_2ND;
     for (int i = 0; i < LLAMA_PSHARD_MISS_COUNT; i++) {
         if (strcmp(env, llama_pshard_miss_policy_name((llama_pshard_miss_policy)i)) == 0) {
             return i;
@@ -605,11 +598,10 @@ struct llama_pshard_plan_registry {
         return (float) ms;
     }
 
-    // the share of the decode cache's slots a plan leaves in place: a pool cache tier all (a cpu_exec one neither
-    // fills nor empties them), a whole-stack pool tier pool_keep, a legacy tier none
+    // the share of the decode cache's slots a plan leaves in place: a pool cache tier all, a whole-stack pool tier
+    // pool_keep, a legacy tier none
     static double slots_kept(const llama_pshard_plan & p) {
-        return p.strategy != LLAMA_PSHARD_EXPERT_POOL ? 0.0
-             : p.cold_ms > 0.0f || p.pool_miss == LLAMA_PSHARD_MISS_CPU_EXEC ? 1.0 : (double) p.pool_keep;
+        return p.strategy != LLAMA_PSHARD_EXPERT_POOL ? 0.0 : p.cold_ms > 0.0f ? 1.0 : (double) p.pool_keep;
     }
 
     // variant marker for a baseline load that fits
@@ -773,11 +765,10 @@ struct llama_pshard_plan_registry {
             ssd_f = (double) (store_experts - std::min(lm->n_ram, store_experts)) / (double) (store_experts - store_slots);
         }
         // the share of the cache's slots in place after p runs over `before`: a cache tier refills its own (its entry
-        // pays), a cpu_exec cache tier neither fills nor empties them, a whole-stack pool tier keeps at most pool_keep
-        // of what it found, a legacy tier empties them
+        // pays), a whole-stack pool tier keeps at most pool_keep of what it found, a legacy tier empties them
         auto kept_after = [](const llama_pshard_plan & p, double before) -> double {
             return p.strategy != LLAMA_PSHARD_EXPERT_POOL ? 0.0 : p.cold_ms > 0.0f ? 1.0
-                 : p.pool_miss == LLAMA_PSHARD_MISS_CPU_EXEC ? before : std::min(before, (double) p.pool_keep);
+                 : std::min(before, (double) p.pool_keep);
         };
         // a batch-major ubatch: its upload reads at the live slots; a whole-stack pool tier priced over a kept layout
         // (pool_ab_scale < 1) uploads what it finds missing
@@ -802,7 +793,7 @@ struct llama_pshard_plan_registry {
         // bottom layers, so it keeps the filled slots of the top pool_keep share of the layers
         auto kept_first = [&](const llama_pshard_plan & p) -> double {
             if (fill == nullptr || fill->empty() || p.strategy != LLAMA_PSHARD_EXPERT_POOL || p.cold_ms > 0.0f ||
-                    p.pool_miss == LLAMA_PSHARD_MISS_CPU_EXEC || p.pool_keep <= 0.0f) {
+                    p.pool_keep <= 0.0f) {
                 return kept_after(p, kept0);
             }
             const size_t n      = fill->size();

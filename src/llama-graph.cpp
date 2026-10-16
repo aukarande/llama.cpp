@@ -2198,7 +2198,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the w_s scales, add_id biases, LoRA - keeps the original router ids.
     // The ids leaves for a pool-managed layer: fetch-only policies remap the four
     // expert MUL_MAT_IDs to slot ids (one leaf); policies that admit CPU routes
-    // (cpu_exec / hybrid / fetch_on_2nd_miss) run TWO expert-FFN chains - GPU over
+    // (hybrid / cpu_admit) run TWO expert-FFN chains - GPU over
     // the pool slots and CPU over the host homes - each seeing -1 for the other
     // side's routes, merged by one ADD at the down output (the split-op). Biases
     // then need expert ids with -1 for the foreign routes too.

@@ -2120,7 +2120,12 @@ bool pshard_registry_load(
             const char * pss = strstr(s.c_str(), " s=");
             td.pool_slots = pss ? (uint32_t)atoi(pss + 3) : 0;
             const char * pmp = strstr(s.c_str(), "miss_policy=");
-            td.pool_miss = pmp ? pshard_miss_policy_from_name(pmp + 12) : 0;
+            const int pool_miss = pmp ? pshard_miss_policy_from_name(pmp + 12) : 0;
+            if (pool_miss < 0) {
+                LLAMA_LOG_WARN("%s: unknown miss policy in cache, invalidating tier: %.24s\n", __func__, pmp + 12);
+                td.viable = false;
+            }
+            td.pool_miss = std::max(0, pool_miss);
             const char * ppm = strstr(s.c_str(), "prefill_mode=");
             td.pool_prefill = ppm ? pshard_prefill_mode_from_name(ppm + 13) : 0;
             const char * phf = strstr(s.c_str(), "hybrid_frac=");
@@ -3102,7 +3107,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
     if (ab_tier) {
         // whole-stack tier: one resident chain over the A/B half, so the pair must
         // fit and the probe's streaming price (upload under the compute fence) holds.
-        // Identity ids: no misses, so no miss policy (a cpu_exec one marks a cache tier that keeps the slots)
+        // Identity ids: no misses, so no miss policy
         plan.is_viable = pool_bytes >= (int64_t) floor_bytes;
         plan.pool_miss = LLAMA_PSHARD_MISS_FETCH;
         // over a pool cache tier's layout (runtime pshard_pool_resize) its scratch and the pair take the region's
@@ -3130,8 +3135,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         // at once (the fetch floor); CPU-route policies spill the overflow to the CPU
         // chain and need one slot per layer, no more - that is the tight-budget flip
         // of design 6a. Price every admissible policy and keep the best, unless
-        // PSHARD_MISS_POLICY forces one (fetch_on_2nd_miss stays manual: its price
-        // needs the admission counters).
+        // PSHARD_MISS_POLICY forces one.
         const bool fetch_fits = pool_bytes >= (int64_t) floor_bytes;
         const bool cpu_fits   = plan.pool_slots >= 1;
 
@@ -3192,18 +3196,12 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         // plus the handoff, not their sum
         auto miss_ms_layer = [&](int pol, const pass_routes & r) -> double {
             switch (pol) {
-                case LLAMA_PSHARD_MISS_CPU_EXEC:
-                    // never admits: the pool stays empty, every route is a CPU route
-                    // (h = 0, independent of s); nothing on the GPU side to overlap
-                    return r.distinct * t_cpu + t_split;
                 case LLAMA_PSHARD_MISS_HYBRID: {
                     // q* fetched, capped by the free slots (hits + q resident at once);
                     // the rest run on the CPU chain, overlapped with the upload
                     const double q = std::min(std::round(plan.pool_hybrid_frac * r.misses), std::max(0.0, s - r.hits));
                     return std::max(q * t_fetch_loaded, (r.misses - q) * t_cpu) + t_split;
                 }
-                case LLAMA_PSHARD_MISS_FETCH_ON_2ND:
-                    return 0.5 * r.misses * t_cpu + 0.5 * r.misses * t_fetch_loaded + t_split; // half admitted (TBD: counters)
                 case LLAMA_PSHARD_MISS_CPU_ADMIT: {
                     // misses run on the CPU chain this pass, their rows upload on the pool's
                     // copy stream for the next pass. The GPU expert chain (hits, VRAM-bound)
@@ -3233,7 +3231,7 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
         if (mp_env >= 0) {
             cands.push_back(mp_env);
         } else {
-            cands = { LLAMA_PSHARD_MISS_FETCH, LLAMA_PSHARD_MISS_CPU_ADMIT, LLAMA_PSHARD_MISS_HYBRID, LLAMA_PSHARD_MISS_CPU_EXEC };
+            cands = { LLAMA_PSHARD_MISS_FETCH, LLAMA_PSHARD_MISS_CPU_ADMIT, LLAMA_PSHARD_MISS_HYBRID };
         }
         int   best     = -1;
         float best_tps = -1.0f;
@@ -3256,9 +3254,9 @@ static llama_pshard_plan llama_pshard_search_pool(const llama_pshard_search_ctx 
             // landing on empty slots: each distinct expert of the first decode steps misses once, where the warm
             // pool misses r1.misses per step. The excess peaks where the distinct-expert curve's slope falls to that
             // rate (while the curve fits the slots) and is paid at this tier's marginal cost per miss (its fixed
-            // per-layer part is paid warm too). cpu_exec never admits, so it has no warm state to lose
+            // per-layer part is paid warm too)
             const pass_routes r1 = routes_at(1);
-            if (best != LLAMA_PSHARD_MISS_CPU_EXEC && r1.misses > 0.0) {
+            if (r1.misses > 0.0) {
                 const bool curve = wl != nullptr && wl->share_n_expert == ctx.n_expert &&
                                    wl->share_n_used == ctx.n_expert_used && wl->distinct_share(1.0) >= 0.0;
                 double extra = 0.0;

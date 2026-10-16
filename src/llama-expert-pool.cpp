@@ -903,7 +903,6 @@ void llama_expert_pool::bind_layer_ids(int32_t il, ggml_tensor * ids_router, ggm
     // k layers ago; every rebuild rebinds all reachable targets, deactivation clears
     if (L.expert_last_gen.size() != n_expert) {
         L.expert_last_gen.assign(n_expert, 0);
-        L.miss_count.assign(n_expert, 0);
         L.expert_pending.assign(n_expert, 0);
     }
 }
@@ -1548,21 +1547,12 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         L.cache_passes++;
 
         // 2. which misses get fetched (admitted) vs computed on CPU
-        //    fetch:             all (the floor guarantees the slots)
-        //    cpu_exec:          none
-        //    fetch_on_2nd_miss: only experts that missed before (admission filter)
-        //    hybrid:            the q* = round(m * B_P/B_H) most recently active misses
+        //    fetch, cpu_admit: all (the floor guarantees the slots; cpu_admit uploads in the background)
+        //    hybrid:           the q* = round(m * B_P/B_H) most recently active misses
         std::vector<uint8_t> admit(miss_list.size(), 1);
         if (dual) {
             const size_t m = miss_list.size();
-            if (miss_policy == 1) {                       // cpu_exec
-                std::fill(admit.begin(), admit.end(), 0);
-            } else if (miss_policy == 2) {                // fetch_on_2nd_miss
-                for (size_t i = 0; i < m; i++) {
-                    const int32_t e = miss_list[i];
-                    admit[i] = L.miss_count[e] > 0 ? 1 : 0;   // counted in the fetch loop below
-                }
-            } else if (miss_policy == 3) {                // hybrid
+            if (miss_policy == LLAMA_PSHARD_MISS_HYBRID) {
                 size_t q = (size_t) (hybrid_frac * (double) m + 0.5);
                 if (m > 0 && q == 0) q = 1;
                 if (q > m) q = m;
@@ -1633,7 +1623,6 @@ bool llama_expert_pool::serve(const ggml_tensor * src, ggml_tensor * view, ggml_
         for (size_t i = 0; i < miss_list.size(); i++) {
             const int32_t e = miss_list[i];
             L.expert_last_gen[e] = generation;
-            ++L.miss_count[e];   // fetch_on_2nd_miss admission reads this
             if (!admit[i]) {
                 L.misses++;
                 continue;

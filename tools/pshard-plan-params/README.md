@@ -124,14 +124,13 @@ The pooled schedule (MoE models only) turns the routed experts into a VRAM cache
 
 ### EXPERT_POOL miss policies
 
-For each cache tier the planner prices four miss policies and keeps the fastest:
+For each cache tier the planner prices three miss policies and keeps the fastest:
 
 - `fetch`: copy the missed expert into the least recently used slot and compute it on GPU. The pool must hold a slot for every expert the pass can route to (`bs x n_expert_used`, at most `n_expert`).
 - `cpu_admit`: compute the miss on CPU in this pass while its rows upload into a slot for the next pass.
 - `hybrid`: fetch a share of the misses (`hybrid_frac`) and compute the rest on CPU, both at once.
-- `cpu_exec`: compute every miss on CPU from host memory. The pool is never filled.
 
-The other three need only one slot per layer. `fetch_on_2nd_miss` (first miss on CPU, a repeated miss fetches) is not a candidate; it runs only when forced. `PSHARD_MISS_POLICY=<name or id>` (`second` = `fetch_on_2nd_miss`) forces one policy for every cache tier (QA); when set, it is part of the fingerprint.
+The other two need only one slot per layer. `PSHARD_MISS_POLICY=<name or id>` forces one policy for every cache tier (QA); when set, it is part of the fingerprint. `cpu_exec` and `fetch_on_2nd_miss` were removed (the planner never picked them); plans saved before predictor 23 are planned again.
 
 The planner always writes `prefill_mode=ab_stream`. `cpu_tail` (stream the stack, compute the ubatch's coldest experts on CPU) is defined but not chosen. `K` (layers whose experts are all resident) is always `0`.
 

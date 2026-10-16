@@ -151,7 +151,6 @@ struct llama_expert_pool {
         ids_buf bias_buf;                     // persistent upload buffers (async-safe)
         std::vector<int32_t> cpu_buf;
         std::vector<uint64_t> expert_last_gen; // [n_expert] recency: last generation routed
-        std::vector<uint32_t> miss_count;      // [n_expert] fetch_on_2nd_miss admission counter
         std::vector<uint64_t> use_count;       // [n_expert] cache-mode routes per expert (the routing workload histogram)
         std::vector<uint32_t> expert_pending;  // [n_expert] generation whose pass admitted the expert
                                                // in the background (cpu_admit: CPU route that pass)

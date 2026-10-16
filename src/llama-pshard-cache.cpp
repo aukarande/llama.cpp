@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -457,10 +458,10 @@ uint64_t pshard_registry_fingerprint(
         }
     }
     // forced miss policy (QA override) plans differently; mixed only when set so
-    // existing registries keep their fingerprints
+    // existing registries keep their fingerprints, by name so a renumbering cannot alias two policies
     const int mp_env = pshard_miss_policy_from_env();
     if (mp_env >= 0) {
-        mix((uint64_t)(mp_env + 1));
+        mix((uint64_t) std::hash<std::string>{}(llama_pshard_miss_policy_name((llama_pshard_miss_policy) mp_env)));
     }
     // a model the RAM expert store serves is priced from the store's RAM and the SSD_Read line, which the profile hash
     // leaves out ("" = no line: priced without SSD reads); mixed only then, so the other models keep their fingerprints

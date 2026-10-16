@@ -66,8 +66,6 @@ overlap in all 16 pairs (identical counters, never slower). The noovl ledger col
 | 5 | hybrid + pred | + `PSHARD_POOL_PREDICT=1` | whether prefetch hurts CPU-route policies everywhere |
 | 7 | cpu_admit | `PSHARD_MISS_POLICY=cpu_admit` | background admission |
 | 8 | cpu_admit + pred | + `PSHARD_POOL_PREDICT=1` | |
-| 10 | cpu_exec | `PSHARD_MISS_POLICY=cpu_exec` | the never-admit floor |
-| 11 | fetch_on_2nd_miss | `PSHARD_MISS_POLICY=fetch_on_2nd_miss` | certify it is dominated, then delete the policy |
 | 12 | plan | `PSHARD_STRATEGY=5`, planner picks the policy | does the pricing pick the measured winner |
 | 13 | poolauto | `PSHARD_POOL_AUTO=1` | does the ladder reach the forced pool |
 
