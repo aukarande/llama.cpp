@@ -179,7 +179,7 @@ static double benchmark_mul_mat_raw(
 static double benchmark_mul_mat_id_raw(
         ggml_backend_t be, ggml_tensor * A, int N, int K, int n_experts, int n_experts_used,
         int batch_size,
-        double * out_time_s, double * out_ops, double * out_bytes, bool bounded = false) {
+        double * out_time_s, double * out_ops, double * out_bytes, bool bounded = false, bool shared = false) {
 
     if ((int64_t)N * batch_size * n_experts_used > INT_MAX) {
         printf("SKIPPED: MUL_MAT_ID N=%d K=%d B=%d (output exceeds INT_MAX)\n", N, K, batch_size);
@@ -212,7 +212,8 @@ static double benchmark_mul_mat_id_raw(
     std::vector<float> B_data((size_t)K * batch_size, 1.0f);
     ggml_backend_tensor_set(B, B_data.data(), 0, ggml_nbytes(B));
     std::vector<int32_t> ids_data(n_experts_used * batch_size);
-    for (int i = 0; i < n_experts_used * batch_size; i++) ids_data[i] = i % n_experts;
+    // every route its own expert while they last, or (shared) every token the same n_experts_used experts
+    for (int i = 0; i < n_experts_used * batch_size; i++) ids_data[i] = shared ? i % n_experts_used : i % n_experts;
     ggml_backend_tensor_set(ids, ids_data.data(), 0, ggml_nbytes(ids));
 
     double time_per_iter = time_graph(be, gf, bounded);
@@ -362,10 +363,13 @@ static void run_moe_benchmarks(
         printf("--- MoE Quantization: %s ---\n", ggml_type_name(qt));
         row_order<bench_result> order;
         row_order<bench_result> host_order;
+        row_order<bench_result> shared_order;
         for (size_t si = 0; si < configs.size(); si++) {
             const auto & cfg = configs[si];
             if (qt == GGML_TYPE_Q2_K && (cfg.K % 256 != 0)) continue;
-            // the experts in the device's pinned host buffer, read in place (rows MUL_MAT_ID@host)
+            // the experts in the device's pinned host buffer, read in place (rows MUL_MAT_ID@host); batches that can
+            // share experts also run with every token on the same experts (MUL_MAT_ID@host_shared): a kernel that reads
+            // each used expert once runs those faster, one that reads every route does not
             for (bool host : { false, true }) {
                 try {
                     gpu_operands w;
@@ -396,6 +400,20 @@ static void run_moe_benchmarks(
                         res.print_dims();
                         printf("\n");
                         (host ? host_order : order).add(bi, si, res);
+
+                        if (host && bs >= 2 && bs <= 512) {
+                            bench_result rs = res;
+                            rs.op_name = "MUL_MAT_ID@host_shared";
+                            if (benchmark_mul_mat_id_raw(be, w.a, cfg.N, cfg.K, cfg.n_experts, cfg.n_experts_used, bs,
+                                    &rs.time_s, &rs.ops, &rs.bytes, true, true) == 0.0) continue;
+                            rs.calculate_derived();
+                            printf("%-20s quant=%-6s AI=%.3f BW=%.2f GB/s Perf=%.2f GFLOP/s",
+                                rs.op_name.c_str(), rs.quant_type.c_str(),
+                                rs.arithmetic_intensity, rs.effective_bw_gb_s, rs.effective_gflops);
+                            rs.print_dims();
+                            printf("\n");
+                            shared_order.add(bi, si, rs);
+                        }
                     }
                 } catch (const std::exception & e) {
                     printf("SKIPPED: %s N=%d K=%d %s (%s)\n", host ? "MUL_MAT_ID@host" : "MUL_MAT_ID", cfg.N, cfg.K,
@@ -405,6 +423,7 @@ static void run_moe_benchmarks(
         }
         order.flush(results);
         host_order.flush(results);
+        shared_order.flush(results);
         printf("\n");
     }
     if (arena) ggml_backend_buffer_free(arena);
@@ -726,6 +745,8 @@ int main(int argc, char ** argv) {
     double peak_gpu_bw = 0.0, peak_gpu_compute = 0.0, peak_host_bw = 0.0;
     for (const auto & r : all_results) {
         const bool host = r.op_name.find("@host") != std::string::npos;
+        // shared-expert rows re-read a few experts (a cache can serve them): not a read rate
+        if (r.op_name.find("@host_shared") != std::string::npos) continue;
         if (r.arithmetic_intensity < 2.0 && r.ops > 0.0) {
             double & bw = host ? peak_host_bw : peak_gpu_bw;
             bw = std::max(bw, (double)r.effective_bw_gb_s);

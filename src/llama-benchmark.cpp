@@ -509,6 +509,7 @@ bool llama_benchmark_predictor::load_gpu(const char * filepath) {
     gpu_entries.clear();
     gpu_map.clear();
     gpu_host_entries.clear();
+    gpu_host_shared_entries.clear();
     gpu_host_map.clear();
     stats.host_read_bw = 0.0;
 
@@ -549,6 +550,7 @@ bool llama_benchmark_predictor::load_gpu(const char * filepath) {
         if (parsed == 14) {
             // an in-place row keeps its op name without the suffix, so the lookups match it like a device row
             char * host = strstr(op_name, "@host");
+            const bool shared = host != nullptr && strcmp(host, "@host_shared") == 0;
             if (host != nullptr) {
                 *host = '\0';
             }
@@ -557,7 +559,9 @@ bool llama_benchmark_predictor::load_gpu(const char * filepath) {
             e.threads     = -1;
             e.eff_gflops  = e.peak_gflops;
             e.eff_pcie_bw = 0.0;
-            if (host != nullptr) {
+            if (shared) {
+                gpu_host_shared_entries.push_back(std::move(e));
+            } else if (host != nullptr) {
                 if (e.ai < e.ridge) {
                     stats.host_read_bw = std::max(stats.host_read_bw, e.bw_gb_s);
                 }
@@ -865,6 +869,27 @@ llama_split_timing llama_benchmark_predictor::predict_split(
                 }
                 if (rate > 0.0) {
                     op_time_ms = (m.ops / 1e9) / rate * 1000.0;
+                    // the rows give every route its own expert; a pass whose tokens share experts lies between them and
+                    // the rows with every token on the same experts, by the distinct experts the workload routes to
+                    const llama_benchmark_entry * ms = nullptr;
+                    for (const auto & e : gpu_host_shared_entries) {
+                        if (e.op_name == match->op_name && e.quant == match->quant && e.N == match->N && e.K == match->K &&
+                                e.n_tokens == match->n_tokens && e.ctx_len == match->ctx_len) {
+                            ms = &e;
+                            break;
+                        }
+                    }
+                    double xs_min = 0.0;
+                    const double rate_s = ms != nullptr ?
+                        llama_benchmark_series_gflops(gpu_host_shared_entries, *ms, x, LLAMA_SERIES_EXPERTS, xs_min) : 0.0;
+                    const double used = (double) m.n_experts_used;
+                    const double d_all = std::min(n_expert, (double) m.M * used);
+                    if (rate_s > rate && d_all > used) {
+                        const double d_wl  = llama_expert_distinct_share(workload, (double) m.M, used, n_expert) * n_expert;
+                        const double f     = std::clamp((d_wl - used) / (d_all - used), 0.0, 1.0);
+                        const double t_sh  = (m.ops / 1e9) / rate_s * 1000.0;
+                        op_time_ms = t_sh + f * (op_time_ms - t_sh);
+                    }
                     // rows of another quant read other bytes: the read scales with the weight's bits
                     const double bpw_w = llama_benchmark_type_bpw(node->src[0]->type);
                     const double bpw_m = llama_benchmark_quant_bpw(match->quant);

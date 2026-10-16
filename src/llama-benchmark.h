@@ -17,7 +17,7 @@ struct llama_pshard_workload;
 
 // pricing model version. Bump it when a pricing formula changes: the plan registry
 // fingerprints it, so plans priced by an older predictor are re-planned, not reused
-constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 20;
+constexpr uint32_t LLAMA_BENCHMARK_PREDICTOR_VERSION = 21;
 
 // the profile files the planner prices from; PSHARD_CPU_PROFILE / PSHARD_GPU_PROFILE
 // override the defaults in the working directory
@@ -240,6 +240,9 @@ struct llama_benchmark_predictor {
     // the GPU profile's in-place rows (op names without their @host suffix): matmuls whose weight the GPU reads in
     // place from its pinned host buffer
     std::vector<llama_benchmark_entry> gpu_host_entries;
+    // the in-place MUL_MAT_ID rows with every token on the same experts (@host_shared): with gpu_host_entries they bound
+    // a pass whose tokens share some of their experts
+    std::vector<llama_benchmark_entry> gpu_host_shared_entries;
     llama_benchmark_stats stats = {};
     // routing workload of the planned model, set by the planner (nullptr = none): the distinct experts per
     // pass that sliced expert copies and MUL_MAT_ID expert reads are priced with
