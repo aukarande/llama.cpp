@@ -433,6 +433,15 @@ struct dram_stress {
     }
 };
 
+// a CPU split between GPU splits (calibrate_cpu_split): a pass of expert matmuls, its time after a GPU gap (as
+// measured) over its time back to back
+struct cpu_split_cal {
+    double pass_us = 0.0;
+    double gap_ms[3] = { 0.0, 0.0, 0.0 };
+    double cold[3]   = { 0.0, 0.0, 0.0 };
+    bool ok() const { return pass_us > 0.0 && gap_ms[0] > 0.0; }
+};
+
 struct calib_results {
     bool       has_gpu = false;
     machine_id machine;
@@ -455,6 +464,7 @@ struct calib_results {
     double pool_serve_us = 0.0, pool_split_us = 0.0;
     double pin_ceiling_gb = 0.0;
     std::string ssd_lines;                                  // SSD_Read: one line per local storage unit
+    cpu_split_cal split;                                    // a CPU split between GPU splits (cold factor)
 };
 
 enum sliced_mode { SLICED_DMA = 0, SLICED_KERNEL = 1, SLICED_SEGS = 2 };
@@ -778,6 +788,105 @@ static double calibrate_staged_upload(pcie_stress_ctx * pcie) {
     return bw;
 }
 
+// a CPU split between GPU splits, as decode runs a layer's CPU part: a pass of 4 expert matmuls (2048x7168 q4_0, one
+// token, 8 of 64 experts, a new set each) back to back and after the GPU ran alone for a gap, while the CPU's workers
+// wait as the runtime's do and its cores may clock down
+static void calibrate_cpu_split(ggml_backend_t gpu, ggml_backend_t cpu_be, int threads, cpu_split_cal & out) {
+    printf("Calibrating a CPU split between GPU splits...\n");
+    ggml_backend_cpu_set_n_threads(cpu_be, threads);
+    const int N = 2048, K = 7168, E = 64, U = 8, R = 4;
+    ggml_context * cctx = ggml_init({ ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true });
+    ggml_tensor * w   = ggml_new_tensor_3d(cctx, GGML_TYPE_Q4_0, K, N, E);
+    ggml_tensor * act = ggml_new_tensor_3d(cctx, GGML_TYPE_F32, K, 1, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, U, R);
+    ggml_cgraph * cg  = ggml_new_graph(cctx);
+    for (int r = 0; r < R; r++) {
+        ggml_build_forward_expand(cg, ggml_mul_mat_id(cctx, w, act, ggml_view_2d(cctx, ids, U, 1, ids->nb[1], r * ids->nb[1])));
+    }
+    ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors(cctx, cpu_be);
+    ggml_context * gctx = ggml_init({ ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true });
+    ggml_cgraph * gg = ggml_new_graph(gctx);
+    ggml_build_forward_expand(gg, ggml_scale(gctx, ggml_new_tensor_1d(gctx, GGML_TYPE_F32, 1 << 22), 1.0f));
+    ggml_backend_buffer_t gbuf = ggml_backend_alloc_ctx_tensors(gctx, gpu);
+    if (cbuf != nullptr && gbuf != nullptr) {
+        ggml_backend_buffer_clear(cbuf, 0);
+        ggml_backend_buffer_clear(gbuf, 0);
+        std::vector<int32_t> idv(U * R);
+        int32_t next = 0;
+        auto cpu_pass = [&]() {
+            for (auto & id : idv) id = (next++ * 37) % E;
+            ggml_backend_tensor_set(ids, idv.data(), 0, ggml_nbytes(ids));
+            bench_timer ct;
+            ct.start();
+            ggml_backend_graph_compute(cpu_be, cg);
+            return ct.stop();
+        };
+        // 100 ms of passes first (the clocks ramp up over tens of ms), then ~0.25 s per measurement
+        bench_timer wt;
+        wt.start();
+        int n_warm = 0;
+        for (; wt.stop() < 0.1; n_warm++) cpu_pass();
+        const int iters = std::clamp((int) (0.25 * n_warm / wt.stop()), 30, 200);
+        auto warm_pass = [&]() {
+            double sum = 0.0;
+            for (int i = 0; i < iters; i++) sum += cpu_pass();
+            return sum / iters;
+        };
+        const double warm0 = warm_pass();
+        // the gap: scale ops launched back to back, sized by their rate so, and timed
+        for (int i = 0; i < 2; i++) ggml_backend_graph_compute(gpu, gg);
+        bench_timer ot;
+        ot.start();
+        for (int i = 0; i < 50; i++) ggml_backend_graph_compute_async(gpu, gg);
+        ggml_backend_synchronize(gpu);
+        const double op_s = ot.stop() / 50;
+        const double gap_target_ms[3] = { 0.05, 0.2, 1.0 };
+        double cold[3] = { 0.0, 0.0, 0.0 };
+        for (int gi = 0; gi < 3; gi++) {
+            const int reps = std::max(1, (int) std::lround(gap_target_ms[gi] / 1e3 / std::max(op_s, 1e-7)));
+            for (int i = 0; i < 5 + iters; i++) {
+                bench_timer gt;
+                gt.start();
+                for (int r = 0; r < reps; r++) ggml_backend_graph_compute_async(gpu, gg);
+                ggml_backend_synchronize(gpu);
+                const double g = gt.stop();
+                const double t = cpu_pass();
+                if (i >= 5) {
+                    out.gap_ms[gi] += g * 1e3 / iters;
+                    cold[gi]       += t / iters;
+                }
+            }
+        }
+        // the reference: the passes back to back before and after the gaps
+        const double warm = 0.5 * (warm0 + warm_pass());
+        out.pass_us = warm * 1e6;
+        printf("  %d expert matmuls %.1f us back to back; after a GPU gap of", R, out.pass_us);
+        for (int gi = 0; gi < 3; gi++) {
+            out.cold[gi] = cold[gi] / warm;
+            printf(" %.3f ms x%.3f", out.gap_ms[gi], out.cold[gi]);
+        }
+        printf("\n");
+    }
+    if (cbuf) ggml_backend_buffer_free(cbuf);
+    if (gbuf) ggml_backend_buffer_free(gbuf);
+    ggml_free(cctx);
+    ggml_free(gctx);
+    printf("\n");
+}
+
+// the CPU_Split values after "pass_us="
+static std::string cpu_split_to_arg(const cpu_split_cal & c) {
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%.1f cold=%.3f:%.3f,%.3f:%.3f,%.3f:%.3f", c.pass_us, c.gap_ms[0], c.cold[0],
+        c.gap_ms[1], c.cold[1], c.gap_ms[2], c.cold[2]);
+    return buf;
+}
+
+static bool cpu_split_from_arg(const char * s, cpu_split_cal & c) {
+    return s != nullptr && sscanf(s, "%lf cold=%lf:%lf,%lf:%lf,%lf:%lf", &c.pass_us, &c.gap_ms[0], &c.cold[0],
+        &c.gap_ms[1], &c.cold[1], &c.gap_ms[2], &c.cold[2]) == 7 && c.ok();
+}
+
 static void write_ssd_line(FILE * f, const calib_results & cr) {
     fputs(cr.ssd_lines.c_str(), f);
 }
@@ -858,6 +967,9 @@ static void write_profile_header(FILE * f, const calib_results & cr, int threads
     if (cr.pool_serve_us > 0.0 || cr.pool_split_us > 0.0) {
         fprintf(f, "#   Pool_Serve_us: %.1f\n", cr.pool_serve_us);
         fprintf(f, "#   Pool_Split_us: %.1f\n", cr.pool_split_us);
+    }
+    if (cr.split.ok()) {
+        fprintf(f, "#   CPU_Split: pass_us=%s\n", cpu_split_to_arg(cr.split).c_str());
     }
     if (cr.pin_ceiling_gb > 0.0) fprintf(f, "#   Host_Pin_Ceiling: %.1f GB\n", cr.pin_ceiling_gb);
 }
@@ -1408,8 +1520,33 @@ int main(int argc, char ** argv) {
     // In an op split one chunk per thread the others then wait on that core, sleep in turn, and the low clock can hold for the whole timed window.
     // No finite spin covers those waits: make the workers spin (libgomp reads OMP_WAIT_POLICY only at load, so set it and restart once).
     if (getenv("GOMP_SPINCOUNT") == nullptr && getenv("OMP_WAIT_POLICY") == nullptr) {
+        // the CPU split calibration first, while the workers still wait as the runtime's do; its result goes to the
+        // restarted profiler as --cpu-split-cal
+        bool skip = false;
+        int  cal_threads = -1;
+        cpu_split_cal cal;
+        for (int i = 1; i < argc; i++) {
+            skip = skip || !strcmp(argv[i], "--ssd") || !strcmp(argv[i], "-h") || !strcmp(argv[i], "--help");
+            if (!strcmp(argv[i], "--threads") && i + 1 < argc) cal_threads = atoi(argv[i + 1]);
+        }
+        if (!skip) {
+            ggml_backend_t cal_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            ggml_backend_t cal_gpu = profiler_gpu_backend_init();
+            if (cal_cpu != nullptr && cal_gpu != nullptr) {
+                calibrate_cpu_split(cal_gpu, cal_cpu, cal_threads > 0 ? cal_threads : common_cpu_get_num_math(), cal);
+            }
+            if (cal_gpu != nullptr) ggml_backend_free(cal_gpu);
+            if (cal_cpu != nullptr) ggml_backend_free(cal_cpu);
+        }
+        std::vector<char *> args(argv, argv + argc);
+        const std::string cal_arg = cpu_split_to_arg(cal);
+        if (cal.ok()) {
+            args.insert(args.begin() + 1, { (char *) "--cpu-split-cal", (char *) cal_arg.c_str() });
+        }
+        args.push_back(nullptr);
         setenv("OMP_WAIT_POLICY", "active", 1);
-        execv("/proc/self/exe", argv);
+        fflush(stdout);
+        execv("/proc/self/exe", args.data());
     }
 #endif
     int32_t fixed_threads = -1;
@@ -1419,6 +1556,7 @@ int main(int argc, char ** argv) {
     const char * splice_path = nullptr;
     const char * output_path = "cpu_profile.txt";
     bool    ssd_only       = false;
+    cpu_split_cal split_cal;   // measured by the process that restarted this one (Linux)
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
@@ -1438,6 +1576,8 @@ int main(int argc, char ** argv) {
             no_pin_ceiling = true;
         } else if (!strcmp(argv[i], "--ssd")) {
             ssd_only = true;
+        } else if (!strcmp(argv[i], "--cpu-split-cal") && i + 1 < argc) {
+            cpu_split_from_arg(argv[++i], split_cal);
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("usage: %s [options]\n", argv[0]);
             printf("\n");
@@ -1563,6 +1703,11 @@ int main(int argc, char ** argv) {
         }
         // before the first CPU graph: the OpenMP workers spin on after it (OMP_WAIT_POLICY=active) beside the DRAM readers
         cr.pcie_concurrent = calibrate_pcie_concurrent(&pcie, threads);
+        // measured before a restart that makes the workers spin, else here (they wait as the runtime's do)
+        cr.split = split_cal;
+        if (!cr.split.ok()) {
+            calibrate_cpu_split(pcie.gpu_backend, cpu_be, threads, cr.split);
+        }
         if (procs.kernel_copies) {
             calibrate_pool_latencies(&pcie, cpu_be, threads, procs, cr);
         } else {
