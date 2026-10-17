@@ -223,7 +223,8 @@ struct llama_benchmark_store {
     double   sat_gbps = 0.0;   // the SSD_Read line: GB/s of expert reads with many in flight,
     double   qd1_gbps = 0.0;   // GB/s of one read at a time
     double   lat_ms   = 0.0;   // and ms a lone read takes beyond its bytes at the qd1 rate
-    bool     overlap  = true;  // the reads of one wait are in flight together (else one after another)
+    bool     overlap  = true;  // the reads of one wait are in flight together and a layer's expert matmuls wait only for
+                               // their own tensor's (else one after another, and the layer waits for all)
 
     // false: not an SSD_Read line
     bool parse_ssd(const std::string & line);

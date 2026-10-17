@@ -412,7 +412,7 @@ std::vector<double> llama_pshard_layer_miss_share(const llama_pshard_workload * 
 
 // the pricing of the RAM expert store's SSD reads. Bump it when that pricing changes: only the registries of models
 // the store serves re-plan
-constexpr uint32_t LLAMA_PSHARD_STORE_PRICING_VERSION = 9;
+constexpr uint32_t LLAMA_PSHARD_STORE_PRICING_VERSION = 10;
 
 // the RAM expert store as the loader decides it for a model (llama_expert_store_decide on the gguf tensor bytes, the
 // RAM and -mra), and the CPU profile's SSD_Read line of the disk holding the model

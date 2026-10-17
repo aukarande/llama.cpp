@@ -1536,9 +1536,12 @@ double llama_benchmark_predictor::predict_tps(
         llama_split_timing t = predict_split(nodes, n_nodes, is_gpu, batch_size, async_copy, &timing_cache, token_scale);
 
         // the store's SSD reads for the split's CPU expert matmuls: a layer's tensors share its routing, and the layer
-        // waits once for the experts its rows use that are not in RAM
+        // reads the experts its rows use that are not in RAM. With the reads in flight together, a tensor's matmul
+        // waits only for its own rows (they land in the order the tensors are used, about 1/n of the reads each): a
+        // layer that reads (probability p of m expected misses) takes r/p to read, of which the matmuls of the n
+        // tensors c hide min(c, r/p) * (n - 1) / n
         if (st != nullptr && !is_gpu) {
-            struct ids_reads { const ggml_tensor * ids; double bytes; int n; };   // one expert's bytes over n tensors
+            struct ids_reads { const ggml_tensor * ids; double bytes; int n; double mm_ms; };   // one expert's bytes over n tensors
             std::vector<ids_reads> lay;
             for (int j = 0; j < n_nodes; j++) {
                 const ggml_tensor * w   = nodes[j]->src[0];
@@ -1549,15 +1552,24 @@ double llama_benchmark_predictor::predict_tps(
                 }
                 auto it = std::find_if(lay.begin(), lay.end(), [&](const auto & l) { return l.ids == ids; });
                 if (it == lay.end()) {
-                    lay.push_back({ ids, 0.0, 0 });
+                    lay.push_back({ ids, 0.0, 0, 0.0 });
                     it = lay.end() - 1;
                 }
                 it->bytes += (double) w->nb[2];
                 it->n++;
+                if (st->overlap) {
+                    it->mm_ms += predict_split(&nodes[j], 1, false, batch_size, async_copy, &timing_cache, token_scale).time_ms;
+                }
             }
             for (const auto & l : lay) {
                 const double rows = std::max(1.0, std::round((double) l.ids->ne[1] * token_scale));
-                ssd_ms += store_read_ms(store_misses(rows, (double) l.ids->ne[0]), l.bytes, 1, l.n);
+                const double m    = store_misses(rows, (double) l.ids->ne[0]);
+                const double r    = store_read_ms(m, l.bytes, 1, l.n);
+                const double p    = 1.0 - std::exp(-m);
+                ssd_ms += r;
+                if (st->overlap && l.n > 1 && p > 0.0) {
+                    ssd_ms -= p * std::min(l.mm_ms, r / p) * (l.n - 1) / l.n;
+                }
             }
         }
 
