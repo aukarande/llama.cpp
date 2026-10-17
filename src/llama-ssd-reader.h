@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -29,11 +30,13 @@ struct llama_ssd_reader {
     struct request {
         OVERLAPPED ov;
         size_t     need;   // bytes the caller uses: a read cut short at the end of the file may stop after them
+        bool       done;
     };
     std::vector<HANDLE> files;
     HANDLE port = nullptr;
     std::vector<std::unique_ptr<request>> reqs;
     size_t n_used  = 0;
+    size_t n_done  = 0;   // the reads [0, n_done) of this batch landed
     size_t pending = 0;
     bool   failed  = false;
     DWORD  last_error = 0;
@@ -83,6 +86,7 @@ struct llama_ssd_reader {
         r->ov.Offset     = (DWORD) (off & 0xffffffffu);
         r->ov.OffsetHigh = (DWORD) (off >> 32);
         r->need = need;
+        r->done = false;
         if (!ReadFile(files[split], dst, (DWORD) len, nullptr, &r->ov)) {
             last_error = GetLastError();
             if (last_error != ERROR_IO_PENDING) {
@@ -99,29 +103,47 @@ struct llama_ssd_reader {
             failed = true;
         }
     }
-    bool wait_all() {
+    // takes the completions the port holds, waiting for at least one; false: the port failed
+    bool collect() {
         OVERLAPPED_ENTRY done[64];
-        while (pending > 0) {
-            ULONG n = 0;
-            if (!GetQueuedCompletionStatusEx(port, done, 64, &n, INFINITE, FALSE)) {
+        ULONG n = 0;
+        if (!GetQueuedCompletionStatusEx(port, done, 64, &n, INFINITE, FALSE)) {
+            failed = true;
+            return false;
+        }
+        for (ULONG i = 0; i < n; i++) {
+            request * r = CONTAINING_RECORD(done[i].lpOverlapped, request, ov);
+            r->done = true;
+            if (done[i].lpOverlapped->Internal != 0 || done[i].dwNumberOfBytesTransferred < r->need) {
+                if (!failed) {
+                    LLAMA_LOG_ERROR("%s: read at %llu failed: status 0x%08llx, %lu of %zu bytes\n", __func__,
+                        ((unsigned long long) r->ov.OffsetHigh << 32) | r->ov.Offset,
+                        (unsigned long long) done[i].lpOverlapped->Internal,
+                        (unsigned long) done[i].dwNumberOfBytesTransferred, r->need);
+                }
                 failed = true;
+            }
+        }
+        pending -= n;
+        return true;
+    }
+    // waits for the first n reads issued since the last wait_all; the later ones stay in flight
+    bool wait_first(size_t n) {
+        n = std::min(n, n_used);
+        while (n_done < n && !failed) {
+            if (reqs[n_done]->done) {
+                n_done++;
+            } else if (!collect()) {
                 break;
             }
-            for (ULONG i = 0; i < n; i++) {
-                const request * r = CONTAINING_RECORD(done[i].lpOverlapped, request, ov);
-                if (done[i].lpOverlapped->Internal != 0 || done[i].dwNumberOfBytesTransferred < r->need) {
-                    if (!failed) {
-                        LLAMA_LOG_ERROR("%s: read at %llu failed: status 0x%08llx, %lu of %zu bytes\n", __func__,
-                            ((unsigned long long) r->ov.OffsetHigh << 32) | r->ov.Offset,
-                            (unsigned long long) done[i].lpOverlapped->Internal,
-                            (unsigned long) done[i].dwNumberOfBytesTransferred, r->need);
-                    }
-                    failed = true;
-                }
-            }
-            pending -= n;
+        }
+        return !failed;
+    }
+    bool wait_all() {
+        while (pending > 0 && collect()) {
         }
         n_used = 0;
+        n_done = 0;
         const bool ok = !failed;
         failed = false;
         return ok;
@@ -172,6 +194,10 @@ struct llama_ssd_reader {
     bool try_read(size_t split, uint64_t off, size_t len, void * dst, size_t need) {
         read(split, off, len, dst, need);
         return true;
+    }
+    bool wait_first(size_t n) {
+        (void) n;
+        return !failed;
     }
     bool wait_all() {
         const bool ok = !failed;

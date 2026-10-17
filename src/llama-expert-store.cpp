@@ -289,6 +289,9 @@ llama_expert_store::~llama_expert_store() {
     if (win[0].pending || win[1].pending) {
         ahead->wait_all();
     }
+    if (pend.layer >= 0) {
+        reader->wait_all();
+    }
     if (win_buf != nullptr) {
         ggml_backend_buffer_free(win_buf);
     }
@@ -529,8 +532,7 @@ bool llama_expert_store::allocate(ggml_backend_dev_t dev, uint32_t n_pin) {
     return true;
 }
 
-void llama_expert_store::fetch(layer & L, const int32_t * experts, size_t n, counters & c) {
-    constexpr size_t sector = llama_ssd_reader::sector;
+void llama_expert_store::claim(layer & L, const int32_t * experts, size_t n) {
     GGML_ASSERT(n <= n_ram - L.lent.size() - L.n_out);
     // device uploads of this layer may still read the slots about to be overwritten
     wait_readers(L.gpu_readers);
@@ -554,34 +556,113 @@ void llama_expert_store::fetch(layer & L, const int32_t * experts, size_t n, cou
         L.expert_of[v] = x;
         L.slot_of[x]   = (int32_t) v;
         L.stamp[v]     = ++L.clock;
-        for (uint32_t ei : L.ents) {
-            const auto & e = ents[ei];
-            const size_t off = e.file_off + (size_t) x * e.row_bytes;
-            const size_t beg = off & ~(sector - 1);
-            const size_t end = GGML_PAD(off + e.row_bytes, sector);
-            reader->read(e.split, beg, end - beg, slot(e, v), off + e.row_bytes - beg);
-            c.bytes += end - beg;
-        }
-        c.reads++;
     }
+}
+
+void llama_expert_store::read_rows(uint32_t ei, const int32_t * experts, size_t n, counters & c) {
+    constexpr size_t sector = llama_ssd_reader::sector;
+    const auto & e = ents[ei];
+    const layer & L = layers[layer_of.at(e.t)];
+    for (size_t i = 0; i < n; i++) {
+        const int32_t x = experts[i];
+        const size_t off = e.file_off + (size_t) x * e.row_bytes;
+        const size_t beg = off & ~(sector - 1);
+        const size_t end = GGML_PAD(off + e.row_bytes, sector);
+        reader->read(e.split, beg, end - beg, slot(e, (uint32_t) L.slot_of[x]), off + e.row_bytes - beg);
+        c.bytes += end - beg;
+    }
+}
+
+void llama_expert_store::publish(uint32_t ei, const int32_t * experts, size_t n) {
+    constexpr size_t sector = llama_ssd_reader::sector;
+    auto & e = ents[ei];
+    const layer & L = layers[layer_of.at(e.t)];
+    // the rows keep the mapping's alignment within a sector, so the kernels read them as they read the mapping
+    for (size_t i = 0; i < n; i++) {
+        const int32_t x = experts[i];
+        const size_t off = e.file_off + (size_t) x * e.row_bytes;
+        e.tbl[x] = slot(e, (uint32_t) L.slot_of[x]) + (off & (sector - 1));
+    }
+}
+
+void llama_expert_store::fetch(layer & L, const int32_t * experts, size_t n, counters & c) {
+    claim(L, experts, n);
+    for (uint32_t ei : L.ents) {
+        read_rows(ei, experts, n, c);
+    }
+    c.reads += n;
     const int64_t t0 = ggml_time_us();
     if (!reader->wait_all()) {
         GGML_ABORT("expert store: an SSD read failed");
     }
     c.wait_us += ggml_time_us() - t0;
-    // the rows keep the mapping's alignment within a sector, so the kernels read them as they read the mapping
-    for (size_t i = 0; i < n; i++) {
-        const int32_t x = experts[i];
-        const size_t  v = (size_t) L.slot_of[x];
-        for (uint32_t ei : L.ents) {
-            auto & e = ents[ei];
-            const size_t off = e.file_off + (size_t) x * e.row_bytes;
-            e.tbl[x] = slot(e, (uint32_t) v) + (off & (sector - 1));
-        }
+    for (uint32_t ei : L.ents) {
+        publish(ei, experts, n);
     }
 }
 
-void llama_expert_store::serve(layer & L, const ggml_tensor * ids) {
+void llama_expert_store::read_ahead(uint32_t li, ggml_cgraph * g, int j, size_t n_miss, counters & c) {
+    layer & L = layers[li];
+    const ggml_tensor * ids = ggml_graph_node(g, j)->src[2];
+    claim(L, want.data(), n_miss);
+    c.reads += n_miss;
+    pend.layer = (int32_t) li;
+    pend.x.assign(want.begin(), want.begin() + n_miss);
+    pend.order.clear();
+    // the tensors the run's matmuls of this routing use, first used first
+    for (int k = j; k < ggml_graph_n_nodes(g); k++) {
+        const ggml_tensor * t = ggml_graph_node(g, k);
+        if (t->op != GGML_OP_MUL_MAT_ID || !(t->flags & GGML_TENSOR_FLAG_COMPUTE) || t->src[2] != ids) {
+            continue;
+        }
+        const auto it = ent_of.find(t->src[0]);
+        if (it != ent_of.end() && layer_of.at(t->src[0]) == li &&
+                std::find(pend.order.begin(), pend.order.end(), it->second) == pend.order.end()) {
+            pend.order.push_back(it->second);
+        }
+    }
+    pend.n_used = pend.order.size();
+    // tensors the run does not use are read with the last one used
+    for (uint32_t ei : L.ents) {
+        if (std::find(pend.order.begin(), pend.order.end(), ei) == pend.order.end()) {
+            pend.order.push_back(ei);
+        }
+    }
+    GGML_ASSERT(pend.n_used > 0);
+    pend.k = 0;
+    pend.c = &c;
+    // every read in flight at once, in the order the tensors are used
+    for (uint32_t ei : pend.order) {
+        read_rows(ei, pend.x.data(), pend.x.size(), c);
+    }
+}
+
+void llama_expert_store::pend_step() {
+    const size_t end  = pend.k + 1 < pend.n_used ? pend.k + 1 : pend.order.size();
+    const bool   last = end == pend.order.size();
+    const int64_t t0 = ggml_time_us();
+    if (!(last ? reader->wait_all() : reader->wait_first(end * pend.x.size()))) {
+        GGML_ABORT("expert store: an SSD read failed");
+    }
+    pend.c->wait_us += ggml_time_us() - t0;
+    for (size_t i = pend.k; i < end; i++) {
+        publish(pend.order[i], pend.x.data(), pend.x.size());
+    }
+    pend.k     = end;
+    pend.layer = last ? -1 : pend.layer;
+}
+
+void llama_expert_store::pend_drain() {
+    while (pend.layer >= 0) {
+        pend_step();
+    }
+}
+
+bool llama_expert_store::pend_has(uint32_t ei) const {
+    return pend.layer >= 0 && std::find(pend.order.begin() + pend.k, pend.order.end(), ei) != pend.order.end();
+}
+
+size_t llama_expert_store::serve(layer & L, const ggml_tensor * ids) {
     const int64_t n_ids  = ids->ne[0];
     const int64_t n_rows = ids->ne[1];
     want.clear();
@@ -622,14 +703,11 @@ void llama_expert_store::serve(layer & L, const ggml_tensor * ids) {
             want[n_miss++] = x;
         }
     }
-    if (n_miss == 0) {
-        return;
-    }
     if (!fill) {
         c.fallbacks += n_miss;
-        return;
+        return 0;
     }
-    fetch(L, want.data(), n_miss, c);
+    return n_miss;
 }
 
 bool llama_expert_store::acquire(const ggml_tensor * t, const int32_t * hits, size_t n_hits, const int32_t * misses,
@@ -879,6 +957,9 @@ bool llama_expert_store::upload(const ggml_tensor * src, ggml_tensor * dst, cons
 
 void llama_expert_store::detach() {
     std::lock_guard<std::mutex> lk(mtx);
+    pend_drain();
+    served_ids   = nullptr;
+    served_layer = UINT32_MAX;
     sweep_stop();
     window_close();
     for (auto & L : layers) {
@@ -1341,8 +1422,12 @@ int llama_expert_store::host_experts(struct ggml_cgraph * g, int j0) {
     if (!on) {
         return n;   // not allocated yet: every expert is read from the mapping
     }
-    const ggml_tensor * served_ids   = nullptr;
-    uint32_t            served_layer = UINT32_MAX;
+    if (j0 == 0) {
+        // a split starts: reads a failed run left in flight land first
+        pend_drain();
+        served_ids   = nullptr;
+        served_layer = UINT32_MAX;
+    }
     for (int j = j0; j < n; j++) {
         const ggml_tensor * t = ggml_graph_node(g, j);
         // a node that does not run (a layer-major sweep's other layers) has no routing yet
@@ -1369,12 +1454,27 @@ int llama_expert_store::host_experts(struct ggml_cgraph * g, int j0) {
             }
         }
         // the layer's expert tensors share one routing: serve it once
-        if (ids == served_ids && it->second == served_layer) {
-            continue;
+        if (ids != served_ids || it->second != served_layer) {
+            pend_drain();
+            auto & c = cnt[ids->ne[1] > 1 ? 1 : 0];
+            const size_t n_miss = serve(layers[it->second], ids);
+            if (n_miss > 0 && llama_ssd_reader::overlap) {
+                read_ahead(it->second, g, j, n_miss, c);
+            } else if (n_miss > 0) {
+                fetch(layers[it->second], want.data(), n_miss, c);
+            }
+            served_ids   = ids;
+            served_layer = it->second;
         }
-        serve(layers[it->second], ids);
-        served_ids   = ids;
-        served_layer = it->second;
+        const uint32_t ei = ent_of.at(t->src[0]);
+        if (pend_has(ei)) {
+            if (j > j0) {
+                return j;   // the nodes before this matmul compute while its rows are read
+            }
+            while (pend_has(ei)) {
+                pend_step();
+            }
+        }
     }
     return n;
 }

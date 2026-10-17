@@ -171,9 +171,35 @@ private:
         uint64_t passes = 0, requests = 0, hits = 0, reads = 0, bytes = 0, wait_us = 0, fallbacks = 0, pinned = 0;
     };
 
-    // reads the experts (all misses, n <= the slots not lent) into the least recently used slots
+    // gives the experts (all misses, n <= the slots not lent) the least recently used slots; their tables point there
+    // once publish runs
+    void claim(layer & L, const int32_t * experts, size_t n);
+    // queues the reads of tensor ei's rows of the experts into their slots
+    void read_rows(uint32_t ei, const int32_t * experts, size_t n, counters & c);
+    void publish(uint32_t ei, const int32_t * experts, size_t n);
+    // reads the experts into the least recently used slots
     void fetch(layer & L, const int32_t * experts, size_t n, counters & c);
-    void serve(layer & L, const ggml_tensor * ids);
+    // counts the routing and stamps its hits; returns the misses to read, in want
+    size_t serve(layer & L, const ggml_tensor * ids);
+
+    // a layer's misses, every read in flight in the order the graph uses the tensors: a tensor's matmul waits only for
+    // its own rows, so the nodes before it compute while the later tensors are read
+    struct pending_reads {
+        int32_t               layer = -1;   // -1: none
+        std::vector<int32_t>  x;            // the experts
+        std::vector<uint32_t> order;        // the layer's tensors; order[n_used - 1..] are waited for together
+        size_t                n_used = 0;
+        size_t                k = 0;        // order[..k] are in place
+        counters *            c = nullptr;
+    };
+    pending_reads pend;
+    const ggml_tensor * served_ids   = nullptr;   // the routing served last in the running split
+    uint32_t            served_layer = UINT32_MAX;
+    void read_ahead(uint32_t li, ggml_cgraph * g, int j, size_t n_miss, counters & c);
+    // waits for order[k]'s reads and points its tables at the slots
+    void pend_step();
+    void pend_drain();
+    bool pend_has(uint32_t ei) const;
 
     std::vector<entry> ents;
     std::vector<layer> layers;
