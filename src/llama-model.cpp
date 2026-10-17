@@ -1485,14 +1485,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
-        for (const auto & dev : devices) {
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
-                ml.use_mmap = false;
-                break;
-            }
+        size_t ram_free  = 0;
+        size_t ram_total = 0;
+        if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+            ggml_backend_dev_memory(cpu_dev, &ram_free, &ram_total);
         }
+        uint64_t file_b = 0;
+        for (const auto & f : ml.files) {
+            file_b += f->size();
+        }
+        std::vector<ggml_backend_dev_t> devs;
+        for (const auto & dev : devices) {
+            devs.push_back(dev.dev);
+        }
+        ml.use_mmap = llama_expert_store_auto_maps(devs, file_b, ram_total);
     }
 
     const char * load_mode_name = params.load_mode == LLAMA_LOAD_MODE_AUTO

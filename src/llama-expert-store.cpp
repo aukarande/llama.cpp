@@ -162,6 +162,20 @@ std::string llama_expert_store_largest_file(const std::string & path_model, uint
     return file;
 }
 
+bool llama_expert_store_auto_maps(const std::vector<ggml_backend_dev_t> & devices, uint64_t file_bytes, size_t ram_total) {
+    if (file_bytes > ram_total) {
+        return true;
+    }
+    for (ggml_backend_dev_t dev : devices) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (!props.caps.mmap_support) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // this process's committed bytes and working set (0 where the system does not say)
 static void process_memory(uint64_t & committed, uint64_t & working_set) {
     committed   = 0;

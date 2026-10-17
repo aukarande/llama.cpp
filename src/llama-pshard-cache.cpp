@@ -272,10 +272,10 @@ static bool pshard_store_weight_bytes(const char * path_model, bool load_mtp, si
 
 llama_pshard_store_info llama_pshard_store_info_for(const char * path_model, const struct llama_model_params * mparams) {
     llama_pshard_store_info info;
-    // the store reads the experts a pass misses from the mapping's files
+    // the store reads the experts a pass misses from the mapping's files: load mode auto maps as the loader does
     const auto mode = mparams->load_mode;
-    const bool mmap = mode == LLAMA_LOAD_MODE_AUTO || mode == LLAMA_LOAD_MODE_MMAP || mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
-    if (path_model == nullptr || !mmap || mparams->max_ram_alloc == 0) {
+    if (path_model == nullptr || mparams->max_ram_alloc == 0 ||
+            !(mode == LLAMA_LOAD_MODE_AUTO || mode == LLAMA_LOAD_MODE_MMAP || mode == LLAMA_LOAD_MODE_MMAP_MLOCK)) {
         return info;
     }
     if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
@@ -285,6 +285,19 @@ llama_pshard_store_info llama_pshard_store_info_for(const char * path_model, con
     const size_t reserve = (size_t) (LLAMA_PSHARD_HOST_PIN_RESERVE_GB * 1e9);
     uint64_t files_b = 0;
     const std::string largest = llama_expert_store_largest_file(path_model, &files_b);
+    if (mode == LLAMA_LOAD_MODE_AUTO) {
+        std::vector<ggml_backend_dev_t> devs;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                devs.push_back(dev);
+            }
+        }
+        if (!llama_expert_store_auto_maps(devs, files_b, info.ram_total)) {
+            return info;
+        }
+    }
     size_t exps_b  = 0;
     size_t other_b = 0;
     size_t row_b   = 0;

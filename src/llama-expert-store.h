@@ -38,6 +38,9 @@ size_t llama_expert_store_stage_bytes(size_t stride);
 std::vector<std::string> llama_expert_store_files(const std::string & path_model);
 // the largest of them, which holds the most experts the store reads ("" = none is readable), and their total bytes
 std::string llama_expert_store_largest_file(const std::string & path_model, uint64_t * total_b = nullptr);
+// whether load mode auto maps a model of file_bytes on these devices: not where a device reads mapped weights poorly (an
+// integrated GPU) and the model fits in RAM whole; a model larger than RAM is mapped, read whole it would not fit
+bool llama_expert_store_auto_maps(const std::vector<ggml_backend_dev_t> & devices, uint64_t file_bytes, size_t ram_total);
 // the store reader's rate in GB/s: unbuffered reads of read_bytes (a sector multiple) at random sector-aligned offsets
 // of path (a scratch file: opened with every sharing mode), n_inflight of them waited for together, for about
 // `seconds` (0 = the file cannot be read)
