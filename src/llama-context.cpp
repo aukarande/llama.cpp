@@ -3076,7 +3076,8 @@ static void lm_reads(const ggml_tensor * t, F && f) {
 }
 
 // the full graph of a ubatch by layers: every builder names layer il's output "l_out-<il>" or "l_last-<il>", with the
-// same floats per token in all layers; a node is activation-derived when it depends on the token or embedding input
+// same floats per token in all layers; a node is activation-derived when it depends on the embedding input (a node of
+// the token ids alone, such as a hash routing, is an input every group computes again)
 struct lm_graph_scan {
     bool                                             rooted = false; // the graph has the token input
     std::unordered_map<const ggml_tensor *, int32_t> pos;            // node -> index
@@ -3096,7 +3097,7 @@ struct lm_graph_scan {
             const ggml_tensor * t = ggml_graph_node(gf, i);
             bool a = t == res->t_inp_embd;
             lm_reads(t, [&](const ggml_tensor * r) {
-                a = a || r == res->t_inp_tokens || r == res->t_inp_embd;
+                a = a || r == res->t_inp_embd;
                 if (const auto it = pos.find(r); it != pos.end()) {
                     a = a || act[it->second];
                     last_use[it->second] = i;
@@ -3361,44 +3362,61 @@ bool llama_context::layer_major_check(uint32_t n_tokens_all, uint32_t n_ubatch, 
 bool llama_context::layer_major_cut(llm_graph_result * res, ggml_cgraph * gf, uint32_t n_tokens) {
     const lm_graph_scan s(gf, res, (int32_t) model.hparams.n_layer(), n_tokens, lm_row);
 
-    const int32_t n     = ggml_graph_n_nodes(gf);
-    const int32_t c_in  = lm_cut.in_il  >= 0 ? s.l_out[lm_cut.in_il]  : -1;
-    const int32_t c_out = lm_cut.out_il >= 0 ? s.l_out[lm_cut.out_il] : n - 1;
-    ggml_tensor * t_in  = c_in >= 0 ? ggml_graph_node(gf, c_in) : nullptr;
-    ggml_tensor * t_out = lm_cut.out_il >= 0 && c_out >= 0 ? ggml_graph_node(gf, c_out) : nullptr;
+    const int32_t n = ggml_graph_n_nodes(gf);
 
+    // the nodes the group of layers (in_il, out_il] computes: nullptr, or why it cannot be cut
+    std::vector<uint8_t> keep;
+    auto cut = [&](int32_t in_il, int32_t out_il) -> const char * {
+        const int32_t c_in  = in_il  >= 0 ? s.l_out[in_il]  : -1;
+        const int32_t c_out = out_il >= 0 ? s.l_out[out_il] : n - 1;
+        const ggml_tensor * t_in  = c_in >= 0 ? ggml_graph_node(gf, c_in) : nullptr;
+        const ggml_tensor * t_out = out_il >= 0 && c_out >= 0 ? ggml_graph_node(gf, c_out) : nullptr;
+        if (!s.rooted) {
+            return "the graph has no token input";
+        }
+        if ((in_il >= 0 && c_in < 0) || c_out <= c_in) {
+            return "a group's layer output is missing";
+        }
+        if ((t_out != nullptr && !ggml_is_contiguous(t_out)) || (t_in != nullptr && !ggml_is_contiguous(t_in))) {
+            return "a group's layer output is not contiguous";
+        }
+        if (t_in != nullptr && t_in->view_src != nullptr) {
+            return "a group's layer output is a view";
+        }
+        keep.assign(n, 0);
+        std::vector<int32_t> stack;
+        for (int32_t i = c_in + 1; i <= c_out; ++i) {
+            keep[i] = 1;
+            stack.push_back(i);
+        }
+        const char * why = nullptr;
+        while (why == nullptr && !stack.empty()) {
+            const int32_t i = stack.back();
+            stack.pop_back();
+            lm_reads(ggml_graph_node(gf, i), [&](const ggml_tensor * r) {
+                const auto it = s.pos.find(r);
+                if (it == s.pos.end() || it->second == c_in || keep[it->second]) {
+                    return;
+                }
+                if (s.act[it->second]) {
+                    why = "a group reads an activation from before its input";
+                    return;
+                }
+                keep[it->second] = 1;
+                stack.push_back(it->second);
+            });
+        }
+        return why;
+    };
+
+    // the first group checks every later group on its graph: a later group that cannot be cut would leave the batch
+    // in the state of the layers that ran
     const char * why = nullptr;
-    if (!s.rooted) {
-        why = "the graph has no token input";
-    } else if ((lm_cut.in_il >= 0 && c_in < 0) || c_out <= c_in) {
-        why = "a group's layer output is missing";
-    } else if ((lm_cut.out_il >= 0 && !ggml_is_contiguous(t_out)) || (t_in != nullptr && !ggml_is_contiguous(t_in))) {
-        why = "a group's layer output is not contiguous";
-    } else if (t_in != nullptr && t_in->view_src != nullptr) {
-        why = "a group's layer output is a view";
+    for (size_t g = 1; lm_cut.in_il < 0 && why == nullptr && g < lm_groups.size(); ++g) {
+        why = cut(lm_groups[g].first - 1, g + 1 < lm_groups.size() ? lm_groups[g].second - 1 : -1);
     }
-
-    std::vector<uint8_t> keep(n, 0);
-    std::vector<int32_t> stack;
-    for (int32_t i = c_in + 1; why == nullptr && i <= c_out; ++i) {
-        keep[i] = 1;
-        stack.push_back(i);
-    }
-    while (why == nullptr && !stack.empty()) {
-        const int32_t i = stack.back();
-        stack.pop_back();
-        lm_reads(ggml_graph_node(gf, i), [&](const ggml_tensor * r) {
-            const auto it = s.pos.find(r);
-            if (it == s.pos.end() || it->second == c_in || keep[it->second]) {
-                return;
-            }
-            if (s.act[it->second]) {
-                why = "a group reads an activation from before its input";
-                return;
-            }
-            keep[it->second] = 1;
-            stack.push_back(it->second);
-        });
+    if (why == nullptr) {
+        why = cut(lm_cut.in_il, lm_cut.out_il);
     }
 
     if (why != nullptr) {
@@ -3413,8 +3431,8 @@ bool llama_context::layer_major_cut(llm_graph_result * res, ggml_cgraph * gf, ui
         }
     }
 
-    lm_cut.t_in  = t_in;
-    lm_cut.t_out = t_out;
+    lm_cut.t_in  = lm_cut.in_il  >= 0 ? ggml_graph_node(gf, s.l_out[lm_cut.in_il])  : nullptr;
+    lm_cut.t_out = lm_cut.out_il >= 0 ? ggml_graph_node(gf, s.l_out[lm_cut.out_il]) : nullptr;
 
     return true;
 }
